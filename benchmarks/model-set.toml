@@ -1,25 +1,28 @@
 schema_version = 1
-family = "qwen3-dense-base"
+family = "qwen3.8-27b"
 
 [[models]]
-role = "host-overhead-floor"
-id = "Qwen/Qwen3-0.6B-Base"
-revision = "PIN_BEFORE_PUBLISHED_RUN"
-dtype = "bfloat16"
-notes = "Small dense Qwen3 model used to expose request/scheduler/host overhead that a larger GPU-bound model can hide."
+role = "primary-local-target"
+id = "Qwen/Qwen3.8-27B"
+revision = "PIN_FROM_LOCAL_ARTIFACT_BEFORE_RECORDED_RUN"
+format = "GGUF"
+quantization = "existing Unsloth Q4 artifact; pin exact local filename/variant"
+runtime_reference = "llama.cpp"
+notes = "Primary first architecture/model target on the RTX 4090. The user already has a Q4 Unsloth Qwen3.8-27B GGUF running with llama.cpp. Inspect and record the exact local artifact, checksum/revision, llama.cpp commit/build, GPU offload, context, flash-attention, MTP, and other runtime settings before treating any run as a benchmark."
 
-[[models]]
-role = "representative-single-gpu"
-id = "Qwen/Qwen3-8B-Base"
-revision = "PIN_BEFORE_PUBLISHED_RUN"
-dtype = "bfloat16"
-notes = "Primary RTX 4090 serving baseline. Same dense Qwen3 architecture family at a size large enough to exercise realistic model execution while fitting on one 24 GiB-class GPU."
+[architecture]
+type = "dense-hybrid-causal-vl"
+text_only_first = true
+notes = "Qwen3.8-27B is non-MoE but not a conventional KV-only transformer: its language stack mixes Gated DeltaNet/linear-attention and full-attention layers and includes MTP; the official model also has a vision encoder. The first Engine path may be text-only, but the core state/model interfaces must not assume KV-only execution."
 
 [semantics]
-endpoint = "/v1/completions"
-chat_template = false
-sampling = "deterministic"
-ignore_eos_for_fixed_output_length_runs = true
+endpoint = "PIN_FROM_LOCAL_LLAMA_CPP_CONFIGURATION"
+chat_template = "PIN_FROM_LOCAL_LLAMA_CPP_CONFIGURATION"
+thinking_mode = "PIN_EXPLICITLY_FOR_EACH_RUN"
+sampling = "PIN_EXPLICITLY_FOR_EACH_RUN"
+ignore_eos_for_fixed_output_length_runs = "PIN_IF_SUPPORTED"
 
-[policy]
-reason = "Use base models for low-level engine comparisons so chat-template and reasoning-mode behavior do not contaminate fixed-token serving measurements. Add post-trained/chat workloads later as an application-level serving case."
+[comparison]
+primary_local_reference = "llama.cpp with the existing Q4 Unsloth GGUF"
+incumbents = ["vLLM", "SGLang"]
+notes = "Do not claim an Engine win from mismatched quantization or model semantics. Exact byte-identical weight formats may not be supported by every engine, so preserve a local llama.cpp same-artifact baseline and separately construct vLLM/SGLang comparisons with matched model semantics and the closest defensible precision/quality envelope. Record the mismatch explicitly."
