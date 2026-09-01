@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/nijaru/engine"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
