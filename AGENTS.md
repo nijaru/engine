@@ -13,15 +13,17 @@ Do not recreate a repository-local `ai/` tree or duplicate product/design/roadma
 ## Session start
 
 1. Read centralized `brief.md`.
-2. Read the canonical context file relevant to the task.
-3. Check `git status` before editing.
-4. Keep implementation claims benchmark-backed.
+2. Read `STATUS.md` before making implementation claims.
+3. Read the canonical context file relevant to the task.
+4. Check `git status` before editing.
+5. Keep implementation claims benchmark-backed.
 
 ## Context load map
 
 | Task | Read |
 |---|---|
 | Product/architecture/scope | `spec.md` |
+| Current implementation | `STATUS.md`, then code/tests |
 | Current implementation sequence | `PLAN.md` |
 | Durable choices | `DECISIONS.md` |
 | Archon/external orchestration boundary | `design/orchestrator-boundary.md` |
