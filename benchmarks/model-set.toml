@@ -1,0 +1,25 @@
+schema_version = 1
+family = "qwen3-dense-base"
+
+[[models]]
+role = "host-overhead-floor"
+id = "Qwen/Qwen3-0.6B-Base"
+revision = "PIN_BEFORE_PUBLISHED_RUN"
+dtype = "bfloat16"
+notes = "Small dense Qwen3 model used to expose request/scheduler/host overhead that a larger GPU-bound model can hide."
+
+[[models]]
+role = "representative-single-gpu"
+id = "Qwen/Qwen3-8B-Base"
+revision = "PIN_BEFORE_PUBLISHED_RUN"
+dtype = "bfloat16"
+notes = "Primary RTX 4090 serving baseline. Same dense Qwen3 architecture family at a size large enough to exercise realistic model execution while fitting on one 24 GiB-class GPU."
+
+[semantics]
+endpoint = "/v1/completions"
+chat_template = false
+sampling = "deterministic"
+ignore_eos_for_fixed_output_length_runs = true
+
+[policy]
+reason = "Use base models for low-level engine comparisons so chat-template and reasoning-mode behavior do not contaminate fixed-token serving measurements. Add post-trained/chat workloads later as an application-level serving case."
