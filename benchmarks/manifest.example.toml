@@ -1,0 +1,57 @@
+schema_version = 1
+
+[run]
+name = "4090-single-gpu-baseline"
+engine = "vllm"
+engine_version = "REPLACE_ME"
+engine_commit = "REPLACE_ME"
+benchmark_client = "aiperf"
+benchmark_client_version = "REPLACE_ME"
+seed = 0
+
+[model]
+id = "REPLACE_ME"
+revision = "REPLACE_ME"
+tokenizer = "REPLACE_ME"
+tokenizer_revision = "REPLACE_ME"
+dtype = "REPLACE_ME"
+quantization = "none"
+
+[hardware]
+device = "NVIDIA GeForce RTX 4090"
+vram_bytes = 25757220864
+driver = "REPLACE_ME"
+cuda = "REPLACE_ME"
+power_limit_watts = 0
+
+[server]
+endpoint_type = "completions"
+base_url = "http://127.0.0.1:8000"
+streaming = true
+command = "REPLACE_ME"
+
+[workload]
+kind = "synthetic"
+input_tokens_mean = 1024
+input_tokens_stddev = 0
+output_tokens_mean = 256
+output_tokens_stddev = 0
+request_count = 1000
+request_rate = 0.0
+max_concurrency = 0
+arrival_pattern = "poisson"
+
+[sampling]
+temperature = 0.0
+ignore_eos = true
+
+[slo]
+ttft_ms = 0.0
+itl_ms = 0.0
+e2e_ms = 0.0
+
+[artifacts]
+raw_client_results = "client/"
+server_logs = "server/"
+telemetry = "telemetry/"
+summary = "summary.json"
