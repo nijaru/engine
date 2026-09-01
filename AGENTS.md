@@ -10,6 +10,10 @@ Durable project context is centralized at:
 
 Do not recreate a repository-local `ai/` tree or duplicate product/design/roadmap prose here.
 
+## Current repository workflow
+
+During current private R&D, work directly on `main`. Do not open pull requests unless the user explicitly asks for one.
+
 ## Session start
 
 1. Read centralized `brief.md`.
@@ -26,6 +30,8 @@ Do not recreate a repository-local `ai/` tree or duplicate product/design/roadma
 | Current implementation | `STATUS.md`, then code/tests |
 | Current implementation sequence | `PLAN.md` |
 | Durable choices | `DECISIONS.md` |
+| Origin/product/business strategy | `research/origin-product-and-market-2026-09-01.md` |
+| Benchmark methodology/tooling | `research/benchmark-tooling-2026-09-01.md`, then repository `benchmarks/` |
 | Archon/external orchestration boundary | `design/orchestrator-boundary.md` |
 | Ecosystem/training research | `research/ecosystem-and-adjacent-runtimes-2026-09-01.md` |
 
