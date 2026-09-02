@@ -14,11 +14,14 @@ const Q4_K_VALUE_TYPE: u32 = 12;
 const Q5_K_VALUE_TYPE: u32 = 13;
 const Q6_K_VALUE_TYPE: u32 = 14;
 const IQ4_NL_VALUE_TYPE: u32 = 20;
+const IQ3_S_VALUE_TYPE: u32 = 21;
 const IQ4_XS_VALUE_TYPE: u32 = 23;
 const Q8_0_BLOCK_ELEMENTS: usize = 32;
 const Q8_0_BLOCK_BYTES: usize = 34;
 const IQ4_NL_BLOCK_ELEMENTS: usize = 32;
 const IQ4_NL_BLOCK_BYTES: usize = 18;
+const IQ3_S_BLOCK_ELEMENTS: usize = 256;
+const IQ3_S_BLOCK_BYTES: usize = 110;
 const Q3_K_BLOCK_ELEMENTS: usize = 256;
 const Q3_K_BLOCK_BYTES: usize = 110;
 const Q4_K_BLOCK_ELEMENTS: usize = 256;
@@ -29,6 +32,34 @@ const Q6_K_BLOCK_ELEMENTS: usize = 256;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const IQ4_XS_BLOCK_ELEMENTS: usize = 256;
 const IQ4_XS_BLOCK_BYTES: usize = 136;
+
+const IQ3_GRID_HEX: &[u8] = include_bytes!("iq3_grid.hex");
+const IQ3_GRID_VALUES: [u8; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+
+fn iq3_hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn iq3_grid_values() -> Vec<u8> {
+    let mut values = Vec::with_capacity(512 * 4);
+    for code in 0..512 {
+        for lane in 0..4 {
+            let value_index = code * 4 + lane;
+            let packed_index = value_index / 2;
+            let high = iq3_hex_nibble(IQ3_GRID_HEX[packed_index * 2]);
+            let low = iq3_hex_nibble(IQ3_GRID_HEX[packed_index * 2 + 1]);
+            let packed = (high << 4) | low;
+            let grid_index = usize::from((packed >> ((value_index % 2) * 4)) & 0x07);
+            values.push(IQ3_GRID_VALUES[grid_index]);
+        }
+    }
+    values
+}
 
 const Q_K_GEMV_SOURCE: &str = r#"
 extern "C" __device__ __forceinline__ float decode_f16(unsigned short bits) {
@@ -72,6 +103,52 @@ extern "C" __device__ __forceinline__ int minimum_value(const unsigned char* blo
     }
     const int index = group - 4;
     return (int)((block[12 + index] >> 4u) | ((block[8 + index] >> 2u) & 0x30u));
+}
+
+extern "C" __global__ void iq3_s_gemv(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    const unsigned char* grid,
+    int input_size,
+    int output_size
+) {
+    const int output_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (output_index >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (output_index * blocks_per_output + block_index) * 110;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned char* low_codes = block + 2;
+        const unsigned char* high_codes = block + 66;
+        const unsigned char* signs = block + 74;
+        const unsigned char* scales = block + 106;
+        for (int group = 0; group < 8; ++group) {
+            const int scale_nibble =
+                (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
+            const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
+            for (int sub = 0; sub < 4; ++sub) {
+                const unsigned char sign_bits = signs[group * 4 + sub];
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int code_index = group * 8 + sub * 2 + lane / 4;
+                    const int high_bit =
+                        (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
+                    const int code = (int)low_codes[code_index] | (high_bit << 8);
+                    const int sign = ((sign_bits >> lane) & 1u) == 0u ? 1 : -1;
+                    const int grid_index = code * 4 + (lane & 3);
+                    const float value = group_scale * (float)grid[grid_index] * (float)sign;
+                    const int input_index = block_index * 256 + group * 32 + sub * 8 + lane;
+                    accumulator += value * input[input_index];
+                }
+            }
+        }
+    }
+    output[output_index] = accumulator;
 }
 
 extern "C" __global__ void q8_0_gemv(
@@ -426,23 +503,12 @@ impl CudaQuantizedGemv {
         })
     }
 
-    /// Execute one block-quantized matrix-vector product into a caller-owned
-    /// output.
-    ///
-    /// The launch is asynchronous with respect to the host. A subsequent copy
-    /// or stream synchronization observes completion. This method does not
-    /// dequantize or copy the encoded weight through host memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CudaQuantizedKernelError`] when the weight type, shape, encoded
-    /// length, or device vector lengths are invalid, or when launch fails.
-    pub fn execute(
+    fn validate(
         &self,
         weight: &CudaQuantizedWeight,
         input: &CudaSlice<f32>,
-        output: &mut CudaSlice<f32>,
-    ) -> Result<(), CudaQuantizedKernelError> {
+        output: &CudaSlice<f32>,
+    ) -> Result<(u32, u32, LaunchConfig), CudaQuantizedKernelError> {
         if self.stream.context().as_ref() != weight.encoded_data().context().as_ref()
             || self.stream.context().as_ref() != input.context().as_ref()
             || self.stream.context().as_ref() != output.context().as_ref()
@@ -512,6 +578,27 @@ impl CudaQuantizedGemv {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        Ok((input_size, output_size, config))
+    }
+
+    /// Execute one block-quantized matrix-vector product into a caller-owned
+    /// output.
+    ///
+    /// The launch is asynchronous with respect to the host. A subsequent copy
+    /// or stream synchronization observes completion. This method does not
+    /// dequantize or copy the encoded weight through host memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight type, shape, encoded
+    /// length, or device vector lengths are invalid, or when launch fails.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        let (input_size, output_size, config) = self.validate(weight, input, output)?;
         // Safety: the device slices are allocated by cudarc, remain alive for
         // the launch, and have lengths checked against the kernel's shape.
         unsafe {
@@ -590,6 +677,89 @@ impl CudaIq4NlGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
+    }
+}
+
+/// A correctness-oriented `IQ3_S` matrix-vector kernel.
+///
+/// The `IQ3_S` grid is kept as a small device-resident lookup table rather than
+/// making the optional CUDA crate depend on the GGUF reader. The table is
+/// generated from the canonical GGML packed mapping at construction time.
+pub struct CudaIq3SGemv {
+    inner: CudaQuantizedGemv,
+    grid: CudaSlice<u8>,
+}
+
+impl CudaIq3SGemv {
+    /// Compile and load the `IQ3_S` kernel on a new CUDA device context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or module loading
+    /// fails.
+    pub fn new(device_index: usize) -> Result<Self, CudaQuantizedKernelError> {
+        let context = CudaContext::new(device_index)
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let stream = context.default_stream();
+        Self::from_context(&context, stream)
+    }
+
+    /// Compile and load the `IQ3_S` kernel on an existing context/stream pair.
+    /// Weight buffers and vectors must be allocated from this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when NVRTC, module loading, or the
+    /// lookup-table upload fails.
+    pub fn from_context(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        let grid = stream
+            .clone_htod(&iq3_grid_values())
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let inner = CudaQuantizedGemv::from_context(
+            context,
+            stream,
+            "iq3_s_gemv",
+            IQ3_S_VALUE_TYPE,
+            IQ3_S_BLOCK_ELEMENTS,
+            IQ3_S_BLOCK_BYTES,
+            "IQ3_S",
+        )?;
+        Ok(Self { inner, grid })
+    }
+
+    /// Execute one `IQ3_S` matrix-vector product into a caller-owned output.
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, shapes, contexts,
+    /// or launch arguments are invalid.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        let (input_size, output_size, config) = self.inner.validate(weight, input, output)?;
+        // Safety: the device slices are allocated by cudarc, remain alive for
+        // the launch, and have lengths checked against the kernel's shape.
+        unsafe {
+            self.inner
+                .stream
+                .launch_builder(&self.inner.kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&self.grid)
+                .arg(&input_size)
+                .arg(&output_size)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 

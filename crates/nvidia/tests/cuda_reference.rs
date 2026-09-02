@@ -13,8 +13,9 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv,
-    CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError, CudaWeightStore,
+    CudaHybridState, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv,
+    CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError,
+    CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -463,6 +464,32 @@ fn q8_0_fixture() -> Vec<u8> {
     (0_u8..6).flat_map(q8_0_fixture_block).collect()
 }
 
+fn iq3_s_fixture_block(seed: u8) -> Vec<u8> {
+    let mut block = vec![0_u8; 110];
+    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    for (index, value) in block[2..66].iter_mut().enumerate() {
+        let index = u8::try_from(index).expect("IQ3_S low-code index");
+        *value = index.wrapping_mul(37).wrapping_add(seed.wrapping_mul(13));
+    }
+    for (index, value) in block[66..74].iter_mut().enumerate() {
+        let index = u8::try_from(index).expect("IQ3_S high-code index");
+        *value = 0x55_u8.rotate_left(u32::from(index % 8)) ^ seed.wrapping_mul(17);
+    }
+    for (index, value) in block[74..106].iter_mut().enumerate() {
+        let index = u8::try_from(index).expect("IQ3_S sign index");
+        *value = 0x33_u8.rotate_left(u32::from(index % 8)) ^ seed.wrapping_mul(29);
+    }
+    for (index, value) in block[106..110].iter_mut().enumerate() {
+        let index = u8::try_from(index).expect("IQ3_S scale index");
+        *value = index.wrapping_mul(5).wrapping_add(seed.wrapping_mul(3));
+    }
+    block
+}
+
+fn iq3_s_fixture() -> Vec<u8> {
+    (0_u8..6).flat_map(iq3_s_fixture_block).collect()
+}
+
 fn iq4_nl_fixture_block(seed: u8) -> Vec<u8> {
     let mut block = vec![0_u8; 18];
     block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
@@ -504,6 +531,59 @@ fn iq4_xs_fixture_block(seed: u8) -> Vec<u8> {
 
 fn iq4_xs_fixture() -> Vec<u8> {
     (0_u8..4).flat_map(iq4_xs_fixture_block).collect()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_iq3_s_gemv_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = iq3_s_fixture();
+    let spec = WeightTensorSpec::new("iq3_s.fixture", vec![512, 3], engine_core::DataType::F32)
+        .expect("IQ3_S fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            21,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload IQ3_S fixture");
+    let weight = store
+        .quantized_tensor("iq3_s.fixture")
+        .expect("IQ3_S fixture weight");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 19).expect("IQ3_S input index");
+            f32::from(pattern) * 0.0625 - 0.5
+        })
+        .collect::<Vec<_>>();
+    let input_device = stream.clone_htod(&input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(3).expect("allocate output");
+    let kernel = CudaIq3SGemv::from_context(&context, stream.clone()).expect("compile IQ3_S");
+    kernel
+        .execute(weight, &input_device, &mut output)
+        .expect("execute IQ3_S GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+    let expected = (0..3)
+        .map(|output_index| {
+            (0..2)
+                .flat_map(|block_index| {
+                    let start = (output_index * 2 + block_index) * 110;
+                    engine_gguf::dequantize_block(21, &encoded[start..start + 110])
+                        .expect("decode IQ3_S fixture")
+                        .into_iter()
+                        .zip(&input[block_index * 256..(block_index + 1) * 256])
+                        .map(|(weight, input)| weight * input)
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
 }
 
 #[test]
