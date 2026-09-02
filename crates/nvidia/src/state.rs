@@ -37,6 +37,13 @@ impl CudaStateBuffer {
         self.len() == 0
     }
 
+    #[must_use]
+    pub fn byte_size(&self) -> Option<u64> {
+        u64::try_from(self.len())
+            .ok()?
+            .checked_mul(self.dtype().byte_width())
+    }
+
     fn zero(&mut self, stream: &Arc<CudaStream>) -> Result<(), CudaStateError> {
         match self {
             Self::F16(buffer) => stream
@@ -85,6 +92,11 @@ impl CudaKvState {
     pub fn token_capacity(&self) -> u32 {
         self.spec.block_tokens()
     }
+
+    #[must_use]
+    pub fn byte_size(&self) -> Option<u64> {
+        self.keys.byte_size()?.checked_add(self.values.byte_size()?)
+    }
 }
 
 /// Physical recurrent/Gated-DeltaNet state. The matrix and convolution
@@ -117,6 +129,13 @@ impl CudaRecurrentState {
 
     pub fn convolution_mut(&mut self) -> &mut CudaStateBuffer {
         &mut self.convolution
+    }
+
+    #[must_use]
+    pub fn byte_size(&self) -> Option<u64> {
+        self.matrix
+            .byte_size()?
+            .checked_add(self.convolution.byte_size()?)
     }
 }
 
@@ -213,6 +232,21 @@ impl CudaHybridState {
     #[must_use]
     pub const fn token_position(&self) -> u32 {
         self.token_position
+    }
+
+    #[must_use]
+    pub fn byte_size(&self) -> Option<u64> {
+        let kv_bytes = self
+            .kv
+            .as_ref()
+            .and_then(CudaKvState::byte_size)
+            .unwrap_or(0);
+        let recurrent_bytes = self
+            .recurrent
+            .as_ref()
+            .and_then(CudaRecurrentState::byte_size)
+            .unwrap_or(0);
+        kv_bytes.checked_add(recurrent_bytes)
     }
 
     /// Clear both state families before a new request/prefix is attached.

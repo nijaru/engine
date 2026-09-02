@@ -378,6 +378,7 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
         engine_core::DataType::F16
     );
     assert_eq!(physical.kv().expect("KV state").values().len(), 32);
+    assert_eq!(physical.kv().expect("KV state").byte_size(), Some(128));
     assert_eq!(
         physical
             .recurrent()
@@ -394,6 +395,11 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
             .len(),
         6
     );
+    assert_eq!(
+        physical.recurrent().expect("recurrent state").byte_size(),
+        Some(56)
+    );
+    assert_eq!(physical.byte_size(), Some(184));
     physical.zero().expect("zero physical state");
     physical.advance_to(2).expect("advance state");
     assert!(matches!(
