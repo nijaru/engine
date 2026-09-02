@@ -314,6 +314,26 @@ impl GgufFile {
         Ok(start..end)
     }
 
+    /// Open a bounded streaming reader for one encoded tensor. This keeps bulk
+    /// weights out of the metadata object and lets a backend choose its own
+    /// chunking or mapping strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor range is invalid or the file cannot be
+    /// opened at that range.
+    pub fn open_tensor(&self, name: &str) -> Result<TensorDataReader, GgufError> {
+        let range = self.tensor_data_range(name)?;
+        let mut file = File::open(&self.path).map_err(|error| GgufError::io(&self.path, &error))?;
+        file.seek(SeekFrom::Start(range.start))
+            .map_err(|error| GgufError::io(&self.path, &error))?;
+        Ok(TensorDataReader {
+            path: self.path.clone(),
+            file,
+            remaining: range.end - range.start,
+        })
+    }
+
     #[must_use]
     pub const fn tensor_data_offset(&self) -> u64 {
         self.tensor_data_offset
@@ -337,6 +357,40 @@ impl GgufFile {
         let config = Qwen35Config::from_metadata(&self.metadata)?;
         config.validate()?;
         Ok(config)
+    }
+}
+
+/// Sequential reader over one encoded tensor payload. The reader stops exactly
+/// at the tensor's encoded byte length and cannot consume the next tensor.
+pub struct TensorDataReader {
+    path: PathBuf,
+    file: File,
+    remaining: u64,
+}
+
+impl TensorDataReader {
+    #[must_use]
+    pub const fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Read for TensorDataReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let requested = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.file.read(&mut buffer[..requested])?;
+        self.remaining -= read as u64;
+        Ok(read)
     }
 }
 
@@ -934,6 +988,22 @@ mod tests {
             .tensor_data_range("token_embd.weight")
             .expect("tensor range");
         assert_eq!(range.end - range.start, 64);
+    }
+
+    #[test]
+    fn streams_only_the_selected_tensor_payload() {
+        let path = std::env::temp_dir().join(format!("engine-gguf-{}-2.gguf", std::process::id()));
+        std::fs::write(&path, fixture()).expect("write fixture");
+        let parsed = GgufFile::open(&path).expect("open fixture");
+        let mut reader = parsed
+            .open_tensor("token_embd.weight")
+            .expect("tensor reader");
+        let mut payload = Vec::new();
+        reader.read_to_end(&mut payload).expect("tensor payload");
+        assert_eq!(payload.len(), 64);
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(reader.read(&mut [0; 1]).expect("bounded read"), 0);
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]
