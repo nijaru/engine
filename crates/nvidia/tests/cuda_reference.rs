@@ -1,8 +1,9 @@
 #![cfg(feature = "cuda")]
 
 use std::io::{Cursor, Read};
+use std::sync::Arc;
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaStream};
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, ConvolutionStateShape, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage,
@@ -15,7 +16,7 @@ use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
     CudaHybridState, CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv,
     CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaReferenceDispatcher,
-    CudaStateError, CudaWeightStore,
+    CudaStateBuffer, CudaStateError, CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -1058,19 +1059,10 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn allocates_distinct_physical_hybrid_state_buffers() {
+    let (kv_spec, recurrent_spec) = hybrid_state_fixture();
     let device = DeviceId::new(0);
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
-    let kv_spec =
-        engine_core::KvStateSpec::new(1, 2, 4, 4, engine_core::DataType::F16).expect("KV spec");
-    let recurrent_spec = RecurrentStateSpec::new(
-        1,
-        RecurrentMatrixShape::new(1, 2, 2, 2).expect("matrix shape"),
-        ConvolutionStateShape::new(3, 2).expect("convolution shape"),
-        engine_core::DataType::F32,
-        engine_core::DataType::F32,
-    )
-    .expect("recurrent spec");
     let mut manager = LogicalStateManager::new(device, 1024, 0);
     let kv = manager
         .allocate_kv(kv_spec, StateLocation::Device(device))
@@ -1080,8 +1072,8 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
         .expect("recurrent allocation");
     let core_state = HybridStateSet::try_new(Some(kv), Some(recurrent)).expect("hybrid state");
 
-    let mut physical =
-        CudaHybridState::from_state_set(stream, &core_state).expect("physical hybrid state");
+    let mut physical = CudaHybridState::from_state_set(stream.clone(), &core_state)
+        .expect("physical hybrid state");
     assert_eq!(physical.kv().expect("KV state").keys().len(), 32);
     assert_eq!(
         physical.kv().expect("KV state").keys().dtype(),
@@ -1116,4 +1108,76 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
         physical.advance_to(1),
         Err(CudaStateError::PositionRegression { .. })
     ));
+
+    write_and_validate_physical_state(&mut physical, &stream, kv_spec, recurrent_spec);
+}
+
+/// Exercise typed physical state writes and validation errors after the
+/// allocation test has built the fixture state.
+fn write_and_validate_physical_state(
+    physical: &mut CudaHybridState,
+    stream: &Arc<CudaStream>,
+    kv_spec: engine_core::KvStateSpec,
+    recurrent_spec: RecurrentStateSpec,
+) {
+    let keys = vec![1_u16, 2, 3, 4, 5, 6, 7, 8];
+    let values = vec![9_u16, 10, 11, 12, 13, 14, 15, 16];
+    physical
+        .write_kv_token(0, 1, &keys, &values)
+        .expect("write KV token");
+    let matrix = vec![0.25_f32; 8];
+    let convolution = vec![0.5_f32; 6];
+    physical
+        .write_recurrent_layer(0, &matrix, &convolution)
+        .expect("write recurrent layer");
+    physical.zero().expect("zero after writes");
+    let kv = physical.kv().expect("KV state after zero");
+    let CudaStateBuffer::F16(keys_slice) = kv.keys() else {
+        panic!("expected F16 KV keys");
+    };
+    let keys = stream.clone_dtoh(keys_slice).expect("download zeroed keys");
+    assert!(keys.iter().all(|&key| key == 0));
+    assert!(matches!(
+        physical.write_kv_token(1, 0, &keys, &keys),
+        Err(CudaStateError::IndexOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        physical.write_kv_token(0, 4, &keys, &keys),
+        Err(CudaStateError::IndexOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        physical.write_recurrent_layer(1, &matrix, &convolution),
+        Err(CudaStateError::IndexOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        physical.write_recurrent_layer(0, &matrix, &[]),
+        Err(CudaStateError::ShapeMismatch { .. })
+    ));
+    let mut kv_only =
+        CudaHybridState::from_specs(stream.clone(), Some(kv_spec), None).expect("KV-only state");
+    assert!(matches!(
+        kv_only.write_recurrent_layer(0, &matrix, &convolution),
+        Err(CudaStateError::MissingFamily { .. })
+    ));
+    let mut recurrent_only =
+        CudaHybridState::from_specs(stream.clone(), None, Some(recurrent_spec))
+            .expect("recurrent-only");
+    assert!(matches!(
+        recurrent_only.write_kv_token(0, 0, &keys, &keys),
+        Err(CudaStateError::MissingFamily { .. })
+    ));
+}
+
+fn hybrid_state_fixture() -> (engine_core::KvStateSpec, RecurrentStateSpec) {
+    let kv_spec =
+        engine_core::KvStateSpec::new(1, 2, 4, 4, engine_core::DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        1,
+        RecurrentMatrixShape::new(1, 2, 2, 2).expect("matrix shape"),
+        ConvolutionStateShape::new(3, 2).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+    (kv_spec, recurrent_spec)
 }

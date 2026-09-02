@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 use engine_core::{
     DataType, DeviceId, HybridStateSet, KvState, KvStateSpec, RecurrentState, RecurrentStateSpec,
     StateLocation,
@@ -97,6 +97,94 @@ impl CudaKvState {
     pub fn byte_size(&self) -> Option<u64> {
         self.keys.byte_size()?.checked_add(self.values.byte_size()?)
     }
+
+    /// Write one token's keys and values into a token-major KV block. The
+    /// caller commits the shared sequence position after all model regions
+    /// have written their state for that token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaStateError`] when the layer/token or vector shape is
+    /// invalid, the state is not F16, or the device copy fails.
+    pub fn write_token(
+        &mut self,
+        layer: u32,
+        token: u32,
+        keys: &[u16],
+        values: &[u16],
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), CudaStateError> {
+        let spec = self.spec;
+        let layer = usize::try_from(layer).map_err(|_| CudaStateError::IndexOverflow {
+            family: "full-attention KV",
+        })?;
+        let token = usize::try_from(token).map_err(|_| CudaStateError::IndexOverflow {
+            family: "full-attention KV",
+        })?;
+        let layers = usize::from(spec.layer_count());
+        let block_tokens =
+            usize::try_from(spec.block_tokens()).map_err(|_| CudaStateError::IndexOverflow {
+                family: "full-attention KV",
+            })?;
+        let token_width = usize::from(spec.kv_heads())
+            .checked_mul(usize::from(spec.head_dim()))
+            .ok_or(CudaStateError::SizeOverflow {
+                family: "full-attention KV token",
+            })?;
+        if layer >= layers {
+            return Err(CudaStateError::IndexOutOfBounds {
+                family: "full-attention KV layer",
+                index: layer,
+                length: layers,
+            });
+        }
+        if token >= block_tokens {
+            return Err(CudaStateError::IndexOutOfBounds {
+                family: "full-attention KV token",
+                index: token,
+                length: block_tokens,
+            });
+        }
+        if keys.len() != token_width || values.len() != token_width {
+            return Err(CudaStateError::ShapeMismatch {
+                family: "full-attention KV token",
+                expected: token_width,
+                actual: keys.len().max(values.len()),
+            });
+        }
+        if spec.dtype() != DataType::F16 {
+            return Err(CudaStateError::UnsupportedDtype {
+                family: "full-attention KV token write",
+                dtype: spec.dtype(),
+            });
+        }
+        let layer_width =
+            block_tokens
+                .checked_mul(token_width)
+                .ok_or(CudaStateError::SizeOverflow {
+                    family: "full-attention KV layer",
+                })?;
+        let offset = layer
+            .checked_mul(layer_width)
+            .and_then(|base| base.checked_add(token.checked_mul(token_width)?))
+            .ok_or(CudaStateError::SizeOverflow {
+                family: "full-attention KV token offset",
+            })?;
+        copy_u16_to_offset(
+            stream,
+            &mut self.keys,
+            offset,
+            keys,
+            "full-attention KV keys",
+        )?;
+        copy_u16_to_offset(
+            stream,
+            &mut self.values,
+            offset,
+            values,
+            "full-attention KV values",
+        )
+    }
 }
 
 /// Physical recurrent/Gated-DeltaNet state. The matrix and convolution
@@ -137,6 +225,113 @@ impl CudaRecurrentState {
             .byte_size()?
             .checked_add(self.convolution.byte_size()?)
     }
+
+    /// Write one recurrent layer's matrix and convolution state. Each slice is
+    /// a contiguous layer in the shape declared by [`RecurrentStateSpec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaStateError`] when the layer or shape is invalid, the
+    /// declared state dtypes are not F32, or the device copy fails.
+    pub fn write_layer(
+        &mut self,
+        layer: u32,
+        matrix: &[f32],
+        convolution: &[f32],
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), CudaStateError> {
+        let spec = self.spec;
+        let layer = usize::try_from(layer).map_err(|_| CudaStateError::IndexOverflow {
+            family: "recurrent state",
+        })?;
+        let layers = usize::from(spec.layer_count());
+        if layer >= layers {
+            return Err(CudaStateError::IndexOutOfBounds {
+                family: "recurrent state layer",
+                index: layer,
+                length: layers,
+            });
+        }
+        if spec.matrix_dtype() != DataType::F32 {
+            return Err(CudaStateError::UnsupportedDtype {
+                family: "recurrent matrix write",
+                dtype: spec.matrix_dtype(),
+            });
+        }
+        if spec.convolution_dtype() != DataType::F32 {
+            return Err(CudaStateError::UnsupportedDtype {
+                family: "recurrent convolution write",
+                dtype: spec.convolution_dtype(),
+            });
+        }
+        let matrix_shape = spec.matrix();
+        let matrix_width = checked_product(
+            [
+                u64::from(matrix_shape.key_heads()),
+                u64::from(matrix_shape.key_head_dim()),
+                u64::from(matrix_shape.value_heads()),
+                u64::from(matrix_shape.value_head_dim()),
+            ],
+            "recurrent matrix layer",
+        )?;
+        let convolution_width = checked_product(
+            [
+                u64::from(spec.convolution().channels()),
+                u64::from(spec.convolution().kernel()),
+            ],
+            "recurrent convolution layer",
+        )?;
+        let matrix_width =
+            usize::try_from(matrix_width).map_err(|_| CudaStateError::HostSizeOverflow {
+                family: "recurrent matrix layer",
+                elements: matrix_width,
+            })?;
+        let convolution_width =
+            usize::try_from(convolution_width).map_err(|_| CudaStateError::HostSizeOverflow {
+                family: "recurrent convolution layer",
+                elements: convolution_width,
+            })?;
+        if matrix.len() != matrix_width {
+            return Err(CudaStateError::ShapeMismatch {
+                family: "recurrent matrix layer",
+                expected: matrix_width,
+                actual: matrix.len(),
+            });
+        }
+        if convolution.len() != convolution_width {
+            return Err(CudaStateError::ShapeMismatch {
+                family: "recurrent convolution layer",
+                expected: convolution_width,
+                actual: convolution.len(),
+            });
+        }
+        let matrix_offset =
+            layer
+                .checked_mul(matrix_width)
+                .ok_or(CudaStateError::SizeOverflow {
+                    family: "recurrent matrix offset",
+                })?;
+        let convolution_offset =
+            layer
+                .checked_mul(convolution_width)
+                .ok_or(CudaStateError::SizeOverflow {
+                    family: "recurrent convolution offset",
+                })?;
+        copy_f32_to_offset(
+            stream,
+            &mut self.matrix,
+            matrix_offset,
+            matrix,
+            "recurrent matrix",
+        )?;
+        copy_f32_to_offset(
+            stream,
+            &mut self.convolution,
+            convolution_offset,
+            convolution,
+            "recurrent convolution history",
+        )
+    }
 }
 
 /// Backend-owned physical counterpart to a core [`HybridStateSet`]. It is a
@@ -150,6 +345,51 @@ pub struct CudaHybridState {
 }
 
 impl CudaHybridState {
+    /// Write one full-attention layer/token KV pair into physical state.
+    /// State position is unchanged until [`Self::advance_to`] commits the
+    /// completed model step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaStateError`] when no KV state exists or the typed write
+    /// validation/device copy fails.
+    pub fn write_kv_token(
+        &mut self,
+        layer: u32,
+        token: u32,
+        keys: &[u16],
+        values: &[u16],
+    ) -> Result<(), CudaStateError> {
+        let Some(kv) = &mut self.kv else {
+            return Err(CudaStateError::MissingFamily {
+                family: "full-attention KV",
+            });
+        };
+        kv.write_token(layer, token, keys, values, &self.stream)
+    }
+
+    /// Write one recurrent layer's matrix and convolution state. State
+    /// position is unchanged until [`Self::advance_to`] commits the completed
+    /// model step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaStateError`] when no recurrent state exists or the typed
+    /// write validation/device copy fails.
+    pub fn write_recurrent_layer(
+        &mut self,
+        layer: u32,
+        matrix: &[f32],
+        convolution: &[f32],
+    ) -> Result<(), CudaStateError> {
+        let Some(recurrent) = &mut self.recurrent else {
+            return Err(CudaStateError::MissingFamily {
+                family: "recurrent state",
+            });
+        };
+        recurrent.write_layer(layer, matrix, convolution, &self.stream)
+    }
+
     /// Allocate physical buffers matching the families present in a core state
     /// set. Host-resident state is rejected because this type owns CUDA device
     /// storage; a later transfer tier can use a separate owner.
@@ -290,12 +530,14 @@ impl CudaHybridState {
 }
 
 fn allocate_kv(stream: &Arc<CudaStream>, spec: KvStateSpec) -> Result<CudaKvState, CudaStateError> {
+    // Physical layout is [layer, token, kv_head, head_dim], making one token
+    // contiguous for state append and attention reads.
     let elements = checked_product(
         [
             u64::from(spec.layer_count()),
+            u64::from(spec.block_tokens()),
             u64::from(spec.kv_heads()),
             u64::from(spec.head_dim()),
-            u64::from(spec.block_tokens()),
         ],
         "full-attention KV",
     )?;
@@ -345,6 +587,60 @@ fn allocate_recurrent(
         matrix,
         convolution,
     })
+}
+
+fn copy_u16_to_offset(
+    stream: &Arc<CudaStream>,
+    destination: &mut CudaStateBuffer,
+    offset: usize,
+    source: &[u16],
+    family: &'static str,
+) -> Result<(), CudaStateError> {
+    let CudaStateBuffer::F16(destination) = destination else {
+        return Err(CudaStateError::UnsupportedDtype {
+            family,
+            dtype: DataType::F32,
+        });
+    };
+    copy_slice_to_offset(stream, destination, offset, source, family)
+}
+
+fn copy_f32_to_offset(
+    stream: &Arc<CudaStream>,
+    destination: &mut CudaStateBuffer,
+    offset: usize,
+    source: &[f32],
+    family: &'static str,
+) -> Result<(), CudaStateError> {
+    let CudaStateBuffer::F32(destination) = destination else {
+        return Err(CudaStateError::UnsupportedDtype {
+            family,
+            dtype: DataType::F16,
+        });
+    };
+    copy_slice_to_offset(stream, destination, offset, source, family)
+}
+
+fn copy_slice_to_offset<T: DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    destination: &mut CudaSlice<T>,
+    offset: usize,
+    source: &[T],
+    family: &'static str,
+) -> Result<(), CudaStateError> {
+    let Some(end) = offset.checked_add(source.len()) else {
+        return Err(CudaStateError::SizeOverflow { family });
+    };
+    let Some(mut view) = destination.try_slice_mut(offset..end) else {
+        return Err(CudaStateError::IndexOutOfBounds {
+            family,
+            index: end,
+            length: destination.len(),
+        });
+    };
+    stream
+        .memcpy_htod(source, &mut view)
+        .map_err(|error| CudaStateError::Driver(error.to_string()))
 }
 
 fn checked_product(
@@ -412,6 +708,22 @@ pub enum CudaStateError {
         current: u32,
         requested: u32,
     },
+    MissingFamily {
+        family: &'static str,
+    },
+    IndexOverflow {
+        family: &'static str,
+    },
+    IndexOutOfBounds {
+        family: &'static str,
+        index: usize,
+        length: usize,
+    },
+    ShapeMismatch {
+        family: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for CudaStateError {
@@ -440,6 +752,18 @@ impl fmt::Display for CudaStateError {
                 f,
                 "physical state position cannot move from {current} back to {requested}"
             ),
+            Self::MissingFamily { family } => write!(f, "physical state has no {family} family"),
+            Self::IndexOverflow { family } => write!(f, "{family} index overflowed"),
+            Self::IndexOutOfBounds {
+                family,
+                index,
+                length,
+            } => write!(f, "{family} index {index} is outside length {length}"),
+            Self::ShapeMismatch {
+                family,
+                expected,
+                actual,
+            } => write!(f, "{family} has {actual} elements, expected {expected}"),
         }
     }
 }
