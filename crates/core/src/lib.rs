@@ -1,5 +1,265 @@
 //! Core types and interfaces for Engine.
 //!
-//! The public surface is intentionally minimal during bootstrap. Stable
-//! scheduler, state, model-provider, execution-plan, and backend boundaries
-//! will be introduced only as their first implementations require them.
+//! These interfaces describe inference semantics and execution ownership without
+//! committing the core to a checkpoint format, device backend, or scheduler
+//! implementation. In particular, hybrid models expose distinct KV and
+//! recurrent state families rather than treating every state buffer as KV.
+
+pub mod backend;
+pub mod device;
+pub mod execution;
+pub mod model;
+pub mod policy;
+pub mod request;
+pub mod state;
+pub mod tensor;
+
+pub use backend::{
+    BackendCapabilities, BackendError, BackendFeatures, BackendId, BackendKind, ComputeBackend,
+};
+pub use device::DeviceId;
+pub use execution::{
+    ExecutionEvent, ExecutionMetrics, ExecutionPhase, ExecutionPlan, ExecutionSegment,
+    ExecutionStage, PlanError,
+};
+pub use model::{
+    ModelCapabilities, ModelDescription, ModelError, ModelId, ModelProvider, ModelRegion,
+    ModelRegionId, ModelRegionKind, MtpCapability, WeightDescription,
+};
+pub use policy::{
+    PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
+};
+pub use request::{
+    RequestError, RequestId, RequestSemantics, RequestSpec, SamplingError, SamplingParams,
+    ThinkingMode,
+};
+pub use state::{
+    ConvolutionStateShape, HybridState, HybridStateSet, KvState, KvStateSpec, RecurrentMatrixShape,
+    RecurrentState, RecurrentStateSpec, StateError, StateHandle, StateId, StateLocation,
+    StateManager, StateRequirement, StateSpecError,
+};
+pub use tensor::{DataType, Quantization, WeightFormat};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StaticProvider {
+        description: ModelDescription,
+    }
+
+    impl ModelProvider for StaticProvider {
+        fn description(&self) -> &ModelDescription {
+            &self.description
+        }
+    }
+
+    fn qwen_description() -> ModelDescription {
+        let model = ModelId::new("Qwen/Qwen3.8-27B").expect("valid model identity");
+        let kv = KvStateSpec::new(16, 4, 256, 16, DataType::F16).expect("valid KV spec");
+        let matrix = RecurrentMatrixShape::new(16, 128, 48, 128).expect("valid matrix shape");
+        let convolution =
+            ConvolutionStateShape::new(10_240, 4).expect("valid convolution state shape");
+        let recurrent =
+            RecurrentStateSpec::new(48, matrix, convolution, DataType::F16, DataType::F32)
+                .expect("valid recurrent spec");
+        let mtp = MtpCapability::new(1, 3);
+        ModelDescription::new(
+            model,
+            "qwen3.8-hybrid",
+            vec![
+                ModelRegion::new(ModelRegionId::new(0), ModelRegionKind::RecurrentAttention),
+                ModelRegion::new(ModelRegionId::new(1), ModelRegionKind::FullAttention),
+                ModelRegion::new(ModelRegionId::new(2), ModelRegionKind::FeedForward),
+            ],
+            vec![
+                StateRequirement::Recurrent(recurrent),
+                StateRequirement::FullAttentionKv(kv),
+            ],
+            ModelCapabilities::new(mtp, true),
+            WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
+        )
+        .expect("valid model description")
+    }
+
+    #[test]
+    fn hybrid_description_and_plan_keep_state_families_distinct() {
+        let description = qwen_description();
+        let backend = BackendId::new("cuda").expect("valid backend identity");
+        let version = PolicyVersion::new(1).expect("valid policy version");
+        let plan = ExecutionPlan::new(
+            description.id().clone(),
+            backend,
+            DeviceId::new(0),
+            version,
+            vec![ExecutionStage::new(
+                ModelRegionId::new(0),
+                ExecutionPhase::Decode,
+            )],
+            description.state_requirements().to_vec(),
+        )
+        .expect("valid plan");
+
+        assert!(plan.requires_kv_state());
+        assert!(plan.requires_recurrent_state());
+        assert_eq!(
+            description
+                .capabilities()
+                .mtp()
+                .expect("MTP")
+                .draft_layers(),
+            1
+        );
+        assert!(description.capabilities().has_vision_encoder());
+
+        let segment = ExecutionSegment::new(
+            RequestId::new(1).expect("valid request ID"),
+            ExecutionPhase::Decode,
+            1,
+            1,
+            32,
+            description.state_requirements().to_vec(),
+        )
+        .expect("valid segment");
+        assert!(plan.validate_segment(&segment).is_ok());
+        let wrong_phase = ExecutionSegment::new(
+            segment.request(),
+            ExecutionPhase::Encoder,
+            1,
+            1,
+            32,
+            Vec::new(),
+        )
+        .expect("valid segment");
+        assert_eq!(
+            plan.validate_segment(&wrong_phase),
+            Err(PlanError::SegmentPhaseMismatch)
+        );
+    }
+
+    #[test]
+    fn provider_rejects_unknown_regions_before_execution() {
+        let description = qwen_description();
+        let plan = ExecutionPlan::new(
+            description.id().clone(),
+            BackendId::new("cuda").expect("valid backend identity"),
+            DeviceId::new(0),
+            PolicyVersion::new(1).expect("valid policy version"),
+            vec![ExecutionStage::new(
+                ModelRegionId::new(99),
+                ExecutionPhase::Decode,
+            )],
+            description.state_requirements().to_vec(),
+        )
+        .expect("valid plan shape");
+
+        let provider = StaticProvider { description };
+        assert_eq!(
+            provider.validate_plan(&plan),
+            Err(ModelError::UnknownRegion(ModelRegionId::new(99)))
+        );
+    }
+
+    #[test]
+    fn typed_state_handles_reject_cross_family_construction() {
+        let spec = KvStateSpec::new(16, 4, 256, 16, DataType::F16).expect("valid KV spec");
+        let requirement = StateRequirement::FullAttentionKv(spec);
+        let handle = StateHandle::new(
+            StateId::new(1).expect("valid state ID"),
+            requirement,
+            StateLocation::Device(DeviceId::new(0)),
+            32,
+        );
+        assert!(KvState::new(handle, spec).is_some());
+
+        let matrix = RecurrentMatrixShape::new(16, 128, 48, 128).expect("valid matrix shape");
+        let convolution =
+            ConvolutionStateShape::new(10_240, 4).expect("valid convolution state shape");
+        let recurrent =
+            RecurrentStateSpec::new(48, matrix, convolution, DataType::F16, DataType::F32)
+                .expect("valid recurrent spec");
+        let wrong_family_handle = StateHandle::new(
+            StateId::new(2).expect("valid state ID"),
+            requirement,
+            StateLocation::Device(DeviceId::new(0)),
+            32,
+        );
+        assert!(RecurrentState::new(wrong_family_handle, recurrent).is_none());
+
+        let recurrent_handle = StateHandle::new(
+            StateId::new(3).expect("valid state ID"),
+            StateRequirement::Recurrent(recurrent),
+            StateLocation::Device(DeviceId::new(0)),
+            31,
+        );
+        let recurrent_state =
+            RecurrentState::new(recurrent_handle, recurrent).expect("valid recurrent state");
+        let kv_handle = StateHandle::new(
+            StateId::new(4).expect("valid state ID"),
+            requirement,
+            StateLocation::Device(DeviceId::new(0)),
+            32,
+        );
+        let kv_state = KvState::new(kv_handle, spec).expect("valid KV state");
+        assert_eq!(
+            HybridStateSet::try_new(Some(kv_state), Some(recurrent_state)),
+            Err(StateError::PositionMismatch)
+        );
+    }
+
+    #[test]
+    fn request_semantics_do_not_contain_performance_policy() {
+        let sampling = SamplingParams::greedy(Some(42));
+        let semantics = RequestSemantics::new(128, sampling, ThinkingMode::Off)
+            .expect("valid request semantics");
+        let request = RequestSpec::new(
+            RequestId::new(1).expect("valid request ID"),
+            ModelId::new("Qwen/Qwen3.8-27B").expect("valid model identity"),
+            semantics,
+        );
+
+        assert_eq!(request.semantics().sampling().seed(), Some(42));
+        assert_eq!(request.semantics().thinking(), ThinkingMode::Off);
+        assert_eq!(request.semantics().max_output_tokens(), 128);
+    }
+
+    #[test]
+    fn policy_snapshot_is_versioned_and_validated() {
+        let snapshot = PolicySnapshot::new(
+            PolicyVersion::new(7).expect("valid policy version"),
+            8,
+            2048,
+            StateTierPreference::Automatic,
+            SpeculationPolicy::native_mtp(3).expect("valid MTP budget"),
+        )
+        .expect("valid policy snapshot");
+
+        assert_eq!(snapshot.version().get(), 7);
+        assert_eq!(snapshot.max_batch_tokens(), 2048);
+        assert_eq!(
+            snapshot.speculation(),
+            SpeculationPolicy::NativeMtp {
+                max_draft_tokens: 3
+            }
+        );
+        assert!(
+            snapshot
+                .validate_for(qwen_description().capabilities())
+                .is_ok()
+        );
+        assert_eq!(
+            snapshot.validate_for(ModelCapabilities::new(None, false)),
+            Err(policy::PolicyError::SpeculationUnavailable)
+        );
+        assert!(
+            PolicySnapshot::new(
+                PolicyVersion::new(8).expect("valid policy version"),
+                0,
+                2048,
+                StateTierPreference::Device,
+                SpeculationPolicy::Disabled,
+            )
+            .is_err()
+        );
+    }
+}
