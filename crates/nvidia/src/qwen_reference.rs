@@ -58,8 +58,13 @@ pub fn softplus(value: f32) -> f32 {
     }
 }
 
-/// Column-oriented recurrent state update for one V head:
-/// `sk = S^T k`, `d = (v - sk) * beta`, `S += k (outer) d`, `o = S^T q`.
+/// Column-oriented recurrent state update for one V head, matching
+/// `ggml_compute_forward_gated_delta_net_one_chunk` (fused AR) and
+/// `build_delta_net_autoregressive` (non-fused):
+/// `sk = S^T k`, `d = (v - sk) * beta`, `S += k (outer) d`,
+/// `o = (S^T q) / sqrt(head_dim)` — llama.cpp scales `q` by `1/sqrt(S_v)`
+/// before the state read (non-fused) or the output (fused); both are the
+/// same scalar and neither affects the state update itself.
 /// `S` is row-major `[head_dim][head_dim]`. Names match the pinned equations.
 #[allow(clippy::many_single_char_names)]
 fn gdn_state_step(
@@ -86,11 +91,13 @@ fn gdn_state_step(
             *state_elem += k[row] * d_elem;
         }
     }
+    let attention_scale = 1.0 / f32::sqrt(f32::from(GDN_HEAD_DIM_U16));
     (0..head_dim)
         .map(|col| {
             (0..head_dim)
                 .map(|row| state[row * head_dim + col] * q[row])
-                .sum()
+                .sum::<f32>()
+                * attention_scale
         })
         .collect()
 }
