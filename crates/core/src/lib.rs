@@ -35,8 +35,8 @@ pub use policy::{
     PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
 };
 pub use request::{
-    RequestError, RequestId, RequestSemantics, RequestSpec, SamplingError, SamplingParams,
-    ThinkingMode,
+    PromptFormat, PromptPolicy, RequestError, RequestId, RequestSemantics, RequestSpec,
+    SamplingError, SamplingParams, SpecialTokenPolicy, ThinkingMode,
 };
 pub use runtime::{ExecutionRuntime, RuntimeError};
 pub use state::{
@@ -232,6 +232,27 @@ mod tests {
         assert_eq!(request.semantics().sampling().seed(), Some(42));
         assert_eq!(request.semantics().thinking(), ThinkingMode::Off);
         assert_eq!(request.semantics().max_output_tokens(), 128);
+        assert_eq!(
+            request.semantics().prompt_policy(),
+            PromptPolicy::plain_text()
+        );
+        let chat_request = request.clone();
+        let chat_semantics =
+            chat_request
+                .semantics()
+                .clone()
+                .with_prompt_policy(PromptPolicy::new(
+                    PromptFormat::EmbeddedChatTemplate,
+                    SpecialTokenPolicy::AddBosAndEos,
+                ));
+        assert_eq!(
+            chat_semantics.prompt_policy().format(),
+            PromptFormat::EmbeddedChatTemplate
+        );
+        assert_eq!(
+            chat_semantics.prompt_policy().special_tokens(),
+            SpecialTokenPolicy::AddBosAndEos
+        );
     }
 
     #[test]

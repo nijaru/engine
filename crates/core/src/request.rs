@@ -26,6 +26,56 @@ pub enum ThinkingMode {
     Automatic,
 }
 
+/// Controls whether a tokenizer adds model boundary tokens to a plain-text
+/// prompt. Special-token parsing remains an explicit adapter operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SpecialTokenPolicy {
+    None,
+    AddBos,
+    AddEos,
+    AddBosAndEos,
+}
+
+/// Selects the prompt representation requested by the caller.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PromptFormat {
+    PlainText,
+    EmbeddedChatTemplate,
+}
+
+/// Semantic prompt encoding policy. It is part of request identity because
+/// changing it can change the token sequence and model output.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PromptPolicy {
+    format: PromptFormat,
+    special_tokens: SpecialTokenPolicy,
+}
+
+impl PromptPolicy {
+    #[must_use]
+    pub const fn new(format: PromptFormat, special_tokens: SpecialTokenPolicy) -> Self {
+        Self {
+            format,
+            special_tokens,
+        }
+    }
+
+    #[must_use]
+    pub const fn plain_text() -> Self {
+        Self::new(PromptFormat::PlainText, SpecialTokenPolicy::None)
+    }
+
+    #[must_use]
+    pub const fn format(self) -> PromptFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub const fn special_tokens(self) -> SpecialTokenPolicy {
+        self.special_tokens
+    }
+}
+
 /// Sampling settings are semantic: changing them can change model output and
 /// therefore they do not belong in a performance-policy snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,6 +164,7 @@ pub struct RequestSemantics {
     max_output_tokens: u32,
     sampling: SamplingParams,
     thinking: ThinkingMode,
+    prompt_policy: PromptPolicy,
 }
 
 impl RequestSemantics {
@@ -132,7 +183,14 @@ impl RequestSemantics {
             max_output_tokens,
             sampling,
             thinking,
+            prompt_policy: PromptPolicy::plain_text(),
         })
+    }
+
+    #[must_use]
+    pub const fn with_prompt_policy(mut self, prompt_policy: PromptPolicy) -> Self {
+        self.prompt_policy = prompt_policy;
+        self
     }
 
     #[must_use]
@@ -148,6 +206,11 @@ impl RequestSemantics {
     #[must_use]
     pub const fn thinking(&self) -> ThinkingMode {
         self.thinking
+    }
+
+    #[must_use]
+    pub const fn prompt_policy(&self) -> PromptPolicy {
+        self.prompt_policy
     }
 }
 

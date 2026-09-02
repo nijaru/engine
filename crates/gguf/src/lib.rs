@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use engine_core::{
     ConvolutionStateShape, DataType, F32BlockStream, KvStateSpec, ModelCapabilities,
     ModelDescription, ModelError, ModelId, ModelLoadError, ModelProvider, ModelRegion,
-    ModelRegionId, ModelRegionKind, MtpCapability, Quantization, RecurrentMatrixShape,
-    RecurrentStateSpec, StateRequirement, WeightArtifact, WeightDescription, WeightFormat,
-    WeightLoader, WeightSource, WeightTensorSpec,
+    ModelRegionId, ModelRegionKind, MtpCapability, PromptFormat, PromptPolicy, Quantization,
+    RecurrentMatrixShape, RecurrentStateSpec, SpecialTokenPolicy, StateRequirement, WeightArtifact,
+    WeightDescription, WeightFormat, WeightLoader, WeightSource, WeightTensorSpec,
 };
 use regex::Regex;
 
@@ -406,6 +406,7 @@ impl GgufFile {
 pub struct GgufTokenizer {
     model: String,
     pretokenizer: String,
+    chat_template: Option<String>,
     tokens: Vec<String>,
     merges: Vec<String>,
     token_types: Vec<i32>,
@@ -484,6 +485,11 @@ impl GgufTokenizer {
     #[must_use]
     pub fn pretokenizer(&self) -> &str {
         &self.pretokenizer
+    }
+
+    #[must_use]
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
     }
 
     #[must_use]
@@ -567,6 +573,38 @@ impl GgufTokenizer {
         Ok(encoded)
     }
 
+    /// Encode text according to an explicit request prompt policy. Embedded
+    /// chat-template rendering is intentionally rejected until a renderer with
+    /// Qwen message semantics exists; the adapter must not silently treat a
+    /// chat request as plain text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::UnsupportedPromptFormat`] for an embedded chat
+    /// template and forwards ordinary tokenizer errors from [`Self::encode`].
+    pub fn encode_with_policy(
+        &self,
+        text: &str,
+        policy: PromptPolicy,
+    ) -> Result<Vec<u32>, GgufError> {
+        if policy.format() == PromptFormat::EmbeddedChatTemplate {
+            return Err(GgufError::UnsupportedPromptFormat(
+                "embedded chat-template rendering is not implemented",
+            ));
+        }
+        let mut encoded = self.encode(text)?;
+        match policy.special_tokens() {
+            SpecialTokenPolicy::None => {}
+            SpecialTokenPolicy::AddBos => encoded.insert(0, self.bos_token_id()),
+            SpecialTokenPolicy::AddEos => encoded.push(self.eos_token_id()),
+            SpecialTokenPolicy::AddBosAndEos => {
+                encoded.insert(0, self.bos_token_id());
+                encoded.push(self.eos_token_id());
+            }
+        }
+        Ok(encoded)
+    }
+
     fn bpe(&self, mut symbols: Vec<String>) -> Vec<String> {
         while symbols.len() > 1 {
             let mut best: Option<(u32, usize)> = None;
@@ -598,9 +636,20 @@ impl GgufTokenizer {
         }
         let token_ids = build_token_ids(&tokens)?;
         let merge_ranks = build_merge_ranks(&merges)?;
+        let chat_template = metadata
+            .get("tokenizer.chat_template")
+            .map(|value| {
+                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    GgufError::MetadataTypeMismatch {
+                        key: "tokenizer.chat_template".to_owned(),
+                    }
+                })
+            })
+            .transpose()?;
         Ok(Self {
             model: required_string(metadata, "tokenizer.ggml.model")?,
             pretokenizer: required_string(metadata, "tokenizer.ggml.pre")?,
+            chat_template,
             tokens,
             merges,
             token_types,
@@ -1388,6 +1437,7 @@ pub enum GgufError {
     },
     MissingTensor(String),
     InvalidTensorSpec(String),
+    UnsupportedPromptFormat(&'static str),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
     TensorByteLengthOverflow,
@@ -1474,6 +1524,9 @@ impl std::fmt::Display for GgufError {
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
             Self::InvalidTensorSpec(reason) => {
                 write!(f, "invalid GGUF tensor stream specification: {reason}")
+            }
+            Self::UnsupportedPromptFormat(reason) => {
+                write!(f, "unsupported prompt format: {reason}")
             }
             Self::UnsupportedTensorType(value) => {
                 write!(f, "unsupported GGML tensor type {value}")
@@ -1998,6 +2051,10 @@ mod tests {
             "tokenizer.ggml.padding_token_id".to_owned(),
             MetadataValue::U32(0),
         );
+        metadata.insert(
+            "tokenizer.chat_template".to_owned(),
+            MetadataValue::String("{{ messages }}".to_owned()),
+        );
 
         let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("tokenizer metadata");
         assert_eq!(tokenizer.model(), "gpt2");
@@ -2010,6 +2067,23 @@ mod tests {
         assert_eq!(tokenizer.bos_token_id(), 1);
         assert_eq!(tokenizer.eos_token_id(), 2);
         assert_eq!(tokenizer.padding_token_id(), Some(0));
+        assert_eq!(tokenizer.chat_template(), Some("{{ messages }}"));
+        assert_eq!(
+            tokenizer
+                .encode_with_policy(
+                    "ab",
+                    PromptPolicy::new(PromptFormat::PlainText, SpecialTokenPolicy::AddBosAndEos,),
+                )
+                .expect("explicit boundary tokens"),
+            vec![1, 2, 2]
+        );
+        assert!(matches!(
+            tokenizer.encode_with_policy(
+                "ab",
+                PromptPolicy::new(PromptFormat::EmbeddedChatTemplate, SpecialTokenPolicy::None,),
+            ),
+            Err(GgufError::UnsupportedPromptFormat(_))
+        ));
     }
 
     #[test]
