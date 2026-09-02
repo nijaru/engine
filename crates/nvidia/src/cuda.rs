@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,6 +42,16 @@ impl std::error::Error for CudaRuntimeError {}
 pub enum CudaWeightError {
     Driver(String),
     Source(String),
+    SourceIncomplete {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
+    EncodedLengthOverflow {
+        name: String,
+        encoded_bytes: u64,
+    },
+    EmptyEncoding(String),
     UnsupportedDtype {
         name: String,
         dtype: DataType,
@@ -67,6 +78,24 @@ impl fmt::Display for CudaWeightError {
         match self {
             Self::Driver(message) => write!(f, "CUDA driver error: {message}"),
             Self::Source(message) => write!(f, "weight source error: {message}"),
+            Self::SourceIncomplete {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "tensor {name:?} encoded source ended at {actual} bytes, expected {expected}"
+            ),
+            Self::EncodedLengthOverflow {
+                name,
+                encoded_bytes,
+            } => write!(
+                f,
+                "tensor {name:?} encoded length {encoded_bytes} does not fit this host"
+            ),
+            Self::EmptyEncoding(name) => {
+                write!(f, "tensor {name:?} has an empty encoded representation")
+            }
             Self::UnsupportedDtype { name, dtype } => {
                 write!(
                     f,
@@ -115,7 +144,36 @@ impl CudaF32Weight {
     }
 }
 
-/// Backend-owned store for canonical F32 tensor materialization.
+/// One opaque block-encoded tensor materialized in backend-owned CUDA memory.
+/// The source format's value type is retained for a matching execution kernel;
+/// this type deliberately does not interpret GGUF or any other format.
+pub struct CudaQuantizedWeight {
+    spec: WeightTensorSpec,
+    value_type: u32,
+    encoded_bytes: usize,
+    data: CudaSlice<u8>,
+}
+
+impl CudaQuantizedWeight {
+    #[must_use]
+    pub fn spec(&self) -> &WeightTensorSpec {
+        &self.spec
+    }
+
+    #[must_use]
+    pub const fn value_type(&self) -> u32 {
+        self.value_type
+    }
+
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+}
+
+/// Backend-owned store for canonical F32 and opaque block-encoded tensor
+/// materialization. The latter retains its source value type for a matching
+/// quantized kernel and is not silently dequantized on the host.
 ///
 /// This is deliberately a bring-up path. It consumes bounded decoded blocks
 /// and uploads them into one contiguous allocation; it is not a replacement
@@ -123,6 +181,7 @@ impl CudaF32Weight {
 pub struct CudaWeightStore {
     stream: Arc<CudaStream>,
     tensors: BTreeMap<String, CudaF32Weight>,
+    quantized_tensors: BTreeMap<String, CudaQuantizedWeight>,
 }
 
 impl CudaWeightStore {
@@ -131,6 +190,7 @@ impl CudaWeightStore {
         Self {
             stream,
             tensors: BTreeMap::new(),
+            quantized_tensors: BTreeMap::new(),
         }
     }
 
@@ -232,6 +292,83 @@ impl CudaWeightStore {
         Ok(spec)
     }
 
+    /// Materialize an opaque block-encoded source without dequantizing it.
+    /// `value_type` is owned by the format adapter and is retained so a
+    /// matching backend kernel can select the correct block layout later.
+    ///
+    /// The caller supplies the exact encoded byte length from its bounded
+    /// source. A source that ends early is rejected; callers with a bounded
+    /// reader should also verify that it has no bytes remaining afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaWeightError`] when the source is empty/incomplete, the
+    /// length does not fit the host, the name is duplicated, or a CUDA copy
+    /// fails.
+    pub fn materialize_quantized<R: Read>(
+        &mut self,
+        spec: WeightTensorSpec,
+        value_type: u32,
+        encoded_bytes: u64,
+        source: &mut R,
+    ) -> Result<WeightTensorSpec, CudaWeightError> {
+        if self.tensors.contains_key(spec.name())
+            || self.quantized_tensors.contains_key(spec.name())
+        {
+            return Err(CudaWeightError::DuplicateTensor(spec.name().to_owned()));
+        }
+        let capacity =
+            usize::try_from(encoded_bytes).map_err(|_| CudaWeightError::EncodedLengthOverflow {
+                name: spec.name().to_owned(),
+                encoded_bytes,
+            })?;
+        if capacity == 0 {
+            return Err(CudaWeightError::EmptyEncoding(spec.name().to_owned()));
+        }
+        let mut device = unsafe { self.stream.alloc::<u8>(capacity) }
+            .map_err(|error| CudaWeightError::Driver(error.to_string()))?;
+        let mut host = vec![0_u8; capacity.min(1024 * 1024)];
+        let mut offset = 0_usize;
+        while offset < capacity {
+            let requested = (capacity - offset).min(host.len());
+            let read = source
+                .read(&mut host[..requested])
+                .map_err(|error| CudaWeightError::Source(error.to_string()))?;
+            if read == 0 {
+                return Err(CudaWeightError::SourceIncomplete {
+                    name: spec.name().to_owned(),
+                    expected: capacity,
+                    actual: offset,
+                });
+            }
+            let end = offset + read;
+            let mut destination = device.try_slice_mut(offset..end).ok_or_else(|| {
+                CudaWeightError::SourceIncomplete {
+                    name: spec.name().to_owned(),
+                    expected: capacity,
+                    actual: offset,
+                }
+            })?;
+            self.stream
+                .memcpy_htod(&host[..read], &mut destination)
+                .map_err(|error| CudaWeightError::Driver(error.to_string()))?;
+            self.stream
+                .synchronize()
+                .map_err(|error| CudaWeightError::Driver(error.to_string()))?;
+            offset = end;
+        }
+        self.quantized_tensors.insert(
+            spec.name().to_owned(),
+            CudaQuantizedWeight {
+                spec: spec.clone(),
+                value_type,
+                encoded_bytes: capacity,
+                data: device,
+            },
+        );
+        Ok(spec)
+    }
+
     /// Validate that every logical tensor in a plan binding has an identical
     /// materialized tensor in this store.
     ///
@@ -241,10 +378,17 @@ impl CudaWeightStore {
     /// differs from the prepared binding.
     pub fn validate_binding(&self, binding: &WeightBinding) -> Result<(), CudaWeightError> {
         for spec in binding.tensors() {
-            let Some(weight) = self.tensors.get(spec.name()) else {
-                return Err(CudaWeightError::MissingTensor(spec.name().to_owned()));
-            };
-            if weight.spec() != spec {
+            let actual = self
+                .tensors
+                .get(spec.name())
+                .map(CudaF32Weight::spec)
+                .or_else(|| {
+                    self.quantized_tensors
+                        .get(spec.name())
+                        .map(CudaQuantizedWeight::spec)
+                })
+                .ok_or_else(|| CudaWeightError::MissingTensor(spec.name().to_owned()))?;
+            if actual != spec {
                 return Err(CudaWeightError::BindingMismatch(format!(
                     "tensor {:?} descriptor differs from materialized storage",
                     spec.name()
@@ -259,6 +403,11 @@ impl CudaWeightStore {
         self.tensors.get(name)
     }
 
+    #[must_use]
+    pub fn quantized_tensor(&self, name: &str) -> Option<&CudaQuantizedWeight> {
+        self.quantized_tensors.get(name)
+    }
+
     /// Copy one materialized tensor back to the host for correctness checks or
     /// diagnostics. Production execution should keep this off the hot path.
     ///
@@ -269,6 +418,22 @@ impl CudaWeightStore {
     pub fn copy_to_host(&self, name: &str) -> Result<Vec<f32>, CudaWeightError> {
         let weight = self
             .tensor(name)
+            .ok_or_else(|| CudaWeightError::MissingTensor(name.to_owned()))?;
+        self.stream
+            .clone_dtoh(&weight.data)
+            .map_err(|error| CudaWeightError::Driver(error.to_string()))
+    }
+
+    /// Copy one opaque encoded tensor back to the host for representation
+    /// parity checks. Production execution should keep this off the hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaWeightError::MissingTensor`] when the name is not bound or
+    /// a device-to-host copy fails.
+    pub fn copy_quantized_to_host(&self, name: &str) -> Result<Vec<u8>, CudaWeightError> {
+        let weight = self
+            .quantized_tensor(name)
             .ok_or_else(|| CudaWeightError::MissingTensor(name.to_owned()))?;
         self.stream
             .clone_dtoh(&weight.data)
@@ -379,6 +544,38 @@ impl CudaReferenceDispatcher {
     pub fn copy_weight_to_host(&self) -> Result<Vec<f32>, CudaRuntimeError> {
         self.weight_store
             .copy_to_host(&self.reference_weight_name)
+            .map_err(|error| CudaRuntimeError::Weight(error.to_string()))
+    }
+
+    /// Materialize an opaque block-encoded tensor alongside the reference
+    /// weight. This validates the raw representation path only; no quantized
+    /// execution kernel is selected by the reference dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaRuntimeError::Weight`] when materialization fails.
+    pub fn materialize_quantized<R: Read>(
+        &mut self,
+        spec: WeightTensorSpec,
+        value_type: u32,
+        encoded_bytes: u64,
+        source: &mut R,
+    ) -> Result<WeightTensorSpec, CudaRuntimeError> {
+        self.weight_store
+            .materialize_quantized(spec, value_type, encoded_bytes, source)
+            .map_err(|error| CudaRuntimeError::Weight(error.to_string()))
+    }
+
+    /// Copy one opaque encoded tensor back to the host for representation
+    /// checks. This is not part of the execution hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaRuntimeError::Weight`] when the tensor is unavailable or
+    /// the copy fails.
+    pub fn copy_quantized_to_host(&self, name: &str) -> Result<Vec<u8>, CudaRuntimeError> {
+        self.weight_store
+            .copy_quantized_to_host(name)
             .map_err(|error| CudaRuntimeError::Weight(error.to_string()))
     }
 

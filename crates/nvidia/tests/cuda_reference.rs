@@ -1,5 +1,7 @@
 #![cfg(feature = "cuda")]
 
+use std::io::Read;
+
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, DeviceId, ExecutionPhase,
     ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage, HybridStateSet,
@@ -306,4 +308,41 @@ fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
     );
     assert_eq!(dispatcher.weight_spec(), Some(&spec));
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn materializes_a_pinned_qwen_quantized_tensor_without_host_dequantization() {
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+    let mut source = provider
+        .open_tensor("blk.0.attn_qkv.weight")
+        .expect("open pinned quantized tensor");
+    assert_eq!(source.value_type(), 13); // Q5_K
+    let spec = source.spec().clone();
+    let encoded_bytes = source.remaining();
+    let mut expected_source = provider
+        .open_tensor("blk.0.attn_qkv.weight")
+        .expect("reopen pinned quantized tensor");
+    let mut expected = Vec::new();
+    expected_source
+        .read_to_end(&mut expected)
+        .expect("read encoded tensor");
+
+    let mut dispatcher = CudaReferenceDispatcher::new(0).expect("CUDA reference dispatcher");
+    let materialized = dispatcher
+        .materialize_quantized(
+            spec.clone(),
+            source.value_type(),
+            encoded_bytes,
+            &mut source,
+        )
+        .expect("materialize opaque quantized tensor");
+    assert_eq!(materialized, spec);
+    assert_eq!(source.remaining(), 0);
+    let actual = dispatcher
+        .copy_quantized_to_host(spec.name())
+        .expect("copy opaque quantized tensor to host");
+    assert_eq!(actual, expected);
 }
