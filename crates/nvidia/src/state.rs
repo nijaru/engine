@@ -68,9 +68,17 @@ impl CudaKvState {
         &self.keys
     }
 
+    pub fn keys_mut(&mut self) -> &mut CudaStateBuffer {
+        &mut self.keys
+    }
+
     #[must_use]
     pub fn values(&self) -> &CudaStateBuffer {
         &self.values
+    }
+
+    pub fn values_mut(&mut self) -> &mut CudaStateBuffer {
+        &mut self.values
     }
 
     #[must_use]
@@ -98,9 +106,17 @@ impl CudaRecurrentState {
         &self.matrix
     }
 
+    pub fn matrix_mut(&mut self) -> &mut CudaStateBuffer {
+        &mut self.matrix
+    }
+
     #[must_use]
     pub fn convolution(&self) -> &CudaStateBuffer {
         &self.convolution
+    }
+
+    pub fn convolution_mut(&mut self) -> &mut CudaStateBuffer {
+        &mut self.convolution
     }
 }
 
@@ -181,9 +197,17 @@ impl CudaHybridState {
         self.kv.as_ref()
     }
 
+    pub fn kv_mut(&mut self) -> Option<&mut CudaKvState> {
+        self.kv.as_mut()
+    }
+
     #[must_use]
     pub fn recurrent(&self) -> Option<&CudaRecurrentState> {
         self.recurrent.as_ref()
+    }
+
+    pub fn recurrent_mut(&mut self) -> Option<&mut CudaRecurrentState> {
+        self.recurrent.as_mut()
     }
 
     #[must_use]
