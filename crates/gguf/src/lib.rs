@@ -318,6 +318,190 @@ impl GgufFile {
     pub const fn tensor_data_offset(&self) -> u64 {
         self.tensor_data_offset
     }
+
+    /// Decode and validate the Qwen3.8 hybrid dimensions carried by this
+    /// artifact. This remains a GGUF adapter; it does not create model kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when the architecture marker, metadata, or hybrid
+    /// dimensions are missing or inconsistent.
+    pub fn qwen35_config(&self) -> Result<Qwen35Config, GgufError> {
+        let architecture = self
+            .metadata("general.architecture")
+            .and_then(MetadataValue::as_str)
+            .ok_or_else(|| GgufError::MissingMetadata("general.architecture".to_owned()))?;
+        if architecture != "qwen35" {
+            return Err(GgufError::UnsupportedArchitecture(architecture.to_owned()));
+        }
+        let config = Qwen35Config::from_metadata(&self.metadata)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35Config {
+    context_length: u64,
+    embedding_length: u32,
+    feed_forward_length: u32,
+    block_count: u32,
+    attention_heads: u32,
+    kv_heads: u32,
+    key_length: u32,
+    value_length: u32,
+    full_attention_interval: u32,
+    ssm_group_count: u32,
+    ssm_inner_size: u32,
+    ssm_state_size: u32,
+    ssm_time_step_rank: u32,
+    ssm_conv_kernel: u32,
+    nextn_predict_layers: u32,
+}
+
+impl Qwen35Config {
+    #[must_use]
+    pub const fn context_length(&self) -> u64 {
+        self.context_length
+    }
+
+    #[must_use]
+    pub const fn embedding_length(&self) -> u32 {
+        self.embedding_length
+    }
+
+    #[must_use]
+    pub const fn feed_forward_length(&self) -> u32 {
+        self.feed_forward_length
+    }
+
+    #[must_use]
+    pub const fn block_count(&self) -> u32 {
+        self.block_count
+    }
+
+    #[must_use]
+    pub const fn attention_heads(&self) -> u32 {
+        self.attention_heads
+    }
+
+    #[must_use]
+    pub const fn kv_heads(&self) -> u32 {
+        self.kv_heads
+    }
+
+    #[must_use]
+    pub const fn key_length(&self) -> u32 {
+        self.key_length
+    }
+
+    #[must_use]
+    pub const fn value_length(&self) -> u32 {
+        self.value_length
+    }
+
+    #[must_use]
+    pub const fn full_attention_interval(&self) -> u32 {
+        self.full_attention_interval
+    }
+
+    #[must_use]
+    pub const fn ssm_group_count(&self) -> u32 {
+        self.ssm_group_count
+    }
+
+    #[must_use]
+    pub const fn ssm_inner_size(&self) -> u32 {
+        self.ssm_inner_size
+    }
+
+    #[must_use]
+    pub const fn ssm_state_size(&self) -> u32 {
+        self.ssm_state_size
+    }
+
+    #[must_use]
+    pub const fn ssm_time_step_rank(&self) -> u32 {
+        self.ssm_time_step_rank
+    }
+
+    #[must_use]
+    pub const fn ssm_conv_kernel(&self) -> u32 {
+        self.ssm_conv_kernel
+    }
+
+    #[must_use]
+    pub const fn nextn_predict_layers(&self) -> u32 {
+        self.nextn_predict_layers
+    }
+
+    #[must_use]
+    pub const fn language_layer_count(&self) -> Option<u32> {
+        self.block_count.checked_sub(self.nextn_predict_layers)
+    }
+
+    fn from_metadata(metadata: &BTreeMap<String, MetadataValue>) -> Result<Self, GgufError> {
+        Ok(Self {
+            context_length: required_u64(metadata, "qwen35.context_length")?,
+            embedding_length: required_u32(metadata, "qwen35.embedding_length")?,
+            feed_forward_length: required_u32(metadata, "qwen35.feed_forward_length")?,
+            block_count: required_u32(metadata, "qwen35.block_count")?,
+            attention_heads: required_u32(metadata, "qwen35.attention.head_count")?,
+            kv_heads: required_u32(metadata, "qwen35.attention.head_count_kv")?,
+            key_length: required_u32(metadata, "qwen35.attention.key_length")?,
+            value_length: required_u32(metadata, "qwen35.attention.value_length")?,
+            full_attention_interval: required_u32(metadata, "qwen35.full_attention_interval")?,
+            ssm_group_count: required_u32(metadata, "qwen35.ssm.group_count")?,
+            ssm_inner_size: required_u32(metadata, "qwen35.ssm.inner_size")?,
+            ssm_state_size: required_u32(metadata, "qwen35.ssm.state_size")?,
+            ssm_time_step_rank: required_u32(metadata, "qwen35.ssm.time_step_rank")?,
+            ssm_conv_kernel: required_u32(metadata, "qwen35.ssm.conv_kernel")?,
+            nextn_predict_layers: required_u32(metadata, "qwen35.nextn_predict_layers")?,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`GgufError::InvalidModelConfiguration`] when a required Qwen3.8
+    /// hybrid dimension is zero or inconsistent.
+    pub fn validate(&self) -> Result<(), GgufError> {
+        let dimensions = [
+            self.context_length,
+            u64::from(self.embedding_length),
+            u64::from(self.feed_forward_length),
+            u64::from(self.block_count),
+            u64::from(self.attention_heads),
+            u64::from(self.kv_heads),
+            u64::from(self.key_length),
+            u64::from(self.value_length),
+            u64::from(self.full_attention_interval),
+            u64::from(self.ssm_group_count),
+            u64::from(self.ssm_inner_size),
+            u64::from(self.ssm_state_size),
+            u64::from(self.ssm_time_step_rank),
+            u64::from(self.ssm_conv_kernel),
+        ];
+        if dimensions.contains(&0) {
+            return Err(GgufError::InvalidModelConfiguration(
+                "Qwen3.8 dimensions must be non-zero",
+            ));
+        }
+        let language_layers =
+            self.language_layer_count()
+                .ok_or(GgufError::InvalidModelConfiguration(
+                    "MTP layer count exceeds total block count",
+                ))?;
+        if self.full_attention_interval > language_layers
+            || language_layers % self.full_attention_interval != 0
+            || !self.attention_heads.is_multiple_of(self.kv_heads)
+            || self.ssm_time_step_rank.checked_mul(self.ssm_state_size) != Some(self.ssm_inner_size)
+        {
+            return Err(GgufError::InvalidModelConfiguration(
+                "Qwen3.8 hybrid dimensions are inconsistent",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A GGUF implementation of the core weight-loader boundary. It validates the
@@ -408,6 +592,12 @@ pub enum GgufError {
         name: String,
         offset: u64,
     },
+    MissingMetadata(String),
+    MetadataTypeMismatch {
+        key: String,
+    },
+    UnsupportedArchitecture(String),
+    InvalidModelConfiguration(&'static str),
     MissingTensor(String),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
@@ -460,6 +650,16 @@ impl std::fmt::Display for GgufError {
             Self::TensorOffsetOutOfBounds { name, offset } => {
                 write!(f, "GGUF tensor {name:?} has out-of-bounds offset {offset}")
             }
+            Self::MissingMetadata(key) => write!(f, "missing GGUF metadata key {key:?}"),
+            Self::MetadataTypeMismatch { key } => {
+                write!(f, "GGUF metadata key {key:?} has an unexpected type")
+            }
+            Self::UnsupportedArchitecture(architecture) => {
+                write!(f, "unsupported GGUF architecture {architecture:?}")
+            }
+            Self::InvalidModelConfiguration(reason) => {
+                write!(f, "invalid Qwen3.8 model configuration: {reason}")
+            }
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
             Self::UnsupportedTensorType(value) => {
                 write!(f, "unsupported GGML tensor type {value}")
@@ -479,6 +679,29 @@ impl std::fmt::Display for GgufError {
 }
 
 impl std::error::Error for GgufError {}
+
+fn required_u64(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<u64, GgufError> {
+    metadata
+        .get(key)
+        .ok_or_else(|| GgufError::MissingMetadata(key.to_owned()))?
+        .as_u64()
+        .ok_or_else(|| GgufError::MetadataTypeMismatch {
+            key: key.to_owned(),
+        })
+}
+
+fn required_u32(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<u32, GgufError> {
+    let value = required_u64(metadata, key)?;
+    u32::try_from(value).map_err(|_| GgufError::MetadataTypeMismatch {
+        key: key.to_owned(),
+    })
+}
 
 fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
     match value_type {
