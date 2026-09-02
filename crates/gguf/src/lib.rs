@@ -506,6 +506,26 @@ fn byte_to_unicode(byte: u8) -> char {
     }
 }
 
+fn unicode_to_byte(character: char) -> Option<u8> {
+    let codepoint = u32::from(character);
+    if let Ok(byte) = u8::try_from(codepoint)
+        && byte_is_direct(byte)
+    {
+        return Some(byte);
+    }
+    let rank = codepoint.checked_sub(256)?;
+    let mut current_rank = 0;
+    for byte in 0..=u8::MAX {
+        if !byte_is_direct(byte) {
+            if current_rank == rank {
+                return Some(byte);
+            }
+            current_rank += 1;
+        }
+    }
+    None
+}
+
 fn build_token_ids(tokens: &[String]) -> Result<BTreeMap<String, u32>, GgufError> {
     let mut token_ids = BTreeMap::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -651,6 +671,45 @@ impl GgufTokenizer {
             });
         }
         Ok(encoded)
+    }
+
+    /// Decode GPT-2/BPE token IDs back to UTF-8 text.
+    ///
+    /// Special-marker tokens are returned literally, which lets callers keep
+    /// stop-marker handling explicit while still supporting chat prompt and
+    /// generated-text round trips.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::TokenizerEncoding`] when a token ID is outside the
+    /// vocabulary, a token contains an unsupported symbol, or the decoded byte
+    /// sequence is not UTF-8.
+    pub fn decode(&self, token_ids: &[u32]) -> Result<String, GgufError> {
+        let mut bytes = Vec::new();
+        for &token_id in token_ids {
+            let token = self
+                .tokens
+                .get(
+                    usize::try_from(token_id).map_err(|_| GgufError::TokenizerEncoding {
+                        detail: format!("token ID {token_id} does not fit this platform"),
+                    })?,
+                )
+                .ok_or_else(|| GgufError::TokenizerEncoding {
+                    detail: format!("token ID {token_id} is outside the vocabulary"),
+                })?;
+            for character in token.chars() {
+                let byte =
+                    unicode_to_byte(character).ok_or_else(|| GgufError::TokenizerEncoding {
+                        detail: format!(
+                            "token {token_id} contains unsupported symbol {character:?}"
+                        ),
+                    })?;
+                bytes.push(byte);
+            }
+        }
+        String::from_utf8(bytes).map_err(|error| GgufError::TokenizerEncoding {
+            detail: format!("decoded tokens are not UTF-8: {error}"),
+        })
     }
 
     /// Render the embedded Qwen chat template for ordinary system, user, and
@@ -2384,6 +2443,11 @@ mod tests {
         assert_eq!(tokenizer.merges(), &["a b"]);
         assert_eq!(tokenizer.token_types(), &[1, 3, 1]);
         assert_eq!(tokenizer.encode("ab").expect("BPE encoding"), vec![2]);
+        assert_eq!(tokenizer.decode(&[2]).expect("BPE decoding"), "ab");
+        assert!(matches!(
+            tokenizer.decode(&[99]),
+            Err(GgufError::TokenizerEncoding { .. })
+        ));
         assert!(tokenizer.encode("").expect("empty encoding").is_empty());
         assert_eq!(tokenizer.bos_token_id(), 1);
         assert_eq!(tokenizer.eos_token_id(), 2);
