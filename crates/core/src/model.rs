@@ -1,6 +1,8 @@
 //! Model descriptions and provider boundary.
 
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::execution::ExecutionPlan;
 use crate::state::StateRequirement;
@@ -174,6 +176,170 @@ impl WeightDescription {
     #[must_use]
     pub const fn quantization(&self) -> Quantization {
         self.quantization
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum WeightSource {
+    File(PathBuf),
+}
+
+impl WeightSource {
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+        }
+    }
+}
+
+/// Metadata for a successfully opened artifact. The loader intentionally does
+/// not read the complete weight file or expose fake tensor buffers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightArtifact {
+    source: WeightSource,
+    byte_len: u64,
+    description: WeightDescription,
+}
+
+impl WeightArtifact {
+    #[must_use]
+    pub fn source(&self) -> &WeightSource {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    #[must_use]
+    pub const fn description(&self) -> &WeightDescription {
+        &self.description
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelLoadError {
+    Io { path: PathBuf, message: String },
+    EmptyArtifact(PathBuf),
+    NotRegularFile(PathBuf),
+    WeightDescriptionMismatch,
+}
+
+impl fmt::Display for ModelLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, message } => {
+                write!(
+                    f,
+                    "could not inspect weight artifact {}: {message}",
+                    path.display()
+                )
+            }
+            Self::EmptyArtifact(path) => write!(f, "weight artifact {} is empty", path.display()),
+            Self::NotRegularFile(path) => {
+                write!(
+                    f,
+                    "weight artifact {} is not a regular file",
+                    path.display()
+                )
+            }
+            Self::WeightDescriptionMismatch => {
+                f.write_str("loaded weights do not match the model description")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModelLoadError {}
+
+/// The first concrete loader verifies a local file artifact without making a
+/// checkpoint format a core-wide execution dependency. Format-specific tensor
+/// readers can implement this boundary later.
+pub trait WeightLoader: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns [`ModelLoadError`] if the artifact cannot be inspected.
+    fn load(&self) -> Result<WeightArtifact, ModelLoadError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileWeightLoader {
+    path: PathBuf,
+    description: WeightDescription,
+}
+
+impl FileWeightLoader {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, description: WeightDescription) -> Self {
+        Self {
+            path: path.into(),
+            description,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl WeightLoader for FileWeightLoader {
+    fn load(&self) -> Result<WeightArtifact, ModelLoadError> {
+        let metadata = fs::metadata(&self.path).map_err(|error| ModelLoadError::Io {
+            path: self.path.clone(),
+            message: error.to_string(),
+        })?;
+        if !metadata.is_file() {
+            return Err(ModelLoadError::NotRegularFile(self.path.clone()));
+        }
+        if metadata.len() == 0 {
+            return Err(ModelLoadError::EmptyArtifact(self.path.clone()));
+        }
+        Ok(WeightArtifact {
+            source: WeightSource::File(self.path.clone()),
+            byte_len: metadata.len(),
+            description: self.description.clone(),
+        })
+    }
+}
+
+/// A provider backed by a verified local artifact. It supplies metadata and
+/// plan validation while execution remains owned by a compute backend.
+pub struct FileModelProvider {
+    description: ModelDescription,
+    artifact: WeightArtifact,
+}
+
+impl FileModelProvider {
+    /// # Errors
+    ///
+    /// Returns [`ModelLoadError::WeightDescriptionMismatch`] when the artifact
+    /// metadata does not match the model declaration.
+    pub fn load(
+        description: ModelDescription,
+        loader: &dyn WeightLoader,
+    ) -> Result<Self, ModelLoadError> {
+        let artifact = loader.load()?;
+        if artifact.description() != description.weights() {
+            return Err(ModelLoadError::WeightDescriptionMismatch);
+        }
+        Ok(Self {
+            description,
+            artifact,
+        })
+    }
+
+    #[must_use]
+    pub fn artifact(&self) -> &WeightArtifact {
+        &self.artifact
+    }
+}
+
+impl ModelProvider for FileModelProvider {
+    fn description(&self) -> &ModelDescription {
+        &self.description
     }
 }
 

@@ -1,5 +1,6 @@
 //! Typed model-state descriptions and lifecycle boundary.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::device::DeviceId;
@@ -83,6 +84,16 @@ impl KvStateSpec {
     #[must_use]
     pub const fn dtype(self) -> DataType {
         self.dtype
+    }
+
+    #[must_use]
+    pub fn byte_size(self) -> Option<u64> {
+        let elements = u64::from(self.layer_count)
+            .checked_mul(u64::from(self.kv_heads))?
+            .checked_mul(u64::from(self.head_dim))?
+            .checked_mul(u64::from(self.block_tokens))?
+            .checked_mul(2)?;
+        elements.checked_mul(self.dtype.byte_width())
     }
 }
 
@@ -222,6 +233,21 @@ impl RecurrentStateSpec {
     pub const fn convolution_dtype(self) -> DataType {
         self.convolution_dtype
     }
+
+    #[must_use]
+    pub fn byte_size(self) -> Option<u64> {
+        let matrix_elements = u64::from(self.matrix.key_heads())
+            .checked_mul(u64::from(self.matrix.key_head_dim()))?
+            .checked_mul(u64::from(self.matrix.value_heads()))?
+            .checked_mul(u64::from(self.matrix.value_head_dim()))?
+            .checked_mul(u64::from(self.layer_count))?;
+        let convolution_elements = u64::from(self.convolution.channels())
+            .checked_mul(u64::from(self.convolution.kernel()))?
+            .checked_mul(u64::from(self.layer_count))?;
+        matrix_elements
+            .checked_mul(self.matrix_dtype.byte_width())?
+            .checked_add(convolution_elements.checked_mul(self.convolution_dtype.byte_width())?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -239,6 +265,14 @@ impl StateRequirement {
     #[must_use]
     pub const fn is_recurrent(self) -> bool {
         matches!(self, Self::Recurrent(_))
+    }
+
+    #[must_use]
+    pub fn byte_size(self) -> Option<u64> {
+        match self {
+            Self::FullAttentionKv(spec) => spec.byte_size(),
+            Self::Recurrent(spec) => spec.byte_size(),
+        }
     }
 }
 
@@ -449,23 +483,254 @@ impl std::error::Error for StateSpecError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StateError {
     UnsupportedRequirement,
+    UnsupportedLocation,
+    CapacityExceeded {
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
+    SizeOverflow,
     InvalidHandle,
     PositionMismatch,
     LocationMismatch,
+    PositionRegression,
 }
 
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedRequirement => f.write_str("state requirement is unsupported"),
+            Self::UnsupportedLocation => {
+                f.write_str("state location is unsupported by this manager")
+            }
+            Self::CapacityExceeded {
+                requested_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "state allocation requires {requested_bytes} bytes, but only {available_bytes} are available"
+            ),
+            Self::SizeOverflow => f.write_str("state size calculation overflowed"),
             Self::InvalidHandle => f.write_str("state handle is invalid or already released"),
             Self::PositionMismatch => f.write_str("state families have different token positions"),
             Self::LocationMismatch => f.write_str("state families have different placements"),
+            Self::PositionRegression => f.write_str("state token position cannot move backwards"),
         }
     }
 }
 
 impl std::error::Error for StateError {}
+
+/// A dependency-free state manager that owns typed allocation metadata and
+/// lifecycle. It deliberately does not allocate tensor storage; a backend can
+/// use its handles to attach device buffers without turning this core crate into
+/// a CUDA or GGUF dependency.
+#[derive(Debug)]
+pub struct LogicalStateManager {
+    device: DeviceId,
+    device_capacity_bytes: u64,
+    host_capacity_bytes: u64,
+    device_used_bytes: u64,
+    host_used_bytes: u64,
+    next_id: u64,
+    allocations: HashMap<StateId, AllocationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AllocationRecord {
+    requirement: StateRequirement,
+    location: StateLocation,
+    token_position: u32,
+    bytes: u64,
+}
+
+impl LogicalStateManager {
+    #[must_use]
+    pub fn new(device: DeviceId, device_capacity_bytes: u64, host_capacity_bytes: u64) -> Self {
+        Self {
+            device,
+            device_capacity_bytes,
+            host_capacity_bytes,
+            device_used_bytes: 0,
+            host_used_bytes: 0,
+            next_id: 1,
+            allocations: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    #[must_use]
+    pub fn capacity_bytes(&self, location: StateLocation) -> Option<u64> {
+        match location {
+            StateLocation::Device(device) if device == self.device => {
+                Some(self.device_capacity_bytes)
+            }
+            StateLocation::Host => Some(self.host_capacity_bytes),
+            StateLocation::Device(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn used_bytes(&self, location: StateLocation) -> Option<u64> {
+        match location {
+            StateLocation::Device(device) if device == self.device => Some(self.device_used_bytes),
+            StateLocation::Host => Some(self.host_used_bytes),
+            StateLocation::Device(_) => None,
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        requirement: StateRequirement,
+        location: StateLocation,
+    ) -> Result<StateHandle, StateError> {
+        let bytes = requirement.byte_size().ok_or(StateError::SizeOverflow)?;
+        let (capacity, used) = match location {
+            StateLocation::Device(device) if device == self.device => {
+                (self.device_capacity_bytes, self.device_used_bytes)
+            }
+            StateLocation::Host => (self.host_capacity_bytes, self.host_used_bytes),
+            StateLocation::Device(_) => return Err(StateError::UnsupportedLocation),
+        };
+        let available = capacity.saturating_sub(used);
+        if bytes > available {
+            return Err(StateError::CapacityExceeded {
+                requested_bytes: bytes,
+                available_bytes: available,
+            });
+        }
+        let id = StateId::new(self.next_id).ok_or(StateError::InvalidHandle)?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(StateError::InvalidHandle)?;
+        if matches!(location, StateLocation::Device(_)) {
+            self.device_used_bytes += bytes;
+        } else {
+            self.host_used_bytes += bytes;
+        }
+        self.allocations.insert(
+            id,
+            AllocationRecord {
+                requirement,
+                location,
+                token_position: 0,
+                bytes,
+            },
+        );
+        Ok(StateHandle::new(id, requirement, location, 0))
+    }
+
+    fn record_for(&self, handle: &StateHandle) -> Result<AllocationRecord, StateError> {
+        let Some(record) = self.allocations.get(&handle.id()) else {
+            return Err(StateError::InvalidHandle);
+        };
+        if record.requirement != handle.requirement()
+            || record.location != handle.location()
+            || record.token_position != handle.token_position()
+        {
+            return Err(StateError::InvalidHandle);
+        }
+        Ok(*record)
+    }
+
+    fn state_handles(state: &HybridStateSet) -> impl Iterator<Item = &StateHandle> {
+        state
+            .kv()
+            .map(KvState::handle)
+            .into_iter()
+            .chain(state.recurrent().map(RecurrentState::handle))
+    }
+
+    fn update_position(
+        &mut self,
+        state: &HybridStateSet,
+        token_position: u32,
+    ) -> Result<(), StateError> {
+        let handles = Self::state_handles(state).collect::<Vec<_>>();
+        for handle in &handles {
+            let record = self.record_for(handle)?;
+            if token_position < record.token_position {
+                return Err(StateError::PositionRegression);
+            }
+        }
+        for handle in handles {
+            let record = self
+                .allocations
+                .get_mut(&handle.id())
+                .ok_or(StateError::InvalidHandle)?;
+            record.token_position = token_position;
+        }
+        Ok(())
+    }
+}
+
+impl StateManager for LogicalStateManager {
+    fn allocate_kv(
+        &mut self,
+        spec: KvStateSpec,
+        location: StateLocation,
+    ) -> Result<KvState, StateError> {
+        let handle = self.reserve(StateRequirement::FullAttentionKv(spec), location)?;
+        KvState::new(handle, spec).ok_or(StateError::UnsupportedRequirement)
+    }
+
+    fn allocate_recurrent(
+        &mut self,
+        spec: RecurrentStateSpec,
+        location: StateLocation,
+    ) -> Result<RecurrentState, StateError> {
+        let handle = self.reserve(StateRequirement::Recurrent(spec), location)?;
+        RecurrentState::new(handle, spec).ok_or(StateError::UnsupportedRequirement)
+    }
+
+    fn commit(
+        &mut self,
+        state: HybridStateSet,
+        token_position: u32,
+    ) -> Result<HybridStateSet, StateError> {
+        self.update_position(&state, token_position)?;
+        let kv = state
+            .kv()
+            .map(|value| {
+                let handle = StateHandle::new(
+                    value.handle().id(),
+                    value.handle().requirement(),
+                    value.handle().location(),
+                    token_position,
+                );
+                KvState::new(handle, value.spec()).ok_or(StateError::InvalidHandle)
+            })
+            .transpose()?;
+        let recurrent = state
+            .recurrent()
+            .map(|value| {
+                let handle = StateHandle::new(
+                    value.handle().id(),
+                    value.handle().requirement(),
+                    value.handle().location(),
+                    token_position,
+                );
+                RecurrentState::new(handle, value.spec()).ok_or(StateError::InvalidHandle)
+            })
+            .transpose()?;
+        HybridStateSet::try_new(kv, recurrent)
+    }
+
+    fn release(&mut self, handle: StateHandle) -> Result<(), StateError> {
+        let record = self.record_for(&handle)?;
+        self.allocations.remove(&handle.id());
+        if matches!(record.location, StateLocation::Device(_)) {
+            self.device_used_bytes -= record.bytes;
+        } else {
+            self.host_used_bytes -= record.bytes;
+        }
+        Ok(())
+    }
+}
 
 /// Storage/lifecycle implementations own allocation, transfer, checkpointing,
 /// and reclamation. Separate methods preserve the type distinction at the API.

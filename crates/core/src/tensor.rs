@@ -12,6 +12,17 @@ pub enum DataType {
     U8,
 }
 
+impl DataType {
+    #[must_use]
+    pub const fn byte_width(self) -> u64 {
+        match self {
+            Self::F16 | Self::BF16 => 2,
+            Self::F32 => 4,
+            Self::I8 | Self::U8 => 1,
+        }
+    }
+}
+
 /// Weight quantization is explicit because similarly named formats are not
 /// interchangeable for correctness or benchmark comparisons.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

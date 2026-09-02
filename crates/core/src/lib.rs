@@ -9,8 +9,10 @@ pub mod backend;
 pub mod device;
 pub mod execution;
 pub mod model;
+pub mod nvidia;
 pub mod policy;
 pub mod request;
+pub mod runtime;
 pub mod state;
 pub mod tensor;
 
@@ -23,9 +25,11 @@ pub use execution::{
     ExecutionStage, PlanError,
 };
 pub use model::{
-    ModelCapabilities, ModelDescription, ModelError, ModelId, ModelProvider, ModelRegion,
-    ModelRegionId, ModelRegionKind, MtpCapability, WeightDescription,
+    FileModelProvider, FileWeightLoader, ModelCapabilities, ModelDescription, ModelError, ModelId,
+    ModelLoadError, ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, MtpCapability,
+    WeightArtifact, WeightDescription, WeightLoader, WeightSource,
 };
+pub use nvidia::{NvidiaBackend, NvidiaDispatcher};
 pub use policy::{
     PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
 };
@@ -33,10 +37,11 @@ pub use request::{
     RequestError, RequestId, RequestSemantics, RequestSpec, SamplingError, SamplingParams,
     ThinkingMode,
 };
+pub use runtime::{ExecutionRuntime, RuntimeError};
 pub use state::{
-    ConvolutionStateShape, HybridState, HybridStateSet, KvState, KvStateSpec, RecurrentMatrixShape,
-    RecurrentState, RecurrentStateSpec, StateError, StateHandle, StateId, StateLocation,
-    StateManager, StateRequirement, StateSpecError,
+    ConvolutionStateShape, HybridState, HybridStateSet, KvState, KvStateSpec, LogicalStateManager,
+    RecurrentMatrixShape, RecurrentState, RecurrentStateSpec, StateError, StateHandle, StateId,
+    StateLocation, StateManager, StateRequirement, StateSpecError,
 };
 pub use tensor::{DataType, Quantization, WeightFormat};
 
@@ -261,5 +266,49 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn logical_state_manager_accounts_for_typed_allocations() {
+        let device = DeviceId::new(0);
+        let spec = KvStateSpec::new(1, 1, 2, 4, DataType::F16).expect("KV spec");
+        assert_eq!(spec.byte_size(), Some(32));
+        let mut manager = LogicalStateManager::new(device, 32, 0);
+        let state = manager
+            .allocate_kv(spec, StateLocation::Device(device))
+            .expect("first allocation");
+        assert_eq!(manager.used_bytes(StateLocation::Device(device)), Some(32));
+        assert!(matches!(
+            manager.allocate_kv(spec, StateLocation::Device(device)),
+            Err(StateError::CapacityExceeded { .. })
+        ));
+
+        let state_set = HybridStateSet::try_new(Some(state), None).expect("state set");
+        let committed = manager.commit(state_set, 4).expect("commit");
+        assert_eq!(committed.token_position(), Some(4));
+        manager
+            .release(committed.kv().expect("KV state").handle().clone())
+            .expect("release");
+        assert_eq!(manager.used_bytes(StateLocation::Device(device)), Some(0));
+    }
+
+    #[test]
+    fn file_provider_verifies_artifact_metadata_without_reading_weights() {
+        let path = std::env::temp_dir().join(format!(
+            "engine-core-weight-{}-{}",
+            std::process::id(),
+            RequestId::new(7).expect("request ID").get()
+        ));
+        std::fs::write(&path, b"weight metadata probe").expect("write fixture");
+        let description = qwen_description();
+        let loader = FileWeightLoader::new(
+            &path,
+            WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
+        );
+        let provider = FileModelProvider::load(description, &loader).expect("load provider");
+        assert_eq!(provider.artifact().byte_len(), 21);
+        assert_eq!(provider.artifact().source().as_path(), path);
+        assert_eq!(provider.description().architecture(), "qwen3.8-hybrid");
+        std::fs::remove_file(path).expect("remove fixture");
     }
 }
