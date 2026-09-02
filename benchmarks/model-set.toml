@@ -4,11 +4,16 @@ family = "qwen3.8-27b"
 [[models]]
 role = "primary-local-target"
 id = "Qwen/Qwen3.8-27B"
-revision = "PIN_FROM_LOCAL_ARTIFACT_BEFORE_RECORDED_RUN"
+revision = "snapshot 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 (HF cache, blobs keyed by sha256)"
 format = "GGUF"
-quantization = "existing Unsloth Q4 artifact; pin exact local filename/variant"
+quantization = "Q4_K_M (file_type 15), Unsloth dynamic UD-Q4_K_M with imatrix (chunks 1251, entries 496)"
+artifact = "Qwen3.8-27B-UD-Q4_K_M.gguf"
+sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
+size_bytes = 16464440224
+local_path = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf"
+vision_artifact = "mmproj-BF16.gguf (sha256 83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53)"
 runtime_reference = "llama.cpp"
-notes = "Primary first architecture/model target on the RTX 4090. The user already has a Q4 Unsloth Qwen3.8-27B GGUF running with llama.cpp. Inspect and record the exact local artifact, checksum/revision, llama.cpp commit/build, GPU offload, context, flash-attention, MTP, and other runtime settings before treating any run as a benchmark."
+notes = "Primary first architecture/model target on the RTX 4090. Architecture in-GGUF: qwen35 arch (llama.cpp's Qwen3.8 implementation), 65 blocks (64 LM layers + 1 bundled MTP layer, nextn_predict_layers = 1), full_attention_interval = 4 => 48 Gated DeltaNet/linear-attention + 16 full-attention layers. hidden 5120, ffn 17408, 24 Q heads / 4 KV heads / head_dim 256, vocab 248320, ctx 262144, rope base 1e7 with partial rotary 0.25. DeltaNet: state_size 128, inner 6144, 16 v-groups, conv kernel 4, time_step_rank 48. Reference environment pinned 2026-09-01: Fedora 44, kernel 7.1.12, RTX 4090 24564 MiB (GPU-810dab77), driver 610.57.04, CUDA 13.1.80, i9-13900KF, 32 GiB RAM."
 
 [architecture]
 type = "dense-hybrid-causal-vl"
@@ -16,13 +21,18 @@ text_only_first = true
 notes = "Qwen3.8-27B is non-MoE but not a conventional KV-only transformer: its language stack mixes Gated DeltaNet/linear-attention and full-attention layers and includes MTP; the official model also has a vision encoder. The first Engine path may be text-only, but the core state/model interfaces must not assume KV-only execution."
 
 [semantics]
-endpoint = "PIN_FROM_LOCAL_LLAMA_CPP_CONFIGURATION"
-chat_template = "PIN_FROM_LOCAL_LLAMA_CPP_CONFIGURATION"
-thinking_mode = "PIN_EXPLICITLY_FOR_EACH_RUN"
-sampling = "PIN_EXPLICITLY_FOR_EACH_RUN"
-ignore_eos_for_fixed_output_length_runs = "PIN_IF_SUPPORTED"
+endpoint = "OpenAI-compatible /v1 (llama-server)"
+chat_template = "GGUF-embedded Unsloth template with thinking/reasoning-effort controls (xhigh default)"
+thinking_mode = "on by default in everyday serving (--reasoning on, budget -1 unlimited; per-request reasoning_effort controls depth)"
+sampling = "bench arms: greedy seed 42, 384 output tokens; everyday serving: default temperature 1.0, top_k 20, top_p 0.95 per GGUF metadata"
+ignore_eos_for_fixed_output_length_runs = "bench-arm.sh does not set ignore_eos; runs are 384-token greedy completions"
 
 [comparison]
-primary_local_reference = "llama.cpp with the existing Q4 Unsloth GGUF"
+primary_local_reference = "llama.cpp with the exact pinned UD-Q4_K_M GGUF (same artifact for Engine later)"
 incumbents = ["vLLM", "SGLang"]
-notes = "Do not claim an Engine win from mismatched quantization or model semantics. Exact byte-identical weight formats may not be supported by every engine, so preserve a local llama.cpp same-artifact baseline and separately construct vLLM/SGLang comparisons with matched model semantics and the closest defensible precision/quality envelope. Record the mismatch explicitly."
+
+[llama_cpp_reference]
+server_build = "0.3.0-dev build 10684 commit cc83d7b48 (master a298422da..cc83d7b48)"
+everyday_command = "llm-serve start -> systemd user unit, llama-server -m <UD-Q4_K_M.gguf> --alias qwen3.8:27b -ngl 99 -c 262144 -np 1 -fa on --cache-type-k q4_0 --cache-type-v q4_0 -b 2048 -ub 256 --split-mode none --cache-ram 16384 --no-cache-idle-slots --ctx-checkpoints 0 --spec-type draft-mtp --mmproj <mmproj-BF16.gguf> --no-mmproj-offload --image-min-tokens 1024 --reasoning on --reasoning-budget -1"
+bench_baseline_2026_09_01 = "see ai/research/local-baseline-llama-cpp-2026-09-01.md for pinned numbers (AR ~49.5 tok/s, MTP n=3 ~90-98 tok/s decode at 16K ctx on build 10684)"
+historical_dflash2 = "Aug-20-2026 suite in ~/qwen38-bench on desktop: DFlash2 n=5 Q4 drafter 123/110/92 tok/s chat/code/reason, AR 49.4/49.6/49.4; llama.cpp build 10548/PR 5ecbe1ac1; recommended everyday preset was DFlash2 until superseded by native MTP default"
