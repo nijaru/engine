@@ -604,13 +604,14 @@ fn dequantize_iq4_xs(encoded: &[u8]) -> Vec<f32> {
         -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
     ];
     let scale = read_f16(encoded, 0);
-    let high_scales = &encoded[2..4];
+    let high_scales = u16::from_le_bytes([encoded[2], encoded[3]]);
     let low_scales = &encoded[4..8];
     let quantized = &encoded[8..];
     let mut output = Vec::with_capacity(QK_K);
     for group in 0..8 {
         let low = (low_scales[group / 2] >> ((group % 2) * 4)) & 0x0f;
-        let high = (high_scales[group % 2] >> ((group / 2) * 2)) & 0x03;
+        let high = u8::try_from((high_scales >> (group * 2)) & 0x03)
+            .expect("IQ4_XS high scale fits in two bits");
         let group_scale = scale * f32::from(signed_scale(low | (high << 4)));
         let data_offset = group * 16;
         for index in 0..16 {
