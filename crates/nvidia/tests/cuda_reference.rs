@@ -7,7 +7,7 @@ use engine_core::{
     ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion, Quantization, WeightBinding,
     WeightDescription, WeightFormat,
 };
-use engine_gguf::{GgufFile, Qwen35ModelProvider};
+use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::CudaReferenceDispatcher;
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -247,6 +247,30 @@ fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
     let provider =
         Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
             .expect("open pinned Qwen GGUF");
+    assert_eq!(
+        provider.layer_kind(0).expect("recurrent layer kind"),
+        Qwen35LayerKind::Recurrent
+    );
+    assert_eq!(
+        provider.layer_kind(3).expect("full-attention layer kind"),
+        Qwen35LayerKind::FullAttention
+    );
+    assert_eq!(
+        provider
+            .layer_weight_binding(DeviceId::new(0), 0)
+            .expect("bind recurrent layer")
+            .tensors()
+            .len(),
+        14
+    );
+    assert_eq!(
+        provider
+            .layer_weight_binding(DeviceId::new(0), 3)
+            .expect("bind full-attention layer")
+            .tensors()
+            .len(),
+        11
+    );
     let binding = provider
         .weight_binding(DeviceId::new(0), &["blk.0.ssm_a"])
         .expect("bind pinned scalar tensor");

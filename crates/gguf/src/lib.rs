@@ -1250,6 +1250,43 @@ fn narrow_u16(value: u32, name: &'static str) -> Result<u16, GgufError> {
     u16::try_from(value).map_err(|_| GgufError::InvalidModelConfiguration(name))
 }
 
+const QWEN35_RECURRENT_LAYER_TENSORS: &[&str] = &[
+    "attn_gate.weight",
+    "attn_norm.weight",
+    "attn_qkv.weight",
+    "ffn_down.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "post_attention_norm.weight",
+    "ssm_a",
+    "ssm_alpha.weight",
+    "ssm_beta.weight",
+    "ssm_conv1d.weight",
+    "ssm_dt.bias",
+    "ssm_norm.weight",
+    "ssm_out.weight",
+];
+
+const QWEN35_FULL_LAYER_TENSORS: &[&str] = &[
+    "attn_k.weight",
+    "attn_k_norm.weight",
+    "attn_norm.weight",
+    "attn_output.weight",
+    "attn_q.weight",
+    "attn_q_norm.weight",
+    "attn_v.weight",
+    "ffn_down.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "post_attention_norm.weight",
+];
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Qwen35LayerKind {
+    Recurrent,
+    FullAttention,
+}
+
 /// A provider for the text-only Qwen3.8 language artifact carried by GGUF.
 /// It owns validated format metadata and the core model description; tensor
 /// execution remains a separate backend/dispatcher responsibility.
@@ -1333,6 +1370,62 @@ impl Qwen35ModelProvider {
         device: DeviceId,
         names: &[&str],
     ) -> Result<WeightBinding, GgufError> {
+        let specs = names
+            .iter()
+            .map(|name| self.open_tensor(name).map(|reader| reader.spec().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        WeightBinding::new(self.description.id().clone(), device, specs)
+            .map_err(|error| GgufError::InvalidWeightBinding(error.to_string()))
+    }
+
+    /// Return the execution kind for one language layer. MTP blocks are not
+    /// included in this accessor and are intentionally a separate capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::InvalidModelConfiguration`] when `layer` is not a
+    /// language-layer index.
+    pub fn layer_kind(&self, layer: u32) -> Result<Qwen35LayerKind, GgufError> {
+        let language_layers =
+            self.config
+                .language_layer_count()
+                .ok_or(GgufError::InvalidModelConfiguration(
+                    "MTP layer count exceeds total block count",
+                ))?;
+        if layer >= language_layers {
+            return Err(GgufError::InvalidModelConfiguration(
+                "Qwen language layer index is out of range",
+            ));
+        }
+        if (layer + 1).is_multiple_of(self.config.full_attention_interval()) {
+            Ok(Qwen35LayerKind::FullAttention)
+        } else {
+            Ok(Qwen35LayerKind::Recurrent)
+        }
+    }
+
+    /// Build a logical binding for all checkpoint tensors used by one language
+    /// layer. This validates names and descriptors without allocating weight
+    /// buffers or claiming that the layer is executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when the layer index or any required tensor is
+    /// invalid or missing.
+    pub fn layer_weight_binding(
+        &self,
+        device: DeviceId,
+        layer: u32,
+    ) -> Result<WeightBinding, GgufError> {
+        let kind = self.layer_kind(layer)?;
+        let suffixes = match kind {
+            Qwen35LayerKind::Recurrent => QWEN35_RECURRENT_LAYER_TENSORS,
+            Qwen35LayerKind::FullAttention => QWEN35_FULL_LAYER_TENSORS,
+        };
+        let names = suffixes
+            .iter()
+            .map(|suffix| format!("blk.{layer}.{suffix}"))
+            .collect::<Vec<_>>();
         let specs = names
             .iter()
             .map(|name| self.open_tensor(name).map(|reader| reader.spec().clone()))
