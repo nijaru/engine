@@ -169,6 +169,10 @@ impl CudaQuantizedWeight {
     pub const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
+
+    pub(crate) fn encoded_data(&self) -> &CudaSlice<u8> {
+        &self.data
+    }
 }
 
 /// Backend-owned store for canonical F32 and opaque block-encoded tensor

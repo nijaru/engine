@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "cudarc/nvrtc"]
 
 [dependencies]
 engine-core = { path = "../core" }
