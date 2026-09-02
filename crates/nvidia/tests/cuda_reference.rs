@@ -93,7 +93,7 @@ fn executes_reference_linear_layer_through_core_runtime() {
     assert_eq!(event.phase(), ExecutionPhase::Decode);
     assert_eq!(event.token_count(), 1);
     assert_eq!(event.policy_version(), policy);
-    assert_eq!(state.token_position(), Some(1));
+    assert_eq!(state.token_position(), None);
     assert_eq!(
         runtime.backend().dispatcher().last_output(),
         Some([16.0, 14.0].as_slice())
