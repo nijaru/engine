@@ -98,6 +98,41 @@ impl TensorInfo {
     pub const fn offset(&self) -> u64 {
         self.offset
     }
+
+    /// # Errors
+    ///
+    /// Returns [`GgufError::ElementCountOverflow`] when the dimensions do not
+    /// fit in a `u64` element count.
+    pub fn element_count(&self) -> Result<u64, GgufError> {
+        self.dimensions.iter().try_fold(1_u64, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or(GgufError::ElementCountOverflow)
+        })
+    }
+
+    /// Encoded byte length for the supported GGML tensor types. Unknown types
+    /// remain parseable but are rejected here until a backend provides their
+    /// block layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor type is unsupported, its dimensions do
+    /// not fit, or its dimensions are not valid for its quantization block.
+    pub fn byte_len(&self) -> Result<u64, GgufError> {
+        let (block_elements, block_bytes) = tensor_layout(self.value_type)?;
+        let elements = self.element_count()?;
+        if elements % block_elements != 0 {
+            return Err(GgufError::QuantizationBlockMismatch {
+                name: self.name.clone(),
+                elements,
+                block_elements,
+            });
+        }
+        (elements / block_elements)
+            .checked_mul(block_bytes)
+            .ok_or(GgufError::TensorByteLengthOverflow)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +143,7 @@ pub struct GgufFile {
     metadata: BTreeMap<String, MetadataValue>,
     tensors: Vec<TensorInfo>,
     tensor_data_offset: u64,
+    file_len: u64,
 }
 
 impl GgufFile {
@@ -211,6 +247,7 @@ impl GgufFile {
             metadata,
             tensors,
             tensor_data_offset,
+            file_len,
         })
     }
 
@@ -242,6 +279,39 @@ impl GgufFile {
     #[must_use]
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
+    }
+
+    #[must_use]
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.iter().find(|tensor| tensor.name() == name)
+    }
+
+    /// Return the absolute byte range for one encoded tensor without reading
+    /// its bulk data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, unsupported, or outside the
+    /// file bounds.
+    pub fn tensor_data_range(&self, name: &str) -> Result<std::ops::Range<u64>, GgufError> {
+        let tensor = self
+            .tensor(name)
+            .ok_or_else(|| GgufError::MissingTensor(name.to_owned()))?;
+        let byte_len = tensor.byte_len()?;
+        let start = self
+            .tensor_data_offset
+            .checked_add(tensor.offset())
+            .ok_or(GgufError::TensorByteLengthOverflow)?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(GgufError::TensorByteLengthOverflow)?;
+        if end > self.file_len {
+            return Err(GgufError::TensorOffsetOutOfBounds {
+                name: tensor.name().to_owned(),
+                offset: tensor.offset(),
+            });
+        }
+        Ok(start..end)
     }
 
     #[must_use]
@@ -314,21 +384,39 @@ impl WeightLoader for GgufWeightLoader {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GgufError {
-    Io { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
     InvalidMagic(u32),
     UnsupportedVersion(u32),
     UnexpectedEof,
     InvalidUtf8,
     InvalidValueType(u32),
     InvalidBool(u8),
-    InvalidLength { kind: &'static str, value: u64 },
+    InvalidLength {
+        kind: &'static str,
+        value: u64,
+    },
     CountOverflow(&'static str),
     ArrayNestingTooDeep,
     DuplicateMetadata(String),
     InvalidDimensionCount(u32),
     InvalidAlignment(u64),
     Truncated,
-    TensorOffsetOutOfBounds { name: String, offset: u64 },
+    TensorOffsetOutOfBounds {
+        name: String,
+        offset: u64,
+    },
+    MissingTensor(String),
+    UnsupportedTensorType(u32),
+    ElementCountOverflow,
+    TensorByteLengthOverflow,
+    QuantizationBlockMismatch {
+        name: String,
+        elements: u64,
+        block_elements: u64,
+    },
 }
 
 impl GgufError {
@@ -372,11 +460,47 @@ impl std::fmt::Display for GgufError {
             Self::TensorOffsetOutOfBounds { name, offset } => {
                 write!(f, "GGUF tensor {name:?} has out-of-bounds offset {offset}")
             }
+            Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
+            Self::UnsupportedTensorType(value) => {
+                write!(f, "unsupported GGML tensor type {value}")
+            }
+            Self::ElementCountOverflow => f.write_str("GGUF tensor element count overflowed"),
+            Self::TensorByteLengthOverflow => f.write_str("GGUF tensor byte length overflowed"),
+            Self::QuantizationBlockMismatch {
+                name,
+                elements,
+                block_elements,
+            } => write!(
+                f,
+                "GGUF tensor {name:?} has {elements} elements, not divisible by block size {block_elements}"
+            ),
         }
     }
 }
 
 impl std::error::Error for GgufError {}
+
+fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
+    match value_type {
+        0 | 26 => Ok((1, 4)),
+        1 | 25 | 30 => Ok((1, 2)),
+        2 => Ok((32, 18)),
+        3 => Ok((32, 20)),
+        6 => Ok((32, 22)),
+        7 => Ok((32, 24)),
+        8 => Ok((32, 34)),
+        9 => Ok((32, 36)),
+        10 => Ok((256, 84)),
+        11 => Ok((256, 110)),
+        12 => Ok((256, 144)),
+        13 => Ok((256, 176)),
+        14 => Ok((256, 210)),
+        15 => Ok((256, 292)),
+        24 => Ok((1, 1)),
+        27 | 28 => Ok((1, 8)),
+        other => Err(GgufError::UnsupportedTensorType(other)),
+    }
+}
 
 fn read_value<R: Read>(
     reader: &mut R,
@@ -541,9 +665,9 @@ mod tests {
         push_u32(&mut bytes, 2);
         push_u64(&mut bytes, 4);
         push_u64(&mut bytes, 8);
-        push_u32(&mut bytes, 12);
+        push_u32(&mut bytes, 1);
         push_u64(&mut bytes, 0);
-        bytes.resize(bytes.len() + 64, 0);
+        bytes.resize(bytes.len() + 256, 0);
         bytes
     }
 
@@ -568,8 +692,24 @@ mod tests {
         );
         assert_eq!(parsed.tensors()[0].name(), "token_embd.weight");
         assert_eq!(parsed.tensors()[0].dimensions(), &[4, 8]);
-        assert_eq!(parsed.tensors()[0].value_type(), 12);
+        assert_eq!(parsed.tensors()[0].value_type(), 1);
         assert_eq!(parsed.tensors()[0].offset(), 0);
+        let range = parsed
+            .tensor_data_range("token_embd.weight")
+            .expect("tensor range");
+        assert_eq!(range.end - range.start, 64);
+    }
+
+    #[test]
+    fn computes_quantized_tensor_block_sizes() {
+        let tensor = TensorInfo {
+            name: "q4".to_owned(),
+            dimensions: vec![256],
+            value_type: 12,
+            offset: 0,
+        };
+        assert_eq!(tensor.element_count().expect("element count"), 256);
+        assert_eq!(tensor.byte_len().expect("Q4_K byte length"), 144);
     }
 
     #[test]
