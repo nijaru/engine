@@ -61,6 +61,16 @@ impl MetadataValue {
     }
 
     #[must_use]
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Self::I8(value) => Some(i32::from(*value)),
+            Self::I16(value) => Some(i32::from(*value)),
+            Self::I32(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
@@ -359,6 +369,95 @@ impl GgufFile {
         let config = Qwen35Config::from_metadata(&self.metadata)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Extract the embedded GPT-2/BPE vocabulary and merge table.
+    ///
+    /// The vocabulary is owned by the returned value so callers can build
+    /// tokenizer lookup tables without retaining the parsed GGUF metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::MissingMetadata`], [`GgufError::MetadataTypeMismatch`],
+    /// or [`GgufError::InvalidTokenizer`] when tokenizer metadata is absent or
+    /// internally inconsistent.
+    pub fn tokenizer(&self) -> Result<GgufTokenizer, GgufError> {
+        GgufTokenizer::from_metadata(&self.metadata)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GgufTokenizer {
+    model: String,
+    pretokenizer: String,
+    tokens: Vec<String>,
+    merges: Vec<String>,
+    token_types: Vec<i32>,
+    bos_token_id: u32,
+    eos_token_id: u32,
+    padding_token_id: Option<u32>,
+}
+
+impl GgufTokenizer {
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    pub fn pretokenizer(&self) -> &str {
+        &self.pretokenizer
+    }
+
+    #[must_use]
+    pub fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+
+    #[must_use]
+    pub fn merges(&self) -> &[String] {
+        &self.merges
+    }
+
+    #[must_use]
+    pub fn token_types(&self) -> &[i32] {
+        &self.token_types
+    }
+
+    #[must_use]
+    pub const fn bos_token_id(&self) -> u32 {
+        self.bos_token_id
+    }
+
+    #[must_use]
+    pub const fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    #[must_use]
+    pub const fn padding_token_id(&self) -> Option<u32> {
+        self.padding_token_id
+    }
+
+    fn from_metadata(metadata: &BTreeMap<String, MetadataValue>) -> Result<Self, GgufError> {
+        let tokens = required_string_array(metadata, "tokenizer.ggml.tokens")?;
+        let merges = required_string_array(metadata, "tokenizer.ggml.merges")?;
+        let token_types = required_i32_array(metadata, "tokenizer.ggml.token_type")?;
+        if tokens.is_empty() || tokens.len() != token_types.len() {
+            return Err(GgufError::InvalidTokenizer(
+                "token and token-type arrays must have the same nonzero length",
+            ));
+        }
+        Ok(Self {
+            model: required_string(metadata, "tokenizer.ggml.model")?,
+            pretokenizer: required_string(metadata, "tokenizer.ggml.pre")?,
+            tokens,
+            merges,
+            token_types,
+            bos_token_id: required_u32(metadata, "tokenizer.ggml.bos_token_id")?,
+            eos_token_id: required_u32(metadata, "tokenizer.ggml.eos_token_id")?,
+            padding_token_id: optional_u32(metadata, "tokenizer.ggml.padding_token_id")?,
+        })
     }
 }
 
@@ -919,6 +1018,7 @@ pub enum GgufError {
     },
     UnsupportedArchitecture(String),
     InvalidModelConfiguration(&'static str),
+    InvalidTokenizer(&'static str),
     InvalidTensorBlockLength {
         value_type: u32,
         expected: usize,
@@ -991,6 +1091,9 @@ impl std::fmt::Display for GgufError {
             Self::InvalidModelConfiguration(reason) => {
                 write!(f, "invalid Qwen3.8 model configuration: {reason}")
             }
+            Self::InvalidTokenizer(reason) => {
+                write!(f, "invalid GGUF tokenizer metadata: {reason}")
+            }
             Self::InvalidTensorBlockLength {
                 value_type,
                 expected,
@@ -1026,6 +1129,90 @@ impl std::fmt::Display for GgufError {
 }
 
 impl std::error::Error for GgufError {}
+
+fn required_string(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<String, GgufError> {
+    metadata
+        .get(key)
+        .ok_or_else(|| GgufError::MissingMetadata(key.to_owned()))?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| GgufError::MetadataTypeMismatch {
+            key: key.to_owned(),
+        })
+}
+
+fn required_string_array(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<Vec<String>, GgufError> {
+    let values = metadata
+        .get(key)
+        .ok_or_else(|| GgufError::MissingMetadata(key.to_owned()))?;
+    let MetadataValue::Array(values) = values else {
+        return Err(GgufError::MetadataTypeMismatch {
+            key: key.to_owned(),
+        });
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| GgufError::MetadataTypeMismatch {
+                    key: key.to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn required_i32_array(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<Vec<i32>, GgufError> {
+    let values = metadata
+        .get(key)
+        .ok_or_else(|| GgufError::MissingMetadata(key.to_owned()))?;
+    let MetadataValue::Array(values) = values else {
+        return Err(GgufError::MetadataTypeMismatch {
+            key: key.to_owned(),
+        });
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_i32()
+                .ok_or_else(|| GgufError::MetadataTypeMismatch {
+                    key: key.to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn optional_u32(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<Option<u32>, GgufError> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| GgufError::MetadataTypeMismatch {
+                    key: key.to_owned(),
+                })
+                .and_then(|value| {
+                    u32::try_from(value).map_err(|_| GgufError::MetadataTypeMismatch {
+                        key: key.to_owned(),
+                    })
+                })
+        })
+        .transpose()
+}
 
 fn required_u64(
     metadata: &BTreeMap<String, MetadataValue>,
@@ -1402,6 +1589,56 @@ mod tests {
                 .all(|value| value.to_bits() == 1.0_f32.to_bits())
         );
         assert_eq!(decoded.len(), 256);
+    }
+
+    #[test]
+    fn extracts_embedded_tokenizer_metadata() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_owned(),
+            MetadataValue::String("gpt2".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.pre".to_owned(),
+            MetadataValue::String("qwen35".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            MetadataValue::Array(vec![
+                MetadataValue::String("a".to_owned()),
+                MetadataValue::String("b".to_owned()),
+            ]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_owned(),
+            MetadataValue::Array(vec![MetadataValue::String("a b".to_owned())]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_owned(),
+            MetadataValue::Array(vec![MetadataValue::I32(1), MetadataValue::I32(3)]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.bos_token_id".to_owned(),
+            MetadataValue::U32(1),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_id".to_owned(),
+            MetadataValue::U32(2),
+        );
+        metadata.insert(
+            "tokenizer.ggml.padding_token_id".to_owned(),
+            MetadataValue::U32(0),
+        );
+
+        let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("tokenizer metadata");
+        assert_eq!(tokenizer.model(), "gpt2");
+        assert_eq!(tokenizer.pretokenizer(), "qwen35");
+        assert_eq!(tokenizer.tokens(), &["a", "b"]);
+        assert_eq!(tokenizer.merges(), &["a b"]);
+        assert_eq!(tokenizer.token_types(), &[1, 3]);
+        assert_eq!(tokenizer.bos_token_id(), 1);
+        assert_eq!(tokenizer.eos_token_id(), 2);
+        assert_eq!(tokenizer.padding_token_id(), Some(0));
     }
 
     #[test]
