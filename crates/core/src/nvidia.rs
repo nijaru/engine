@@ -7,6 +7,7 @@
 use crate::backend::{BackendCapabilities, BackendError, BackendKind, ComputeBackend};
 use crate::execution::{ExecutionEvent, ExecutionMetrics, ExecutionPlan, ExecutionSegment};
 use crate::state::HybridStateSet;
+use crate::weights::WeightBinding;
 
 pub trait NvidiaDispatcher: Send {
     /// Dispatch one already validated segment and return measured execution
@@ -19,6 +20,7 @@ pub trait NvidiaDispatcher: Send {
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
+        weights: &WeightBinding,
         state: &mut HybridStateSet,
     ) -> Result<ExecutionMetrics, BackendError>;
 }
@@ -74,7 +76,9 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         state: &mut HybridStateSet,
     ) -> Result<ExecutionEvent, BackendError> {
         self.validate_execution(plan, segment, state)?;
-        let metrics = self.dispatcher.dispatch(plan, segment, state)?;
+        let metrics = self
+            .dispatcher
+            .dispatch(plan, segment, plan.weights(), state)?;
         ExecutionEvent::new(
             segment.request(),
             plan.policy_version(),
@@ -108,6 +112,7 @@ mod tests {
             &mut self,
             _plan: &ExecutionPlan,
             _segment: &ExecutionSegment,
+            _weights: &WeightBinding,
             _state: &mut HybridStateSet,
         ) -> Result<ExecutionMetrics, BackendError> {
             Ok(ExecutionMetrics::new(12, 4, 8))
@@ -136,7 +141,7 @@ mod tests {
             KvStateSpec::new(1, 1, 2, 1, DataType::F16).expect("KV spec"),
         );
         let plan = ExecutionPlan::new(
-            model,
+            model.clone(),
             BackendId::new("cuda").expect("backend ID"),
             device,
             policy,
@@ -145,6 +150,7 @@ mod tests {
                 ExecutionPhase::Decode,
             )],
             vec![requirement],
+            WeightBinding::empty(model.clone(), device),
         )
         .expect("plan");
         let request = RequestId::new(1).expect("request ID");

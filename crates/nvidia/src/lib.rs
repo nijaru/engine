@@ -9,4 +9,6 @@
 mod cuda;
 
 #[cfg(feature = "cuda")]
-pub use cuda::{CudaReferenceDispatcher, CudaRuntimeError};
+pub use cuda::{
+    CudaF32Weight, CudaReferenceDispatcher, CudaRuntimeError, CudaWeightError, CudaWeightStore,
+};

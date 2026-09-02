@@ -15,6 +15,7 @@ pub mod request;
 pub mod runtime;
 pub mod state;
 pub mod tensor;
+pub mod weights;
 
 pub use backend::{
     BackendCapabilities, BackendError, BackendFeatures, BackendId, BackendKind, ComputeBackend,
@@ -44,6 +45,9 @@ pub use state::{
     StateLocation, StateManager, StateRequirement, StateSpecError,
 };
 pub use tensor::{DataType, Quantization, WeightFormat};
+pub use weights::{
+    F32BlockStream, WeightBinding, WeightBindingError, WeightSpecError, WeightTensorSpec,
+};
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +106,7 @@ mod tests {
                 ExecutionPhase::Decode,
             )],
             description.state_requirements().to_vec(),
+            WeightBinding::empty(description.id().clone(), DeviceId::new(0)),
         )
         .expect("valid plan");
 
@@ -155,6 +160,7 @@ mod tests {
                 ExecutionPhase::Decode,
             )],
             description.state_requirements().to_vec(),
+            WeightBinding::empty(description.id().clone(), DeviceId::new(0)),
         )
         .expect("valid plan shape");
 

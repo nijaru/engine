@@ -10,10 +10,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use engine_core::{
-    ConvolutionStateShape, DataType, KvStateSpec, ModelCapabilities, ModelDescription, ModelError,
-    ModelId, ModelLoadError, ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind,
-    MtpCapability, Quantization, RecurrentMatrixShape, RecurrentStateSpec, StateRequirement,
-    WeightArtifact, WeightDescription, WeightFormat, WeightLoader, WeightSource,
+    ConvolutionStateShape, DataType, F32BlockStream, KvStateSpec, ModelCapabilities,
+    ModelDescription, ModelError, ModelId, ModelLoadError, ModelProvider, ModelRegion,
+    ModelRegionId, ModelRegionKind, MtpCapability, Quantization, RecurrentMatrixShape,
+    RecurrentStateSpec, StateRequirement, WeightArtifact, WeightDescription, WeightFormat,
+    WeightLoader, WeightSource, WeightTensorSpec,
 };
 use regex::Regex;
 
@@ -341,7 +342,14 @@ impl GgufFile {
     /// Returns an error when the tensor range is invalid or the file cannot be
     /// opened at that range.
     pub fn open_tensor(&self, name: &str) -> Result<TensorDataReader, GgufError> {
+        let tensor = self
+            .tensor(name)
+            .ok_or_else(|| GgufError::MissingTensor(name.to_owned()))?;
+        let value_type = tensor.value_type();
+        let dimensions = tensor.dimensions().to_vec();
         let range = self.tensor_data_range(name)?;
+        let spec = WeightTensorSpec::new(name.to_owned(), dimensions, DataType::F32)
+            .map_err(|error| GgufError::InvalidTensorSpec(error.to_string()))?;
         let mut file = File::open(&self.path).map_err(|error| GgufError::io(&self.path, &error))?;
         file.seek(SeekFrom::Start(range.start))
             .map_err(|error| GgufError::io(&self.path, &error))?;
@@ -349,6 +357,8 @@ impl GgufFile {
             path: self.path.clone(),
             file,
             remaining: range.end - range.start,
+            spec,
+            value_type,
         })
     }
 
@@ -609,29 +619,30 @@ pub struct TensorDataReader {
     path: PathBuf,
     file: File,
     remaining: u64,
+    spec: WeightTensorSpec,
+    value_type: u32,
 }
 
 impl TensorDataReader {
     /// Read and dequantize the next complete block in this tensor payload.
-    /// `None` means the bounded tensor range is exhausted.
+    /// `None` means the bounded tensor range is exhausted. The GGML value type
+    /// is captured when the reader is opened, so callers cannot decode a block
+    /// with a type borrowed from another tensor.
     ///
     /// # Errors
     ///
     /// Returns [`GgufError::UnsupportedTensorType`] when no decoder exists,
     /// [`GgufError::TensorPayloadTruncated`] when the remaining range is not a
     /// complete block, or an I/O/dequantization error.
-    pub fn read_dequantized_block(
-        &mut self,
-        value_type: u32,
-    ) -> Result<Option<Vec<f32>>, GgufError> {
-        let (_, block_bytes) = tensor_layout(value_type)?;
+    pub fn read_dequantized_block(&mut self) -> Result<Option<Vec<f32>>, GgufError> {
+        let (_, block_bytes) = tensor_layout(self.value_type)?;
         if self.remaining == 0 {
             return Ok(None);
         }
         let block_bytes_u64 = block_bytes;
         if self.remaining < block_bytes_u64 {
             return Err(GgufError::TensorPayloadTruncated {
-                value_type,
+                value_type: self.value_type,
                 expected: block_bytes_u64,
                 remaining: self.remaining,
             });
@@ -641,7 +652,17 @@ impl TensorDataReader {
         let mut encoded = vec![0; block_bytes];
         self.read_exact(&mut encoded)
             .map_err(|error| GgufError::io(&self.path, &error))?;
-        dequantize_block(value_type, &encoded).map(Some)
+        dequantize_block(self.value_type, &encoded).map(Some)
+    }
+
+    #[must_use]
+    pub fn spec(&self) -> &WeightTensorSpec {
+        &self.spec
+    }
+
+    #[must_use]
+    pub const fn value_type(&self) -> u32 {
+        self.value_type
     }
 
     #[must_use]
@@ -652,6 +673,18 @@ impl TensorDataReader {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl F32BlockStream for TensorDataReader {
+    type Error = GgufError;
+
+    fn spec(&self) -> &WeightTensorSpec {
+        self.spec()
+    }
+
+    fn next_block(&mut self) -> Result<Option<Vec<f32>>, Self::Error> {
+        self.read_dequantized_block()
     }
 }
 
@@ -1343,6 +1376,7 @@ pub enum GgufError {
         remaining: u64,
     },
     MissingTensor(String),
+    InvalidTensorSpec(String),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
     TensorByteLengthOverflow,
@@ -1427,6 +1461,9 @@ impl std::fmt::Display for GgufError {
                 "GGML tensor type {value_type} needs {expected} bytes for the next block, but only {remaining} remain"
             ),
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
+            Self::InvalidTensorSpec(reason) => {
+                write!(f, "invalid GGUF tensor stream specification: {reason}")
+            }
             Self::UnsupportedTensorType(value) => {
                 write!(f, "unsupported GGML tensor type {value}")
             }
@@ -1804,7 +1841,7 @@ mod tests {
             .expect("tensor block reader");
         for _ in 0..32 {
             let block = block_reader
-                .read_dequantized_block(1)
+                .read_dequantized_block()
                 .expect("dequantized block")
                 .expect("block present");
             assert_eq!(block.len(), 1);
@@ -1812,7 +1849,7 @@ mod tests {
         }
         assert!(
             block_reader
-                .read_dequantized_block(1)
+                .read_dequantized_block()
                 .expect("exhausted block reader")
                 .is_none()
         );

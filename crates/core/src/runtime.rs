@@ -141,6 +141,7 @@ mod tests {
         StateRequirement,
     };
     use crate::tensor::{DataType, Quantization, WeightFormat};
+    use crate::weights::WeightBinding;
 
     struct TestProvider {
         description: ModelDescription,
@@ -159,6 +160,7 @@ mod tests {
             &mut self,
             _plan: &ExecutionPlan,
             _segment: &ExecutionSegment,
+            _weights: &WeightBinding,
             _state: &mut HybridStateSet,
         ) -> Result<ExecutionMetrics, BackendError> {
             Ok(ExecutionMetrics::new(20, 0, 0))
@@ -186,7 +188,7 @@ mod tests {
         .expect("model description");
         let backend_id = BackendId::new("cuda").expect("backend ID");
         let plan = ExecutionPlan::new(
-            model,
+            model.clone(),
             backend_id.clone(),
             device,
             PolicyVersion::new(1).expect("policy version"),
@@ -195,6 +197,7 @@ mod tests {
                 ExecutionPhase::Decode,
             )],
             vec![requirement],
+            WeightBinding::empty(model.clone(), device),
         )
         .expect("plan");
         let segment = ExecutionSegment::new(

@@ -8,6 +8,7 @@ use crate::model::{ModelId, ModelRegionId};
 use crate::policy::PolicyVersion;
 use crate::request::RequestId;
 use crate::state::StateRequirement;
+use crate::weights::WeightBinding;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExecutionPhase {
@@ -116,6 +117,7 @@ pub struct ExecutionPlan {
     policy_version: PolicyVersion,
     stages: Vec<ExecutionStage>,
     state_requirements: Vec<StateRequirement>,
+    weights: WeightBinding,
 }
 
 impl ExecutionPlan {
@@ -129,9 +131,13 @@ impl ExecutionPlan {
         policy_version: PolicyVersion,
         stages: Vec<ExecutionStage>,
         state_requirements: Vec<StateRequirement>,
+        weights: WeightBinding,
     ) -> Result<Self, PlanError> {
         if stages.is_empty() {
             return Err(PlanError::EmptyStages);
+        }
+        if weights.model() != &model || weights.device() != device {
+            return Err(PlanError::WeightBindingMismatch);
         }
         Ok(Self {
             model,
@@ -140,6 +146,7 @@ impl ExecutionPlan {
             policy_version,
             stages,
             state_requirements,
+            weights,
         })
     }
 
@@ -197,6 +204,11 @@ impl ExecutionPlan {
     #[must_use]
     pub fn state_requirements(&self) -> &[StateRequirement] {
         &self.state_requirements
+    }
+
+    #[must_use]
+    pub fn weights(&self) -> &WeightBinding {
+        &self.weights
     }
 
     #[must_use]
@@ -312,6 +324,7 @@ pub enum PlanError {
     ZeroWork,
     SegmentPhaseMismatch,
     SegmentStateUndeclared,
+    WeightBindingMismatch,
 }
 
 impl fmt::Display for PlanError {
@@ -324,6 +337,9 @@ impl fmt::Display for PlanError {
             }
             Self::SegmentStateUndeclared => {
                 f.write_str("execution segment requires undeclared model state")
+            }
+            Self::WeightBindingMismatch => {
+                f.write_str("weight binding does not match the execution model/device")
             }
         }
     }
