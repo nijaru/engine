@@ -9,7 +9,12 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use engine_core::{ModelLoadError, WeightArtifact, WeightDescription, WeightLoader, WeightSource};
+use engine_core::{
+    ConvolutionStateShape, DataType, KvStateSpec, ModelCapabilities, ModelDescription, ModelError,
+    ModelId, ModelLoadError, ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind,
+    MtpCapability, Quantization, RecurrentMatrixShape, RecurrentStateSpec, StateRequirement,
+    WeightArtifact, WeightDescription, WeightFormat, WeightLoader, WeightSource,
+};
 use regex::Regex;
 
 mod iq3_s;
@@ -1061,6 +1066,174 @@ impl Qwen35Config {
     }
 }
 
+fn qwen35_model_description(
+    config: &Qwen35Config,
+    kv_block_tokens: u32,
+) -> Result<ModelDescription, GgufError> {
+    let language_layers =
+        config
+            .language_layer_count()
+            .ok_or(GgufError::InvalidModelConfiguration(
+                "MTP layer count exceeds total block count",
+            ))?;
+    let full_layers = language_layers / config.full_attention_interval();
+    let recurrent_layers = language_layers - full_layers;
+    let full_spec = KvStateSpec::new(
+        narrow_u16(full_layers, "full-attention layer count")?,
+        narrow_u16(config.kv_heads(), "KV head count")?,
+        narrow_u16(config.key_length(), "full-attention head dimension")?,
+        kv_block_tokens,
+        DataType::F16,
+    )
+    .map_err(|_| {
+        GgufError::InvalidModelConfiguration("full-attention state dimensions are invalid")
+    })?;
+    let matrix = RecurrentMatrixShape::new(
+        narrow_u16(config.ssm_group_count(), "recurrent key head count")?,
+        narrow_u16(config.ssm_state_size(), "recurrent key head dimension")?,
+        narrow_u16(config.ssm_time_step_rank(), "recurrent value head count")?,
+        narrow_u16(
+            config.ssm_inner_size() / config.ssm_time_step_rank(),
+            "recurrent value head dimension",
+        )?,
+    )
+    .ok_or(GgufError::InvalidModelConfiguration(
+        "recurrent matrix dimensions are invalid",
+    ))?;
+    let convolution_channels = config
+        .ssm_inner_size()
+        .checked_add(
+            2 * config
+                .ssm_group_count()
+                .checked_mul(config.ssm_state_size())
+                .ok_or(GgufError::InvalidModelConfiguration(
+                    "recurrent convolution dimensions overflow",
+                ))?,
+        )
+        .ok_or(GgufError::InvalidModelConfiguration(
+            "recurrent convolution dimensions overflow",
+        ))?;
+    let recurrent_spec = RecurrentStateSpec::new(
+        narrow_u16(recurrent_layers, "recurrent layer count")?,
+        matrix,
+        ConvolutionStateShape::new(
+            convolution_channels,
+            narrow_u16(config.ssm_conv_kernel(), "recurrent convolution kernel")?,
+        )
+        .ok_or(GgufError::InvalidModelConfiguration(
+            "recurrent convolution dimensions are invalid",
+        ))?,
+        DataType::F32,
+        DataType::F32,
+    )
+    .map_err(|_| GgufError::InvalidModelConfiguration("recurrent state dimensions are invalid"))?;
+    let model_id = ModelId::new("Qwen/Qwen3.8-27B")
+        .map_err(|_| GgufError::InvalidModelConfiguration("Qwen model identity is invalid"))?;
+    let mtp = MtpCapability::new(
+        u8::try_from(config.nextn_predict_layers()).map_err(|_| {
+            GgufError::InvalidModelConfiguration("MTP layer count exceeds the core capability")
+        })?,
+        u8::try_from(config.nextn_predict_layers()).map_err(|_| {
+            GgufError::InvalidModelConfiguration("MTP token count exceeds the core capability")
+        })?,
+    );
+    ModelDescription::new(
+        model_id,
+        "qwen3.8-hybrid",
+        vec![
+            ModelRegion::new(ModelRegionId::new(0), ModelRegionKind::Embedding),
+            ModelRegion::new(ModelRegionId::new(1), ModelRegionKind::RecurrentAttention),
+            ModelRegion::new(ModelRegionId::new(2), ModelRegionKind::FullAttention),
+            ModelRegion::new(ModelRegionId::new(3), ModelRegionKind::FeedForward),
+            ModelRegion::new(ModelRegionId::new(4), ModelRegionKind::OutputProjection),
+        ],
+        vec![
+            StateRequirement::Recurrent(recurrent_spec),
+            StateRequirement::FullAttentionKv(full_spec),
+        ],
+        ModelCapabilities::new(mtp, false),
+        WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
+    )
+    .map_err(|error| match error {
+        ModelError::InvalidDescription(reason) => GgufError::InvalidModelConfiguration(reason),
+        ModelError::PlanModelMismatch
+        | ModelError::UnknownRegion(_)
+        | ModelError::UndeclaredState(_) => {
+            GgufError::InvalidModelConfiguration("unexpected model description validation failure")
+        }
+    })
+}
+
+fn narrow_u16(value: u32, name: &'static str) -> Result<u16, GgufError> {
+    u16::try_from(value).map_err(|_| GgufError::InvalidModelConfiguration(name))
+}
+
+/// A provider for the text-only Qwen3.8 language artifact carried by GGUF.
+/// It owns validated format metadata and the core model description; tensor
+/// execution remains a separate backend/dispatcher responsibility.
+pub struct Qwen35ModelProvider {
+    file: GgufFile,
+    config: Qwen35Config,
+    description: ModelDescription,
+}
+
+impl Qwen35ModelProvider {
+    /// Open and validate a Qwen3.8 GGUF artifact without materializing weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when the artifact, model metadata, tensor ranges,
+    /// or core model description is invalid.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, GgufError> {
+        Self::open_with_kv_block_tokens(path, 16)
+    }
+
+    /// Open with an explicit full-attention KV allocation block size.
+    /// This is a performance/layout choice, not a model semantic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when the block size, artifact, model metadata,
+    /// tensor ranges, or core model description is invalid.
+    pub fn open_with_kv_block_tokens(
+        path: impl Into<PathBuf>,
+        kv_block_tokens: u32,
+    ) -> Result<Self, GgufError> {
+        if kv_block_tokens == 0 {
+            return Err(GgufError::InvalidModelConfiguration(
+                "KV block size must be non-zero",
+            ));
+        }
+        let file = GgufFile::open(path)?;
+        let config = file.qwen35_config()?;
+        for tensor in file.tensors() {
+            file.tensor_data_range(tensor.name())?;
+        }
+        let description = qwen35_model_description(&config, kv_block_tokens)?;
+        Ok(Self {
+            file,
+            config,
+            description,
+        })
+    }
+
+    #[must_use]
+    pub fn file(&self) -> &GgufFile {
+        &self.file
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &Qwen35Config {
+        &self.config
+    }
+}
+
+impl ModelProvider for Qwen35ModelProvider {
+    fn description(&self) -> &ModelDescription {
+        &self.description
+    }
+}
+
 /// A GGUF implementation of the core weight-loader boundary. It validates the
 /// GGUF directory and returns artifact metadata; it does not claim to decode
 /// tensors or provide an execution-ready model.
@@ -1789,6 +1962,51 @@ mod tests {
         assert_eq!(tokenizer.bos_token_id(), 1);
         assert_eq!(tokenizer.eos_token_id(), 2);
         assert_eq!(tokenizer.padding_token_id(), Some(0));
+    }
+
+    #[test]
+    fn builds_qwen35_description_with_distinct_state_families() {
+        let config = Qwen35Config {
+            context_length: 262_144,
+            embedding_length: 5120,
+            feed_forward_length: 17_408,
+            block_count: 65,
+            attention_heads: 24,
+            kv_heads: 4,
+            key_length: 256,
+            value_length: 256,
+            full_attention_interval: 4,
+            ssm_group_count: 16,
+            ssm_inner_size: 6144,
+            ssm_state_size: 128,
+            ssm_time_step_rank: 48,
+            ssm_conv_kernel: 4,
+            nextn_predict_layers: 1,
+        };
+        let description = qwen35_model_description(&config, 16).expect("model description");
+        assert_eq!(description.id().as_str(), "Qwen/Qwen3.8-27B");
+        assert_eq!(description.regions().len(), 5);
+        assert_eq!(description.state_requirements().len(), 2);
+        assert!(
+            description
+                .state_requirements()
+                .iter()
+                .any(|requirement| matches!(requirement, StateRequirement::FullAttentionKv(_)))
+        );
+        assert!(
+            description
+                .state_requirements()
+                .iter()
+                .any(|requirement| matches!(requirement, StateRequirement::Recurrent(_)))
+        );
+        assert_eq!(
+            description
+                .capabilities()
+                .mtp()
+                .expect("MTP")
+                .max_draft_tokens(),
+            1
+        );
     }
 
     #[test]
