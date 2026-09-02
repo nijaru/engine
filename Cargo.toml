@@ -2,6 +2,7 @@
 members = [
     "crates/core",
     "crates/gguf",
+    "crates/nvidia",
     "crates/server",
 ]
 resolver = "2"
