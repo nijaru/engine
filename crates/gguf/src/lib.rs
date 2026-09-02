@@ -140,6 +140,18 @@ impl TensorInfo {
     /// not fit, or its dimensions are not valid for its quantization block.
     pub fn byte_len(&self) -> Result<u64, GgufError> {
         let (block_elements, block_bytes) = tensor_layout(self.value_type)?;
+        let first_dimension = self
+            .dimensions
+            .first()
+            .copied()
+            .ok_or(GgufError::InvalidDimensionCount(0))?;
+        if first_dimension % block_elements != 0 {
+            return Err(GgufError::QuantizationDimensionMismatch {
+                name: self.name.clone(),
+                dimension: first_dimension,
+                block_elements,
+            });
+        }
         let elements = self.element_count()?;
         if elements % block_elements != 0 {
             return Err(GgufError::QuantizationBlockMismatch {
@@ -1561,6 +1573,11 @@ pub enum GgufError {
         elements: u64,
         block_elements: u64,
     },
+    QuantizationDimensionMismatch {
+        name: String,
+        dimension: u64,
+        block_elements: u64,
+    },
 }
 
 impl GgufError {
@@ -1658,6 +1675,14 @@ impl std::fmt::Display for GgufError {
             } => write!(
                 f,
                 "GGUF tensor {name:?} has {elements} elements, not divisible by block size {block_elements}"
+            ),
+            Self::QuantizationDimensionMismatch {
+                name,
+                dimension,
+                block_elements,
+            } => write!(
+                f,
+                "GGUF tensor {name:?} first dimension {dimension} is not divisible by block size {block_elements}"
             ),
         }
     }
@@ -2276,6 +2301,20 @@ mod tests {
         };
         assert_eq!(tensor.element_count().expect("element count"), 256);
         assert_eq!(tensor.byte_len().expect("Q4_K byte length"), 144);
+        let split_rows = TensorInfo {
+            name: "q4-split-rows".to_owned(),
+            dimensions: vec![128, 2],
+            value_type: 12,
+            offset: 0,
+        };
+        assert!(matches!(
+            split_rows.byte_len(),
+            Err(GgufError::QuantizationDimensionMismatch {
+                dimension: 128,
+                block_elements: 256,
+                ..
+            })
+        ));
 
         let iq_tensor = TensorInfo {
             name: "iq4_xs".to_owned(),

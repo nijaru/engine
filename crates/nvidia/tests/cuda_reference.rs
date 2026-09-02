@@ -13,7 +13,8 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaQ4KGemv, CudaReferenceDispatcher, CudaStateError, CudaWeightStore,
+    CudaHybridState, CudaQ4KGemv, CudaQ5KGemv, CudaReferenceDispatcher, CudaStateError,
+    CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -324,7 +325,7 @@ fn materializes_a_pinned_qwen_quantized_block_without_host_dequantization() {
         .open_tensor("blk.0.attn_qkv.weight")
         .expect("open pinned quantized tensor");
     assert_eq!(source.value_type(), 13); // Q5_K
-    let mut first_block = [0_u8; 144];
+    let mut first_block = [0_u8; 176];
     source
         .read_exact(&mut first_block)
         .expect("read first encoded Q5_K block");
@@ -371,6 +372,27 @@ fn q4_k_fixture() -> Vec<u8> {
     (0_u8..4).flat_map(q4_k_fixture_block).collect()
 }
 
+fn q5_k_fixture_block(seed: u8) -> Vec<u8> {
+    let mut block = q4_k_fixture_block(seed);
+    block.resize(176, 0);
+    block[16..48].fill(0x55_u8.rotate_left(u32::from(seed)));
+    block[48..]
+        .iter_mut()
+        .enumerate()
+        .for_each(|(index, value)| {
+            let pattern =
+                u8::try_from((index + usize::from(seed) * 7) % 16).expect("Q5_K fixture index");
+            let low = pattern.wrapping_mul(5) & 0x0f;
+            let high = 15_u8.wrapping_sub(pattern.wrapping_mul(5)) & 0x0f;
+            *value = low | (high << 4);
+        });
+    block
+}
+
+fn q5_k_fixture() -> Vec<u8> {
+    (0_u8..4).flat_map(q5_k_fixture_block).collect()
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn executes_q4_k_gemv_against_the_gguf_decoder() {
@@ -411,6 +433,59 @@ fn executes_q4_k_gemv_against_the_gguf_decoder() {
                     let start = (output_index * 2 + block_index) * 144;
                     engine_gguf::dequantize_block(12, &encoded[start..start + 144])
                         .expect("decode Q4_K fixture")
+                        .into_iter()
+                        .zip(&input[block_index * 256..(block_index + 1) * 256])
+                        .map(|(weight, input)| weight * input)
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_q5_k_gemv_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = q5_k_fixture();
+    let spec = WeightTensorSpec::new("q5_k.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("Q5_K fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            13,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload Q5_K fixture");
+    let weight = store
+        .quantized_tensor("q5_k.fixture")
+        .expect("Q5_K fixture weight");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q5_K input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    let input_device = stream.clone_htod(&input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(2).expect("allocate output");
+    let kernel = CudaQ5KGemv::from_context(&context, stream.clone()).expect("compile Q5_K");
+    kernel
+        .execute(weight, &input_device, &mut output)
+        .expect("execute Q5_K GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+    let expected = (0..2)
+        .map(|output_index| {
+            (0..2)
+                .flat_map(|block_index| {
+                    let start = (output_index * 2 + block_index) * 176;
+                    engine_gguf::dequantize_block(13, &encoded[start..start + 176])
+                        .expect("decode Q5_K fixture")
                         .into_iter()
                         .zip(&input[block_index * 256..(block_index + 1) * 256])
                         .map(|(weight, input)| weight * input)

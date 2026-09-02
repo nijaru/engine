@@ -20,7 +20,7 @@ pub use cuda::{
 };
 
 #[cfg(feature = "cuda")]
-pub use quantized::{CudaQ4KGemv, CudaQuantizedKernelError};
+pub use quantized::{CudaQ4KGemv, CudaQ5KGemv, CudaQuantizedKernelError};
 
 #[cfg(feature = "cuda")]
 pub use state::{
