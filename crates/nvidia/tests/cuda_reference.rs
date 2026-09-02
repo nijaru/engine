@@ -7,7 +7,7 @@ use engine_core::{
     ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion, Quantization, WeightBinding,
     WeightDescription, WeightFormat,
 };
-use engine_gguf::GgufFile;
+use engine_gguf::{GgufFile, Qwen35ModelProvider};
 use engine_nvidia::CudaReferenceDispatcher;
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -239,4 +239,43 @@ fn materializes_a_bounded_gguf_tensor_before_reference_execution() {
     );
     assert!(event.metrics().elapsed_nanos() > 0);
     std::fs::remove_file(path).expect("remove GGUF fixture");
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+    let mut source = provider
+        .open_tensor("blk.0.ssm_a")
+        .expect("open pinned scalar tensor");
+    assert_eq!(source.value_type(), 0);
+    assert_eq!(source.spec().dimensions(), &[48]);
+    let spec = source.spec().clone();
+    let mut expected = Vec::new();
+    while let Some(block) = source
+        .read_dequantized_block()
+        .expect("decode pinned scalar block")
+    {
+        expected.extend(block);
+    }
+    assert_eq!(expected.len(), 48);
+
+    let mut materialized_source = provider
+        .open_tensor("blk.0.ssm_a")
+        .expect("reopen pinned scalar tensor");
+    let dispatcher = CudaReferenceDispatcher::from_f32_source(0, &mut materialized_source)
+        .expect("materialize pinned scalar tensor");
+    let actual = dispatcher
+        .copy_weight_to_host()
+        .expect("copy pinned scalar tensor to host");
+    assert_eq!(actual.len(), expected.len());
+    assert!(
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    );
+    assert_eq!(dispatcher.weight_spec(), Some(&spec));
 }

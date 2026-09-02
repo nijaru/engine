@@ -258,6 +258,22 @@ impl CudaWeightStore {
     pub fn tensor(&self, name: &str) -> Option<&CudaF32Weight> {
         self.tensors.get(name)
     }
+
+    /// Copy one materialized tensor back to the host for correctness checks or
+    /// diagnostics. Production execution should keep this off the hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaWeightError::MissingTensor`] when the name is not bound or
+    /// a device-to-host copy fails.
+    pub fn copy_to_host(&self, name: &str) -> Result<Vec<f32>, CudaWeightError> {
+        let weight = self
+            .tensor(name)
+            .ok_or_else(|| CudaWeightError::MissingTensor(name.to_owned()))?;
+        self.stream
+            .clone_dtoh(&weight.data)
+            .map_err(|error| CudaWeightError::Driver(error.to_string()))
+    }
 }
 
 /// A concrete CUDA dispatcher for a tiny stateless F32 linear layer.
@@ -351,6 +367,19 @@ impl CudaReferenceDispatcher {
         self.weight_store
             .tensor(&self.reference_weight_name)
             .map(CudaF32Weight::spec)
+    }
+
+    /// Copy the reference tensor back to the host for a materialization
+    /// correctness check. This is not part of the execution hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaRuntimeError::Weight`] when the tensor is unavailable or
+    /// the device-to-host copy fails.
+    pub fn copy_weight_to_host(&self) -> Result<Vec<f32>, CudaRuntimeError> {
+        self.weight_store
+            .copy_to_host(&self.reference_weight_name)
+            .map_err(|error| CudaRuntimeError::Weight(error.to_string()))
     }
 
     fn run_linear_layer(

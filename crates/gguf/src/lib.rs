@@ -1259,6 +1259,17 @@ impl Qwen35ModelProvider {
     pub const fn config(&self) -> &Qwen35Config {
         &self.config
     }
+
+    /// Open one validated tensor as a bounded canonical F32 stream. The
+    /// provider still leaves physical allocation and execution to a backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when the tensor is missing, unsupported, or its
+    /// encoded range cannot be opened.
+    pub fn open_tensor(&self, name: &str) -> Result<TensorDataReader, GgufError> {
+        self.file.open_tensor(name)
+    }
 }
 
 impl ModelProvider for Qwen35ModelProvider {
