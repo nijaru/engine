@@ -8,8 +8,11 @@ use cudarc::nvrtc::compile_ptx;
 
 use crate::cuda::CudaQuantizedWeight;
 
+const Q8_0_VALUE_TYPE: u32 = 8;
 const Q4_K_VALUE_TYPE: u32 = 12;
 const Q5_K_VALUE_TYPE: u32 = 13;
+const Q8_0_BLOCK_ELEMENTS: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 34;
 const Q4_K_BLOCK_ELEMENTS: usize = 256;
 const Q4_K_BLOCK_BYTES: usize = 144;
 const Q5_K_BLOCK_ELEMENTS: usize = 256;
@@ -57,6 +60,32 @@ extern "C" __device__ __forceinline__ int minimum_value(const unsigned char* blo
     }
     const int index = group - 4;
     return (int)((block[12 + index] >> 4u) | ((block[8 + index] >> 2u) & 0x30u));
+}
+
+extern "C" __global__ void q8_0_gemv(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int output_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (output_index >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 32;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (output_index * blocks_per_output + block_index) * 34;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        for (int local = 0; local < 32; ++local) {
+            const int quantized = (int)((signed char)block[2 + local]);
+            accumulator += d * (float)quantized * input[block_index * 32 + local];
+        }
+    }
+    output[output_index] = accumulator;
 }
 
 extern "C" __global__ void q4_k_gemv(
@@ -323,6 +352,70 @@ impl CudaQuantizedGemv {
                 .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// A correctness-oriented `Q8_0` matrix-vector kernel.
+///
+/// The first tensor dimension is the contiguous input (`K`) count and the
+/// second is the output (`N`) count, matching GGML's column-major ordering.
+/// The kernel keeps encoded weights on the device and does not route them
+/// through a host dequantization buffer.
+pub struct CudaQ8_0Gemv {
+    inner: CudaQuantizedGemv,
+}
+
+impl CudaQ8_0Gemv {
+    /// Compile and load the `Q8_0` kernel on a new CUDA device context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or module loading
+    /// fails.
+    pub fn new(device_index: usize) -> Result<Self, CudaQuantizedKernelError> {
+        let context = CudaContext::new(device_index)
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let stream = context.default_stream();
+        Self::from_context(&context, stream)
+    }
+
+    /// Compile and load the `Q8_0` kernel on an existing context/stream pair.
+    /// Weight buffers and vectors must be allocated from this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when NVRTC or module loading fails.
+    pub fn from_context(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        Ok(Self {
+            inner: CudaQuantizedGemv::from_context(
+                context,
+                stream,
+                "q8_0_gemv",
+                Q8_0_VALUE_TYPE,
+                Q8_0_BLOCK_ELEMENTS,
+                Q8_0_BLOCK_BYTES,
+                "Q8_0",
+            )?,
+        })
+    }
+
+    /// Execute one `Q8_0` matrix-vector product into a caller-owned output.
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, shapes, contexts,
+    /// or launch arguments are invalid.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute(weight, input, output)
     }
 }
 

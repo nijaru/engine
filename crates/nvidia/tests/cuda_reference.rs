@@ -13,8 +13,8 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaQ4KGemv, CudaQ5KGemv, CudaReferenceDispatcher, CudaStateError,
-    CudaWeightStore,
+    CudaHybridState, CudaQ4KGemv, CudaQ5KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher,
+    CudaStateError, CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -391,6 +391,75 @@ fn q5_k_fixture_block(seed: u8) -> Vec<u8> {
 
 fn q5_k_fixture() -> Vec<u8> {
     (0_u8..4).flat_map(q5_k_fixture_block).collect()
+}
+
+fn q8_0_fixture_block(seed: u8) -> Vec<u8> {
+    let mut block = vec![0_u8; 34];
+    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    for index in 0..32 {
+        let pattern =
+            u8::try_from((index + usize::from(seed) * 3) % 31).expect("Q8_0 fixture index");
+        let quantized = i8::try_from(pattern).expect("Q8_0 value") - 15;
+        block[2 + index] = quantized.to_ne_bytes()[0];
+    }
+    block
+}
+
+fn q8_0_fixture() -> Vec<u8> {
+    (0_u8..6).flat_map(q8_0_fixture_block).collect()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_q8_0_gemv_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = q8_0_fixture();
+    let spec = WeightTensorSpec::new("q8_0.fixture", vec![64, 3], engine_core::DataType::F32)
+        .expect("Q8_0 fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            8,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload Q8_0 fixture");
+    let weight = store
+        .quantized_tensor("q8_0.fixture")
+        .expect("Q8_0 fixture weight");
+    let input = (0..64)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q8_0 input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    let input_device = stream.clone_htod(&input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(3).expect("allocate output");
+    let kernel = CudaQ8_0Gemv::from_context(&context, stream.clone()).expect("compile Q8_0");
+    kernel
+        .execute(weight, &input_device, &mut output)
+        .expect("execute Q8_0 GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+    let expected = (0..3)
+        .map(|output_index| {
+            (0..2)
+                .flat_map(|block_index| {
+                    let start = (output_index * 2 + block_index) * 34;
+                    engine_gguf::dequantize_block(8, &encoded[start..start + 34])
+                        .expect("decode Q8_0 fixture")
+                        .into_iter()
+                        .zip(&input[block_index * 32..(block_index + 1) * 32])
+                        .map(|(weight, input)| weight * input)
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
 }
 
 #[test]
