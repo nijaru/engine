@@ -186,6 +186,11 @@ pub enum WeightSource {
 
 impl WeightSource {
     #[must_use]
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self::File(path.into())
+    }
+
+    #[must_use]
     pub fn as_path(&self) -> &Path {
         match self {
             Self::File(path) => path,
@@ -203,6 +208,19 @@ pub struct WeightArtifact {
 }
 
 impl WeightArtifact {
+    #[must_use]
+    pub fn new(
+        source: WeightSource,
+        byte_len: u64,
+        description: WeightDescription,
+    ) -> Option<Self> {
+        (byte_len > 0).then_some(Self {
+            source,
+            byte_len,
+            description,
+        })
+    }
+
     #[must_use]
     pub fn source(&self) -> &WeightSource {
         &self.source
@@ -224,6 +242,7 @@ pub enum ModelLoadError {
     Io { path: PathBuf, message: String },
     EmptyArtifact(PathBuf),
     NotRegularFile(PathBuf),
+    InvalidArtifact { path: PathBuf, message: String },
     WeightDescriptionMismatch,
 }
 
@@ -244,6 +263,9 @@ impl fmt::Display for ModelLoadError {
                     "weight artifact {} is not a regular file",
                     path.display()
                 )
+            }
+            Self::InvalidArtifact { path, message } => {
+                write!(f, "invalid weight artifact {}: {message}", path.display())
             }
             Self::WeightDescriptionMismatch => {
                 f.write_str("loaded weights do not match the model description")
