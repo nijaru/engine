@@ -10,11 +10,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use engine_core::{
-    ConvolutionStateShape, DataType, F32BlockStream, KvStateSpec, ModelCapabilities,
+    ConvolutionStateShape, DataType, DeviceId, F32BlockStream, KvStateSpec, ModelCapabilities,
     ModelDescription, ModelError, ModelId, ModelLoadError, ModelProvider, ModelRegion,
     ModelRegionId, ModelRegionKind, MtpCapability, PromptFormat, PromptPolicy, Quantization,
     RecurrentMatrixShape, RecurrentStateSpec, SpecialTokenPolicy, StateRequirement, WeightArtifact,
-    WeightDescription, WeightFormat, WeightLoader, WeightSource, WeightTensorSpec,
+    WeightBinding, WeightDescription, WeightFormat, WeightLoader, WeightSource, WeightTensorSpec,
 };
 use regex::Regex;
 
@@ -1319,6 +1319,27 @@ impl Qwen35ModelProvider {
     pub fn open_tensor(&self, name: &str) -> Result<TensorDataReader, GgufError> {
         self.file.open_tensor(name)
     }
+
+    /// Build a logical model/device binding for selected tensors without
+    /// allocating or uploading their data. The backend materializes those
+    /// streams and retains the physical buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError`] when a requested tensor cannot be opened or the
+    /// names contain a duplicate.
+    pub fn weight_binding(
+        &self,
+        device: DeviceId,
+        names: &[&str],
+    ) -> Result<WeightBinding, GgufError> {
+        let specs = names
+            .iter()
+            .map(|name| self.open_tensor(name).map(|reader| reader.spec().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        WeightBinding::new(self.description.id().clone(), device, specs)
+            .map_err(|error| GgufError::InvalidWeightBinding(error.to_string()))
+    }
 }
 
 impl ModelProvider for Qwen35ModelProvider {
@@ -1437,6 +1458,7 @@ pub enum GgufError {
     },
     MissingTensor(String),
     InvalidTensorSpec(String),
+    InvalidWeightBinding(String),
     UnsupportedPromptFormat(&'static str),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
@@ -1524,6 +1546,9 @@ impl std::fmt::Display for GgufError {
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
             Self::InvalidTensorSpec(reason) => {
                 write!(f, "invalid GGUF tensor stream specification: {reason}")
+            }
+            Self::InvalidWeightBinding(reason) => {
+                write!(f, "invalid GGUF weight binding: {reason}")
             }
             Self::UnsupportedPromptFormat(reason) => {
                 write!(f, "unsupported prompt format: {reason}")

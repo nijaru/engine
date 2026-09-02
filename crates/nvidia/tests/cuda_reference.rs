@@ -247,6 +247,10 @@ fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
     let provider =
         Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
             .expect("open pinned Qwen GGUF");
+    let binding = provider
+        .weight_binding(DeviceId::new(0), &["blk.0.ssm_a"])
+        .expect("bind pinned scalar tensor");
+    assert_eq!(binding.tensors().len(), 1);
     let mut source = provider
         .open_tensor("blk.0.ssm_a")
         .expect("open pinned scalar tensor");
