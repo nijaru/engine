@@ -2,15 +2,17 @@
 
 use std::io::Read;
 
+use cudarc::driver::CudaContext;
 use engine_core::{
-    BackendCapabilities, BackendFeatures, BackendId, BackendKind, DeviceId, ExecutionPhase,
-    ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage, HybridStateSet,
-    LogicalStateManager, ModelCapabilities, ModelDescription, ModelId, ModelProvider, ModelRegion,
-    ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion, Quantization, WeightBinding,
-    WeightDescription, WeightFormat,
+    BackendCapabilities, BackendFeatures, BackendId, BackendKind, ConvolutionStateShape, DeviceId,
+    ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage,
+    HybridStateSet, LogicalStateManager, ModelCapabilities, ModelDescription, ModelId,
+    ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion,
+    Quantization, RecurrentMatrixShape, RecurrentStateSpec, StateLocation, StateManager,
+    WeightBinding, WeightDescription, WeightFormat,
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
-use engine_nvidia::CudaReferenceDispatcher;
+use engine_nvidia::{CudaHybridState, CudaReferenceDispatcher, CudaStateError};
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend(value.to_le_bytes());
@@ -345,4 +347,61 @@ fn materializes_a_pinned_qwen_quantized_tensor_without_host_dequantization() {
         .copy_quantized_to_host(spec.name())
         .expect("copy opaque quantized tensor to host");
     assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn allocates_distinct_physical_hybrid_state_buffers() {
+    let device = DeviceId::new(0);
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let kv_spec =
+        engine_core::KvStateSpec::new(1, 2, 4, 4, engine_core::DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        1,
+        RecurrentMatrixShape::new(1, 2, 2, 2).expect("matrix shape"),
+        ConvolutionStateShape::new(3, 2).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+    let mut manager = LogicalStateManager::new(device, 1024, 0);
+    let kv = manager
+        .allocate_kv(kv_spec, StateLocation::Device(device))
+        .expect("KV allocation");
+    let recurrent = manager
+        .allocate_recurrent(recurrent_spec, StateLocation::Device(device))
+        .expect("recurrent allocation");
+    let core_state = HybridStateSet::try_new(Some(kv), Some(recurrent)).expect("hybrid state");
+
+    let mut physical =
+        CudaHybridState::from_state_set(stream, &core_state).expect("physical hybrid state");
+    assert_eq!(physical.kv().expect("KV state").keys().len(), 32);
+    assert_eq!(
+        physical.kv().expect("KV state").keys().dtype(),
+        engine_core::DataType::F16
+    );
+    assert_eq!(physical.kv().expect("KV state").values().len(), 32);
+    assert_eq!(
+        physical
+            .recurrent()
+            .expect("recurrent state")
+            .matrix()
+            .len(),
+        8
+    );
+    assert_eq!(
+        physical
+            .recurrent()
+            .expect("recurrent state")
+            .convolution()
+            .len(),
+        6
+    );
+    physical.zero().expect("zero physical state");
+    physical.advance_to(2).expect("advance state");
+    assert!(matches!(
+        physical.advance_to(1),
+        Err(CudaStateError::PositionRegression { .. })
+    ));
 }

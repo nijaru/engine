@@ -7,9 +7,16 @@
 
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "cuda")]
+mod state;
 
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaF32Weight, CudaQuantizedWeight, CudaReferenceDispatcher, CudaRuntimeError, CudaWeightError,
     CudaWeightStore,
+};
+
+#[cfg(feature = "cuda")]
+pub use state::{
+    CudaHybridState, CudaKvState, CudaRecurrentState, CudaStateBuffer, CudaStateError,
 };
