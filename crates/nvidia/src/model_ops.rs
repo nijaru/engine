@@ -84,7 +84,7 @@ extern "C" __global__ void argmax(
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
-    float best_value = -INFINITY;
+    float best_value = -3.402823466e+38f;
     unsigned int best_index = 0;
     for (int index = 0; index < length; ++index) {
         if (logits[index] > best_value) {
