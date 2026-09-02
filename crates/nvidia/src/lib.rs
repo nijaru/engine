@@ -15,6 +15,8 @@ mod quantized;
 #[cfg(feature = "cuda")]
 mod state;
 
+mod qwen_reference;
+
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaF32Weight, CudaQuantizedWeight, CudaReferenceDispatcher, CudaRuntimeError, CudaWeightError,
@@ -33,4 +35,9 @@ pub use quantized::{
 #[cfg(feature = "cuda")]
 pub use state::{
     CudaHybridState, CudaKvState, CudaRecurrentState, CudaStateBuffer, CudaStateError,
+};
+
+pub use qwen_reference::{
+    GDN_D_CONV, GDN_HEAD_DIM, GDN_INNER, GDN_K_HEADS, GDN_QKV_DIM, GDN_V_HEADS, GdnLayerWeights,
+    N_EMBD, gguf_gemv, host_gdn_ar_step, l2_normalize, softplus,
 };
