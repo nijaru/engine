@@ -1013,7 +1013,7 @@ fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
         8 => Ok((32, 34)),
         9 => Ok((32, 36)),
         10 => Ok((256, 84)),
-        11 => Ok((256, 110)),
+        11 | 21 => Ok((256, 110)),
         12 => Ok((256, 144)),
         13 => Ok((256, 176)),
         14 => Ok((256, 210)),
@@ -1022,7 +1022,6 @@ fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
         17 => Ok((256, 74)),
         18 => Ok((256, 98)),
         19 => Ok((256, 50)),
-        21 => Ok((256, 106)),
         22 => Ok((256, 82)),
         23 => Ok((256, 136)),
         24 => Ok((1, 1)),
@@ -1341,7 +1340,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            dequantize_block(21, &[0; 106]),
+            dequantize_block(21, &[0; 110]),
             Err(GgufError::UnsupportedTensorType(21))
         ));
     }
@@ -1364,6 +1363,14 @@ mod tests {
             offset: 0,
         };
         assert_eq!(iq_tensor.byte_len().expect("IQ4_XS byte length"), 136);
+
+        let iq3_s_tensor = TensorInfo {
+            name: "iq3_s".to_owned(),
+            dimensions: vec![256],
+            value_type: 21,
+            offset: 0,
+        };
+        assert_eq!(iq3_s_tensor.byte_len().expect("IQ3_S byte length"), 110);
     }
 
     #[test]
