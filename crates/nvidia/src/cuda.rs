@@ -219,7 +219,9 @@ impl CudaWeightStore {
                 dtype: spec.dtype(),
             });
         }
-        if self.tensors.contains_key(spec.name()) {
+        if self.tensors.contains_key(spec.name())
+            || self.quantized_tensors.contains_key(spec.name())
+        {
             return Err(CudaWeightError::DuplicateTensor(spec.name().to_owned()));
         }
         let capacity = usize::try_from(spec.element_count()).map_err(|_| {
@@ -331,17 +333,21 @@ impl CudaWeightStore {
         let mut offset = 0_usize;
         while offset < capacity {
             let requested = (capacity - offset).min(host.len());
-            let read = source
-                .read(&mut host[..requested])
-                .map_err(|error| CudaWeightError::Source(error.to_string()))?;
-            if read == 0 {
-                return Err(CudaWeightError::SourceIncomplete {
-                    name: spec.name().to_owned(),
-                    expected: capacity,
-                    actual: offset,
-                });
+            let mut filled = 0_usize;
+            while filled < requested {
+                let read = source
+                    .read(&mut host[filled..requested])
+                    .map_err(|error| CudaWeightError::Source(error.to_string()))?;
+                if read == 0 {
+                    return Err(CudaWeightError::SourceIncomplete {
+                        name: spec.name().to_owned(),
+                        expected: capacity,
+                        actual: offset + filled,
+                    });
+                }
+                filled += read;
             }
-            let end = offset + read;
+            let end = offset + requested;
             let mut destination = device.try_slice_mut(offset..end).ok_or_else(|| {
                 CudaWeightError::SourceIncomplete {
                     name: spec.name().to_owned(),
@@ -350,7 +356,7 @@ impl CudaWeightStore {
                 }
             })?;
             self.stream
-                .memcpy_htod(&host[..read], &mut destination)
+                .memcpy_htod(&host[..requested], &mut destination)
                 .map_err(|error| CudaWeightError::Driver(error.to_string()))?;
             self.stream
                 .synchronize()
