@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 engine-core = { path = "../core" }
+regex = "1.13.1"
 
 [lints]
 workspace = true

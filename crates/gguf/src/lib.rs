@@ -10,6 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use engine_core::{ModelLoadError, WeightArtifact, WeightDescription, WeightLoader, WeightSource};
+use regex::Regex;
 
 mod iq3_s;
 
@@ -396,6 +397,60 @@ pub struct GgufTokenizer {
     bos_token_id: u32,
     eos_token_id: u32,
     padding_token_id: Option<u32>,
+    token_ids: BTreeMap<String, u32>,
+    merge_ranks: BTreeMap<(String, String), u32>,
+}
+
+const QWEN35_PRETOKENIZER: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s+";
+
+fn byte_to_unicode(byte: u8) -> char {
+    if (33..=126).contains(&byte) || (161..=172).contains(&byte) || (174..=255).contains(&byte) {
+        char::from(byte)
+    } else {
+        char::from_u32(256 + u32::from(byte)).unwrap_or('\u{fffd}')
+    }
+}
+
+fn build_token_ids(tokens: &[String]) -> Result<BTreeMap<String, u32>, GgufError> {
+    let mut token_ids = BTreeMap::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| {
+            GgufError::InvalidTokenizer("vocabulary is too large for a u32 token ID")
+        })?;
+        if token_ids.insert(token.clone(), index).is_some() {
+            return Err(GgufError::InvalidTokenizer(
+                "vocabulary contains duplicate tokens",
+            ));
+        }
+    }
+    Ok(token_ids)
+}
+
+fn build_merge_ranks(merges: &[String]) -> Result<BTreeMap<(String, String), u32>, GgufError> {
+    let mut ranks = BTreeMap::new();
+    for (rank, merge) in merges.iter().enumerate() {
+        let (left, right) = merge
+            .split_once(' ')
+            .ok_or_else(|| GgufError::TokenizerEncoding {
+                detail: format!("merge {merge:?} does not contain two symbols"),
+            })?;
+        if left.is_empty() || right.is_empty() || right.contains(' ') {
+            return Err(GgufError::TokenizerEncoding {
+                detail: format!("merge {merge:?} does not contain exactly two symbols"),
+            });
+        }
+        let rank = u32::try_from(rank)
+            .map_err(|_| GgufError::InvalidTokenizer("merge table is too large for a u32 rank"))?;
+        if ranks
+            .insert((left.to_owned(), right.to_owned()), rank)
+            .is_some()
+        {
+            return Err(GgufError::InvalidTokenizer(
+                "merge table contains duplicates",
+            ));
+        }
+    }
+    Ok(ranks)
 }
 
 impl GgufTokenizer {
@@ -439,6 +494,77 @@ impl GgufTokenizer {
         self.padding_token_id
     }
 
+    /// Encode ordinary text with the embedded Qwen3.5 GPT-2/BPE vocabulary.
+    /// Special-token parsing is intentionally not implicit; callers must handle
+    /// chat-template or special-token policy before invoking this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::InvalidTokenizer`] for an unsupported pretokenizer,
+    /// or [`GgufError::TokenizerEncoding`] when the pretokenizer leaves a gap,
+    /// a merge is malformed, or a final BPE symbol is absent from the
+    /// vocabulary.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, GgufError> {
+        if self.model != "gpt2" || self.pretokenizer != "qwen35" {
+            return Err(GgufError::InvalidTokenizer(
+                "only the embedded Qwen3.5 GPT-2 tokenizer is supported",
+            ));
+        }
+        let pretokenizer = Regex::new(QWEN35_PRETOKENIZER)
+            .map_err(|_| GgufError::InvalidTokenizer("invalid Qwen3.5 pretokenizer pattern"))?;
+        let mut encoded = Vec::new();
+        let mut end = 0;
+        for part in pretokenizer.find_iter(text) {
+            if part.start() != end {
+                return Err(GgufError::TokenizerEncoding {
+                    detail: "pretokenizer did not cover the complete input".to_owned(),
+                });
+            }
+            end = part.end();
+            let mapped: Vec<String> = part
+                .as_str()
+                .as_bytes()
+                .iter()
+                .map(|byte| byte_to_unicode(*byte).to_string())
+                .collect();
+            let symbols = self.bpe(mapped);
+            for symbol in symbols {
+                let token_id = self.token_ids.get(&symbol).copied().ok_or_else(|| {
+                    GgufError::TokenizerEncoding {
+                        detail: format!("BPE symbol {symbol:?} is absent from the vocabulary"),
+                    }
+                })?;
+                encoded.push(token_id);
+            }
+        }
+        if end != text.len() {
+            return Err(GgufError::TokenizerEncoding {
+                detail: "pretokenizer did not cover the complete input".to_owned(),
+            });
+        }
+        Ok(encoded)
+    }
+
+    fn bpe(&self, mut symbols: Vec<String>) -> Vec<String> {
+        while symbols.len() > 1 {
+            let mut best: Option<(u32, usize)> = None;
+            for index in 0..symbols.len() - 1 {
+                let pair = (symbols[index].clone(), symbols[index + 1].clone());
+                if let Some(&rank) = self.merge_ranks.get(&pair)
+                    && best.is_none_or(|(best_rank, _)| rank < best_rank)
+                {
+                    best = Some((rank, index));
+                }
+            }
+            let Some((_, index)) = best else {
+                break;
+            };
+            let merged = format!("{}{}", symbols[index], symbols[index + 1]);
+            symbols.splice(index..=index + 1, [merged]);
+        }
+        symbols
+    }
+
     fn from_metadata(metadata: &BTreeMap<String, MetadataValue>) -> Result<Self, GgufError> {
         let tokens = required_string_array(metadata, "tokenizer.ggml.tokens")?;
         let merges = required_string_array(metadata, "tokenizer.ggml.merges")?;
@@ -448,6 +574,8 @@ impl GgufTokenizer {
                 "token and token-type arrays must have the same nonzero length",
             ));
         }
+        let token_ids = build_token_ids(&tokens)?;
+        let merge_ranks = build_merge_ranks(&merges)?;
         Ok(Self {
             model: required_string(metadata, "tokenizer.ggml.model")?,
             pretokenizer: required_string(metadata, "tokenizer.ggml.pre")?,
@@ -457,6 +585,8 @@ impl GgufTokenizer {
             bos_token_id: required_u32(metadata, "tokenizer.ggml.bos_token_id")?,
             eos_token_id: required_u32(metadata, "tokenizer.ggml.eos_token_id")?,
             padding_token_id: optional_u32(metadata, "tokenizer.ggml.padding_token_id")?,
+            token_ids,
+            merge_ranks,
         })
     }
 }
@@ -1019,6 +1149,9 @@ pub enum GgufError {
     UnsupportedArchitecture(String),
     InvalidModelConfiguration(&'static str),
     InvalidTokenizer(&'static str),
+    TokenizerEncoding {
+        detail: String,
+    },
     InvalidTensorBlockLength {
         value_type: u32,
         expected: usize,
@@ -1093,6 +1226,9 @@ impl std::fmt::Display for GgufError {
             }
             Self::InvalidTokenizer(reason) => {
                 write!(f, "invalid GGUF tokenizer metadata: {reason}")
+            }
+            Self::TokenizerEncoding { detail } => {
+                write!(f, "GGUF tokenizer encoding failed: {detail}")
             }
             Self::InvalidTensorBlockLength {
                 value_type,
@@ -1607,6 +1743,7 @@ mod tests {
             MetadataValue::Array(vec![
                 MetadataValue::String("a".to_owned()),
                 MetadataValue::String("b".to_owned()),
+                MetadataValue::String("ab".to_owned()),
             ]),
         );
         metadata.insert(
@@ -1615,7 +1752,11 @@ mod tests {
         );
         metadata.insert(
             "tokenizer.ggml.token_type".to_owned(),
-            MetadataValue::Array(vec![MetadataValue::I32(1), MetadataValue::I32(3)]),
+            MetadataValue::Array(vec![
+                MetadataValue::I32(1),
+                MetadataValue::I32(3),
+                MetadataValue::I32(1),
+            ]),
         );
         metadata.insert(
             "tokenizer.ggml.bos_token_id".to_owned(),
@@ -1633,9 +1774,11 @@ mod tests {
         let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("tokenizer metadata");
         assert_eq!(tokenizer.model(), "gpt2");
         assert_eq!(tokenizer.pretokenizer(), "qwen35");
-        assert_eq!(tokenizer.tokens(), &["a", "b"]);
+        assert_eq!(tokenizer.tokens(), &["a", "b", "ab"]);
         assert_eq!(tokenizer.merges(), &["a b"]);
-        assert_eq!(tokenizer.token_types(), &[1, 3]);
+        assert_eq!(tokenizer.token_types(), &[1, 3, 1]);
+        assert_eq!(tokenizer.encode("ab").expect("BPE encoding"), vec![2]);
+        assert!(tokenizer.encode("").expect("empty encoding").is_empty());
         assert_eq!(tokenizer.bos_token_id(), 1);
         assert_eq!(tokenizer.eos_token_id(), 2);
         assert_eq!(tokenizer.padding_token_id(), Some(0));
