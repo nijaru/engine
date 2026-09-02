@@ -105,6 +105,46 @@ extern "C" __device__ __forceinline__ int minimum_value(const unsigned char* blo
     return (int)((block[12 + index] >> 4u) | ((block[8 + index] >> 2u) & 0x30u));
 }
 
+extern "C" __global__ void iq3_s_embedding(
+    const unsigned char* weights,
+    unsigned int token_index,
+    float* output,
+    const unsigned char* grid,
+    int hidden_size,
+    int vocabulary_size
+) {
+    const int hidden_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (hidden_index >= hidden_size || token_index >= (unsigned int)vocabulary_size) {
+        return;
+    }
+
+    const int blocks_per_token = hidden_size / 256;
+    const int block_index = hidden_index / 256;
+    const int local = hidden_index & 255;
+    const unsigned char* block =
+        weights + ((int)token_index * blocks_per_token + block_index) * 110;
+    const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+    const unsigned char* low_codes = block + 2;
+    const unsigned char* high_codes = block + 66;
+    const unsigned char* signs = block + 74;
+    const unsigned char* scales = block + 106;
+    const int group = local / 32;
+    const int within_group = local & 31;
+    const int sub = within_group / 8;
+    const int lane = within_group & 7;
+    const int scale_nibble =
+        (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
+    const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
+    const int code_index = group * 8 + sub * 2 + lane / 4;
+    const int high_bit =
+        (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
+    const int code = (int)low_codes[code_index] | (high_bit << 8);
+    const int sign = ((signs[group * 4 + sub] >> lane) & 1u) == 0u ? 1 : -1;
+    const int grid_index = code * 4 + (lane & 3);
+    output[hidden_index] =
+        group_scale * (float)grid[grid_index] * (float)sign;
+}
+
 extern "C" __global__ void iq3_s_gemv(
     const unsigned char* weights,
     const float* input,
@@ -756,6 +796,154 @@ impl CudaIq3SGemv {
                 .arg(&self.grid)
                 .arg(&input_size)
                 .arg(&output_size)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+/// A correctness-oriented `IQ3_S` embedding lookup kernel.
+///
+/// GGML stores an embedding matrix as `[hidden, vocabulary]`, so each token is
+/// one contiguous column of `IQ3_S` blocks. This kernel gathers one such column
+/// directly into a device F32 vector.
+pub struct CudaIq3SEmbedding {
+    inner: CudaQuantizedGemv,
+    grid: CudaSlice<u8>,
+}
+
+impl CudaIq3SEmbedding {
+    /// Compile and load the `IQ3_S` embedding kernel on a new CUDA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or module loading
+    /// fails.
+    pub fn new(device_index: usize) -> Result<Self, CudaQuantizedKernelError> {
+        let context = CudaContext::new(device_index)
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let stream = context.default_stream();
+        Self::from_context(&context, stream)
+    }
+
+    /// Compile and load the `IQ3_S` embedding kernel on an existing context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or the lookup
+    /// table upload fails.
+    pub fn from_context(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        let grid = stream
+            .clone_htod(&iq3_grid_values())
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let inner = CudaQuantizedGemv::from_context(
+            context,
+            stream,
+            "iq3_s_embedding",
+            IQ3_S_VALUE_TYPE,
+            IQ3_S_BLOCK_ELEMENTS,
+            IQ3_S_BLOCK_BYTES,
+            "IQ3_S embedding",
+        )?;
+        Ok(Self { inner, grid })
+    }
+
+    /// Gather one token embedding into a caller-owned device vector.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, token index,
+    /// output shape, contexts, or launch arguments are invalid.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        token_index: u32,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        if self.inner.stream.context().as_ref() != weight.encoded_data().context().as_ref()
+            || self.inner.stream.context().as_ref() != output.context().as_ref()
+        {
+            return Err(CudaQuantizedKernelError::ContextMismatch);
+        }
+        if weight.value_type() != IQ3_S_VALUE_TYPE {
+            return Err(CudaQuantizedKernelError::UnsupportedValueType {
+                expected: IQ3_S_VALUE_TYPE,
+                actual: weight.value_type(),
+            });
+        }
+        let dimensions = weight.spec().dimensions();
+        if dimensions.len() != 2 {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "expected rank-2 tensor, got rank {}",
+                dimensions.len()
+            )));
+        }
+        let hidden_size =
+            usize::try_from(dimensions[0]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let vocabulary_size =
+            usize::try_from(dimensions[1]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        if hidden_size == 0
+            || vocabulary_size == 0
+            || !hidden_size.is_multiple_of(IQ3_S_BLOCK_ELEMENTS)
+        {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "IQ3_S embedding shape is {hidden_size}x{vocabulary_size}; hidden size must be a positive multiple of {IQ3_S_BLOCK_ELEMENTS}"
+            )));
+        }
+        let blocks = hidden_size
+            .checked_div(IQ3_S_BLOCK_ELEMENTS)
+            .and_then(|value| value.checked_mul(vocabulary_size))
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        let expected_bytes = blocks
+            .checked_mul(IQ3_S_BLOCK_BYTES)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        if weight.encoded_bytes() != expected_bytes {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "encoded length is {}, expected {expected_bytes}",
+                weight.encoded_bytes()
+            )));
+        }
+        if u64::from(token_index) >= dimensions[1] {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "token index {token_index} is outside vocabulary size {vocabulary_size}"
+            )));
+        }
+        if hidden_size > i32::MAX as usize || vocabulary_size > i32::MAX as usize {
+            return Err(CudaQuantizedKernelError::ShapeOverflow);
+        }
+        if output.len() != hidden_size {
+            return Err(CudaQuantizedKernelError::OutputLength {
+                expected: hidden_size,
+                actual: output.len(),
+            });
+        }
+        let hidden_size =
+            u32::try_from(hidden_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let vocabulary_size =
+            u32::try_from(vocabulary_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (hidden_size.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: the device slices are allocated by cudarc, remain alive for
+        // the launch, and have lengths checked against the kernel's shape.
+        unsafe {
+            self.inner
+                .stream
+                .launch_builder(&self.inner.kernel)
+                .arg(weight.encoded_data())
+                .arg(&token_index)
+                .arg(output)
+                .arg(&self.grid)
+                .arg(&hidden_size)
+                .arg(&vocabulary_size)
                 .launch(config)
                 .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
         }

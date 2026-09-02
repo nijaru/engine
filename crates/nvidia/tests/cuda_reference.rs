@@ -13,8 +13,8 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv,
-    CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError,
+    CudaHybridState, CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv,
+    CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError,
     CudaWeightStore,
 };
 
@@ -578,6 +578,48 @@ fn executes_iq3_s_gemv_against_the_gguf_decoder() {
                         .map(|(weight, input)| weight * input)
                 })
                 .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_iq3_s_embedding_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = iq3_s_fixture();
+    let spec = WeightTensorSpec::new("iq3_s.embedding", vec![512, 3], engine_core::DataType::F32)
+        .expect("IQ3_S embedding fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            21,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload IQ3_S embedding fixture");
+    let weight = store
+        .quantized_tensor("iq3_s.embedding")
+        .expect("IQ3_S embedding weight");
+    let mut output = stream
+        .alloc_zeros::<f32>(512)
+        .expect("allocate embedding output");
+    let kernel =
+        CudaIq3SEmbedding::from_context(&context, stream.clone()).expect("compile IQ3_S embedding");
+    kernel
+        .execute(weight, 1, &mut output)
+        .expect("execute IQ3_S embedding");
+    let actual = stream.clone_dtoh(&output).expect("download embedding");
+    let expected = (0..2)
+        .flat_map(|block_index| {
+            let start = (2 + block_index) * 110;
+            engine_gguf::dequantize_block(21, &encoded[start..start + 110])
+                .expect("decode IQ3_S embedding fixture")
         })
         .collect::<Vec<_>>();
     assert_eq!(actual.len(), expected.len());

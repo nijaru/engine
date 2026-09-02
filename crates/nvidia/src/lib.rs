@@ -21,8 +21,8 @@ pub use cuda::{
 
 #[cfg(feature = "cuda")]
 pub use quantized::{
-    CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv,
-    CudaQ8_0Gemv, CudaQuantizedKernelError,
+    CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv,
+    CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQuantizedKernelError,
 };
 
 #[cfg(feature = "cuda")]
