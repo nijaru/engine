@@ -394,6 +394,233 @@ impl Read for TensorDataReader {
     }
 }
 
+/// Dequantize one complete GGML block into scalar `f32` values.
+///
+/// This deliberately operates on one block rather than allocating an entire
+/// model tensor. Callers can stream or map a tensor and invoke it for each
+/// block. The implementation covers the types present in the scalar and
+/// common K-quant portions of the pinned Qwen3.8 artifact; unsupported IQ
+/// variants remain explicit errors until their reference layouts are ported.
+///
+/// # Errors
+///
+/// Returns [`GgufError::UnsupportedTensorType`] for a type without a decoder,
+/// or [`GgufError::InvalidTensorBlockLength`] when `encoded` is not exactly one
+/// block for `value_type`.
+pub fn dequantize_block(value_type: u32, encoded: &[u8]) -> Result<Vec<f32>, GgufError> {
+    let (_, block_bytes) = tensor_layout(value_type)?;
+    let expected = usize::try_from(block_bytes).map_err(|_| GgufError::TensorByteLengthOverflow)?;
+    if encoded.len() != expected {
+        return Err(GgufError::InvalidTensorBlockLength {
+            value_type,
+            expected,
+            actual: encoded.len(),
+        });
+    }
+    match value_type {
+        0 => Ok(vec![f32::from_le_bytes([
+            encoded[0], encoded[1], encoded[2], encoded[3],
+        ])]),
+        1 => Ok(vec![f16_to_f32(u16::from_le_bytes([
+            encoded[0], encoded[1],
+        ]))]),
+        8 => Ok(dequantize_q8_0(encoded)),
+        11 => Ok(dequantize_q3_k(encoded)),
+        12 => Ok(dequantize_q4_k(encoded)),
+        13 => Ok(dequantize_q5_k(encoded)),
+        14 => Ok(dequantize_q6_k(encoded)),
+        20 => Ok(dequantize_iq4_nl(encoded)),
+        23 => Ok(dequantize_iq4_xs(encoded)),
+        _ => Err(GgufError::UnsupportedTensorType(value_type)),
+    }
+}
+
+const QK_K: usize = 256;
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = bits & 0x03ff;
+    match exponent {
+        0 => sign * f32::from(fraction) * 2_f32.powi(-24),
+        0x1f if fraction == 0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        exponent => {
+            sign * (1.0 + f32::from(fraction) / 1024.0) * 2_f32.powi(i32::from(exponent) - 15)
+        }
+    }
+}
+
+fn read_f16(encoded: &[u8], offset: usize) -> f32 {
+    f16_to_f32(u16::from_le_bytes([encoded[offset], encoded[offset + 1]]))
+}
+
+fn signed_scale(value: u8) -> i8 {
+    value.wrapping_sub(32).cast_signed()
+}
+
+fn q4_k_scales(encoded: &[u8]) -> ([u8; 8], [u8; 8]) {
+    let mut scales = [0; 8];
+    let mut minima = [0; 8];
+    for index in 0..4 {
+        let low_scale = encoded[index] & 0x3f;
+        let high_scale = (encoded[8 + index] & 0x0f) | ((encoded[index] >> 2) & 0x30);
+        let low_min = encoded[4 + index] & 0x3f;
+        let high_min = (encoded[8 + index] >> 4) | ((encoded[4 + index] >> 2) & 0x30);
+        scales[index] = low_scale;
+        scales[index + 4] = high_scale;
+        minima[index] = low_min;
+        minima[index + 4] = high_min;
+    }
+    (scales, minima)
+}
+
+fn dequantize_q8_0(encoded: &[u8]) -> Vec<f32> {
+    let scale = read_f16(encoded, 0);
+    (0..32)
+        .map(|index| scale * f32::from(i8::from_le_bytes([encoded[2 + index]])))
+        .collect()
+}
+
+fn dequantize_q4_k(encoded: &[u8]) -> Vec<f32> {
+    let scale = read_f16(encoded, 0);
+    let minimum_scale = read_f16(encoded, 2);
+    let (scales, minima) = q4_k_scales(&encoded[4..16]);
+    let mut output = Vec::with_capacity(QK_K);
+    for group in 0..8 {
+        let data_offset = 16 + (group / 2) * 32;
+        let shift = (group % 2) * 4;
+        let group_scale = scale * f32::from(scales[group]);
+        let group_minimum = minimum_scale * f32::from(minima[group]);
+        for index in 0..32 {
+            let quantized = (encoded[data_offset + index] >> shift) & 0x0f;
+            output.push(group_scale * f32::from(quantized) - group_minimum);
+        }
+    }
+    output
+}
+
+fn dequantize_q5_k(encoded: &[u8]) -> Vec<f32> {
+    let scale = read_f16(encoded, 0);
+    let minimum_scale = read_f16(encoded, 2);
+    let (scales, minima) = q4_k_scales(&encoded[4..16]);
+    let high_bits = &encoded[16..48];
+    let low_bits = &encoded[48..];
+    let mut output = Vec::with_capacity(QK_K);
+    for group in 0..8 {
+        let data_offset = (group / 2) * 32;
+        let shift = (group % 2) * 4;
+        let group_scale = scale * f32::from(scales[group]);
+        let group_minimum = minimum_scale * f32::from(minima[group]);
+        for index in 0..32 {
+            let low = (low_bits[data_offset + index] >> shift) & 0x0f;
+            let high = (high_bits[index] >> group) & 1;
+            output.push(group_scale * f32::from(low | (high << 4)) - group_minimum);
+        }
+    }
+    output
+}
+
+fn dequantize_q6_k(encoded: &[u8]) -> Vec<f32> {
+    let low_bits = &encoded[..128];
+    let high_bits = &encoded[128..192];
+    let scales = &encoded[192..208];
+    let scale = read_f16(encoded, 208);
+    let mut output = Vec::with_capacity(QK_K);
+    for group in 0..8 {
+        let chunk = group / 4;
+        let variant = group % 4;
+        let low_offset = chunk * 64 + (variant % 2) * 32;
+        let low_shift = if variant < 2 { 0 } else { 4 };
+        let high_offset = chunk * 32;
+        let high_shift = variant % 4;
+        for half in 0..2 {
+            let scale_index = group * 2 + half;
+            let group_scale = scale * f32::from(i8::from_le_bytes([scales[scale_index]]));
+            for index in 0..16 {
+                let low = (low_bits[low_offset + index] >> low_shift) & 0x0f;
+                let high = (high_bits[high_offset + index] >> (high_shift * 2)) & 0x03;
+                let quantized = i16::from(low | (high << 4)) - 32;
+                output.push(group_scale * f32::from(quantized));
+            }
+        }
+    }
+    output
+}
+
+fn dequantize_q3_k(encoded: &[u8]) -> Vec<f32> {
+    let high_bits = &encoded[..32];
+    let low_bits = &encoded[32..96];
+    let packed_scales = &encoded[96..108];
+    let scale = read_f16(encoded, 108);
+    let mut scales = [0_i8; 16];
+    for index in 0..8 {
+        let low_scale = (packed_scales[index] & 0x0f)
+            | (((packed_scales[8 + index % 4] >> ((index / 4) * 2)) & 0x03) << 4);
+        let high_slot = index + 8;
+        let high_scale = (packed_scales[index] >> 4)
+            | (((packed_scales[8 + high_slot % 4] >> ((high_slot / 4) * 2)) & 0x03) << 4);
+        scales[index] = signed_scale(low_scale);
+        scales[index + 8] = signed_scale(high_scale);
+    }
+    let mut output = Vec::with_capacity(QK_K);
+    for (group, &packed_scale) in scales.iter().enumerate() {
+        let chunk = group / 8;
+        let variant = (group / 2) % 4;
+        let half = group % 2;
+        let low_offset = chunk * 32 + half * 16;
+        let high_offset = half * 16;
+        let group_scale = scale * f32::from(packed_scale);
+        for index in 0..16 {
+            let low = (low_bits[low_offset + index] >> (variant * 2)) & 0x03;
+            let high = ((high_bits[high_offset + index] >> (group / 2)) & 1) ^ 1;
+            let quantized = i16::from(low) - i16::from(high) * 4;
+            output.push(group_scale * f32::from(quantized));
+        }
+    }
+    output
+}
+
+fn dequantize_iq4_nl(encoded: &[u8]) -> Vec<f32> {
+    const K_VALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+    let scale = read_f16(encoded, 0);
+    let mut output = Vec::with_capacity(32);
+    for index in 0..16 {
+        let byte = encoded[2 + index];
+        output.push(scale * f32::from(K_VALUES[usize::from(byte & 0x0f)]));
+        output.push(scale * f32::from(K_VALUES[usize::from(byte >> 4)]));
+    }
+    output
+}
+
+fn dequantize_iq4_xs(encoded: &[u8]) -> Vec<f32> {
+    const K_VALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+    let scale = read_f16(encoded, 0);
+    let high_scales = &encoded[2..4];
+    let low_scales = &encoded[4..8];
+    let quantized = &encoded[8..];
+    let mut output = Vec::with_capacity(QK_K);
+    for group in 0..8 {
+        let low = (low_scales[group / 2] >> ((group % 2) * 4)) & 0x0f;
+        let high = (high_scales[group % 2] >> ((group / 2) * 2)) & 0x03;
+        let group_scale = scale * f32::from(signed_scale(low | (high << 4)));
+        let data_offset = group * 16;
+        for index in 0..16 {
+            let byte = quantized[data_offset + index];
+            output.push(group_scale * f32::from(K_VALUES[usize::from(byte & 0x0f)]));
+        }
+        for index in 0..16 {
+            let byte = quantized[data_offset + index];
+            output.push(group_scale * f32::from(K_VALUES[usize::from(byte >> 4)]));
+        }
+    }
+    output
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen35Config {
     context_length: u64,
@@ -652,6 +879,11 @@ pub enum GgufError {
     },
     UnsupportedArchitecture(String),
     InvalidModelConfiguration(&'static str),
+    InvalidTensorBlockLength {
+        value_type: u32,
+        expected: usize,
+        actual: usize,
+    },
     MissingTensor(String),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
@@ -714,6 +946,14 @@ impl std::fmt::Display for GgufError {
             Self::InvalidModelConfiguration(reason) => {
                 write!(f, "invalid Qwen3.8 model configuration: {reason}")
             }
+            Self::InvalidTensorBlockLength {
+                value_type,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "GGML tensor type {value_type} requires {expected} bytes per block, got {actual}"
+            ),
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
             Self::UnsupportedTensorType(value) => {
                 write!(f, "unsupported GGML tensor type {value}")
@@ -1004,6 +1244,101 @@ mod tests {
         assert_eq!(reader.remaining(), 0);
         assert_eq!(reader.read(&mut [0; 1]).expect("bounded read"), 0);
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn dequantizes_supported_scalar_and_quantized_blocks() {
+        let mut f32_block = [0_u8; 4];
+        f32_block.copy_from_slice(&1.5_f32.to_le_bytes());
+        assert_eq!(
+            dequantize_block(0, &f32_block).expect("F32")[0].to_bits(),
+            1.5_f32.to_bits()
+        );
+
+        let f16_block = 0x3c00_u16.to_le_bytes();
+        assert_eq!(
+            dequantize_block(1, &f16_block).expect("F16")[0].to_bits(),
+            1.0_f32.to_bits()
+        );
+
+        let mut q8 = [0_u8; 34];
+        q8[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        q8[2] = 0x80;
+        q8[3] = 0x7f;
+        let decoded = dequantize_block(8, &q8).expect("Q8_0");
+        assert_eq!(decoded[0].to_bits(), (-128.0_f32).to_bits());
+        assert_eq!(decoded[1].to_bits(), 127.0_f32.to_bits());
+        assert_eq!(decoded.len(), 32);
+
+        let mut q4 = [0_u8; 144];
+        q4[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        q4[4..8].fill(1);
+        q4[16] = 0x10;
+        let decoded = dequantize_block(12, &q4).expect("Q4_K");
+        assert_eq!(decoded[0].to_bits(), 0.0_f32.to_bits());
+        assert_eq!(decoded[32].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(decoded.len(), 256);
+
+        let mut q5 = [0_u8; 176];
+        q5[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        q5[4..8].fill(1);
+        q5[16] = 1;
+        q5[48] = 0x10;
+        let decoded = dequantize_block(13, &q5).expect("Q5_K");
+        assert_eq!(decoded[0].to_bits(), 16.0_f32.to_bits());
+        assert_eq!(decoded[32].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(decoded.len(), 256);
+
+        let mut q6 = [0_u8; 210];
+        q6[192..208].fill(1);
+        q6[208..210].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let decoded = dequantize_block(14, &q6).expect("Q6_K");
+        assert!(
+            decoded
+                .iter()
+                .all(|value| value.to_bits() == (-32.0_f32).to_bits())
+        );
+
+        let mut q3 = [0_u8; 110];
+        q3[108..110].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let decoded = dequantize_block(11, &q3).expect("Q3_K");
+        assert!(
+            decoded
+                .iter()
+                .all(|value| value.to_bits() == 128.0_f32.to_bits())
+        );
+
+        let mut iq4_nl = [0_u8; 18];
+        iq4_nl[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        iq4_nl[2] = 0x08;
+        let decoded = dequantize_block(20, &iq4_nl).expect("IQ4_NL");
+        assert_eq!(decoded[0].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(decoded[1].to_bits(), (-127.0_f32).to_bits());
+        assert_eq!(decoded.len(), 32);
+
+        let mut iq4_xs = [0_u8; 136];
+        iq4_xs[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        iq4_xs[8] = 0x08;
+        let decoded = dequantize_block(23, &iq4_xs).expect("IQ4_XS");
+        assert_eq!(decoded[0].to_bits(), (-32.0_f32).to_bits());
+        assert_eq!(decoded.len(), 256);
+    }
+
+    #[test]
+    fn rejects_invalid_dequantization_blocks() {
+        let error = dequantize_block(12, &[0; 143]).expect_err("short block");
+        assert!(matches!(
+            error,
+            GgufError::InvalidTensorBlockLength {
+                value_type: 12,
+                expected: 144,
+                actual: 143
+            }
+        ));
+        assert!(matches!(
+            dequantize_block(21, &[0; 106]),
+            Err(GgufError::UnsupportedTensorType(21))
+        ));
     }
 
     #[test]
