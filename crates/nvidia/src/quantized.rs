@@ -13,8 +13,12 @@ const Q3_K_VALUE_TYPE: u32 = 11;
 const Q4_K_VALUE_TYPE: u32 = 12;
 const Q5_K_VALUE_TYPE: u32 = 13;
 const Q6_K_VALUE_TYPE: u32 = 14;
+const IQ4_NL_VALUE_TYPE: u32 = 20;
+const IQ4_XS_VALUE_TYPE: u32 = 23;
 const Q8_0_BLOCK_ELEMENTS: usize = 32;
 const Q8_0_BLOCK_BYTES: usize = 34;
+const IQ4_NL_BLOCK_ELEMENTS: usize = 32;
+const IQ4_NL_BLOCK_BYTES: usize = 18;
 const Q3_K_BLOCK_ELEMENTS: usize = 256;
 const Q3_K_BLOCK_BYTES: usize = 110;
 const Q4_K_BLOCK_ELEMENTS: usize = 256;
@@ -23,6 +27,8 @@ const Q5_K_BLOCK_ELEMENTS: usize = 256;
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_ELEMENTS: usize = 256;
 const Q6_K_BLOCK_BYTES: usize = 210;
+const IQ4_XS_BLOCK_ELEMENTS: usize = 256;
+const IQ4_XS_BLOCK_BYTES: usize = 136;
 
 const Q_K_GEMV_SOURCE: &str = r#"
 extern "C" __device__ __forceinline__ float decode_f16(unsigned short bits) {
@@ -89,6 +95,78 @@ extern "C" __global__ void q8_0_gemv(
         for (int local = 0; local < 32; ++local) {
             const int quantized = (int)((signed char)block[2 + local]);
             accumulator += d * (float)quantized * input[block_index * 32 + local];
+        }
+    }
+    output[output_index] = accumulator;
+}
+
+extern "C" __global__ void iq4_nl_gemv(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int output_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (output_index >= output_size) {
+        return;
+    }
+    const int blocks_per_output = input_size / 32;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (output_index * blocks_per_output + block_index) * 18;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        for (int local = 0; local < 32; ++local) {
+            const int index = local < 16 ? local : local - 16;
+            const int nibble = local < 16
+                ? (int)(block[2 + index] & 0x0fu)
+                : (int)(block[2 + index] >> 4u);
+            accumulator += d * (float)values[nibble] * input[block_index * 32 + local];
+        }
+    }
+    output[output_index] = accumulator;
+}
+
+extern "C" __global__ void iq4_xs_gemv(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int output_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (output_index >= output_size) {
+        return;
+    }
+    const int blocks_per_output = input_size / 256;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (output_index * blocks_per_output + block_index) * 136;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned short high_scales =
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8u);
+        for (int group = 0; group < 8; ++group) {
+            const int low = (int)((block[4 + group / 2] >> ((group & 1) * 4)) & 0x0fu);
+            const int high = (int)((high_scales >> (group * 2)) & 0x03u);
+            const float group_scale = d * (float)((low | (high << 4)) - 32);
+            const int data_offset = 8 + group * 16;
+            for (int local = 0; local < 16; ++local) {
+                const unsigned char packed = block[data_offset + local];
+                accumulator += group_scale * (float)values[packed & 0x0fu]
+                    * input[block_index * 256 + group * 32 + local];
+                accumulator += group_scale * (float)values[packed >> 4u]
+                    * input[block_index * 256 + group * 32 + 16 + local];
+            }
         }
     }
     output[output_index] = accumulator;
@@ -448,6 +526,133 @@ impl CudaQuantizedGemv {
                 .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// A correctness-oriented `IQ4_NL` matrix-vector kernel.
+///
+/// The first tensor dimension is the contiguous input (`K`) count and the
+/// second is the output (`N`) count, matching GGML's column-major ordering.
+/// The kernel keeps encoded weights on the device and does not route them
+/// through a host dequantization buffer.
+pub struct CudaIq4NlGemv {
+    inner: CudaQuantizedGemv,
+}
+
+impl CudaIq4NlGemv {
+    /// Compile and load the `IQ4_NL` kernel on a new CUDA device context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or module loading
+    /// fails.
+    pub fn new(device_index: usize) -> Result<Self, CudaQuantizedKernelError> {
+        let context = CudaContext::new(device_index)
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let stream = context.default_stream();
+        Self::from_context(&context, stream)
+    }
+
+    /// Compile and load the `IQ4_NL` kernel on an existing context/stream pair.
+    /// Weight buffers and vectors must be allocated from this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when NVRTC or module loading fails.
+    pub fn from_context(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        Ok(Self {
+            inner: CudaQuantizedGemv::from_context(
+                context,
+                stream,
+                "iq4_nl_gemv",
+                IQ4_NL_VALUE_TYPE,
+                IQ4_NL_BLOCK_ELEMENTS,
+                IQ4_NL_BLOCK_BYTES,
+                "IQ4_NL",
+            )?,
+        })
+    }
+
+    /// Execute one `IQ4_NL` matrix-vector product into a caller-owned output.
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, shapes, contexts,
+    /// or launch arguments are invalid.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute(weight, input, output)
+    }
+}
+
+/// A correctness-oriented `IQ4_XS` matrix-vector kernel.
+///
+/// It shares the GGML `[K,N]` contract and launch validation with
+/// [`CudaIq4NlGemv`], but decodes per-group scales and the 136-byte block
+/// layout used by GGML value type 23.
+pub struct CudaIq4XsGemv {
+    inner: CudaQuantizedGemv,
+}
+
+impl CudaIq4XsGemv {
+    /// Compile and load the `IQ4_XS` kernel on a new CUDA device context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when CUDA, NVRTC, or module loading
+    /// fails.
+    pub fn new(device_index: usize) -> Result<Self, CudaQuantizedKernelError> {
+        let context = CudaContext::new(device_index)
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        let stream = context.default_stream();
+        Self::from_context(&context, stream)
+    }
+
+    /// Compile and load the `IQ4_XS` kernel on an existing context/stream pair.
+    /// Weight buffers and vectors must be allocated from this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when NVRTC or module loading fails.
+    pub fn from_context(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        Ok(Self {
+            inner: CudaQuantizedGemv::from_context(
+                context,
+                stream,
+                "iq4_xs_gemv",
+                IQ4_XS_VALUE_TYPE,
+                IQ4_XS_BLOCK_ELEMENTS,
+                IQ4_XS_BLOCK_BYTES,
+                "IQ4_XS",
+            )?,
+        })
+    }
+
+    /// Execute one `IQ4_XS` matrix-vector product into a caller-owned output.
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, shapes, contexts,
+    /// or launch arguments are invalid.
+    pub fn execute(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute(weight, input, output)
     }
 }
 

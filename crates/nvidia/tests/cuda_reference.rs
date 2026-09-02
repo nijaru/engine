@@ -13,8 +13,8 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv,
-    CudaReferenceDispatcher, CudaStateError, CudaWeightStore,
+    CudaHybridState, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv,
+    CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError, CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -461,6 +461,155 @@ fn q8_0_fixture_block(seed: u8) -> Vec<u8> {
 
 fn q8_0_fixture() -> Vec<u8> {
     (0_u8..6).flat_map(q8_0_fixture_block).collect()
+}
+
+fn iq4_nl_fixture_block(seed: u8) -> Vec<u8> {
+    let mut block = vec![0_u8; 18];
+    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    for (index, value) in block[2..].iter_mut().enumerate() {
+        let low = u8::try_from((index + usize::from(seed)) % 16).expect("IQ4_NL low index");
+        let high = u8::try_from((15 + usize::from(seed) - index) % 16).expect("IQ4_NL high index");
+        *value = low | (high << 4);
+    }
+    block
+}
+
+fn iq4_nl_fixture() -> Vec<u8> {
+    (0_u8..6).flat_map(iq4_nl_fixture_block).collect()
+}
+
+fn iq4_xs_fixture_block(seed: u8) -> Vec<u8> {
+    let mut block = vec![0_u8; 136];
+    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    let mut high_scales = 0_u16;
+    for group in 0..8 {
+        let group_bits = u16::try_from(group).expect("IQ4_XS group");
+        high_scales |= ((group_bits + u16::from(seed)) & 3) << (group_bits * 2);
+        let low = u8::try_from((group + usize::from(seed)) % 16).expect("IQ4_XS low scale");
+        let byte = &mut block[4 + group / 2];
+        if group % 2 == 0 {
+            *byte = (*byte & 0xf0) | low;
+        } else {
+            *byte = (*byte & 0x0f) | (low << 4);
+        }
+    }
+    block[2..4].copy_from_slice(&high_scales.to_le_bytes());
+    for (index, value) in block[8..].iter_mut().enumerate() {
+        let low = u8::try_from((index + usize::from(seed) * 5) % 16).expect("IQ4_XS low index");
+        let high = u8::try_from((index * 7 + usize::from(seed)) % 16).expect("IQ4_XS high index");
+        *value = low | (high << 4);
+    }
+    block
+}
+
+fn iq4_xs_fixture() -> Vec<u8> {
+    (0_u8..4).flat_map(iq4_xs_fixture_block).collect()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_iq4_nl_gemv_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = iq4_nl_fixture();
+    let spec = WeightTensorSpec::new("iq4_nl.fixture", vec![64, 3], engine_core::DataType::F32)
+        .expect("IQ4_NL fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            20,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload IQ4_NL fixture");
+    let weight = store
+        .quantized_tensor("iq4_nl.fixture")
+        .expect("IQ4_NL fixture weight");
+    let input = (0..64)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("IQ4_NL input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    let input_device = stream.clone_htod(&input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(3).expect("allocate output");
+    let kernel = CudaIq4NlGemv::from_context(&context, stream.clone()).expect("compile IQ4_NL");
+    kernel
+        .execute(weight, &input_device, &mut output)
+        .expect("execute IQ4_NL GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+    let expected = (0..3)
+        .map(|output_index| {
+            (0..2)
+                .flat_map(|block_index| {
+                    let start = (output_index * 2 + block_index) * 18;
+                    engine_gguf::dequantize_block(20, &encoded[start..start + 18])
+                        .expect("decode IQ4_NL fixture")
+                        .into_iter()
+                        .zip(&input[block_index * 32..(block_index + 1) * 32])
+                        .map(|(weight, input)| weight * input)
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_iq4_xs_gemv_against_the_gguf_decoder() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let encoded = iq4_xs_fixture();
+    let spec = WeightTensorSpec::new("iq4_xs.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("IQ4_XS fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    store
+        .materialize_quantized(
+            spec,
+            23,
+            encoded.len() as u64,
+            &mut Cursor::new(encoded.clone()),
+        )
+        .expect("upload IQ4_XS fixture");
+    let weight = store
+        .quantized_tensor("iq4_xs.fixture")
+        .expect("IQ4_XS fixture weight");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("IQ4_XS input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    let input_device = stream.clone_htod(&input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(2).expect("allocate output");
+    let kernel = CudaIq4XsGemv::from_context(&context, stream.clone()).expect("compile IQ4_XS");
+    kernel
+        .execute(weight, &input_device, &mut output)
+        .expect("execute IQ4_XS GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+    let expected = (0..2)
+        .map(|output_index| {
+            (0..2)
+                .flat_map(|block_index| {
+                    let start = (output_index * 2 + block_index) * 136;
+                    engine_gguf::dequantize_block(23, &encoded[start..start + 136])
+                        .expect("decode IQ4_XS fixture")
+                        .into_iter()
+                        .zip(&input[block_index * 256..(block_index + 1) * 256])
+                        .map(|(weight, input)| weight * input)
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-3);
+    }
 }
 
 #[test]
