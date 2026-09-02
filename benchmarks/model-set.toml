@@ -15,6 +15,18 @@ vision_artifact = "mmproj-BF16.gguf (sha256 83ee4f4f205fa514161778c41df1ea14144f
 runtime_reference = "llama.cpp"
 notes = "Primary first architecture/model target on the RTX 4090. Architecture in-GGUF: qwen35 arch (llama.cpp's Qwen3.8 implementation), 65 blocks (64 LM layers + 1 bundled MTP layer, nextn_predict_layers = 1), full_attention_interval = 4 => 48 Gated DeltaNet/linear-attention + 16 full-attention layers. hidden 5120, ffn 17408, 24 Q heads / 4 KV heads / head_dim 256, vocab 248320, ctx 262144, rope base 1e7 with partial rotary 0.25. DeltaNet: state_size 128, inner 6144, 16 v-groups, conv kernel 4, time_step_rank 48. Reference environment pinned 2026-09-01: Fedora 44, kernel 7.1.12, RTX 4090 24564 MiB (GPU-810dab77), driver 610.57.04, CUDA 13.1.80, i9-13900KF, 32 GiB RAM."
 
+[[models]]
+role = "incumbent-reference"
+id = "cyankiwi/Qwen3.8-27B-AWQ-INT4"
+revision = "snapshot 63768c10df38c0395e12ef49edac1bd539eaeeea"
+format = "safetensors"
+quantization = "compressed-tensors W4A16 AWQ, group size 32"
+artifact = "five safetensors shards"
+size_bytes = 21017689808
+local_path = "/home/nick/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea"
+runtime_reference = "vLLM 0.28.0"
+notes = "Q4-class incumbent comparison only; this is not the same artifact or quantization as the primary Unsloth UD-Q4_K_M GGUF. vLLM required --max-model-len 16384 --gpu-memory-utilization 0.98 --enforce-eager on the 24-GiB RTX 4090."
+
 [architecture]
 type = "dense-hybrid-causal-vl"
 text_only_first = true
@@ -36,3 +48,10 @@ server_build = "0.3.0-dev build 10684 commit cc83d7b48 (master a298422da..cc83d7
 everyday_command = "llm-serve start -> systemd user unit, llama-server -m <UD-Q4_K_M.gguf> --alias qwen3.8:27b -ngl 99 -c 262144 -np 1 -fa on --cache-type-k q4_0 --cache-type-v q4_0 -b 2048 -ub 256 --split-mode none --cache-ram 16384 --no-cache-idle-slots --ctx-checkpoints 0 --spec-type draft-mtp --mmproj <mmproj-BF16.gguf> --no-mmproj-offload --image-min-tokens 1024 --reasoning on --reasoning-budget -1"
 bench_baseline_2026_09_01 = "see ai/research/local-baseline-llama-cpp-2026-09-01.md for pinned numbers (AR ~49.5 tok/s, MTP n=3 ~90-98 tok/s decode at 16K ctx on build 10684)"
 historical_dflash2 = "Aug-20-2026 suite in ~/qwen38-bench on desktop: DFlash2 n=5 Q4 drafter 123/110/92 tok/s chat/code/reason, AR 49.4/49.6/49.4; llama.cpp build 10548/PR 5ecbe1ac1; recommended everyday preset was DFlash2 until superseded by native MTP default"
+
+[vllm_reference]
+server_build = "vLLM 0.28.0"
+serve_command = "vllm serve <AWQ snapshot> --served-model-name qwen3.8:27b-awq --max-model-len 16384 --gpu-memory-utilization 0.98 --enforce-eager --port 8090"
+matched_aiperf_2026_09_01 = "AIPerf 0.12.0, synthetic chat nominal 256->128, c1, stream, seed 42, thinking off: active output 35.90 tok/s (p50 35.83), E2E 34.83, TTFT p50 130.21 ms, ITL p50 27.91 ms; 10/10 profiling requests succeeded"
+native_bench_crosscheck_2026_09_01 = "vllm bench serve: 35.45 tok/s, median TTFT 130.24 ms, median TPOT 27.31 ms, P99 ITL 29.57 ms"
+artifact_mismatch = "W4A16 compressed-tensors AWQ is a Q4-class incumbent reference, not an apples-to-apples comparison to the primary UD-Q4_K_M GGUF"
