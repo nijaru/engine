@@ -403,11 +403,18 @@ pub struct GgufTokenizer {
 
 const QWEN35_PRETOKENIZER: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s+";
 
+fn byte_is_direct(byte: u8) -> bool {
+    (33..=126).contains(&byte) || (161..=172).contains(&byte) || (174..=255).contains(&byte)
+}
+
 fn byte_to_unicode(byte: u8) -> char {
-    if (33..=126).contains(&byte) || (161..=172).contains(&byte) || (174..=255).contains(&byte) {
+    if byte_is_direct(byte) {
         char::from(byte)
     } else {
-        char::from_u32(256 + u32::from(byte)).unwrap_or('\u{fffd}')
+        let rank = (0..byte)
+            .filter(|candidate| !byte_is_direct(*candidate))
+            .count();
+        char::from_u32(256 + u32::try_from(rank).unwrap_or(0)).unwrap_or('\u{fffd}')
     }
 }
 
