@@ -371,6 +371,38 @@ pub struct TensorDataReader {
 }
 
 impl TensorDataReader {
+    /// Read and dequantize the next complete block in this tensor payload.
+    /// `None` means the bounded tensor range is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::UnsupportedTensorType`] when no decoder exists,
+    /// [`GgufError::TensorPayloadTruncated`] when the remaining range is not a
+    /// complete block, or an I/O/dequantization error.
+    pub fn read_dequantized_block(
+        &mut self,
+        value_type: u32,
+    ) -> Result<Option<Vec<f32>>, GgufError> {
+        let (_, block_bytes) = tensor_layout(value_type)?;
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let block_bytes_u64 = block_bytes;
+        if self.remaining < block_bytes_u64 {
+            return Err(GgufError::TensorPayloadTruncated {
+                value_type,
+                expected: block_bytes_u64,
+                remaining: self.remaining,
+            });
+        }
+        let block_bytes =
+            usize::try_from(block_bytes).map_err(|_| GgufError::TensorByteLengthOverflow)?;
+        let mut encoded = vec![0; block_bytes];
+        self.read_exact(&mut encoded)
+            .map_err(|error| GgufError::io(&self.path, &error))?;
+        dequantize_block(value_type, &encoded).map(Some)
+    }
+
     #[must_use]
     pub const fn remaining(&self) -> u64 {
         self.remaining
@@ -892,6 +924,11 @@ pub enum GgufError {
         expected: usize,
         actual: usize,
     },
+    TensorPayloadTruncated {
+        value_type: u32,
+        expected: u64,
+        remaining: u64,
+    },
     MissingTensor(String),
     UnsupportedTensorType(u32),
     ElementCountOverflow,
@@ -961,6 +998,14 @@ impl std::fmt::Display for GgufError {
             } => write!(
                 f,
                 "GGML tensor type {value_type} requires {expected} bytes per block, got {actual}"
+            ),
+            Self::TensorPayloadTruncated {
+                value_type,
+                expected,
+                remaining,
+            } => write!(
+                f,
+                "GGML tensor type {value_type} needs {expected} bytes for the next block, but only {remaining} remain"
             ),
             Self::MissingTensor(name) => write!(f, "GGUF tensor {name:?} was not found"),
             Self::UnsupportedTensorType(value) => {
@@ -1250,6 +1295,24 @@ mod tests {
         assert_eq!(payload.len(), 64);
         assert_eq!(reader.remaining(), 0);
         assert_eq!(reader.read(&mut [0; 1]).expect("bounded read"), 0);
+
+        let mut block_reader = parsed
+            .open_tensor("token_embd.weight")
+            .expect("tensor block reader");
+        for _ in 0..32 {
+            let block = block_reader
+                .read_dequantized_block(1)
+                .expect("dequantized block")
+                .expect("block present");
+            assert_eq!(block.len(), 1);
+            assert_eq!(block[0].to_bits(), 0.0_f32.to_bits());
+        }
+        assert!(
+            block_reader
+                .read_dequantized_block(1)
+                .expect("exhausted block reader")
+                .is_none()
+        );
         std::fs::remove_file(path).expect("remove fixture");
     }
 
