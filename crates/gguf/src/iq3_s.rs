@@ -17,7 +17,7 @@ fn grid_value(code: u16, lane: usize) -> u8 {
     let high = hex_nibble(GRID_HEX[packed_index * 2]);
     let low = hex_nibble(GRID_HEX[packed_index * 2 + 1]);
     let packed = (high << 4) | low;
-    GRID_VALUES[usize::from((packed >> ((value_index % 2) * 3)) & 0x07)]
+    GRID_VALUES[usize::from((packed >> ((value_index % 2) * 4)) & 0x07)]
 }
 
 pub(crate) fn dequantize_block(encoded: &[u8]) -> Vec<f32> {
