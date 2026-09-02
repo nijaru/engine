@@ -105,8 +105,9 @@ fn gdn_state_step(
 /// Causal depth-4 convolution over `[history | new]` per channel, then `SiLU`.
 /// The GGUF conv weight stores element `(tap, channel)` at
 /// `tap + channel * d_conv`. Advances `conv` in place: drop the oldest
-/// input, append the new token's projection. Returns the activated output.
-fn gdn_conv_step(qkv_mixed: &[f32], ssm_conv1d: &[f32], conv: &mut [f32]) -> Vec<f32> {
+/// input, append the new token's projection. Returns the raw and activated
+/// outputs.
+fn gdn_conv_step(qkv_mixed: &[f32], ssm_conv1d: &[f32], conv: &mut [f32]) -> (Vec<f32>, Vec<f32>) {
     let history_len = GDN_D_CONV - 1;
     let conv_out: Vec<f32> = qkv_mixed
         .iter()
@@ -130,7 +131,8 @@ fn gdn_conv_step(qkv_mixed: &[f32], ssm_conv1d: &[f32], conv: &mut [f32]) -> Vec
         conv[base + 1] = conv[base + 2];
         conv[base + 2] = *new_input;
     }
-    conv_out.iter().map(|v| v / (1.0 + (-v).exp())).collect()
+    let activated = conv_out.iter().map(|v| v / (1.0 + (-v).exp())).collect();
+    (conv_out, activated)
 }
 
 /// Dequantized weights for one GDN layer, in GGUF flat order.
@@ -155,11 +157,37 @@ pub struct GdnLayerWeights {
     pub ssm_out: Vec<f32>,
 }
 
-/// One host-reference Gated-DeltaNet autoregressive decode step.
+/// Intermediate tensors from one host GDN AR step, in ggml flat order, for
+/// empirical parity checks against llama.cpp debug captures.
+#[derive(Debug)]
+pub struct GdnStepTrace {
+    /// `linear_attn_qkv_mixed` `[10240]`.
+    pub qkv_mixed: Vec<f32>,
+    /// `z` gate projection `[6144]`.
+    pub z_gate: Vec<f32>,
+    /// Post-sigmoid `beta` `[48]`.
+    pub beta: Vec<f32>,
+    /// Decay log-gate `[48]`.
+    pub gate: Vec<f32>,
+    /// `conv_output_raw` `[10240]` (pre-`SiLU`).
+    pub conv_raw: Vec<f32>,
+    /// `conv_output_silu` `[10240]`.
+    pub conv_act: Vec<f32>,
+    /// Tiled, l2-normalized q `[48][128]`.
+    pub q_tiled: Vec<f32>,
+    /// Tiled, l2-normalized k `[48][128]`.
+    pub k_tiled: Vec<f32>,
+    /// `final_output` after the gated norm, before `ssm_out` `[6144]`.
+    pub gated: Vec<f32>,
+    /// Layer output `[5120]` (`linear_attn_out`).
+    pub out: Vec<f32>,
+}
+
+/// One host-reference Gated-DeltaNet autoregressive decode step, returning
+/// all intermediates for parity validation.
 ///
 /// `matrix` is all V-head states `[heads][head_dim][head_dim]`; `conv` is the
-/// per-channel history `[channels][d_conv-1]` in oldest-first order. Returns
-/// the layer output `[5120]`.
+/// per-channel history `[channels][d_conv-1]` in oldest-first order.
 ///
 /// # Panics
 ///
@@ -168,13 +196,13 @@ pub struct GdnLayerWeights {
 // The argument list mirrors the layer's weight/state set; a struct would
 // obscure the reference equations under test.
 #[allow(clippy::too_many_arguments)]
-pub fn host_gdn_ar_step(
+pub fn host_gdn_ar_step_traced(
     weights: &GdnLayerWeights,
     hidden: &[f32],
     matrix: &mut [f32],
     conv: &mut [f32],
     eps: f32,
-) -> Vec<f32> {
+) -> GdnStepTrace {
     assert_eq!(hidden.len(), N_EMBD);
 
     let qkv_mixed = gguf_gemv(&weights.attn_qkv, N_EMBD, hidden);
@@ -190,7 +218,7 @@ pub fn host_gdn_ar_step(
         .map(|((raw, dt), a_precomputed)| softplus(raw + dt) * a_precomputed)
         .collect();
 
-    let conv_act = gdn_conv_step(&qkv_mixed, &weights.ssm_conv1d, conv);
+    let (conv_raw, conv_act) = gdn_conv_step(&qkv_mixed, &weights.ssm_conv1d, conv);
 
     // Tile normalized k-heads across v-heads (tiled GGUF V ordering).
     let mut q48 = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM];
@@ -236,5 +264,35 @@ pub fn host_gdn_ar_step(
         }
     }
 
-    gguf_gemv(&weights.ssm_out, GDN_INNER, &gated)
+    let out = gguf_gemv(&weights.ssm_out, GDN_INNER, &gated);
+    GdnStepTrace {
+        qkv_mixed,
+        z_gate,
+        beta,
+        gate,
+        conv_raw,
+        conv_act,
+        q_tiled: q48,
+        k_tiled: k48,
+        gated,
+        out,
+    }
+}
+
+/// One host-reference Gated-DeltaNet autoregressive decode step.
+///
+/// Returns the layer output `[5120]`.
+///
+/// # Panics
+///
+/// Panics when `hidden` is not `[5120]` or the state/weight slices do not
+/// match the pinned Qwen3.8-27B GDN geometry.
+pub fn host_gdn_ar_step(
+    weights: &GdnLayerWeights,
+    hidden: &[f32],
+    matrix: &mut [f32],
+    conv: &mut [f32],
+    eps: f32,
+) -> Vec<f32> {
+    host_gdn_ar_step_traced(weights, hidden, matrix, conv, eps).out
 }

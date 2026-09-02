@@ -39,5 +39,6 @@ pub use state::{
 
 pub use qwen_reference::{
     GDN_D_CONV, GDN_HEAD_DIM, GDN_INNER, GDN_K_HEADS, GDN_QKV_DIM, GDN_V_HEADS, GdnLayerWeights,
-    N_EMBD, gguf_gemv, host_gdn_ar_step, l2_normalize, softplus,
+    GdnStepTrace, N_EMBD, gguf_gemv, host_gdn_ar_step, host_gdn_ar_step_traced, l2_normalize,
+    softplus,
 };
