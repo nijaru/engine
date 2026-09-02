@@ -1044,6 +1044,15 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
         let expected = gate / (1.0 + (-gate).exp()) * up;
         assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
     }
+
+    let mut logits = vec![-10.0_f32; 513];
+    logits[401] = 7.0;
+    logits[402] = 7.0;
+    let logits_device = stream.clone_htod(&logits).expect("upload logits");
+    assert_eq!(
+        ops.argmax(&logits_device).expect("select greedy token"),
+        401
+    );
 }
 
 #[test]

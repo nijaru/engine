@@ -76,6 +76,25 @@ extern "C" __global__ void rms_norm(
     }
 }
 
+extern "C" __global__ void argmax(
+    const float* logits,
+    unsigned int* output,
+    int length
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    float best_value = -INFINITY;
+    unsigned int best_index = 0;
+    for (int index = 0; index < length; ++index) {
+        if (logits[index] > best_value) {
+            best_value = logits[index];
+            best_index = (unsigned int)index;
+        }
+    }
+    output[0] = best_index;
+}
+
 extern "C" __global__ void silu_mul(
     const float* gate,
     const float* up,
@@ -96,6 +115,7 @@ extern "C" __global__ void silu_mul(
 /// over throughput; measured tiled/fused replacements can preserve the API.
 pub struct CudaQwen35Ops {
     stream: Arc<CudaStream>,
+    argmax: CudaFunction,
     rms_norm: CudaFunction,
     silu_mul: CudaFunction,
 }
@@ -133,6 +153,9 @@ impl CudaQwen35Ops {
         let module = context
             .load_module(ptx)
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let argmax = module
+            .load_function("argmax")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let rms_norm = module
             .load_function("rms_norm")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -141,6 +164,7 @@ impl CudaQwen35Ops {
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
+            argmax,
             rms_norm,
             silu_mul,
         })
@@ -160,6 +184,57 @@ impl CudaQwen35Ops {
             return Err(CudaModelKernelError::ContextMismatch);
         }
         Ok(())
+    }
+
+    /// Select the first index with the greatest finite logit value.
+    ///
+    /// This is a blocking host read because token selection is the boundary
+    /// between device logits and the next request token. The launch itself is
+    /// submitted asynchronously before the result is copied back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when the context, input, or launch is
+    /// invalid.
+    pub fn argmax(&self, logits: &CudaSlice<f32>) -> Result<u32, CudaModelKernelError> {
+        if self.stream.context().as_ref() != logits.context().as_ref() {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if logits.is_empty() {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let length =
+            u32::try_from(logits.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let mut selected = self
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        // Safety: cudarc allocated both slices, the length is checked, and the
+        // single-thread launch writes exactly one result element.
+        unsafe {
+            self.stream
+                .launch_builder(&self.argmax)
+                .arg(logits)
+                .arg(&mut selected)
+                .arg(&length)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        self.stream
+            .synchronize()
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let selected = self
+            .stream
+            .clone_dtoh(&selected)
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        selected
+            .first()
+            .copied()
+            .ok_or(CudaModelKernelError::EmptyInput)
     }
 
     /// Apply `RMSNorm` to one F32 vector.
