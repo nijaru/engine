@@ -414,6 +414,66 @@ impl GgufFile {
     }
 }
 
+/// A role/content pair accepted by the built-in Qwen chat-template subset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+impl ChatMessage {
+    #[must_use]
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+/// Options controlling the generation suffix emitted by Qwen's chat template.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ChatTemplateOptions {
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+}
+
+impl ChatTemplateOptions {
+    #[must_use]
+    pub const fn new(add_generation_prompt: bool, enable_thinking: bool) -> Self {
+        Self {
+            add_generation_prompt,
+            enable_thinking,
+        }
+    }
+
+    #[must_use]
+    pub const fn add_generation_prompt(self) -> bool {
+        self.add_generation_prompt
+    }
+
+    #[must_use]
+    pub const fn enable_thinking(self) -> bool {
+        self.enable_thinking
+    }
+}
+
+impl Default for ChatTemplateOptions {
+    fn default() -> Self {
+        Self::new(true, true)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GgufTokenizer {
     model: String,
@@ -459,6 +519,14 @@ fn build_token_ids(tokens: &[String]) -> Result<BTreeMap<String, u32>, GgufError
         }
     }
     Ok(token_ids)
+}
+
+fn append_chat_message(rendered: &mut String, role: &str, content: &str) {
+    rendered.push_str("<|im_start|>");
+    rendered.push_str(role);
+    rendered.push('\n');
+    rendered.push_str(content.trim());
+    rendered.push_str("<|im_end|>\n");
 }
 
 fn build_merge_ranks(merges: &[String]) -> Result<BTreeMap<(String, String), u32>, GgufError> {
@@ -585,10 +653,120 @@ impl GgufTokenizer {
         Ok(encoded)
     }
 
-    /// Encode text according to an explicit request prompt policy. Embedded
-    /// chat-template rendering is intentionally rejected until a renderer with
-    /// Qwen message semantics exists; the adapter must not silently treat a
-    /// chat request as plain text.
+    /// Render the embedded Qwen chat template for ordinary system, user, and
+    /// assistant messages. This deliberately implements the text-only subset:
+    /// tool calls, tool responses, developer messages, and multimodal content
+    /// are rejected instead of being silently flattened.
+    ///
+    /// Existing assistant messages receive Qwen's empty-thinking wrapper. The
+    /// `enable_thinking` option controls only the generation suffix, matching
+    /// the template's behavior for a newly requested assistant turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GgufError::UnsupportedPromptFormat`] when chat-template
+    /// metadata is absent, or [`GgufError::TokenizerEncoding`] for an invalid
+    /// role/order.
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String, GgufError> {
+        if self.chat_template.is_none() {
+            return Err(GgufError::UnsupportedPromptFormat(
+                "the GGUF has no embedded chat template",
+            ));
+        }
+        let mut rendered = String::new();
+        let mut message_index = 0;
+        if let Some(message) = messages.first()
+            && message.role() == "system"
+        {
+            append_chat_message(&mut rendered, "system", message.content());
+            message_index = 1;
+        }
+        for message in &messages[message_index..] {
+            match message.role() {
+                "user" => append_chat_message(&mut rendered, "user", message.content()),
+                "assistant" => {
+                    rendered.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+                    rendered.push_str(message.content().trim());
+                    rendered.push_str("<|im_end|>\n");
+                }
+                "system" | "developer" => {
+                    return Err(GgufError::TokenizerEncoding {
+                        detail: "system messages must be at the beginning of the chat".to_owned(),
+                    });
+                }
+                role => {
+                    return Err(GgufError::TokenizerEncoding {
+                        detail: format!("unsupported Qwen chat message role {role:?}"),
+                    });
+                }
+            }
+        }
+        if options.add_generation_prompt() {
+            rendered.push_str("<|im_start|>assistant\n");
+            if options.enable_thinking() {
+                rendered.push_str("<think>\n");
+            } else {
+                rendered.push_str("<think>\n\n</think>\n\n");
+            }
+        }
+        Ok(rendered)
+    }
+
+    /// Render and encode the embedded Qwen text chat template, preserving its
+    /// special markers as their vocabulary IDs instead of passing them through
+    /// ordinary GPT-2/BPE encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns chat-template, special-token, or ordinary tokenizer errors.
+    pub fn encode_chat(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<Vec<u32>, GgufError> {
+        let rendered = self.render_chat(messages, options)?;
+        self.encode_rendered_chat(&rendered)
+    }
+
+    fn encode_rendered_chat(&self, rendered: &str) -> Result<Vec<u32>, GgufError> {
+        const SPECIAL_MARKERS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"];
+        let mut encoded = Vec::new();
+        let mut cursor = 0;
+        while cursor < rendered.len() {
+            let next = SPECIAL_MARKERS
+                .iter()
+                .filter_map(|marker| {
+                    rendered[cursor..]
+                        .find(marker)
+                        .map(|index| (index, *marker))
+                })
+                .min_by_key(|(index, _)| *index);
+            let Some((relative_index, marker)) = next else {
+                encoded.extend(self.encode(&rendered[cursor..])?);
+                break;
+            };
+            let marker_start = cursor + relative_index;
+            if marker_start > cursor {
+                encoded.extend(self.encode(&rendered[cursor..marker_start])?);
+            }
+            let token_id = self.token_ids.get(marker).copied().ok_or_else(|| {
+                GgufError::TokenizerEncoding {
+                    detail: format!("chat special token {marker:?} is absent from the vocabulary"),
+                }
+            })?;
+            encoded.push(token_id);
+            cursor = marker_start + marker.len();
+        }
+        Ok(encoded)
+    }
+
+    /// Encode text according to an explicit request prompt policy. Plain text
+    /// remains separate from [`Self::encode_chat`], because a chat request must
+    /// carry message structure rather than being silently flattened.
     ///
     /// # Errors
     ///
@@ -2211,6 +2389,28 @@ mod tests {
         assert_eq!(tokenizer.eos_token_id(), 2);
         assert_eq!(tokenizer.padding_token_id(), Some(0));
         assert_eq!(tokenizer.chat_template(), Some("{{ messages }}"));
+        let messages = [
+            ChatMessage::new("system", " system "),
+            ChatMessage::new("user", " question "),
+            ChatMessage::new("assistant", " answer "),
+        ];
+        assert_eq!(
+            tokenizer
+                .render_chat(&messages, ChatTemplateOptions::default())
+                .expect("Qwen chat rendering"),
+            "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert!(matches!(
+            tokenizer.render_chat(
+                &[ChatMessage::new("tool", "result")],
+                ChatTemplateOptions::new(false, false),
+            ),
+            Err(GgufError::TokenizerEncoding { .. })
+        ));
+        assert!(matches!(
+            tokenizer.encode_chat(&messages, ChatTemplateOptions::default()),
+            Err(GgufError::TokenizerEncoding { .. })
+        ));
         assert_eq!(
             tokenizer
                 .encode_with_policy(
@@ -2227,6 +2427,72 @@ mod tests {
             ),
             Err(GgufError::UnsupportedPromptFormat(_))
         ));
+    }
+
+    #[test]
+    fn encodes_qwen_chat_special_tokens_without_bpe_flattening() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_owned(),
+            MetadataValue::String("gpt2".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.pre".to_owned(),
+            MetadataValue::String("qwen35".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            MetadataValue::Array(
+                [
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    "<think>",
+                    "</think>",
+                    "a",
+                    "s",
+                    "i",
+                    "t",
+                    "n",
+                    "Ċ",
+                ]
+                .into_iter()
+                .map(|token| MetadataValue::String(token.to_owned()))
+                .collect(),
+            ),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_owned(),
+            MetadataValue::Array(Vec::new()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_owned(),
+            MetadataValue::Array(vec![MetadataValue::I32(4); 10]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.bos_token_id".to_owned(),
+            MetadataValue::U32(0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_id".to_owned(),
+            MetadataValue::U32(1),
+        );
+        metadata.insert(
+            "tokenizer.chat_template".to_owned(),
+            MetadataValue::String("qwen".to_owned()),
+        );
+        let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("chat tokenizer");
+        assert_eq!(
+            tokenizer
+                .encode_chat(&[], ChatTemplateOptions::new(true, true))
+                .expect("thinking generation prompt"),
+            vec![0, 4, 5, 5, 6, 5, 7, 4, 8, 7, 9, 2, 9]
+        );
+        assert_eq!(
+            tokenizer
+                .encode_chat(&[], ChatTemplateOptions::new(true, false))
+                .expect("non-thinking generation prompt"),
+            vec![0, 4, 5, 5, 6, 5, 7, 4, 8, 7, 9, 2, 9, 9, 3, 9, 9]
+        );
     }
 
     #[test]
