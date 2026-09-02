@@ -1181,3 +1181,430 @@ fn hybrid_state_fixture() -> (engine_core::KvStateSpec, RecurrentStateSpec) {
     .expect("recurrent spec");
     (kv_spec, recurrent_spec)
 }
+
+/// Dequantize one entire pinned tensor to host F32 in GGUF flat order
+/// (column-major over [ne0, ne1]: element (i0, i1) at i0 + i1*ne0).
+fn pinned_tensor_f32(provider: &Qwen35ModelProvider, name: &str) -> Vec<f32> {
+    let mut reader = provider.open_tensor(name).expect("open pinned tensor");
+    let mut values = Vec::new();
+    while let Some(block) = reader
+        .read_dequantized_block()
+        .expect("decode pinned tensor block")
+    {
+        values.extend(block);
+    }
+    let expected =
+        usize::try_from(reader.spec().element_count()).expect("tensor element count fits the host");
+    assert_eq!(values.len(), expected, "tensor {name} decoded length");
+    values
+}
+
+/// ggml `mul_mat` GEMV against a GGUF `[in_dim, out_dim]` tensor stored flat
+/// column-major over `ne0 = in_dim`: column `n` is `values[n*in_dim..(n+1)*in_dim]`.
+fn gguf_gemv(weight: &[f32], in_dim: usize, x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len(), in_dim);
+    (0..weight.len() / in_dim)
+        .map(|n| {
+            let column = &weight[n * in_dim..(n + 1) * in_dim];
+            x.iter().zip(column).map(|(xv, wv)| xv * wv).sum()
+        })
+        .collect()
+}
+
+/// Qwen3.8-27B GDN layer geometry, verified against the pinned artifact.
+const GDN: (usize, usize, usize, usize) = (16, 48, 128, 4);
+const GDN_K_HEADS: usize = GDN.0;
+const GDN_V_HEADS: usize = GDN.1;
+const GDN_HEAD_DIM: usize = GDN.2;
+const GDN_D_CONV: usize = GDN.3;
+const GDN_HEAD_DIM_U16: u16 = 128;
+const GDN_K_OFFSET: usize = 2048;
+const GDN_V_OFFSET: usize = 4096;
+const GDN_QKV_DIM: usize = 10240;
+const GDN_INNER: usize = 6144;
+
+/// Per-head l2 normalization with an eps floor on the norm.
+fn l2_normalize(values: &[f32], eps: f32) -> Vec<f32> {
+    let sum: f32 = values.iter().map(|x| x * x).sum();
+    let scale = 1.0 / sum.sqrt().max(eps);
+    values.iter().map(|x| x * scale).collect()
+}
+
+/// softplus with the ggml-compatible large-input shortcut.
+fn softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        (1.0 + value.exp()).ln()
+    }
+}
+
+/// Column-oriented recurrent state update for one V head:
+/// `sk = S^T k`, `d = (v - sk) * beta`, `S += k (outer) d`, `o = S^T q`.
+/// `S` is row-major `[head_dim][head_dim]`. Names match the pinned equations.
+#[allow(clippy::many_single_char_names)]
+fn gdn_state_step(
+    state: &mut [f32],
+    k: &[f32],
+    v: &[f32],
+    q: &[f32],
+    decay: f32,
+    beta: f32,
+) -> Vec<f32> {
+    let head_dim = GDN_HEAD_DIM;
+    for state_elem in state.iter_mut() {
+        *state_elem *= decay;
+    }
+    let mut sk = vec![0.0_f32; head_dim];
+    for (row, state_row) in state.chunks_exact(head_dim).enumerate() {
+        for (col, state_elem) in state_row.iter().enumerate() {
+            sk[col] += state_elem * k[row];
+        }
+    }
+    let d: Vec<f32> = (0..head_dim).map(|col| (v[col] - sk[col]) * beta).collect();
+    for (row, state_row) in state.chunks_exact_mut(head_dim).enumerate() {
+        for (state_elem, d_elem) in state_row.iter_mut().zip(&d) {
+            *state_elem += k[row] * d_elem;
+        }
+    }
+    (0..head_dim)
+        .map(|col| {
+            (0..head_dim)
+                .map(|row| state[row * head_dim + col] * q[row])
+                .sum()
+        })
+        .collect()
+}
+
+/// Causal depth-4 convolution over `[history | new]` per channel, then `SiLU`.
+/// The GGUF conv weight stores element `(tap, channel)` at
+/// `tap + channel * d_conv`. Advances `conv` in place: drop the oldest
+/// input, append the new token's projection. Returns the activated output.
+fn gdn_conv_step(qkv_mixed: &[f32], ssm_conv1d: &[f32], conv: &mut [f32]) -> Vec<f32> {
+    let history_len = GDN_D_CONV - 1;
+    let conv_out: Vec<f32> = qkv_mixed
+        .iter()
+        .enumerate()
+        .map(|(channel, new_input)| {
+            (0..GDN_D_CONV)
+                .map(|tap| {
+                    let input = if tap < history_len {
+                        conv[channel * history_len + tap]
+                    } else {
+                        *new_input
+                    };
+                    input * ssm_conv1d[tap + channel * GDN_D_CONV]
+                })
+                .sum::<f32>()
+        })
+        .collect();
+    for (channel, new_input) in qkv_mixed.iter().enumerate() {
+        let base = channel * history_len;
+        conv[base] = conv[base + 1];
+        conv[base + 1] = conv[base + 2];
+        conv[base + 2] = *new_input;
+    }
+    conv_out.iter().map(|v| v / (1.0 + (-v).exp())).collect()
+}
+
+/// One host-reference Gated-DeltaNet autoregressive decode step, using the
+/// equations pinned from llama.cpp `cc83d7b48` (see
+/// `ai/research/qwen35-forward-semantics-llama-cpp-2026-09-02.md`).
+///
+/// `matrix` is all V-head states `[heads][head_dim][head_dim]`; `conv` is the
+/// per-channel history `[channels][d_conv-1]` in oldest-first order. Returns
+/// the layer output `[5120]`. Names mirror the pinned equations.
+// The argument list mirrors the layer's weight/state set; a struct would
+// obscure the reference equations under test.
+#[allow(clippy::too_many_arguments)]
+fn host_gdn_ar_step(
+    hidden: &[f32],
+    attn_qkv: &[f32],
+    attn_gate: &[f32],
+    ssm_beta: &[f32],
+    ssm_alpha: &[f32],
+    ssm_dt_bias: &[f32],
+    ssm_a: &[f32],
+    ssm_conv1d: &[f32],
+    ssm_norm: &[f32],
+    ssm_out: &[f32],
+    matrix: &mut [f32],
+    conv: &mut [f32],
+    eps: f32,
+) -> Vec<f32> {
+    const N_EMBD: usize = 5120;
+    assert_eq!(hidden.len(), N_EMBD);
+
+    let qkv_mixed = gguf_gemv(attn_qkv, N_EMBD, hidden);
+    let z_gate = gguf_gemv(attn_gate, N_EMBD, hidden);
+    let beta: Vec<f32> = gguf_gemv(ssm_beta, N_EMBD, hidden)
+        .iter()
+        .map(|raw| 1.0 / (1.0 + (-raw).exp()))
+        .collect();
+    let gate: Vec<f32> = gguf_gemv(ssm_alpha, N_EMBD, hidden)
+        .iter()
+        .zip(ssm_dt_bias)
+        .zip(ssm_a)
+        .map(|((raw, dt), a_precomputed)| softplus(raw + dt) * a_precomputed)
+        .collect();
+
+    let conv_act = gdn_conv_step(&qkv_mixed, ssm_conv1d, conv);
+
+    // Tile normalized k-heads across v-heads (tiled GGUF V ordering).
+    let mut q48 = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM];
+    let mut k48 = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM];
+    for head in 0..GDN_K_HEADS {
+        let qh = l2_normalize(
+            &conv_act[head * GDN_HEAD_DIM..(head + 1) * GDN_HEAD_DIM],
+            eps,
+        );
+        let kh = l2_normalize(
+            &conv_act[GDN_K_OFFSET + head * GDN_HEAD_DIM..GDN_K_OFFSET + (head + 1) * GDN_HEAD_DIM],
+            eps,
+        );
+        for rep in 0..(GDN_V_HEADS / GDN_K_HEADS) {
+            let dst = (rep * GDN_K_HEADS + head) * GDN_HEAD_DIM;
+            q48[dst..dst + GDN_HEAD_DIM].copy_from_slice(&qh);
+            k48[dst..dst + GDN_HEAD_DIM].copy_from_slice(&kh);
+        }
+    }
+
+    let head_dim = GDN_HEAD_DIM;
+    let mut o = vec![0.0_f32; GDN_INNER];
+    for head in 0..GDN_V_HEADS {
+        let state = &mut matrix[head * head_dim * head_dim..(head + 1) * head_dim * head_dim];
+        let k = &k48[head * head_dim..(head + 1) * head_dim];
+        let v = &conv_act[GDN_V_OFFSET + head * head_dim..GDN_V_OFFSET + (head + 1) * head_dim];
+        let q = &q48[head * head_dim..(head + 1) * head_dim];
+        let out_head = gdn_state_step(state, k, v, q, gate[head].exp(), beta[head]);
+        o[head * head_dim..(head + 1) * head_dim].copy_from_slice(&out_head);
+    }
+
+    // Gated norm: `rms(o) * ssm_norm * silu(z)`, per head; ssm_norm is NOT +1'd.
+    let head_dim_f = f32::from(GDN_HEAD_DIM_U16);
+    let mut gated = vec![0.0_f32; GDN_INNER];
+    for head in 0..GDN_V_HEADS {
+        let o_head = &o[head * head_dim..(head + 1) * head_dim];
+        let sum: f32 = o_head.iter().map(|x| x * x).sum();
+        let inv = (sum / head_dim_f + eps).sqrt().recip();
+        for i in 0..head_dim {
+            let zv = z_gate[head * head_dim + i];
+            let silu = zv / (1.0 + (-zv).exp());
+            gated[head * head_dim + i] = o_head[i] * inv * ssm_norm[i] * silu;
+        }
+    }
+
+    gguf_gemv(ssm_out, GDN_INNER, &gated)
+}
+
+/// Fixed pseudo-hidden-state from an xorshift stream in [-1, 1).
+fn deterministic_hidden_state() -> Vec<f32> {
+    let mut hidden = vec![0.0_f32; 5120];
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    for value in &mut hidden {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mantissa = u32::try_from(seed >> 40).expect("shifted seed fits u32");
+        *value = f32::from_bits(mantissa & 0x007F_FFFF) / 16_777_216.0 - 1.0;
+    }
+    hidden
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+fn host_reference_gdn_ar_step_is_deterministic_and_self_consistent() {
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+    let prefix = "blk.0.";
+    let names = [
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "ssm_beta.weight",
+        "ssm_alpha.weight",
+        "ssm_dt.bias",
+        "ssm_a",
+        "ssm_conv1d.weight",
+        "ssm_norm.weight",
+        "ssm_out.weight",
+    ];
+    let tensors: Vec<Vec<f32>> = names
+        .iter()
+        .map(|suffix| pinned_tensor_f32(&provider, &format!("{prefix}{suffix}")))
+        .collect();
+    let (attn_qkv, attn_gate, ssm_beta, ssm_alpha) =
+        (&tensors[0], &tensors[1], &tensors[2], &tensors[3]);
+    let (ssm_dt_bias, ssm_a, ssm_conv1d, ssm_norm, ssm_out) = (
+        &tensors[4],
+        &tensors[5],
+        &tensors[6],
+        &tensors[7],
+        &tensors[8],
+    );
+
+    // Deterministic pseudo-hidden-state (xorshift), fixed across runs.
+    let hidden = deterministic_hidden_state();
+
+    let initial = |scale: f32| vec![scale; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+    let conv_initial = |scale: f32| vec![scale; GDN_QKV_DIM * (GDN_D_CONV - 1)];
+
+    // Two independent runs from identical initial state must agree bit-for-bit
+    // and produce finite output.
+    let mut matrix_a = initial(0.25);
+    let mut conv_a = conv_initial(0.125);
+    let mut matrix_b = initial(0.25);
+    let mut conv_b = conv_initial(0.125);
+    let out_a = host_gdn_ar_step(
+        &hidden,
+        attn_qkv,
+        attn_gate,
+        ssm_beta,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_a,
+        ssm_conv1d,
+        ssm_norm,
+        ssm_out,
+        &mut matrix_a,
+        &mut conv_a,
+        1.0e-6,
+    );
+    let out_b = host_gdn_ar_step(
+        &hidden,
+        attn_qkv,
+        attn_gate,
+        ssm_beta,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_a,
+        ssm_conv1d,
+        ssm_norm,
+        ssm_out,
+        &mut matrix_b,
+        &mut conv_b,
+        1.0e-6,
+    );
+    assert_eq!(out_a.len(), 5120);
+    assert!(out_a.iter().all(|v| v.is_finite()));
+    assert!(
+        out_a
+            .iter()
+            .zip(&out_b)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    assert!(
+        matrix_a
+            .iter()
+            .zip(&matrix_b)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+fn host_reference_gdn_ar_step_evolves_and_depends_on_state() {
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+    let prefix = "blk.0.";
+    let names = [
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "ssm_beta.weight",
+        "ssm_alpha.weight",
+        "ssm_dt.bias",
+        "ssm_a",
+        "ssm_conv1d.weight",
+        "ssm_norm.weight",
+        "ssm_out.weight",
+    ];
+    let tensors: Vec<Vec<f32>> = names
+        .iter()
+        .map(|suffix| pinned_tensor_f32(&provider, &format!("{prefix}{suffix}")))
+        .collect();
+    let (attn_qkv, attn_gate, ssm_beta, ssm_alpha) =
+        (&tensors[0], &tensors[1], &tensors[2], &tensors[3]);
+    let (ssm_dt_bias, ssm_a, ssm_conv1d, ssm_norm, ssm_out) = (
+        &tensors[4],
+        &tensors[5],
+        &tensors[6],
+        &tensors[7],
+        &tensors[8],
+    );
+    let hidden = deterministic_hidden_state();
+    let initial = |scale: f32| vec![scale; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+    let conv_initial = |scale: f32| vec![scale; GDN_QKV_DIM * (GDN_D_CONV - 1)];
+
+    let mut matrix = initial(0.25);
+    let mut conv = conv_initial(0.125);
+    let _first = host_gdn_ar_step(
+        &hidden,
+        attn_qkv,
+        attn_gate,
+        ssm_beta,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_a,
+        ssm_conv1d,
+        ssm_norm,
+        ssm_out,
+        &mut matrix,
+        &mut conv,
+        1.0e-6,
+    );
+
+    // State must actually change (decay + outer-product update applied).
+    assert!(
+        matrix
+            .iter()
+            .zip(initial(0.25))
+            .any(|(a, init)| (a - init).abs() > 1.0e-6)
+    );
+    assert!(
+        conv.iter()
+            .zip(conv_initial(0.125))
+            .any(|(c, init)| (c - init).abs() > 1.0e-6)
+    );
+
+    // A second step from the evolved state must differ from a fresh state at
+    // the same input (state dependence).
+    let mut matrix_fresh = initial(0.25);
+    let mut conv_fresh = conv_initial(0.125);
+    let out_second = host_gdn_ar_step(
+        &hidden,
+        attn_qkv,
+        attn_gate,
+        ssm_beta,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_a,
+        ssm_conv1d,
+        ssm_norm,
+        ssm_out,
+        &mut matrix,
+        &mut conv,
+        1.0e-6,
+    );
+    let out_fresh = host_gdn_ar_step(
+        &hidden,
+        attn_qkv,
+        attn_gate,
+        ssm_beta,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_a,
+        ssm_conv1d,
+        ssm_norm,
+        ssm_out,
+        &mut matrix_fresh,
+        &mut conv_fresh,
+        1.0e-6,
+    );
+    assert!(
+        out_second
+            .iter()
+            .zip(&out_fresh)
+            .any(|(a, b)| (a - b).abs() > 1.0e-4)
+    );
+}
