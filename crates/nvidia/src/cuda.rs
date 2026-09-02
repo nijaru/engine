@@ -96,6 +96,9 @@ impl CudaReferenceDispatcher {
         let started = Instant::now();
         // cuBLAS uses column-major matrices. WEIGHTS is a 2x4 matrix, so the
         // output is a two-element vector with m=2 and n=4.
+        // Safety: the device slices remain alive for the duration of the call;
+        // their lengths are 8, 4, and 2 elements, matching the 2x4 GEMV
+        // configuration and its leading dimensions.
         unsafe {
             self.blas
                 .gemv(
@@ -131,7 +134,7 @@ impl CudaReferenceDispatcher {
         }
         self.last_output = Some(output);
         let elapsed_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        Ok(ExecutionMetrics::new(elapsed_nanos, 1, 1))
+        Ok(ExecutionMetrics::new(elapsed_nanos, 0, 0))
     }
 }
 
