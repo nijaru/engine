@@ -177,6 +177,9 @@ pub struct GdnStepTrace {
     pub q_tiled: Vec<f32>,
     /// Tiled, l2-normalized k `[48][128]`.
     pub k_tiled: Vec<f32>,
+    /// Pre-gate fused-GDN output `(S^T q)/sqrt(128)` per head `[6144]`
+    /// (`attn_output` in llama.cpp debug captures).
+    pub attn_out: Vec<f32>,
     /// `final_output` after the gated norm, before `ssm_out` `[6144]`.
     pub gated: Vec<f32>,
     /// Layer output `[5120]` (`linear_attn_out`).
@@ -274,6 +277,7 @@ pub fn host_gdn_ar_step_traced(
         conv_act,
         q_tiled: q48,
         k_tiled: k48,
+        attn_out: o,
         gated,
         out,
     }

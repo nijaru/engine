@@ -1406,9 +1406,14 @@ fn llama_capture_sum(name: &str) -> Option<f64> {
 /// Relative tolerance for sum comparisons against llama.cpp Q8-activation
 /// matmuls: 1% absorbs rounding of the printed 6-decimal sums and Q8
 /// activation quantization noise on large tensors.
-fn sum_close(actual: f64, expected: f64) -> bool {
-    let scale = actual.abs().max(expected.abs()).max(1.0);
-    (actual - expected).abs() / scale < 0.01
+fn sum_close(actual: f64, expected: f64, elements: usize) -> bool {
+    // Elementwise ops match tightly. Matmuls quantize activations to Q8 inside
+    // ggml, so the F32 reference carries bounded noise roughly proportional to
+    // the element count; a near-cancelling sum with large L1 amplifies it. The
+    // bound therefore scales with element count, capped by a 1% relative term.
+    let relative = (actual - expected).abs() / actual.abs().max(expected.abs()).max(1.0);
+    let absolute = f64::from(u32::try_from(elements).expect("elements fit u32")) * 0.004;
+    relative < 0.01 || (actual - expected).abs() < absolute
 }
 
 fn pinned_embedding_row(provider: &Qwen35ModelProvider, token: usize) -> Vec<f32> {
@@ -1507,36 +1512,43 @@ fn host_reference_gdn_step_matches_llama_debug_capture() {
     let trace = host_gdn_ar_step_traced(&weights, &attn_norm, &mut matrix, &mut conv, 1.0e-6);
 
     let sum = |values: &[f32]| -> f64 { values.iter().map(|v| f64::from(*v)).sum() };
-    let checks: Vec<(&str, f64)> = vec![
-        ("model.input_embed", embed_sum),
-        ("attn_norm-0", attn_norm_sum),
-        ("linear_attn_qkv_mixed-0", sum(&trace.qkv_mixed)),
-        ("conv_output_raw-0", sum(&trace.conv_raw)),
-        ("conv_output_silu-0", sum(&trace.conv_act)),
-        ("q_conv_predelta-0", sum(&trace.q_tiled)),
-        ("k_conv_predelta-0", sum(&trace.k_tiled)),
-        ("v_conv_predelta-0", sum(&trace.conv_act[4096..])),
-        ("gate-0", sum(&trace.gate)),
-        ("beta_sigmoid-0", sum(&trace.beta)),
-        ("attn_output-0", {
-            // attn_output is the pre-gate fused-GDN output (S^T q)/sqrt(128);
-            // recompute from the traced state by re-reading o before the gated
-            // norm: trace.out is post-projection, so use the intermediate
-            // captured in the trace struct via gated inverse — not available;
-            // instead compare the gated final_output below and treat
-            // attn_output as covered by the state-sum check.
-            sum(&matrix)
-        }),
-        ("z-0", sum(&trace.z_gate)),
-        ("final_output-0", sum(&trace.gated)),
-        ("linear_attn_out-0", sum(&trace.out)),
+    // llama.cpp's q/k tensors are pre-tile [128, 16]; the engine trace holds
+    // tiled 48-head copies (3 identical repetitions), so compare the first 16
+    // heads only.
+    let checks: Vec<(&str, f64, usize)> = vec![
+        ("model.input_embed", embed_sum, embed.len()),
+        ("attn_norm-0", attn_norm_sum, attn_norm.len()),
+        (
+            "linear_attn_qkv_mixed-0",
+            sum(&trace.qkv_mixed),
+            trace.qkv_mixed.len(),
+        ),
+        (
+            "conv_output_raw-0",
+            sum(&trace.conv_raw),
+            trace.conv_raw.len(),
+        ),
+        (
+            "conv_output_silu-0",
+            sum(&trace.conv_act),
+            trace.conv_act.len(),
+        ),
+        ("q_conv_predelta-0", sum(&trace.q_tiled[..2048]), 2048),
+        ("k_conv_predelta-0", sum(&trace.k_tiled[..2048]), 2048),
+        ("v_conv_predelta-0", sum(&trace.conv_act[4096..]), 6144),
+        ("gate-0", sum(&trace.gate), trace.gate.len()),
+        ("beta_sigmoid-0", sum(&trace.beta), trace.beta.len()),
+        ("attn_output-0", sum(&trace.attn_out), trace.attn_out.len()),
+        ("z-0", sum(&trace.z_gate), trace.z_gate.len()),
+        ("final_output-0", sum(&trace.gated), trace.gated.len()),
+        ("linear_attn_out-0", sum(&trace.out), trace.out.len()),
     ];
     let mut failures = Vec::new();
-    for (name, actual) in checks {
+    for (name, actual, elements) in checks {
         let Some(expected) = llama_capture_sum(name) else {
             continue;
         };
-        if !sum_close(actual, expected) {
+        if !sum_close(actual, expected, elements) {
             failures.push(format!(
                 "{name}: engine sum {actual:.4} vs llama.cpp {expected:.4}"
             ));
