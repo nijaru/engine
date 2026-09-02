@@ -9,6 +9,8 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cuda")]
+mod model_ops;
+#[cfg(feature = "cuda")]
 mod quantized;
 #[cfg(feature = "cuda")]
 mod state;
@@ -18,6 +20,9 @@ pub use cuda::{
     CudaF32Weight, CudaQuantizedWeight, CudaReferenceDispatcher, CudaRuntimeError, CudaWeightError,
     CudaWeightStore,
 };
+
+#[cfg(feature = "cuda")]
+pub use model_ops::{CudaModelKernelError, CudaQwen35Ops};
 
 #[cfg(feature = "cuda")]
 pub use quantized::{

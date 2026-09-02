@@ -14,8 +14,8 @@ use engine_core::{
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
     CudaHybridState, CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv,
-    CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaReferenceDispatcher, CudaStateError,
-    CudaWeightStore,
+    CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaReferenceDispatcher,
+    CudaStateError, CudaWeightStore,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -996,6 +996,53 @@ fn executes_q5_k_gemv_against_the_gguf_decoder() {
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(expected) {
         assert!((actual - expected).abs() < 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_qwen_elementwise_ops_against_host_equations() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let input = vec![1.0_f32, -2.0, 3.0, -4.0];
+    let weights = vec![1.0_f32, 0.5, 2.0, -1.0];
+    let input_device = stream.clone_htod(&input).expect("upload RMSNorm input");
+    let weights_device = stream.clone_htod(&weights).expect("upload RMSNorm weights");
+    let mut normalized = stream
+        .alloc_zeros::<f32>(input.len())
+        .expect("allocate RMSNorm output");
+    ops.rms_norm(&input_device, &weights_device, &mut normalized, 1e-5)
+        .expect("execute RMSNorm");
+    let actual = stream
+        .clone_dtoh(&normalized)
+        .expect("download RMSNorm output");
+    let inverse_norm = (input.iter().map(|value| value * value).sum::<f32>() / 4.0 + 1e-5)
+        .sqrt()
+        .recip();
+    for ((actual, input), weight) in actual.iter().zip(&input).zip(&weights) {
+        let expected = input * inverse_norm * weight;
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+
+    let gate = (0..513)
+        .map(|index| f32::from(u16::try_from(index).expect("SiLU index fits")) * 0.01 - 2.5)
+        .collect::<Vec<_>>();
+    let up = (0..513)
+        .map(|index| 1.0 - f32::from(u16::try_from(index).expect("SiLU index fits")) * 0.002)
+        .collect::<Vec<_>>();
+    let gate_device = stream.clone_htod(&gate).expect("upload SiLU gate");
+    let up_device = stream.clone_htod(&up).expect("upload SiLU up");
+    let mut fused = stream
+        .alloc_zeros::<f32>(gate.len())
+        .expect("allocate SiLU output");
+    ops.silu_mul(&gate_device, &up_device, &mut fused)
+        .expect("execute SiLU multiplication");
+    let actual = stream.clone_dtoh(&fused).expect("download SiLU output");
+    for ((actual, gate), up) in actual.iter().zip(&gate).zip(&up) {
+        let expected = gate / (1.0 + (-gate).exp()) * up;
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
     }
 }
 
