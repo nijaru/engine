@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use engine_core::{ModelLoadError, WeightArtifact, WeightDescription, WeightLoader, WeightSource};
 
+mod iq3_s;
+
 const GGUF_MAGIC: u32 = 0x4655_4747;
 const GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -430,6 +432,7 @@ pub fn dequantize_block(value_type: u32, encoded: &[u8]) -> Result<Vec<f32>, Ggu
         13 => Ok(dequantize_q5_k(encoded)),
         14 => Ok(dequantize_q6_k(encoded)),
         20 => Ok(dequantize_iq4_nl(encoded)),
+        21 => Ok(iq3_s::dequantize_block(encoded)),
         23 => Ok(dequantize_iq4_xs(encoded)),
         _ => Err(GgufError::UnsupportedTensorType(value_type)),
     }
@@ -1326,6 +1329,16 @@ mod tests {
         let decoded = dequantize_block(23, &iq4_xs).expect("IQ4_XS");
         assert_eq!(decoded[0].to_bits(), (-32.0_f32).to_bits());
         assert_eq!(decoded.len(), 256);
+
+        let mut iq3_s = [0_u8; 110];
+        iq3_s[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let decoded = dequantize_block(21, &iq3_s).expect("IQ3_S");
+        assert!(
+            decoded
+                .iter()
+                .all(|value| value.to_bits() == 1.0_f32.to_bits())
+        );
+        assert_eq!(decoded.len(), 256);
     }
 
     #[test]
@@ -1340,8 +1353,8 @@ mod tests {
             }
         ));
         assert!(matches!(
-            dequantize_block(21, &[0; 110]),
-            Err(GgufError::UnsupportedTensorType(21))
+            dequantize_block(22, &[0; 82]),
+            Err(GgufError::UnsupportedTensorType(22))
         ));
     }
 
