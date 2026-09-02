@@ -590,6 +590,9 @@ fn dequantize_iq4_nl(encoded: &[u8]) -> Vec<f32> {
     for index in 0..16 {
         let byte = encoded[2 + index];
         output.push(scale * f32::from(K_VALUES[usize::from(byte & 0x0f)]));
+    }
+    for index in 0..16 {
+        let byte = encoded[2 + index];
         output.push(scale * f32::from(K_VALUES[usize::from(byte >> 4)]));
     }
     output
@@ -1313,7 +1316,7 @@ mod tests {
         iq4_nl[2] = 0x08;
         let decoded = dequantize_block(20, &iq4_nl).expect("IQ4_NL");
         assert_eq!(decoded[0].to_bits(), 1.0_f32.to_bits());
-        assert_eq!(decoded[1].to_bits(), (-127.0_f32).to_bits());
+        assert_eq!(decoded[16].to_bits(), (-127.0_f32).to_bits());
         assert_eq!(decoded.len(), 32);
 
         let mut iq4_xs = [0_u8; 136];
