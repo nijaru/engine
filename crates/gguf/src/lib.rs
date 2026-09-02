@@ -538,8 +538,9 @@ fn dequantize_q6_k(encoded: &[u8]) -> Vec<f32> {
             let scale_index = group * 2 + half;
             let group_scale = scale * f32::from(i8::from_le_bytes([scales[scale_index]]));
             for index in 0..16 {
-                let low = (low_bits[low_offset + index] >> low_shift) & 0x0f;
-                let high = (high_bits[high_offset + index] >> (high_shift * 2)) & 0x03;
+                let position = half * 16 + index;
+                let low = (low_bits[low_offset + position] >> low_shift) & 0x0f;
+                let high = (high_bits[high_offset + position] >> (high_shift * 2)) & 0x03;
                 let quantized = i16::from(low | (high << 4)) - 32;
                 output.push(group_scale * f32::from(quantized));
             }
