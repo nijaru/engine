@@ -484,7 +484,7 @@ fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
     match value_type {
         0 | 26 => Ok((1, 4)),
         1 | 25 | 30 => Ok((1, 2)),
-        2 => Ok((32, 18)),
+        2 | 20 => Ok((32, 18)),
         3 => Ok((32, 20)),
         6 => Ok((32, 22)),
         7 => Ok((32, 24)),
@@ -496,8 +496,21 @@ fn tensor_layout(value_type: u32) -> Result<(u64, u64), GgufError> {
         13 => Ok((256, 176)),
         14 => Ok((256, 210)),
         15 => Ok((256, 292)),
+        16 | 35 => Ok((256, 66)),
+        17 => Ok((256, 74)),
+        18 => Ok((256, 98)),
+        19 => Ok((256, 50)),
+        21 => Ok((256, 106)),
+        22 => Ok((256, 82)),
+        23 => Ok((256, 136)),
         24 => Ok((1, 1)),
         27 | 28 => Ok((1, 8)),
+        29 => Ok((256, 56)),
+        34 => Ok((256, 54)),
+        39 => Ok((32, 17)),
+        40 => Ok((64, 36)),
+        41 => Ok((128, 18)),
+        42 => Ok((64, 18)),
         other => Err(GgufError::UnsupportedTensorType(other)),
     }
 }
@@ -710,6 +723,14 @@ mod tests {
         };
         assert_eq!(tensor.element_count().expect("element count"), 256);
         assert_eq!(tensor.byte_len().expect("Q4_K byte length"), 144);
+
+        let iq_tensor = TensorInfo {
+            name: "iq4_xs".to_owned(),
+            dimensions: vec![256],
+            value_type: 23,
+            offset: 0,
+        };
+        assert_eq!(iq_tensor.byte_len().expect("IQ4_XS byte length"), 136);
     }
 
     #[test]
