@@ -300,3 +300,153 @@ pub fn host_gdn_ar_step(
 ) -> Vec<f32> {
     host_gdn_ar_step_traced(weights, hidden, matrix, conv, eps).out
 }
+
+/// Full-attention layer geometry, verified against the pinned artifact:
+/// 24 q heads (with per-head gates), 4 KV heads, `head_dim` 256.
+pub const ATTN_Q_HEADS: usize = 24;
+pub const ATTN_KV_HEADS: usize = 4;
+pub const ATTN_HEAD_DIM: usize = 256;
+/// Rotary dimensions per head (first 64 of 256); `rope.dimension_count`.
+pub const ATTN_ROT_DIMS: usize = 64;
+/// `rope.freq_base` for the pinned artifact.
+pub const ATTN_ROPE_BASE: f32 = 1.0e7;
+
+/// Dequantized weights for one full-attention layer, in GGUF flat order.
+pub struct AttnLayerWeights {
+    /// `attn_q` [5120][12288], per-head `[q(256) | gate(256)]` at stride 512.
+    pub attn_q: Vec<f32>,
+    /// `attn_k` [5120][1024].
+    pub attn_k: Vec<f32>,
+    /// `attn_v` [5120][1024].
+    pub attn_v: Vec<f32>,
+    /// `attn_q_norm` [256], raw (already +1'd).
+    pub attn_q_norm: Vec<f32>,
+    /// `attn_k_norm` [256], raw (already +1'd).
+    pub attn_k_norm: Vec<f32>,
+    /// `attn_output` [6144][5120].
+    pub attn_output: Vec<f32>,
+}
+
+/// One full-attention autoregressive decode step with position `pos`.
+///
+/// `kv_keys`/`kv_values` hold all cached tokens' K/V (`[tokens][4][256]`,
+/// newest last) and are extended in place. Returns the layer output `[5120]`.
+///
+/// # Panics
+///
+/// Panics when any weight/state slice does not match the pinned geometry.
+pub fn host_full_attn_ar_step(
+    weights: &AttnLayerWeights,
+    hidden: &[f32],
+    kv_keys: &mut Vec<f32>,
+    kv_values: &mut Vec<f32>,
+    pos: usize,
+    eps: f32,
+) -> Vec<f32> {
+    assert_eq!(hidden.len(), N_EMBD);
+
+    let q_gate = gguf_gemv(&weights.attn_q, N_EMBD, hidden);
+    let k_raw = gguf_gemv(&weights.attn_k, N_EMBD, hidden);
+    let v_raw = gguf_gemv(&weights.attn_v, N_EMBD, hidden);
+
+    // Per-head Q/K RMSNorm (weights raw; GGUF stores +1'd values).
+    let head_dim = ATTN_HEAD_DIM;
+    let mut q = vec![0.0_f32; ATTN_Q_HEADS * head_dim];
+    let mut gate = vec![0.0_f32; ATTN_Q_HEADS * head_dim];
+    for head in 0..ATTN_Q_HEADS {
+        let src = &q_gate[head * 2 * head_dim..(head + 1) * 2 * head_dim];
+        let normalized = rms_norm_raw(&src[..head_dim], &weights.attn_q_norm, eps);
+        q[head * head_dim..(head + 1) * head_dim].copy_from_slice(&normalized);
+        gate[head * head_dim..(head + 1) * head_dim].copy_from_slice(&src[head_dim..2 * head_dim]);
+    }
+    let mut k = vec![0.0_f32; ATTN_KV_HEADS * head_dim];
+    for head in 0..ATTN_KV_HEADS {
+        let normalized = rms_norm_raw(
+            &k_raw[head * head_dim..(head + 1) * head_dim],
+            &weights.attn_k_norm,
+            eps,
+        );
+        k[head * head_dim..(head + 1) * head_dim].copy_from_slice(&normalized);
+    }
+
+    // Text-only rope: NEOX half-split pairing (x[p], x[p + 32]) over the
+    // first 64 dims of each head; theta_p = pos * base^(-p/32); dims 64..255
+    // pass through. IMROPE degenerates to this for text positions.
+    #[allow(clippy::cast_precision_loss)]
+    let apply_rope = |values: &mut [f32]| {
+        for head in 0..ATTN_Q_HEADS.min(values.len() / head_dim) {
+            let base = head * head_dim;
+            for pair in 0..ATTN_ROT_DIMS / 2 {
+                let theta =
+                    pos as f32 * ATTN_ROPE_BASE.powf(-(2.0 * pair as f32) / ATTN_ROT_DIMS as f32);
+                let (sin, cos) = theta.sin_cos();
+                let x0 = values[base + pair];
+                let x1 = values[base + ATTENTION_PAIR_STRIDE + pair];
+                values[base + pair] = x0 * cos - x1 * sin;
+                values[base + ATTENTION_PAIR_STRIDE + pair] = x0 * sin + x1 * cos;
+            }
+        }
+    };
+    apply_rope(&mut q);
+    apply_rope(&mut k);
+
+    // Append the new token's K/V to the cache.
+    kv_keys.extend_from_slice(&k);
+    kv_values.extend_from_slice(&v_raw);
+
+    // Attention per q head over its block-mapped KV head
+    // (ggml mul_mat broadcast: i02 = i12 / r2 -> q heads 0-5 -> kv 0, ...).
+    let q_per_kv = ATTN_Q_HEADS / ATTN_KV_HEADS;
+    let tokens = kv_keys.len() / (ATTN_KV_HEADS * head_dim);
+    let scale = 1.0 / f32::sqrt(f32::from(u16::try_from(head_dim).expect("head dim")));
+    let mut attn_out = vec![0.0_f32; ATTN_Q_HEADS * head_dim];
+    for q_head in 0..ATTN_Q_HEADS {
+        let kv_head = q_head / q_per_kv;
+        let q_vec = &q[q_head * head_dim..(q_head + 1) * head_dim];
+        let mut scores = vec![0.0_f32; tokens];
+        for (token, score) in scores.iter_mut().enumerate() {
+            let key = &kv_keys[(token * ATTN_KV_HEADS + kv_head) * head_dim
+                ..(token * ATTN_KV_HEADS + kv_head + 1) * head_dim];
+            *score = q_vec.iter().zip(key).map(|(qv, kv)| qv * kv).sum::<f32>() * scale;
+        }
+        // Causal softmax over all cached tokens.
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let score_exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let total: f32 = score_exps.iter().sum();
+        for token in 0..tokens {
+            let value = &kv_values[(token * ATTN_KV_HEADS + kv_head) * head_dim
+                ..(token * ATTN_KV_HEADS + kv_head + 1) * head_dim];
+            let weight = score_exps[token] / total;
+            for (out, value_elem) in attn_out[q_head * head_dim..(q_head + 1) * head_dim]
+                .iter_mut()
+                .zip(value)
+            {
+                *out += weight * value_elem;
+            }
+        }
+    }
+
+    // Sigmoid gate per head, elementwise.
+    for head in 0..ATTN_Q_HEADS {
+        for i in 0..head_dim {
+            let g = gate[head * head_dim + i];
+            let sigmoid = 1.0 / (1.0 + (-g).exp());
+            attn_out[head * head_dim + i] *= sigmoid;
+        }
+    }
+
+    // Output projection [6144 -> 5120].
+    gguf_gemv(&weights.attn_output, ATTN_Q_HEADS * head_dim, &attn_out)
+}
+
+/// NEOX half-split pair stride for text rope (`n_dims/2` = 32).
+const ATTENTION_PAIR_STRIDE: usize = 32;
+
+/// Per-vector `RMSNorm` with raw (already +1'd) GGUF weights.
+fn rms_norm_raw(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    assert_eq!(input.len(), weight.len());
+    let sum: f32 = input.iter().map(|x| x * x).sum();
+    let count = f32::from(u16::try_from(input.len()).expect("input length fits u16"));
+    let inv = (sum / count + eps).sqrt().recip();
+    input.iter().zip(weight).map(|(x, w)| x * inv * w).collect()
+}
