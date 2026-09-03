@@ -2604,7 +2604,25 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
     };
 
     // Budget below the requirement must be rejected before any upload.
-    let norm_tensors = collect(&["output_norm.weight", "blk.0.ssm_dt.bias"]);
+    // The norm tensors stage through the F32 path (wrap_f32_stream).
+    let norm_tensors: Vec<StagedTensorSource> = ["output_norm.weight", "blk.0.ssm_dt.bias"]
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            let mut blocks = engine_nvidia::wrap_f32_stream(reader);
+            let _: &engine_core::WeightTensorSpec = blocks.spec();
+            StagedTensorSource {
+                spec,
+                value_type,
+                encoded_bytes,
+                reader: Box::new(std::io::empty()),
+                f32_blocks: Some(Box::new(blocks)),
+            }
+        })
+        .collect();
     let total: u64 = norm_tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
     let undersized = CudaQwen35Weights::stage(&context, &stream, total - 1, norm_tensors)
         .err()
@@ -2617,6 +2635,7 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
     // A Q5_K tensor stages, finds its kernel family, and dispatches a real
     // GEMV against the staged device weights.
     let q5_tensors = collect(&["blk.0.attn_qkv.weight"]);
+    // (The F32 norm path above already exercised wrap_f32_stream.)
     let q5_bytes: u64 = q5_tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
     let staged = CudaQwen35Weights::stage(&context, &stream, q5_bytes + 1, q5_tensors)
         .expect("stage Q5_K tensor");

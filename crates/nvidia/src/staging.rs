@@ -296,7 +296,6 @@ where
     fn next_block(&mut self) -> Result<Option<Vec<f32>>, Self::Error> {
         self.inner
             .next_block()
-            .map(|block| block)
             .map_err(|error| F32SourceError(error.to_string()))
     }
 }

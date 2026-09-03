@@ -35,7 +35,10 @@ pub use quantized::{
 };
 
 #[cfg(feature = "cuda")]
-pub use staging::{CudaQwen35Weights, CudaWeightStagingError, QwenGemvKernel, StagedTensorSource};
+pub use staging::{
+    CudaQwen35Weights, CudaWeightStagingError, F32SourceError, QwenGemvKernel, StagedTensorSource,
+    WrappingF32Stream, wrap_f32_stream,
+};
 
 #[cfg(feature = "cuda")]
 pub use state::{
