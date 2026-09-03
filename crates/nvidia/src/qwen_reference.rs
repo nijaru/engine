@@ -339,6 +339,9 @@ pub struct AttnStepTrace {
     pub k_normed: Vec<f32>,
     /// `Vcur` raw v `[4][256]`.
     pub v: Vec<f32>,
+    /// Raw k projection before norm/rope `[1024]` (first capture
+    /// occurrence of `Kcur`).
+    pub k_raw: Vec<f32>,
     /// `Qcur` post-rope q `[24][256]`.
     pub q_rope: Vec<f32>,
     /// `Kcur` post-rope k `[4][256]`.
@@ -395,6 +398,10 @@ pub fn host_full_attn_ar_step_traced(
         );
         k[head * head_dim..(head + 1) * head_dim].copy_from_slice(&normalized);
     }
+
+    // Pre-rope normed copies for the trace (rope applies in place below).
+    let q_normed = q.clone();
+    let k_normed = k.clone();
 
     // Text-only rope: NEOX half-split pairing (x[p], x[p + 32]) over the
     // first 64 dims of each head; theta_p = pos * base^(-p/32); dims 64..255
@@ -469,9 +476,10 @@ pub fn host_full_attn_ar_step_traced(
     let out = gguf_gemv(&weights.attn_output, ATTN_Q_HEADS * head_dim, &attn_gated);
     AttnStepTrace {
         q_gate,
-        q_normed: q.clone(),
-        k_normed: k.clone(),
+        q_normed,
+        k_normed,
         v: v_raw.clone(),
+        k_raw,
         q_rope: q,
         k_rope: k,
         gate_sigmoid,

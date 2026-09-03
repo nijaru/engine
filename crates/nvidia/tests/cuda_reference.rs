@@ -14,10 +14,12 @@ use engine_core::{
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaHybridState, CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv,
-    CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaReferenceDispatcher,
-    CudaStateBuffer, CudaStateError, CudaWeightStore, GDN_D_CONV, GDN_HEAD_DIM, GDN_QKV_DIM,
-    GDN_V_HEADS, GdnLayerWeights, N_EMBD, host_gdn_ar_step, host_gdn_ar_step_traced,
+    ATTN_HEAD_DIM, ATTN_Q_HEADS, AttnLayerWeights, CudaHybridState, CudaIq3SEmbedding,
+    CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv,
+    CudaQ8_0Gemv, CudaQwen35Ops, CudaReferenceDispatcher, CudaStateBuffer, CudaStateError,
+    CudaWeightStore, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_QKV_DIM, GDN_V_HEADS,
+    GdnLayerWeights, N_EMBD, host_ffn_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
+    host_gdn_ar_step_traced,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -1557,6 +1559,355 @@ fn host_reference_gdn_step_matches_llama_debug_capture() {
     assert!(
         failures.is_empty(),
         "GDN parity failures:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Golden layer-3 full-attention sums from genuine llama.cpp build 10684
+/// inference, captured by `scripts/llama-attn-capture.sh` on 2026-09-02
+/// (1-token run: prompt "Hi" = token 12675, position 0, rope identity).
+const LLAMA_ATTN_CAPTURE_1TOK: &[(&str, &str)] = &[
+    ("model.input_embed", "-1.055925"),
+    ("attn_norm-0", "-65.716560"),
+    ("l_out-2", "6.607050"),
+    ("attn_norm-3", "9.732841"),
+    ("Qcur_full-3", "-27808.511719"),
+    ("Qcur_normed-3", "122.420403"),
+    ("Qcur-3", "122.420403"),
+    ("Vcur-3", "-4.807240"),
+    ("Kcur-3-raw", "22.731773"),
+    ("Kcur_normed-3", "12.335545"),
+    ("Kcur-3", "12.335545"),
+    ("attn_pregate-3", "-28.811741"),
+    ("gate_reshaped-3", "-27890.394531"),
+    ("gate_sigmoid-3", "94.876389"),
+    ("attn_gated-3", "-2.508305"),
+    ("attn_output-3", "6.240145"),
+    ("attn_residual-3", "12.847154"),
+    ("attn_post_norm-3", "-34.353695"),
+    ("ffn_out-3", "-0.134532"),
+    ("l_out-3", "12.712581"),
+];
+
+/// Golden layer-3 sums from the 2-token run (prompt "Hi there" = tokens
+/// [12675, 1017]): a genuine prefill batch — GDN layers take the chunked
+/// path, attention runs over a 2-entry causal KV cache, and rope rotates at
+/// position 1. Tensor sums cover both tokens.
+const LLAMA_ATTN_CAPTURE_2TOK: &[(&str, &str)] = &[
+    ("model.input_embed", "-1.024361"),
+    ("attn_norm-0", "-63.792130"),
+    ("l_out-2", "22.629915"),
+    ("attn_norm-3", "53.849220"),
+    ("Qcur_full-3", "-56920.371094"),
+    ("Qcur_normed-3", "230.419525"),
+    ("Qcur-3", "243.807587"),
+    ("Vcur-3", "38.204910"),
+    ("Kcur-3-raw", "35.833229"),
+    ("Kcur_normed-3", "13.997391"),
+    ("Kcur-3", "9.906808"),
+    ("attn_pregate-3", "-27.824806"),
+    ("gate_reshaped-3", "-57094.621094"),
+    ("gate_sigmoid-3", "193.474472"),
+    ("attn_gated-3", "-2.569808"),
+    ("attn_output-3", "19.881910"),
+    ("attn_residual-3", "42.511784"),
+    ("attn_post_norm-3", "-45.576557"),
+    ("ffn_out-3", "0.789787"),
+    ("l_out-3", "43.301579"),
+];
+
+fn capture_sum(table: &[(&str, &str)], name: &str) -> Option<f64> {
+    table
+        .iter()
+        .find(|(capture_name, _)| *capture_name == name)
+        .and_then(|(_, text)| text.parse::<f64>().ok())
+}
+
+fn load_gdn_layer(provider: &Qwen35ModelProvider, layer: usize) -> GdnLayerWeights {
+    let prefix = format!("blk.{layer}.");
+    GdnLayerWeights {
+        attn_qkv: pinned_tensor_f32(provider, &format!("{prefix}attn_qkv.weight")),
+        attn_gate: pinned_tensor_f32(provider, &format!("{prefix}attn_gate.weight")),
+        ssm_beta: pinned_tensor_f32(provider, &format!("{prefix}ssm_beta.weight")),
+        ssm_alpha: pinned_tensor_f32(provider, &format!("{prefix}ssm_alpha.weight")),
+        ssm_dt_bias: pinned_tensor_f32(provider, &format!("{prefix}ssm_dt.bias")),
+        ssm_a: pinned_tensor_f32(provider, &format!("{prefix}ssm_a")),
+        ssm_conv1d: pinned_tensor_f32(provider, &format!("{prefix}ssm_conv1d.weight")),
+        ssm_norm: pinned_tensor_f32(provider, &format!("{prefix}ssm_norm.weight")),
+        ssm_out: pinned_tensor_f32(provider, &format!("{prefix}ssm_out.weight")),
+    }
+}
+
+fn load_attn_layer(provider: &Qwen35ModelProvider, layer: usize) -> AttnLayerWeights {
+    let prefix = format!("blk.{layer}.");
+    AttnLayerWeights {
+        attn_q: pinned_tensor_f32(provider, &format!("{prefix}attn_q.weight")),
+        attn_k: pinned_tensor_f32(provider, &format!("{prefix}attn_k.weight")),
+        attn_v: pinned_tensor_f32(provider, &format!("{prefix}attn_v.weight")),
+        attn_q_norm: pinned_tensor_f32(provider, &format!("{prefix}attn_q_norm.weight")),
+        attn_k_norm: pinned_tensor_f32(provider, &format!("{prefix}attn_k_norm.weight")),
+        attn_output: pinned_tensor_f32(provider, &format!("{prefix}attn_output.weight")),
+    }
+}
+
+fn load_ffn_layer(provider: &Qwen35ModelProvider, layer: usize) -> FfnLayerWeights {
+    let prefix = format!("blk.{layer}.");
+    FfnLayerWeights {
+        ffn_gate: pinned_tensor_f32(provider, &format!("{prefix}ffn_gate.weight")),
+        ffn_up: pinned_tensor_f32(provider, &format!("{prefix}ffn_up.weight")),
+        ffn_down: pinned_tensor_f32(provider, &format!("{prefix}ffn_down.weight")),
+    }
+}
+
+/// The `gate_reshaped` slice of `Qcur_full`: the gate half of each per-head
+/// `[q(256) | gate(256)]` block.
+fn gate_half(q_gate: &[f32]) -> Vec<f32> {
+    let mut gate = Vec::with_capacity(ATTN_Q_HEADS * ATTN_HEAD_DIM);
+    for head in 0..ATTN_Q_HEADS {
+        let base = head * 2 * ATTN_HEAD_DIM;
+        gate.extend_from_slice(&q_gate[base + ATTN_HEAD_DIM..base + 2 * ATTN_HEAD_DIM]);
+    }
+    gate
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+// One layer-major replay through four layers; splitting it would hide the
+// cross-layer state evolution that this gate exists to validate.
+#[allow(clippy::too_many_lines)]
+fn host_reference_full_attn_matches_llama_debug_capture() {
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+    let eps = 1.0e-6_f32;
+    let tokens = [12_675_usize, 1017];
+
+    // Embedding rows for both prompt tokens.
+    let embeds = tokens
+        .iter()
+        .map(|token| pinned_embedding_row(&provider, *token))
+        .collect::<Vec<_>>();
+
+    // Layer-major replay: process both tokens per layer, freeing each layer's
+    // weights before loading the next. State (GDN matrix/conv, attention KV)
+    // is shared across the two tokens and evolves sequentially.
+    let mut x_cur = embeds.clone();
+    let mut attn_norm_sums = [0.0_f64; 2];
+    let mut l_out2_sums = [0.0_f64; 2];
+    let mut traces = Vec::new();
+    let mut post_norm3_sums = [0.0_f64; 2];
+    let mut ffn_out3_sums = [0.0_f64; 2];
+    let mut l_out3_sums = [0.0_f64; 2];
+
+    let mut gdn_matrix = Vec::new();
+    let mut gdn_conv = Vec::new();
+    let mut kv_keys = Vec::new();
+    let mut kv_values = Vec::new();
+
+    for layer in 0..=3_usize {
+        let attn_norm_w = pinned_tensor_f32(&provider, &format!("blk.{layer}.attn_norm.weight"));
+        let post_norm_w = pinned_tensor_f32(
+            &provider,
+            &format!("blk.{layer}.post_attention_norm.weight"),
+        );
+        let ffn_w = load_ffn_layer(&provider, layer);
+
+        if layer < 3 {
+            // Gated-DeltaNet layer with FFN/residual wrapper.
+            let gdn_w = load_gdn_layer(&provider, layer);
+            if gdn_matrix.is_empty() {
+                gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+                gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
+            }
+            for (token_index, x) in x_cur.iter_mut().enumerate() {
+                let normalized = host_rms_norm(x, &attn_norm_w, eps);
+                if layer == 0 {
+                    attn_norm_sums[token_index] = normalized.iter().map(|v| f64::from(*v)).sum();
+                }
+                let attn_out =
+                    host_gdn_ar_step(&gdn_w, &normalized, &mut gdn_matrix, &mut gdn_conv, eps);
+                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, eps);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+            }
+        } else {
+            // Full-attention layer 3: traced, with the residual/FFN wrapper.
+            let attn_w = load_attn_layer(&provider, layer);
+            for (token_index, x) in x_cur.iter_mut().enumerate() {
+                let normalized = host_rms_norm(x, &attn_norm_w, eps);
+                let trace = host_full_attn_ar_step_traced(
+                    &attn_w,
+                    &normalized,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    token_index,
+                    eps,
+                );
+                for (x_elem, out_elem) in x.iter_mut().zip(&trace.out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, eps);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                post_norm3_sums[token_index] = post.iter().map(|v| f64::from(*v)).sum();
+                ffn_out3_sums[token_index] = ffn_out.iter().map(|v| f64::from(*v)).sum();
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+                l_out3_sums[token_index] = x.iter().map(|v| f64::from(*v)).sum();
+                traces.push(trace);
+            }
+        }
+
+        if layer == 2 {
+            for (token_index, x) in x_cur.iter().enumerate() {
+                l_out2_sums[token_index] = x.iter().map(|v| f64::from(*v)).sum();
+            }
+        }
+    }
+
+    let sum = |values: &[f32]| -> f64 { values.iter().map(|v| f64::from(*v)).sum() };
+    let trace_t0 = &traces[0];
+    let trace_t1 = &traces[1];
+
+    // Token-0-only values (rope identity at position 0).
+    let first_token: Vec<(&str, f64, usize)> = vec![
+        ("model.input_embed", sum(&embeds[0]), N_EMBD),
+        ("attn_norm-0", attn_norm_sums[0], N_EMBD),
+        ("l_out-2", l_out2_sums[0], N_EMBD),
+        ("Qcur_full-3", sum(&trace_t0.q_gate), 12_288),
+        ("Qcur_normed-3", sum(&trace_t0.q_normed), 6144),
+        ("Qcur-3", sum(&trace_t0.q_rope), 6144),
+        ("Vcur-3", sum(&trace_t0.v), 1024),
+        ("Kcur-3-raw", sum(&trace_t0.k_raw), 1024),
+        ("Kcur_normed-3", sum(&trace_t0.k_normed), 1024),
+        ("Kcur-3", sum(&trace_t0.k_rope), 1024),
+        ("attn_pregate-3", sum(&trace_t0.attn_pregate), 6144),
+        ("gate_reshaped-3", sum(&gate_half(&trace_t0.q_gate)), 6144),
+        ("gate_sigmoid-3", sum(&trace_t0.gate_sigmoid), 6144),
+        ("attn_gated-3", sum(&trace_t0.attn_gated), 6144),
+        ("attn_output-3", sum(&trace_t0.out), N_EMBD),
+        (
+            "attn_residual-3",
+            l_out2_sums[0] + sum(&trace_t0.out),
+            N_EMBD,
+        ),
+        ("attn_post_norm-3", post_norm3_sums[0], N_EMBD),
+        ("ffn_out-3", ffn_out3_sums[0], N_EMBD),
+        ("l_out-3", l_out3_sums[0], N_EMBD),
+    ];
+
+    // Both tokens combined (2-token prefill; rope rotates at position 1).
+    let combined = |a: &[f32], other: &[f32]| -> f64 { sum(a) + sum(other) };
+    let both_tokens: Vec<(&str, f64, usize)> = vec![
+        (
+            "model.input_embed",
+            combined(&embeds[0], &embeds[1]),
+            2 * N_EMBD,
+        ),
+        (
+            "attn_norm-0",
+            attn_norm_sums[0] + attn_norm_sums[1],
+            2 * N_EMBD,
+        ),
+        ("l_out-2", l_out2_sums[0] + l_out2_sums[1], 2 * N_EMBD),
+        (
+            "attn_norm-3",
+            attn_norm_sums[0] + attn_norm_sums[1],
+            2 * N_EMBD,
+        ),
+        (
+            "Qcur_full-3",
+            combined(&trace_t0.q_gate, &trace_t1.q_gate),
+            24_576,
+        ),
+        (
+            "Qcur_normed-3",
+            combined(&trace_t0.q_normed, &trace_t1.q_normed),
+            12_288,
+        ),
+        (
+            "Qcur-3",
+            combined(&trace_t0.q_rope, &trace_t1.q_rope),
+            12_288,
+        ),
+        ("Vcur-3", combined(&trace_t0.v, &trace_t1.v), 2048),
+        (
+            "Kcur-3-raw",
+            combined(&trace_t0.k_raw, &trace_t1.k_raw),
+            2048,
+        ),
+        (
+            "Kcur_normed-3",
+            combined(&trace_t0.k_normed, &trace_t1.k_normed),
+            2048,
+        ),
+        ("Kcur-3", combined(&trace_t0.k_rope, &trace_t1.k_rope), 2048),
+        (
+            "attn_pregate-3",
+            combined(&trace_t0.attn_pregate, &trace_t1.attn_pregate),
+            12_288,
+        ),
+        (
+            "gate_reshaped-3",
+            combined(&gate_half(&trace_t0.q_gate), &gate_half(&trace_t1.q_gate)),
+            12_288,
+        ),
+        (
+            "gate_sigmoid-3",
+            combined(&trace_t0.gate_sigmoid, &trace_t1.gate_sigmoid),
+            12_288,
+        ),
+        (
+            "attn_gated-3",
+            combined(&trace_t0.attn_gated, &trace_t1.attn_gated),
+            12_288,
+        ),
+        (
+            "attn_output-3",
+            combined(&trace_t0.out, &trace_t1.out),
+            2 * N_EMBD,
+        ),
+        (
+            "attn_residual-3",
+            l_out2_sums[0] + sum(&trace_t0.out) + l_out2_sums[1] + sum(&trace_t1.out),
+            2 * N_EMBD,
+        ),
+        (
+            "attn_post_norm-3",
+            post_norm3_sums[0] + post_norm3_sums[1],
+            2 * N_EMBD,
+        ),
+        ("ffn_out-3", ffn_out3_sums[0] + ffn_out3_sums[1], 2 * N_EMBD),
+        ("l_out-3", l_out3_sums[0] + l_out3_sums[1], 2 * N_EMBD),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, actual, elements) in first_token {
+        if let Some(expected) = capture_sum(LLAMA_ATTN_CAPTURE_1TOK, name)
+            .filter(|expected| !sum_close(actual, *expected, elements))
+        {
+            failures.push(format!(
+                "{name} (1tok): engine {actual:.4} vs llama.cpp {expected:.4}"
+            ));
+        }
+    }
+    for (name, actual, elements) in both_tokens {
+        if let Some(expected) = capture_sum(LLAMA_ATTN_CAPTURE_2TOK, name)
+            .filter(|expected| !sum_close(actual, *expected, elements))
+        {
+            failures.push(format!(
+                "{name} (2tok): engine {actual:.4} vs llama.cpp {expected:.4}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "attention parity failures:\n  {}",
         failures.join("\n  ")
     );
 }
