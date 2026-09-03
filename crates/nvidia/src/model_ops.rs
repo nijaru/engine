@@ -56,6 +56,7 @@ impl fmt::Display for CudaModelKernelError {
 impl std::error::Error for CudaModelKernelError {}
 
 const MODEL_OPS_SOURCE: &str = r#"
+#include <cuda_fp16.h>
 extern "C" __global__ void rms_norm(
     const float* input,
     const float* weight,
@@ -151,6 +152,116 @@ extern "C" __global__ void gdn_scalar_gate(
     decay[head] = expf(a[head] * softplus_value);
     beta[head] = 1.0f / (1.0f + expf(-beta_raw[head]));
 }
+extern "C" __global__ void rope_neox(
+    float* values,
+    long long position,
+    int head_count,
+    int head_dim,
+    int rot_dim_pairs,
+    float base
+) {
+    // One thread per (head, pair). NEOX half-split: pair (p, p + rot/2)
+    // over the first rot_dim dims of each head; the remaining dims pass
+    // through. All heads share the scalar position.
+    const int pair_index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total_pairs = head_count * rot_dim_pairs;
+    if (pair_index >= total_pairs) {
+        return;
+    }
+    const int head = pair_index / rot_dim_pairs;
+    const int pair = pair_index % rot_dim_pairs;
+    const float pos = (float)position;
+    const int half = rot_dim_pairs;
+    const float theta =
+        pos * powf(base, -(2.0f * (float)pair) / (2.0f * (float)half));
+    const float sin_theta = sinf(theta);
+    const float cos_theta = cosf(theta);
+    const int offset = head * head_dim + pair;
+    const float x0 = values[offset];
+    const float x1 = values[offset + half];
+    values[offset] = x0 * cos_theta - x1 * sin_theta;
+    values[offset + half] = x0 * sin_theta + x1 * cos_theta;
+}
+
+extern "C" __global__ void attn_score_gqa(
+    const float* q,
+    const unsigned short* keys,
+    const unsigned short* values,
+    const float* gate_scratch,
+    float* scores_scratch,
+    float* output,
+    int tokens,
+    int scores_stride,
+    int q_heads,
+    int kv_heads,
+    int head_dim
+) {
+    // One thread per q head; serial over cached tokens. Reads the F16 KV
+    // cache laid out [token][kv_head][head_dim] and computes the
+    // block-mapped GQA decode: scores, softmax, weighted V sum, then the
+    // sigmoid gate. scores_scratch is a [q_heads][scores_stride] buffer;
+    // only the first `tokens` entries per head are used.
+    const int q_head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (q_head >= q_heads) {
+        return;
+    }
+    const int q_per_kv = q_heads / kv_heads;
+    const int kv_head = q_head / q_per_kv;
+    const float scale = rsqrtf((float)head_dim);
+
+    float* scores = scores_scratch + q_head * scores_stride;
+    for (int token = 0; token < tokens; ++token) {
+        const unsigned short* key =
+            keys + ((long long)token * kv_heads + kv_head) * head_dim;
+        const float* q_vec = q + q_head * head_dim;
+        float dot = 0.0f;
+        for (int dim = 0; dim < head_dim; ++dim) {
+            dot += q_vec[dim] * __half2float(key[dim]);
+        }
+        scores[token] = dot * scale;
+    }
+    float max_score = -3.402823466e+38f;
+    for (int token = 0; token < tokens; ++token) {
+        max_score = fmaxf(max_score, scores[token]);
+    }
+    float total = 0.0f;
+    for (int token = 0; token < tokens; ++token) {
+        scores[token] = expf(scores[token] - max_score);
+        total += scores[token];
+    }
+    const float inv_total = 1.0f / total;
+
+    float* out = output + q_head * head_dim;
+    for (int dim = 0; dim < head_dim; ++dim) {
+        out[dim] = 0.0f;
+    }
+    for (int token = 0; token < tokens; ++token) {
+        const float weight = scores[token] * inv_total;
+        const unsigned short* value =
+            values + ((long long)token * kv_heads + kv_head) * head_dim;
+        for (int dim = 0; dim < head_dim; ++dim) {
+            out[dim] += weight * __half2float(value[dim]);
+        }
+    }
+
+    // Sigmoid gate from the second half of each 2*head_dim q-head slice.
+    const float* gate = gate_scratch + q_head * 2 * head_dim + head_dim;
+    for (int dim = 0; dim < head_dim; ++dim) {
+        const float sigmoid = 1.0f / (1.0f + expf(-gate[dim]));
+        out[dim] *= sigmoid;
+    }
+}
+
+extern "C" __global__ void sigmoid_inplace(
+    float* values,
+    int length
+) {
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= length) {
+        return;
+    }
+    values[index] = 1.0f / (1.0f + expf(-values[index]));
+}
 "#;
 
 /// Reference-oriented elementwise operations used by Qwen-family model
@@ -163,6 +274,9 @@ pub struct CudaQwen35Ops {
     silu_mul: CudaFunction,
     l2_norm: CudaFunction,
     gdn_scalar_gate: CudaFunction,
+    rope_neox: CudaFunction,
+    sigmoid_inplace: CudaFunction,
+    attn_score_gqa: CudaFunction,
 }
 
 impl CudaQwen35Ops {
@@ -213,6 +327,15 @@ impl CudaQwen35Ops {
         let gdn_scalar_gate = module
             .load_function("gdn_scalar_gate")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let rope_neox = module
+            .load_function("rope_neox")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let sigmoid_inplace = module
+            .load_function("sigmoid_inplace")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let attn_score_gqa = module
+            .load_function("attn_score_gqa")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
             argmax,
@@ -220,6 +343,9 @@ impl CudaQwen35Ops {
             silu_mul,
             l2_norm,
             gdn_scalar_gate,
+            rope_neox,
+            sigmoid_inplace,
+            attn_score_gqa,
         })
     }
 
@@ -516,6 +642,212 @@ impl CudaQwen35Ops {
                 .arg(&mut *decay)
                 .arg(&mut *beta)
                 .arg(&heads_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Apply NEOX half-split rotary position embedding in place over the
+    /// first `rot_dims` dims of each head. All heads share the scalar
+    /// `position`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    pub fn rope_neox(
+        &self,
+        values: &mut CudaSlice<f32>,
+        position: u64,
+        head_count: usize,
+        head_dim: usize,
+        rot_dims: usize,
+        base: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != values.context().as_ref() {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if head_count == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if values.len() != head_count * head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: head_count * head_dim,
+                actual: values.len(),
+            });
+        }
+        if !rot_dims.is_multiple_of(2) || rot_dims > head_dim {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        if !base.is_finite() || base <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let pairs = u32::try_from(rot_dims / 2).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_count_u32 =
+            u32::try_from(head_count).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total_pairs = head_count
+            .checked_mul(rot_dims / 2)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total_pairs_u32 =
+            u32::try_from(total_pairs).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_pairs_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated the slice, geometry is validated, and the
+        // launch keeps the pointer alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_neox)
+                .arg(&mut *values)
+                .arg(&position)
+                .arg(&head_count_u32)
+                .arg(&head_dim_u32)
+                .arg(&pairs)
+                .arg(&base)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Apply the elementwise sigmoid in place.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn sigmoid_inplace(&self, values: &mut CudaSlice<f32>) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != values.context().as_ref() {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if values.is_empty() {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let length =
+            u32::try_from(values.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (length.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated the slice and the validated length bounds
+        // every access on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.sigmoid_inplace)
+                .arg(&mut *values)
+                .arg(&length)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// One full-attention decode step over the F16 KV cache with
+    /// block-mapped GQA, softmax, weighted V sum, and sigmoid gate.
+    ///
+    /// `q` is the rope'd `[q_heads * head_dim]` query vector;
+    /// `gate_scratch` holds the raw `[q_heads * 2 * head_dim]` q projection
+    /// whose second half per head gates the output; `keys`/`values` are the
+    /// `[tokens][kv_heads][head_dim]` F16 cache slices for one layer;
+    /// `scores_scratch` is a `[q_heads * scores_stride]` accumulator reset by
+    /// the caller; `output` receives `[q_heads * head_dim]`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    pub fn attn_score_gqa(
+        &self,
+        q: &CudaSlice<f32>,
+        keys: &CudaSlice<u16>,
+        values: &CudaSlice<u16>,
+        gate_scratch: &CudaSlice<f32>,
+        scores_scratch: &mut CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        tokens: usize,
+        scores_stride: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != q.context().as_ref()
+            || context.as_ref() != keys.context().as_ref()
+            || context.as_ref() != values.context().as_ref()
+            || context.as_ref() != gate_scratch.context().as_ref()
+            || context.as_ref() != scores_scratch.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        if q.len() != q_heads * head_dim
+            || gate_scratch.len() != q_heads * 2 * head_dim
+            || output.len() != q_heads * head_dim
+            || scores_scratch.len() < q_heads * scores_stride
+            || scores_stride < tokens
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: q_heads * head_dim,
+                actual: q.len(),
+            });
+        }
+        if keys.len() < tokens * kv_heads * head_dim || values.len() < tokens * kv_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: tokens * kv_heads * head_dim,
+                actual: keys.len().min(values.len()),
+            });
+        }
+        let tokens_u32 = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let stride_u32 =
+            u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let q_heads_u32 =
+            u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let kv_heads_u32 =
+            u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (q_heads_u32.div_ceil(32), 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and
+        // the launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.attn_score_gqa)
+                .arg(q)
+                .arg(keys)
+                .arg(values)
+                .arg(gate_scratch)
+                .arg(&mut *scores_scratch)
+                .arg(&mut *output)
+                .arg(&tokens_u32)
+                .arg(&stride_u32)
+                .arg(&q_heads_u32)
+                .arg(&kv_heads_u32)
+                .arg(&head_dim_u32)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
