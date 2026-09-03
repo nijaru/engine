@@ -400,6 +400,57 @@ impl CudaQwen35Ops {
         Ok(())
     }
 
+    /// Apply elementwise `SiLU` to `gate` and multiply it by `up`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn silu_mul(
+        &self,
+        gate: &CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaModelKernelError> {
+        self.check_contexts(gate, up, output)?;
+        if gate.is_empty() {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if gate.len() != up.len() {
+            return Err(CudaModelKernelError::InputLength {
+                expected: gate.len(),
+                actual: up.len(),
+            });
+        }
+        if output.len() != gate.len() {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: gate.len(),
+                actual: output.len(),
+            });
+        }
+        let length = u32::try_from(gate.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (length.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, lengths are validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.silu_mul)
+                .arg(gate)
+                .arg(up)
+                .arg(output)
+                .arg(&length)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Compute the per-head GDN scalar gates from projected inputs, matching
     /// the host reference: `decay = exp(a · softplus(alpha + dt_bias))` where
     /// `a = -exp(A_log)`, and `beta = sigmoid(beta_raw)`.

@@ -1090,18 +1090,10 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
     // alpha/beta_raw come from the ssm_alpha/ssm_beta projections; a is
     // ssm_a = -exp(A_log); dt_bias does not touch beta.
     let heads = 16;
-    let alpha: Vec<f32> = (0..heads)
-        .map(|index| -0.5 + f32::from(index) * 0.07)
-        .collect();
-    let beta_raw: Vec<f32> = (0..heads)
-        .map(|index| f32::from(index) * 0.11 - 0.8)
-        .collect();
-    let dt_bias: Vec<f32> = (0..heads)
-        .map(|index| -0.3 + f32::from(index) * 0.05)
-        .collect();
-    let a: Vec<f32> = (0..heads)
-        .map(|index| -1.0 - f32::from(index) * 0.1)
-        .collect();
+    let alpha: Vec<f32> = (0..heads).map(|index| -0.5 + index as f32 * 0.07).collect();
+    let beta_raw: Vec<f32> = (0..heads).map(|index| index as f32 * 0.11 - 0.8).collect();
+    let dt_bias: Vec<f32> = (0..heads).map(|index| -0.3 + index as f32 * 0.05).collect();
+    let a: Vec<f32> = (0..heads).map(|index| -1.0 - index as f32 * 0.1).collect();
     let alpha_device = stream.clone_htod(&alpha).expect("upload alpha");
     let beta_raw_device = stream.clone_htod(&beta_raw).expect("upload beta raw");
     let dt_bias_device = stream.clone_htod(&dt_bias).expect("upload dt bias");
