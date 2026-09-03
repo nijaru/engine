@@ -1702,6 +1702,45 @@ fn capture_sum(table: &[(&str, &str)], name: &str) -> Option<f64> {
         .and_then(|(_, text)| text.parse::<f64>().ok())
 }
 
+/// Deterministic pseudo-random f32 fixtures in 0.125 steps within [-4, 4):
+/// every value is exactly representable in F16, so F16 cache rounding is
+/// lossless and host replays can compare against the F32 equations.
+fn fixture_quantized_f32(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    let steps = u16::try_from((*state >> 16) & 0x3f).expect("steps fit u16");
+    f32::from(steps) * 0.125 - 4.0
+}
+
+/// Exact F16 bit patterns for `fixture_quantized_f32` values without an
+/// f16 dependency: sign, bias-15 exponent, 10-bit fraction. The 2^-3 step
+/// size keeps at least 7 trailing zero fraction bits, so the conversion is
+/// exact.
+fn fixture_f16_bits(value: f32) -> u16 {
+    if value == 0.0 {
+        return 0;
+    }
+    let sign = u16::from(value.is_sign_negative()) << 15;
+    let magnitude = value.abs();
+    // magnitude is a multiple of 0.125 in [0, 4); normalize to [1, 2).
+    let mut exponent = 0_i32;
+    let mut mantissa = magnitude;
+    while mantissa >= 2.0 {
+        mantissa *= 0.5;
+        exponent += 1;
+    }
+    while mantissa < 1.0 {
+        mantissa *= 2.0;
+        exponent -= 1;
+    }
+    // mantissa in [1, 2): 10-bit fraction = (mantissa - 1) * 2^10.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "fixtures are exact multiples of 2^-3"
+    )]
+    let fraction = ((mantissa - 1.0) * 1024.0) as i32;
+    sign | u16::try_from((exponent + 15) * 1024 + fraction).expect("f16 bits fit u16")
+}
+
 use engine_nvidia::rms_norm_raw as host_rms_norm;
 
 fn load_gdn_layer(provider: &Qwen35ModelProvider, layer: usize) -> GdnLayerWeights {
@@ -1995,15 +2034,15 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn executes_rope_sigmoid_against_host_equations() {
+    const HEADS: usize = 4;
+    const HEAD_DIM: usize = 256;
+    const ROT_DIMS: usize = 64;
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
 
     // rope_neox: NEOX half-split pairs over the first 64 dims of each
     // 256-dim head, matching the pinned reference equations.
-    const HEADS: usize = 4;
-    const HEAD_DIM: usize = 256;
-    const ROT_DIMS: usize = 64;
     let base = 1.0e7_f32;
     let mut host = vec![0.0_f32; HEADS * HEAD_DIM];
     for (index, value) in host.iter_mut().enumerate() {
@@ -2061,67 +2100,39 @@ fn executes_rope_sigmoid_against_host_equations() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn executes_attn_score_gqa_against_host_equations() {
+    const Q_HEADS: usize = 6;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 32;
+    const TOKENS: usize = 3;
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
 
     // Small geometry exercising block-mapped GQA: 6 q heads over 2 kv
-    // heads, head_dim 32, three cached tokens.
-    const Q_HEADS: usize = 6;
-    const KV_HEADS: usize = 2;
-    const HEAD_DIM: usize = 32;
-    const TOKENS: usize = 3;
+    // heads, head_dim 32, three cached tokens. Fixtures use 0.125 steps in
+    // [-4, 4): exactly representable in F16, so the F16 cache rounding is
+    // lossless and the host replay compares against the F32 equations.
     let mut state = 12345_u32;
-    let pseudo = |state: &mut u32| {
-        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (*state >> 16) & 0x7fff
-    };
-    // Fixtures use 0.125 steps in [-4, 4): every value is exactly
-    // representable in F16, so the F16 cache rounding is lossless and the
-    // host replay can compare directly against the F32 equations.
-    let quantized = |state: &mut u32| {
-        let steps = u16::try_from(pseudo(state) % 64).expect("steps fit u16");
-        f32::from(steps) * 0.125 - 4.0
-    };
     let q: Vec<f32> = (0..Q_HEADS * HEAD_DIM)
-        .map(|_| quantized(&mut state))
+        .map(|_| fixture_quantized_f32(&mut state))
         .collect();
     let gate_raw: Vec<f32> = (0..Q_HEADS * 2 * HEAD_DIM)
-        .map(|_| quantized(&mut state))
+        .map(|_| fixture_quantized_f32(&mut state))
         .collect();
     let keys_f32: Vec<f32> = (0..TOKENS * KV_HEADS * HEAD_DIM)
-        .map(|_| quantized(&mut state))
+        .map(|_| fixture_quantized_f32(&mut state))
         .collect();
     let values_f32: Vec<f32> = (0..TOKENS * KV_HEADS * HEAD_DIM)
-        .map(|_| quantized(&mut state))
+        .map(|_| fixture_quantized_f32(&mut state))
         .collect();
-    // F16 bits: values are exact multiples of 2^-3 within [-4, 4), so the
-    // standard round-to-nearest conversion is a bit pattern we can build
-    // without a f16 dependency: sign, exponent bias 15, 10 mantissa bits.
-    let to_f16_bits = |value: f32| -> u16 {
-        if value == 0.0 {
-            return 0;
-        }
-        let sign = u16::from(value.is_sign_negative()) << 15;
-        let magnitude = value.abs();
-        // magnitude is a multiple of 0.125 in [0, 4); normalize to [1, 2).
-        let mut exponent = 0_i32;
-        let mut mantissa = magnitude;
-        while mantissa >= 2.0 {
-            mantissa *= 0.5;
-            exponent += 1;
-        }
-        while mantissa < 1.0 {
-            mantissa *= 2.0;
-            exponent -= 1;
-        }
-        // mantissa in [1, 2): 10-bit fraction = (mantissa - 1) * 2^10, exact
-        // because the step size 2^-3 keeps at least 7 trailing zero bits.
-        let fraction = ((mantissa - 1.0) * 1024.0) as i32;
-        sign | u16::try_from((exponent + 15) * 1024 + fraction).expect("f16 bits fit u16")
-    };
-    let keys: Vec<u16> = keys_f32.iter().map(|&value| to_f16_bits(value)).collect();
-    let values: Vec<u16> = values_f32.iter().map(|&value| to_f16_bits(value)).collect();
+    let keys: Vec<u16> = keys_f32
+        .iter()
+        .map(|&value| fixture_f16_bits(value))
+        .collect();
+    let values: Vec<u16> = values_f32
+        .iter()
+        .map(|&value| fixture_f16_bits(value))
+        .collect();
 
     let q_device = stream.clone_htod(&q).expect("upload q");
     let keys_device = stream.clone_htod(&keys).expect("upload keys");
@@ -2155,7 +2166,7 @@ fn executes_attn_score_gqa_against_host_equations() {
     for q_head in 0..Q_HEADS {
         let kv_head = q_head / q_per_kv;
         let q_vec = &q[q_head * HEAD_DIM..(q_head + 1) * HEAD_DIM];
-        let mut head_scores = vec![0.0_f32; TOKENS];
+        let mut head_scores = [0.0_f32; TOKENS];
         for (token, score) in head_scores.iter_mut().enumerate() {
             let start = (token * KV_HEADS + kv_head) * HEAD_DIM;
             let key = &keys_f32[start..start + HEAD_DIM];
@@ -2169,10 +2180,10 @@ fn executes_attn_score_gqa_against_host_equations() {
         let total: f32 = exps.iter().sum();
         for dim in 0..HEAD_DIM {
             let mut out = 0.0_f32;
-            for token in 0..TOKENS {
+            for (token, exp) in exps.iter().enumerate() {
                 let value_start = (token * KV_HEADS + kv_head) * HEAD_DIM;
                 let value = &values_f32[value_start..value_start + HEAD_DIM];
-                out += (exps[token] / total) * value[dim];
+                out += (exp / total) * value[dim];
             }
             let gate = gate_raw[q_head * 2 * HEAD_DIM + HEAD_DIM + dim];
             let sigmoid = 1.0 / (1.0 + (-gate).exp());
