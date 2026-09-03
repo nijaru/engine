@@ -1057,6 +1057,14 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
         ops.argmax(&logits_device).expect("select greedy token"),
         401
     );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_l2_norm_against_host_equations() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
 
     // l2_norm: eps floor on the norm, matching ggml l2_norm_f32.
     let l2_input = vec![3.0_f32, 4.0, 0.0, -12.0];
@@ -1085,15 +1093,31 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
         .clone_dtoh(&zeros_out)
         .expect("download zero l2 output");
     assert!(actual.iter().all(|value| value.abs() < 1e-7));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_gdn_scalar_gate_against_host_equations() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
 
     // gdn_scalar_gate: decay/beta equations against the host reference.
     // alpha/beta_raw come from the ssm_alpha/ssm_beta projections; a is
     // ssm_a = -exp(A_log); dt_bias does not touch beta.
     let heads = 16;
-    let alpha: Vec<f32> = (0..heads).map(|index| -0.5 + index as f32 * 0.07).collect();
-    let beta_raw: Vec<f32> = (0..heads).map(|index| index as f32 * 0.11 - 0.8).collect();
-    let dt_bias: Vec<f32> = (0..heads).map(|index| -0.3 + index as f32 * 0.05).collect();
-    let a: Vec<f32> = (0..heads).map(|index| -1.0 - index as f32 * 0.1).collect();
+    let alpha: Vec<f32> = (0..heads)
+        .map(|index| -0.5 + f32::from(u16::try_from(index).expect("head index fits")) * 0.07)
+        .collect();
+    let beta_raw: Vec<f32> = (0..heads)
+        .map(|index| f32::from(u16::try_from(index).expect("head index fits")) * 0.11 - 0.8)
+        .collect();
+    let dt_bias: Vec<f32> = (0..heads)
+        .map(|index| -0.3 + f32::from(u16::try_from(index).expect("head index fits")) * 0.05)
+        .collect();
+    let a: Vec<f32> = (0..heads)
+        .map(|index| -1.0 - f32::from(u16::try_from(index).expect("head index fits")) * 0.1)
+        .collect();
     let alpha_device = stream.clone_htod(&alpha).expect("upload alpha");
     let beta_raw_device = stream.clone_htod(&beta_raw).expect("upload beta raw");
     let dt_bias_device = stream.clone_htod(&dt_bias).expect("upload dt bias");
