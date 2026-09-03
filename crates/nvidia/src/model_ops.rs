@@ -108,6 +108,49 @@ extern "C" __global__ void silu_mul(
     const float value = gate[index];
     output[index] = (value / (1.0f + expf(-value))) * up[index];
 }
+
+extern "C" __global__ void l2_norm(
+    const float* input,
+    float* output,
+    int length,
+    float epsilon
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int index = 0; index < length; ++index) {
+        sum += input[index] * input[index];
+    }
+    const float scale = 1.0f / fmaxf(sqrtf(sum), epsilon);
+    for (int index = 0; index < length; ++index) {
+        output[index] = input[index] * scale;
+    }
+}
+
+extern "C" __global__ void gdn_scalar_gate(
+    const float* alpha,
+    const float* beta_raw,
+    const float* dt_bias,
+    const float* a,
+    float* decay,
+    float* beta,
+    int heads
+) {
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= heads) {
+        return;
+    }
+    // Matches the pinned host reference: decay = exp(a * softplus(alpha +
+    // dt_bias)) where a = -exp(A_log), and beta = sigmoid(beta_raw) where
+    // beta_raw is the ssm_beta projection (dt_bias does not touch beta).
+    const float softplus_arg = alpha[head] + dt_bias[head];
+    const float softplus_value = softplus_arg > 20.0f
+        ? softplus_arg
+        : logf(1.0f + expf(softplus_arg));
+    decay[head] = expf(a[head] * softplus_value);
+    beta[head] = 1.0f / (1.0f + expf(-beta_raw[head]));
+}
 "#;
 
 /// Reference-oriented elementwise operations used by Qwen-family model
@@ -118,6 +161,8 @@ pub struct CudaQwen35Ops {
     argmax: CudaFunction,
     rms_norm: CudaFunction,
     silu_mul: CudaFunction,
+    l2_norm: CudaFunction,
+    gdn_scalar_gate: CudaFunction,
 }
 
 impl CudaQwen35Ops {
@@ -162,11 +207,19 @@ impl CudaQwen35Ops {
         let silu_mul = module
             .load_function("silu_mul")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let l2_norm = module
+            .load_function("l2_norm")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_scalar_gate = module
+            .load_function("gdn_scalar_gate")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
             argmax,
             rms_norm,
             silu_mul,
+            l2_norm,
+            gdn_scalar_gate,
         })
     }
 
@@ -293,7 +346,63 @@ impl CudaQwen35Ops {
         Ok(())
     }
 
-    /// Apply elementwise `SiLU` to `gate` and multiply it by `up`.
+    /// Apply per-head `l2` normalization with an eps floor on the norm,
+    /// matching `ggml_compute_forward_l2_norm_f32`:
+    /// `1 / max(sqrt(sum(x²)), eps)`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, epsilon, or
+    /// launch arguments are invalid.
+    pub fn l2_norm(
+        &self,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if input.is_empty() {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if output.len() != input.len() {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: input.len(),
+                actual: output.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let length = u32::try_from(input.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // Safety: cudarc allocated both slices, lengths are validated, and
+        // the one-block launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.l2_norm)
+                .arg(input)
+                .arg(output)
+                .arg(&length)
+                .arg(&epsilon)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Compute the per-head GDN scalar gates from projected inputs, matching
+    /// the host reference: `decay = exp(a · softplus(alpha + dt_bias))` where
+    /// `a = -exp(A_log)`, and `beta = sigmoid(beta_raw)`.
     ///
     /// The launch is asynchronous with respect to the host.
     ///
@@ -301,43 +410,61 @@ impl CudaQwen35Ops {
     ///
     /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
     /// arguments are invalid.
-    pub fn silu_mul(
+    pub fn gdn_scalar_gate(
         &self,
-        gate: &CudaSlice<f32>,
-        up: &CudaSlice<f32>,
-        output: &mut CudaSlice<f32>,
+        alpha: &CudaSlice<f32>,
+        beta_raw: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        decay: &mut CudaSlice<f32>,
+        beta: &mut CudaSlice<f32>,
     ) -> Result<(), CudaModelKernelError> {
-        self.check_contexts(gate, up, output)?;
-        if gate.is_empty() {
+        let context = self.stream.context();
+        if context.as_ref() != alpha.context().as_ref()
+            || context.as_ref() != beta_raw.context().as_ref()
+            || context.as_ref() != dt_bias.context().as_ref()
+            || context.as_ref() != a.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        let heads = alpha.len();
+        if heads == 0 {
             return Err(CudaModelKernelError::EmptyInput);
         }
-        if gate.len() != up.len() {
+        let lengths = [
+            beta_raw.len(),
+            dt_bias.len(),
+            a.len(),
+            decay.len(),
+            beta.len(),
+        ];
+        if lengths.iter().any(|&len| len != heads) {
             return Err(CudaModelKernelError::InputLength {
-                expected: gate.len(),
-                actual: up.len(),
+                expected: heads,
+                actual: lengths
+                    .into_iter()
+                    .find(|&len| len != heads)
+                    .unwrap_or(heads),
             });
         }
-        if output.len() != gate.len() {
-            return Err(CudaModelKernelError::OutputLength {
-                expected: gate.len(),
-                actual: output.len(),
-            });
-        }
-        let length = u32::try_from(gate.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let config = LaunchConfig {
-            grid_dim: (length.div_ceil(256), 1, 1),
-            block_dim: (256, 1, 1),
+            grid_dim: (heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
             shared_mem_bytes: 0,
         };
         // Safety: cudarc allocated all slices, lengths are validated, and the
         // launch keeps all pointers alive on the same stream.
         unsafe {
             self.stream
-                .launch_builder(&self.silu_mul)
-                .arg(gate)
-                .arg(up)
-                .arg(output)
-                .arg(&length)
+                .launch_builder(&self.gdn_scalar_gate)
+                .arg(alpha)
+                .arg(beta_raw)
+                .arg(dt_bias)
+                .arg(a)
+                .arg(&mut *decay)
+                .arg(&mut *beta)
+                .arg(&heads_u32)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }

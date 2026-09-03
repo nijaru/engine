@@ -542,7 +542,12 @@ pub fn host_ffn_step(weights: &FfnLayerWeights, hidden: &[f32]) -> Vec<f32> {
 const ATTENTION_PAIR_STRIDE: usize = 32;
 
 /// Per-vector `RMSNorm` with raw (already +1'd) GGUF weights.
-fn rms_norm_raw(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+///
+/// # Panics
+///
+/// Panics when the input and weight lengths differ.
+#[must_use]
+pub fn rms_norm_raw(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     assert_eq!(input.len(), weight.len());
     let sum: f32 = input.iter().map(|x| x * x).sum();
     let count = f32::from(u16::try_from(input.len()).expect("input length fits u16"));

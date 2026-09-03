@@ -42,5 +42,5 @@ pub use qwen_reference::{
     AttnStepTrace, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_INNER, GDN_K_HEADS, GDN_QKV_DIM,
     GDN_V_HEADS, GdnLayerWeights, GdnStepTrace, N_EMBD, N_FF, gguf_gemv, host_ffn_step,
     host_full_attn_ar_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
-    host_gdn_ar_step_traced, l2_normalize, softplus,
+    host_gdn_ar_step_traced, l2_normalize, rms_norm_raw, softplus,
 };

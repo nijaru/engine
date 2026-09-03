@@ -220,7 +220,10 @@ mod tests {
         let mut state_manager = LogicalStateManager::new(device, 1024, 0);
         let kv_spec = match requirement {
             StateRequirement::FullAttentionKv(spec) => spec,
-            StateRequirement::Recurrent(_) => unreachable!(),
+            // The fixture builder above only produces the KV requirement.
+            StateRequirement::Recurrent(_) => {
+                unimplemented!("test fixtures only exercise the full-attention KV requirement")
+            }
         };
         let kv = state_manager
             .allocate_kv(kv_spec, StateLocation::Device(device))

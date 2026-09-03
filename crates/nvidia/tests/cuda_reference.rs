@@ -1057,6 +1057,86 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
         ops.argmax(&logits_device).expect("select greedy token"),
         401
     );
+
+    // l2_norm: eps floor on the norm, matching ggml l2_norm_f32.
+    let l2_input = vec![3.0_f32, 4.0, 0.0, -12.0];
+    let l2_device = stream.clone_htod(&l2_input).expect("upload l2 input");
+    let mut l2_out = stream
+        .alloc_zeros::<f32>(l2_input.len())
+        .expect("allocate l2 output");
+    ops.l2_norm(&l2_device, &mut l2_out, 1e-5)
+        .expect("execute l2 normalization");
+    let actual = stream.clone_dtoh(&l2_out).expect("download l2 output");
+    let sum_squares = l2_input.iter().map(|value| value * value).sum::<f32>();
+    let scale = 1.0_f32 / sum_squares.sqrt().max(1e-5_f32);
+    for (actual, input) in actual.iter().zip(&l2_input) {
+        let expected = input * scale;
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+    // eps floor: a zero vector must normalize to zero, not NaN.
+    let zeros = vec![0.0_f32; 128];
+    let zeros_device = stream.clone_htod(&zeros).expect("upload zero l2 input");
+    let mut zeros_out = stream
+        .alloc_zeros::<f32>(zeros.len())
+        .expect("allocate zero l2 output");
+    ops.l2_norm(&zeros_device, &mut zeros_out, 1e-5)
+        .expect("execute l2 normalization on zeros");
+    let actual = stream
+        .clone_dtoh(&zeros_out)
+        .expect("download zero l2 output");
+    assert!(actual.iter().all(|value| value.abs() < 1e-7));
+
+    // gdn_scalar_gate: decay/beta equations against the host reference.
+    // alpha/beta_raw come from the ssm_alpha/ssm_beta projections; a is
+    // ssm_a = -exp(A_log); dt_bias does not touch beta.
+    let heads = 16;
+    let alpha: Vec<f32> = (0..heads)
+        .map(|index| -0.5 + f32::from(index) * 0.07)
+        .collect();
+    let beta_raw: Vec<f32> = (0..heads)
+        .map(|index| f32::from(index) * 0.11 - 0.8)
+        .collect();
+    let dt_bias: Vec<f32> = (0..heads)
+        .map(|index| -0.3 + f32::from(index) * 0.05)
+        .collect();
+    let a: Vec<f32> = (0..heads)
+        .map(|index| -1.0 - f32::from(index) * 0.1)
+        .collect();
+    let alpha_device = stream.clone_htod(&alpha).expect("upload alpha");
+    let beta_raw_device = stream.clone_htod(&beta_raw).expect("upload beta raw");
+    let dt_bias_device = stream.clone_htod(&dt_bias).expect("upload dt bias");
+    let a_device = stream.clone_htod(&a).expect("upload a");
+    let mut decay = stream.alloc_zeros::<f32>(heads).expect("allocate decay");
+    let mut beta = stream.alloc_zeros::<f32>(heads).expect("allocate beta");
+    ops.gdn_scalar_gate(
+        &alpha_device,
+        &beta_raw_device,
+        &dt_bias_device,
+        &a_device,
+        &mut decay,
+        &mut beta,
+    )
+    .expect("execute GDN scalar gate");
+    let decay_actual = stream.clone_dtoh(&decay).expect("download decay");
+    let beta_actual = stream.clone_dtoh(&beta).expect("download beta");
+    for head in 0..heads {
+        let softplus_arg = alpha[head] + dt_bias[head];
+        let softplus_value = if softplus_arg > 20.0 {
+            softplus_arg
+        } else {
+            (1.0 + softplus_arg.exp()).ln()
+        };
+        let expected_decay = (a[head] * softplus_value).exp();
+        let expected_beta = 1.0 / (1.0 + (-beta_raw[head]).exp());
+        assert!(
+            (decay_actual[head] - expected_decay).abs() < 1e-5,
+            "decay {}: {} != {}",
+            head,
+            decay_actual[head],
+            expected_decay
+        );
+        assert!((beta_actual[head] - expected_beta).abs() < 1e-5);
+    }
 }
 
 #[test]
@@ -1399,10 +1479,7 @@ const LLAMA_GDN_CAPTURE_SUMS: &[(&str, &str)] = &[
 /// Parsed golden sums (values are printed with 6 decimals by `llama-debug`;
 /// parsing keeps the transcribed text verbatim and comparable at runtime).
 fn llama_capture_sum(name: &str) -> Option<f64> {
-    LLAMA_GDN_CAPTURE_SUMS
-        .iter()
-        .find(|(capture_name, _)| *capture_name == name)
-        .and_then(|(_, text)| text.parse::<f64>().ok())
+    capture_sum(LLAMA_GDN_CAPTURE_SUMS, name)
 }
 
 /// Relative tolerance for sum comparisons against llama.cpp Q8-activation
@@ -1448,20 +1525,6 @@ fn pinned_embedding_row(provider: &Qwen35ModelProvider, token: usize) -> Vec<f32
 
 fn pinned_norm_weights(provider: &Qwen35ModelProvider, name: &str) -> Vec<f32> {
     pinned_tensor_f32(provider, name)
-}
-
-/// Host `RMSNorm` matching ggml: `x / rms(x) * weight` with weight used raw
-/// (GGUF stores +1'd values).
-#[allow(clippy::cast_possible_truncation)]
-fn host_rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-    let sum: f64 = input.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-    let count = f64::from(u32::try_from(input.len()).expect("input length fits u32"));
-    let inv = (sum / count + f64::from(eps)).sqrt().recip();
-    input
-        .iter()
-        .zip(weight)
-        .map(|(v, w)| (f64::from(*v) * inv * f64::from(*w)) as f32)
-        .collect()
 }
 
 #[test]
@@ -1622,6 +1685,8 @@ fn capture_sum(table: &[(&str, &str)], name: &str) -> Option<f64> {
         .find(|(capture_name, _)| *capture_name == name)
         .and_then(|(_, text)| text.parse::<f64>().ok())
 }
+
+use engine_nvidia::rms_norm_raw as host_rms_norm;
 
 fn load_gdn_layer(provider: &Qwen35ModelProvider, layer: usize) -> GdnLayerWeights {
     let prefix = format!("blk.{layer}.");
