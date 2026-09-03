@@ -56,7 +56,42 @@ impl fmt::Display for CudaModelKernelError {
 impl std::error::Error for CudaModelKernelError {}
 
 const MODEL_OPS_SOURCE: &str = r#"
-#include <cuda_fp16.h>
+// F16 -> F32 bit conversion without cuda_fp16.h (NVRTC's default include
+// path does not ship it): zero-extend to F32, rebias the exponent, and
+// denormalize subnormals explicitly.
+__device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
+    const unsigned int sign = (unsigned int)(bits >> 15) & 1u;
+    const unsigned int exponent = ((unsigned int)(bits >> 10) & 0x1fu);
+    const unsigned int fraction = (unsigned int)(bits & 0x3ffu);
+    if (exponent == 0u) {
+        // Subnormal or zero: normalize via the smallest normal exponent.
+        if (fraction == 0u) {
+            return sign ? -0.0f : 0.0f;
+        }
+        // Find the leading bit position of the fraction.
+        int shift = -1;
+        unsigned int value = fraction;
+        while (value != 0u) {
+            value >>= 1u;
+            ++shift;
+        }
+        const int leading = shift; // position of the MSB, 0-based
+        const unsigned int normalized = (fraction << (10 - leading)) & 0x3ffu;
+        const int new_exponent = -14 - leading + 127;
+        const unsigned int result = (sign << 31) | ((unsigned int)new_exponent << 23) | (normalized << 13);
+        return __int_as_float(result);
+    }
+    if (exponent == 31u) {
+        // Inf or NaN.
+        const unsigned int result =
+            (sign << 31) | 0x7f800000u | (fraction ? 0x7fc00000u : 0u);
+        return __int_as_float(result);
+    }
+    const unsigned int result = (sign << 31)
+        | ((exponent - 15u + 127u) << 23)
+        | (fraction << 13);
+    return __int_as_float(result);
+}
 extern "C" __global__ void rms_norm(
     const float* input,
     const float* weight,
@@ -216,7 +251,7 @@ extern "C" __global__ void attn_score_gqa(
         const float* q_vec = q + q_head * head_dim;
         float dot = 0.0f;
         for (int dim = 0; dim < head_dim; ++dim) {
-            dot += q_vec[dim] * __half2float(key[dim]);
+            dot += q_vec[dim] * f16_bits_to_f32(key[dim]);
         }
         scores[token] = dot * scale;
     }
@@ -240,7 +275,7 @@ extern "C" __global__ void attn_score_gqa(
         const unsigned short* value =
             values + ((long long)token * kv_heads + kv_head) * head_dim;
         for (int dim = 0; dim < head_dim; ++dim) {
-            out[dim] += weight * __half2float(value[dim]);
+            out[dim] += weight * f16_bits_to_f32(value[dim]);
         }
     }
 
