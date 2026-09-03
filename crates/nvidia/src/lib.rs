@@ -13,6 +13,8 @@ mod model_ops;
 #[cfg(feature = "cuda")]
 mod quantized;
 #[cfg(feature = "cuda")]
+mod staging;
+#[cfg(feature = "cuda")]
 mod state;
 
 mod qwen_reference;
@@ -31,6 +33,9 @@ pub use quantized::{
     CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KEmbedding,
     CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQuantizedKernelError,
 };
+
+#[cfg(feature = "cuda")]
+pub use staging::{CudaQwen35Weights, CudaWeightStagingError, QwenGemvKernel, StagedTensorSource};
 
 #[cfg(feature = "cuda")]
 pub use state::{

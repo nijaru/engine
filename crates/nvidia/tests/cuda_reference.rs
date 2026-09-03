@@ -16,10 +16,11 @@ use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
     ATTN_HEAD_DIM, ATTN_Q_HEADS, AttnLayerWeights, CudaHybridState, CudaIq3SEmbedding,
     CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KEmbedding, CudaQ4KGemv,
-    CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaReferenceDispatcher,
-    CudaStateBuffer, CudaStateError, CudaWeightStore, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM,
-    GDN_QKV_DIM, GDN_V_HEADS, GdnLayerWeights, N_EMBD, host_ffn_step,
-    host_full_attn_ar_step_traced, host_gdn_ar_step, host_gdn_ar_step_traced,
+    CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaQwen35Weights,
+    CudaReferenceDispatcher, CudaStateBuffer, CudaStateError, CudaWeightStagingError,
+    CudaWeightStore, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_QKV_DIM, GDN_V_HEADS,
+    GdnLayerWeights, N_EMBD, StagedTensorSource, host_ffn_step, host_full_attn_ar_step_traced,
+    host_gdn_ar_step, host_gdn_ar_step_traced,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -2571,5 +2572,105 @@ fn executes_gdn_gated_norm_and_residual_against_host_equations() {
     for (index, (actual, (a, i))) in actual.iter().zip(acc.iter().zip(&inc)).enumerate() {
         let expected = a + i;
         assert!((actual - expected).abs() < 1e-5, "residual[{index}]");
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+
+    let collect = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| {
+                let reader = provider.open_tensor(name).expect("open tensor");
+                let spec = reader.spec().clone();
+                let value_type = reader.value_type();
+                let encoded_bytes = reader.remaining();
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Budget below the requirement must be rejected before any upload.
+    let norm_tensors = collect(&["output_norm.weight", "blk.0.ssm_dt.bias"]);
+    let total: u64 = norm_tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
+    let undersized = match CudaQwen35Weights::stage(&context, &stream, total - 1, norm_tensors) {
+        Err(error) => error,
+        Ok(_) => panic!("undersized budget must be rejected before upload"),
+    };
+    assert!(matches!(
+        undersized,
+        CudaWeightStagingError::BudgetExceeded { .. }
+    ));
+
+    // A Q5_K tensor stages, finds its kernel family, and dispatches a real
+    // GEMV against the staged device weights.
+    let q5_tensors = collect(&["blk.0.attn_qkv.weight"]);
+    let q5_bytes: u64 = q5_tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
+    let staged = CudaQwen35Weights::stage(&context, &stream, q5_bytes + 1, q5_tensors)
+        .expect("stage Q5_K tensor");
+    let weight = staged
+        .quantized_tensor("blk.0.attn_qkv.weight")
+        .expect("staged Q5_K weight");
+    assert_eq!(weight.value_type(), 13);
+    let kernel = staged.gemv_for(13).expect("Q5_K kernel compiled");
+
+    let mut host_input = vec![0.0_f32; 5120];
+    let mut state = 321_u32;
+    for value in &mut host_input {
+        *value = fixture_quantized_f32(&mut state);
+    }
+    let input = stream.clone_htod(&host_input).expect("upload input");
+    let mut output = stream.alloc_zeros::<f32>(10240).expect("allocate output");
+    kernel
+        .execute(weight, &input, &mut output)
+        .expect("execute staged GEMV");
+    let actual = stream.clone_dtoh(&output).expect("download output");
+
+    // Host replay against the GGUF decoder: column-major [K, N] contract.
+    let mut reader = provider
+        .open_tensor("blk.0.attn_qkv.weight")
+        .expect("reopen tensor");
+    let mut columns: Vec<Vec<f32>> = Vec::new();
+    let mut block = Vec::new();
+    while let Some(next) = reader.read_dequantized_block().expect("decode block") {
+        block.extend(next);
+        while block.len() >= 5120 {
+            let take = 5120.min(block.len());
+            let column: Vec<f32> = block[..take].to_vec();
+            // Columns arrive element-major over K; accumulate per output.
+            if columns.is_empty() {
+                columns.push(Vec::new());
+            }
+            block.drain(..take);
+        }
+    }
+    // Simpler: decode the full tensor into flat row-major [N][K] via the
+    // gguf_gemv convention (column n = values[n*5120..(n+1)*5120]) and
+    // compare the first outputs directly.
+    let mut reader = provider
+        .open_tensor("blk.0.attn_qkv.weight")
+        .expect("reopen tensor again");
+    let mut flat = Vec::new();
+    while let Some(next) = reader.read_dequantized_block().expect("decode block") {
+        flat.extend(next);
+    }
+    for (n, actual) in actual.iter().enumerate().take(256) {
+        let expected: f32 = (0..5120).map(|k| flat[n * 5120 + k] * host_input[k]).sum();
+        assert!(
+            (actual - expected).abs() < 1.0,
+            "gemv[{n}]: {actual} != {expected}"
+        );
     }
 }
