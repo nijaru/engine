@@ -2605,10 +2605,9 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
     // Budget below the requirement must be rejected before any upload.
     let norm_tensors = collect(&["output_norm.weight", "blk.0.ssm_dt.bias"]);
     let total: u64 = norm_tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
-    let undersized = match CudaQwen35Weights::stage(&context, &stream, total - 1, norm_tensors) {
-        Err(error) => error,
-        Ok(_) => panic!("undersized budget must be rejected before upload"),
-    };
+    let undersized = CudaQwen35Weights::stage(&context, &stream, total - 1, norm_tensors)
+        .err()
+        .expect("undersized budget must be rejected before upload");
     assert!(matches!(
         undersized,
         CudaWeightStagingError::BudgetExceeded { .. }
@@ -2638,30 +2637,11 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
         .expect("execute staged GEMV");
     let actual = stream.clone_dtoh(&output).expect("download output");
 
-    // Host replay against the GGUF decoder: column-major [K, N] contract.
+    // Host replay against the GGUF decoder: the [K, N] convention stores
+    // output column n at flat[n*5120..(n+1)*5120].
     let mut reader = provider
         .open_tensor("blk.0.attn_qkv.weight")
         .expect("reopen tensor");
-    let mut columns: Vec<Vec<f32>> = Vec::new();
-    let mut block = Vec::new();
-    while let Some(next) = reader.read_dequantized_block().expect("decode block") {
-        block.extend(next);
-        while block.len() >= 5120 {
-            let take = 5120.min(block.len());
-            let column: Vec<f32> = block[..take].to_vec();
-            // Columns arrive element-major over K; accumulate per output.
-            if columns.is_empty() {
-                columns.push(Vec::new());
-            }
-            block.drain(..take);
-        }
-    }
-    // Simpler: decode the full tensor into flat row-major [N][K] via the
-    // gguf_gemv convention (column n = values[n*5120..(n+1)*5120]) and
-    // compare the first outputs directly.
-    let mut reader = provider
-        .open_tensor("blk.0.attn_qkv.weight")
-        .expect("reopen tensor again");
     let mut flat = Vec::new();
     while let Some(next) = reader.read_dequantized_block().expect("decode block") {
         flat.extend(next);
