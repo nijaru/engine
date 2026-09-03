@@ -2612,8 +2612,7 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
             let spec = reader.spec().clone();
             let value_type = reader.value_type();
             let encoded_bytes = reader.remaining();
-            let mut blocks = engine_nvidia::wrap_f32_stream(reader);
-            let _: &engine_core::WeightTensorSpec = blocks.spec();
+            let blocks = engine_nvidia::wrap_f32_stream(reader);
             StagedTensorSource {
                 spec,
                 value_type,
