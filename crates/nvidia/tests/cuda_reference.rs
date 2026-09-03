@@ -2673,3 +2673,85 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+fn stages_the_full_pinned_qwen_text_path() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let provider =
+        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+            .expect("open pinned Qwen GGUF");
+
+    // Enumerate the full text path: globals plus every language layer's
+    // validated binding. The pinned artifact has 64 language layers; the
+    // MTP block (blk.64) stays excluded by construction.
+    let device = DeviceId::new(0);
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    for layer in 0..64_u32 {
+        let binding = provider
+            .layer_weight_binding(device, layer)
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                // Small raw F32/F16 tensors (norms, biases, conv weights)
+                // stage through the dequantized block stream.
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+
+    let total: u64 = tensors.iter().map(|tensor| tensor.encoded_bytes).sum();
+    let staged = CudaQwen35Weights::stage(&context, &stream, 20_u64 << 30, tensors)
+        .expect("stage the full text path");
+
+    // The pinned artifact uses these quant families for the projections.
+    for value_type in [12_u32, 13, 14] {
+        assert!(
+            staged.gemv_for(value_type).is_some(),
+            "value type {value_type} kernel missing"
+        );
+    }
+    for name in [
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.ssm_out.weight",
+        "blk.63.attn_output.weight",
+    ] {
+        assert!(staged.quantized_tensor(name).is_some(), "{name} missing");
+    }
+    eprintln!(
+        "staged {} tensors, {total} encoded bytes across all families",
+        names.len()
+    );
+}
