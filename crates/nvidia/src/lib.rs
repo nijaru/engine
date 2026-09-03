@@ -9,6 +9,8 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cuda")]
+mod decode;
+#[cfg(feature = "cuda")]
 mod model_ops;
 #[cfg(feature = "cuda")]
 mod quantized;
@@ -39,6 +41,9 @@ pub use staging::{
     CudaQwen35Weights, CudaWeightStagingError, F32SourceError, QwenGemvKernel, StagedTensorSource,
     WrappingF32Stream, wrap_f32_stream,
 };
+
+#[cfg(feature = "cuda")]
+pub use decode::{CudaDecodeError, CudaQwen35Decode, QwenLayerKind};
 
 #[cfg(feature = "cuda")]
 pub use state::{

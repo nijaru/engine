@@ -17,10 +17,10 @@ use engine_nvidia::{
     ATTN_HEAD_DIM, ATTN_Q_HEADS, AttnLayerWeights, CudaHybridState, CudaIq3SEmbedding,
     CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KEmbedding, CudaQ4KGemv,
     CudaQ5KGemv, CudaQ6KGemv, CudaQ8_0Gemv, CudaQwen35Ops, CudaQwen35Weights,
-    CudaReferenceDispatcher, CudaStateBuffer, CudaStateError, CudaWeightStagingError,
-    CudaWeightStore, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_QKV_DIM, GDN_V_HEADS,
-    GdnLayerWeights, N_EMBD, StagedTensorSource, host_ffn_step, host_full_attn_ar_step_traced,
-    host_gdn_ar_step, host_gdn_ar_step_traced,
+    CudaReferenceDispatcher, CudaStateError, CudaWeightStagingError, CudaWeightStore,
+    FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_QKV_DIM, GDN_V_HEADS, GdnLayerWeights, N_EMBD,
+    StagedTensorSource, host_ffn_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
+    host_gdn_ar_step_traced,
 };
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -1174,33 +1174,26 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
 
     let mut physical = CudaHybridState::from_state_set(stream.clone(), &core_state)
         .expect("physical hybrid state");
-    assert_eq!(physical.kv().expect("KV state").keys().len(), 32);
+    let kv = physical.kv().expect("KV state");
+    assert_eq!(kv.spec().layer_count(), 1);
+    assert_eq!(kv.layer_keys(0).expect("layer keys").len(), 32);
     assert_eq!(
-        physical.kv().expect("KV state").keys().dtype(),
+        kv.layer_keys(0).expect("layer keys").dtype(),
         engine_core::DataType::F16
     );
-    assert_eq!(physical.kv().expect("KV state").values().len(), 32);
-    assert_eq!(physical.kv().expect("KV state").byte_size(), Some(128));
+    assert_eq!(kv.layer_values(0).expect("layer values").len(), 32);
+    assert_eq!(kv.byte_size(), Some(128));
+    let recurrent = physical.recurrent().expect("recurrent state");
+    assert_eq!(recurrent.spec().layer_count(), 1);
+    assert_eq!(recurrent.layer_matrix(0).expect("layer matrix").len(), 8);
     assert_eq!(
-        physical
-            .recurrent()
-            .expect("recurrent state")
-            .matrix()
-            .len(),
-        8
-    );
-    assert_eq!(
-        physical
-            .recurrent()
-            .expect("recurrent state")
-            .convolution()
+        recurrent
+            .layer_convolution(0)
+            .expect("layer convolution")
             .len(),
         6
     );
-    assert_eq!(
-        physical.recurrent().expect("recurrent state").byte_size(),
-        Some(56)
-    );
+    assert_eq!(recurrent.byte_size(), Some(56));
     assert_eq!(physical.byte_size(), Some(184));
     physical.zero().expect("zero physical state");
     physical.advance_to(2).expect("advance state");
@@ -1231,10 +1224,13 @@ fn write_and_validate_physical_state(
         .write_recurrent_layer(0, &matrix, &convolution)
         .expect("write recurrent layer");
     physical.zero().expect("zero after writes");
-    let kv = physical.kv().expect("KV state after zero");
-    let CudaStateBuffer::F16(keys_slice) = kv.keys() else {
-        panic!("expected F16 KV keys");
-    };
+    let keys_slice = physical
+        .kv()
+        .expect("KV state after zero")
+        .layer_keys(0)
+        .expect("layer keys")
+        .as_f16()
+        .expect("F16 KV keys");
     let keys = stream.clone_dtoh(keys_slice).expect("download zeroed keys");
     assert!(keys.iter().all(|&key| key == 0));
     assert!(matches!(
@@ -2873,5 +2869,192 @@ fn executes_kv_append_f16_against_host_rounding() {
                 .iter()
                 .all(|bits| *bits == 0)
         );
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+// Layer-major host replay vs token-major device replay over the same state
+// evolution; splitting it would hide cross-layer divergence.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end parity gate over the four-layer prefix"
+)]
+fn decodes_four_layers_against_the_host_reference() {
+    use engine_core::{
+        ConvolutionStateShape, DataType, KvStateSpec, RecurrentMatrixShape, RecurrentStateSpec,
+    };
+    use engine_nvidia::host_full_attn_ar_step;
+    use engine_nvidia::{CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource};
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const TOKENS: [usize; 2] = [12_675, 1017];
+    const LAYERS: usize = 4;
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let _ = &provider;
+    let stream = context.default_stream();
+
+    // Stage globals plus layers 0..LAYERS only; the executor validates the
+    // full required set, so build the plan over exactly the staged layers.
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    let device = DeviceId::new(0);
+    for layer in 0..LAYERS {
+        let binding = provider
+            .layer_weight_binding(device, u32::try_from(layer).expect("layer fits u32"))
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+    let staged = Arc::new(
+        CudaQwen35Weights::stage(&context, &stream, 4_u64 << 30, tensors)
+            .expect("stage the four-layer prefix"),
+    );
+
+    // Layer plan and matching state families: 3 GDN layers + 1 full-attention.
+    let layer_kinds = [QwenLayerKind::Recurrent; 3]
+        .into_iter()
+        .chain([QwenLayerKind::FullAttention])
+        .collect::<Vec<_>>();
+    let kv_spec = KvStateSpec::new(1, 4, 256, 8, DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        3,
+        RecurrentMatrixShape::new(1, 128, 48, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        DataType::F32,
+        DataType::F32,
+    )
+    .expect("recurrent spec");
+    let mut state = engine_nvidia::CudaHybridState::from_specs(
+        stream.clone(),
+        Some(kv_spec),
+        Some(recurrent_spec),
+    )
+    .expect("physical hybrid state");
+    state.zero().expect("zero state");
+
+    let mut executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("build decode executor");
+
+    // Host reference chain: same 4-layer prefix, same tokens, same eps.
+    let embeds: Vec<Vec<f32>> = TOKENS
+        .iter()
+        .map(|token| pinned_embedding_row(&provider, *token))
+        .collect();
+    let mut host_hidden = embeds.clone();
+    let mut host_kv_keys = Vec::new();
+    let mut host_kv_values = Vec::new();
+    for layer in 0..LAYERS {
+        let attn_norm_w = pinned_tensor_f32(&provider, &format!("blk.{layer}.attn_norm.weight"));
+        let post_norm_w = pinned_tensor_f32(
+            &provider,
+            &format!("blk.{layer}.post_attention_norm.weight"),
+        );
+        let ffn_w = load_ffn_layer(&provider, layer);
+        if layer < 3 {
+            let gdn_w = load_gdn_layer(&provider, layer);
+            let mut gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+            let mut gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
+            for x in &mut host_hidden {
+                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
+                let attn_out =
+                    host_gdn_ar_step(&gdn_w, &normalized, &mut gdn_matrix, &mut gdn_conv, EPS);
+                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, EPS);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+            }
+        } else {
+            let attn_w = load_attn_layer(&provider, layer);
+            for (position, x) in host_hidden.iter_mut().enumerate() {
+                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
+                let attn_out = host_full_attn_ar_step(
+                    &attn_w,
+                    &normalized,
+                    &mut host_kv_keys,
+                    &mut host_kv_values,
+                    position,
+                    EPS,
+                );
+                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, EPS);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+            }
+        }
+    }
+
+    // Device replay: two tokens through the executor, in order.
+    for (position, token) in TOKENS.iter().enumerate() {
+        let chosen = executor
+            .decode_step(
+                &mut state,
+                u32::try_from(*token).expect("token fits u32"),
+                u32::try_from(position).expect("position fits u32"),
+            )
+            .expect("decode step");
+        // The four-layer prefix must stay deterministic; nothing samples here,
+        // but the argmax must run cleanly. Compare the residual stream.
+        let device_hidden = executor.copy_hidden().expect("device hidden after step");
+        let host_x = &host_hidden[position];
+        let max_abs = device_hidden
+            .iter()
+            .zip(host_x)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < 5.0e-3,
+            "device residual diverged at position {position}: max abs {max_abs}"
+        );
+        let _ = chosen;
     }
 }

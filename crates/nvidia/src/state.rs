@@ -37,6 +37,42 @@ impl CudaStateBuffer {
         self.len() == 0
     }
 
+    /// The F16 device data, when this buffer is an F16 allocation.
+    #[must_use]
+    pub fn as_f16(&self) -> Option<&CudaSlice<u16>> {
+        match self {
+            Self::F16(buffer) => Some(buffer),
+            Self::F32(_) => None,
+        }
+    }
+
+    /// The mutable F16 device data, when this buffer is an F16 allocation.
+    #[must_use]
+    pub fn as_f16_mut(&mut self) -> Option<&mut CudaSlice<u16>> {
+        match self {
+            Self::F16(buffer) => Some(buffer),
+            Self::F32(_) => None,
+        }
+    }
+
+    /// The F32 device data, when this buffer is an F32 allocation.
+    #[must_use]
+    pub fn as_f32(&self) -> Option<&CudaSlice<f32>> {
+        match self {
+            Self::F32(buffer) => Some(buffer),
+            Self::F16(_) => None,
+        }
+    }
+
+    /// The mutable F32 device data, when this buffer is an F32 allocation.
+    #[must_use]
+    pub fn as_f32_mut(&mut self) -> Option<&mut CudaSlice<f32>> {
+        match self {
+            Self::F32(buffer) => Some(buffer),
+            Self::F16(_) => None,
+        }
+    }
+
     #[must_use]
     pub fn byte_size(&self) -> Option<u64> {
         u64::try_from(self.len())
@@ -57,11 +93,14 @@ impl CudaStateBuffer {
 }
 
 /// Physical full-attention KV state. Keys and values remain separate device
-/// buffers even when they share one allocation shape.
+/// buffers even when they share one allocation shape; each layer owns its
+/// pair so kernels address one layer's cache without offset arithmetic.
 pub struct CudaKvState {
     spec: KvStateSpec,
-    keys: CudaStateBuffer,
-    values: CudaStateBuffer,
+    /// Per-layer `[token][kv_head][head_dim]` key caches.
+    keys: Vec<CudaStateBuffer>,
+    /// Per-layer `[token][kv_head][head_dim]` value caches.
+    values: Vec<CudaStateBuffer>,
 }
 
 impl CudaKvState {
@@ -70,22 +109,27 @@ impl CudaKvState {
         self.spec
     }
 
+    /// The device key cache for one full-attention layer.
     #[must_use]
-    pub fn keys(&self) -> &CudaStateBuffer {
-        &self.keys
+    pub fn layer_keys(&self, layer: u32) -> Option<&CudaStateBuffer> {
+        self.keys.get(usize::try_from(layer).ok()?)
     }
 
-    pub fn keys_mut(&mut self) -> &mut CudaStateBuffer {
-        &mut self.keys
-    }
-
+    /// The device value cache for one full-attention layer.
     #[must_use]
-    pub fn values(&self) -> &CudaStateBuffer {
-        &self.values
+    pub fn layer_values(&self, layer: u32) -> Option<&CudaStateBuffer> {
+        self.values.get(usize::try_from(layer).ok()?)
     }
 
-    pub fn values_mut(&mut self) -> &mut CudaStateBuffer {
-        &mut self.values
+    /// The mutable key and value caches for one full-attention layer.
+    pub fn layer_mut(
+        &mut self,
+        layer: u32,
+    ) -> Option<(&mut CudaStateBuffer, &mut CudaStateBuffer)> {
+        let index = usize::try_from(layer).ok()?;
+        let keys = self.keys.get_mut(index)?;
+        let values = self.values.get_mut(index)?;
+        Some((keys, values))
     }
 
     #[must_use]
@@ -95,7 +139,14 @@ impl CudaKvState {
 
     #[must_use]
     pub fn byte_size(&self) -> Option<u64> {
-        self.keys.byte_size()?.checked_add(self.values.byte_size()?)
+        self.keys
+            .iter()
+            .try_fold(0_u64, |sum, buffer| sum.checked_add(buffer.byte_size()?))?
+            .checked_add(
+                self.values
+                    .iter()
+                    .try_fold(0_u64, |sum, buffer| sum.checked_add(buffer.byte_size()?))?,
+            )
     }
 
     /// Write one token's keys and values into a token-major KV block. The
@@ -158,29 +209,40 @@ impl CudaKvState {
                 dtype: spec.dtype(),
             });
         }
-        let layer_width =
-            block_tokens
-                .checked_mul(token_width)
-                .ok_or(CudaStateError::SizeOverflow {
-                    family: "full-attention KV layer",
-                })?;
-        let offset = layer
-            .checked_mul(layer_width)
-            .and_then(|base| base.checked_add(token.checked_mul(token_width)?))
+        let token_offset = token
+            .checked_mul(token_width)
             .ok_or(CudaStateError::SizeOverflow {
                 family: "full-attention KV token offset",
             })?;
+        let key_layers = self.keys.len();
+        let layer_keys = self
+            .keys
+            .get_mut(layer)
+            .ok_or(CudaStateError::IndexOutOfBounds {
+                family: "full-attention KV layer",
+                index: layer,
+                length: key_layers,
+            })?;
+        let value_layers = self.values.len();
+        let layer_values = self
+            .values
+            .get_mut(layer)
+            .ok_or(CudaStateError::IndexOutOfBounds {
+                family: "full-attention KV layer",
+                index: layer,
+                length: value_layers,
+            })?;
         copy_u16_to_offset(
             stream,
-            &mut self.keys,
-            offset,
+            layer_keys,
+            token_offset,
             keys,
             "full-attention KV keys",
         )?;
         copy_u16_to_offset(
             stream,
-            &mut self.values,
-            offset,
+            layer_values,
+            token_offset,
             values,
             "full-attention KV values",
         )
@@ -191,8 +253,10 @@ impl CudaKvState {
 /// history have independent buffers and are never represented as KV pages.
 pub struct CudaRecurrentState {
     spec: RecurrentStateSpec,
-    matrix: CudaStateBuffer,
-    convolution: CudaStateBuffer,
+    /// Per-layer `[k_heads][k_dim][v_heads][v_dim]` state matrices.
+    matrix: Vec<CudaStateBuffer>,
+    /// Per-layer `[channels][kernel - 1]` convolution histories.
+    convolution: Vec<CudaStateBuffer>,
 }
 
 impl CudaRecurrentState {
@@ -201,29 +265,39 @@ impl CudaRecurrentState {
         self.spec
     }
 
+    /// The device state matrix for one recurrent layer.
     #[must_use]
-    pub fn matrix(&self) -> &CudaStateBuffer {
-        &self.matrix
+    pub fn layer_matrix(&self, layer: u32) -> Option<&CudaStateBuffer> {
+        self.matrix.get(usize::try_from(layer).ok()?)
     }
 
-    pub fn matrix_mut(&mut self) -> &mut CudaStateBuffer {
-        &mut self.matrix
-    }
-
+    /// The device convolution history for one recurrent layer.
     #[must_use]
-    pub fn convolution(&self) -> &CudaStateBuffer {
-        &self.convolution
+    pub fn layer_convolution(&self, layer: u32) -> Option<&CudaStateBuffer> {
+        self.convolution.get(usize::try_from(layer).ok()?)
     }
 
-    pub fn convolution_mut(&mut self) -> &mut CudaStateBuffer {
-        &mut self.convolution
+    /// The mutable matrix and convolution history for one recurrent layer.
+    pub fn layer_mut(
+        &mut self,
+        layer: u32,
+    ) -> Option<(&mut CudaStateBuffer, &mut CudaStateBuffer)> {
+        let index = usize::try_from(layer).ok()?;
+        let matrix = self.matrix.get_mut(index)?;
+        let convolution = self.convolution.get_mut(index)?;
+        Some((matrix, convolution))
     }
 
     #[must_use]
     pub fn byte_size(&self) -> Option<u64> {
         self.matrix
-            .byte_size()?
-            .checked_add(self.convolution.byte_size()?)
+            .iter()
+            .try_fold(0_u64, |sum, buffer| sum.checked_add(buffer.byte_size()?))?
+            .checked_add(
+                self.convolution
+                    .iter()
+                    .try_fold(0_u64, |sum, buffer| sum.checked_add(buffer.byte_size()?))?,
+            )
     }
 
     /// Write one recurrent layer's matrix and convolution state. Each slice is
@@ -305,29 +379,29 @@ impl CudaRecurrentState {
                 actual: convolution.len(),
             });
         }
-        let matrix_offset =
-            layer
-                .checked_mul(matrix_width)
-                .ok_or(CudaStateError::SizeOverflow {
-                    family: "recurrent matrix offset",
-                })?;
-        let convolution_offset =
-            layer
-                .checked_mul(convolution_width)
-                .ok_or(CudaStateError::SizeOverflow {
-                    family: "recurrent convolution offset",
+        let matrix_layers = self.matrix.len();
+        let layer_matrix = self
+            .matrix
+            .get_mut(layer)
+            .ok_or(CudaStateError::IndexOutOfBounds {
+                family: "recurrent state layer",
+                index: layer,
+                length: matrix_layers,
+            })?;
+        copy_f32_to_offset(stream, layer_matrix, 0, matrix, "recurrent matrix")?;
+        let convolution_layers = self.convolution.len();
+        let layer_convolution =
+            self.convolution
+                .get_mut(layer)
+                .ok_or(CudaStateError::IndexOutOfBounds {
+                    family: "recurrent state layer",
+                    index: layer,
+                    length: convolution_layers,
                 })?;
         copy_f32_to_offset(
             stream,
-            &mut self.matrix,
-            matrix_offset,
-            matrix,
-            "recurrent matrix",
-        )?;
-        copy_f32_to_offset(
-            stream,
-            &mut self.convolution,
-            convolution_offset,
+            layer_convolution,
+            0,
             convolution,
             "recurrent convolution history",
         )
@@ -496,12 +570,20 @@ impl CudaHybridState {
     /// Returns [`CudaStateError::Driver`] when the device memset fails.
     pub fn zero(&mut self) -> Result<(), CudaStateError> {
         if let Some(kv) = &mut self.kv {
-            kv.keys.zero(&self.stream)?;
-            kv.values.zero(&self.stream)?;
+            for buffer in &mut kv.keys {
+                buffer.zero(&self.stream)?;
+            }
+            for buffer in &mut kv.values {
+                buffer.zero(&self.stream)?;
+            }
         }
         if let Some(recurrent) = &mut self.recurrent {
-            recurrent.matrix.zero(&self.stream)?;
-            recurrent.convolution.zero(&self.stream)?;
+            for buffer in &mut recurrent.matrix {
+                buffer.zero(&self.stream)?;
+            }
+            for buffer in &mut recurrent.convolution {
+                buffer.zero(&self.stream)?;
+            }
         }
         self.stream
             .synchronize()
@@ -530,19 +612,33 @@ impl CudaHybridState {
 }
 
 fn allocate_kv(stream: &Arc<CudaStream>, spec: KvStateSpec) -> Result<CudaKvState, CudaStateError> {
-    // Physical layout is [layer, token, kv_head, head_dim], making one token
-    // contiguous for state append and attention reads.
-    let elements = checked_product(
+    // Each layer's cache is a contiguous [token][kv_head][head_dim] buffer,
+    // making one token contiguous for state append and attention reads.
+    let layer_elements = checked_product(
         [
-            u64::from(spec.layer_count()),
             u64::from(spec.block_tokens()),
             u64::from(spec.kv_heads()),
             u64::from(spec.head_dim()),
         ],
-        "full-attention KV",
+        "full-attention KV layer",
     )?;
-    let keys = allocate_buffer(stream, spec.dtype(), elements, "full-attention KV keys")?;
-    let values = allocate_buffer(stream, spec.dtype(), elements, "full-attention KV values")?;
+    let layer_count = usize::from(spec.layer_count());
+    let mut keys = Vec::with_capacity(layer_count);
+    let mut values = Vec::with_capacity(layer_count);
+    for _ in 0..layer_count {
+        keys.push(allocate_buffer(
+            stream,
+            spec.dtype(),
+            layer_elements,
+            "full-attention KV keys",
+        )?);
+        values.push(allocate_buffer(
+            stream,
+            spec.dtype(),
+            layer_elements,
+            "full-attention KV values",
+        )?);
+    }
     Ok(CudaKvState { spec, keys, values })
 }
 
@@ -553,7 +649,6 @@ fn allocate_recurrent(
     let matrix_shape = spec.matrix();
     let matrix_elements = checked_product(
         [
-            u64::from(spec.layer_count()),
             u64::from(matrix_shape.key_heads()),
             u64::from(matrix_shape.key_head_dim()),
             u64::from(matrix_shape.value_heads()),
@@ -564,24 +659,28 @@ fn allocate_recurrent(
     let convolution_shape = spec.convolution();
     let convolution_elements = checked_product(
         [
-            u64::from(spec.layer_count()),
             u64::from(convolution_shape.channels()),
             u64::from(convolution_shape.kernel()),
         ],
         "recurrent convolution history",
     )?;
-    let matrix = allocate_buffer(
-        stream,
-        spec.matrix_dtype(),
-        matrix_elements,
-        "recurrent matrix",
-    )?;
-    let convolution = allocate_buffer(
-        stream,
-        spec.convolution_dtype(),
-        convolution_elements,
-        "recurrent convolution history",
-    )?;
+    let layer_count = usize::from(spec.layer_count());
+    let mut matrix = Vec::with_capacity(layer_count);
+    let mut convolution = Vec::with_capacity(layer_count);
+    for _ in 0..layer_count {
+        matrix.push(allocate_buffer(
+            stream,
+            spec.matrix_dtype(),
+            matrix_elements,
+            "recurrent matrix",
+        )?);
+        convolution.push(allocate_buffer(
+            stream,
+            spec.convolution_dtype(),
+            convolution_elements,
+            "recurrent convolution history",
+        )?);
+    }
     Ok(CudaRecurrentState {
         spec,
         matrix,
