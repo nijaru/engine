@@ -1693,14 +1693,13 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
     // is shared across the two tokens and evolves sequentially.
     let mut x_cur = embeds.clone();
     let mut attn_norm_sums = [0.0_f64; 2];
+    let mut attn_norm3_sums = [0.0_f64; 2];
     let mut l_out2_sums = [0.0_f64; 2];
     let mut traces = Vec::new();
     let mut post_norm3_sums = [0.0_f64; 2];
     let mut ffn_out3_sums = [0.0_f64; 2];
     let mut l_out3_sums = [0.0_f64; 2];
 
-    let mut gdn_matrix = Vec::new();
-    let mut gdn_conv = Vec::new();
     let mut kv_keys = Vec::new();
     let mut kv_values = Vec::new();
 
@@ -1713,12 +1712,11 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
         let ffn_w = load_ffn_layer(&provider, layer);
 
         if layer < 3 {
-            // Gated-DeltaNet layer with FFN/residual wrapper.
+            // Gated-DeltaNet layer with FFN/residual wrapper. Each recurrent
+            // layer owns its state; a fresh context starts every layer at zero.
             let gdn_w = load_gdn_layer(&provider, layer);
-            if gdn_matrix.is_empty() {
-                gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
-                gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
-            }
+            let mut gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+            let mut gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
             for (token_index, x) in x_cur.iter_mut().enumerate() {
                 let normalized = host_rms_norm(x, &attn_norm_w, eps);
                 if layer == 0 {
@@ -1740,6 +1738,7 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
             let attn_w = load_attn_layer(&provider, layer);
             for (token_index, x) in x_cur.iter_mut().enumerate() {
                 let normalized = host_rms_norm(x, &attn_norm_w, eps);
+                attn_norm3_sums[token_index] = normalized.iter().map(|v| f64::from(*v)).sum();
                 let trace = host_full_attn_ar_step_traced(
                     &attn_w,
                     &normalized,
@@ -1817,7 +1816,7 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
         ("l_out-2", l_out2_sums[0] + l_out2_sums[1], 2 * N_EMBD),
         (
             "attn_norm-3",
-            attn_norm_sums[0] + attn_norm_sums[1],
+            attn_norm3_sums[0] + attn_norm3_sums[1],
             2 * N_EMBD,
         ),
         (
