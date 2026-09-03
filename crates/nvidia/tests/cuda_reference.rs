@@ -2259,7 +2259,7 @@ fn executes_gdn_conv_silu_against_host_equations() {
     let weight: Vec<f32> = (0..CHANNELS * 4)
         .map(|_| fixture_quantized_f32(&mut state))
         .collect();
-    let mut history: Vec<f32> = (0..CHANNELS * 3)
+    let history: Vec<f32> = (0..CHANNELS * 3)
         .map(|_| fixture_quantized_f32(&mut state))
         .collect();
 
