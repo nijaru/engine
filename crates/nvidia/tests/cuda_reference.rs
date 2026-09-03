@@ -2597,6 +2597,7 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
                     value_type,
                     encoded_bytes,
                     reader: Box::new(reader),
+                    f32_blocks: None,
                 }
             })
             .collect::<Vec<_>>()

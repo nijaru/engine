@@ -142,6 +142,12 @@ impl CudaF32Weight {
     pub fn spec(&self) -> &WeightTensorSpec {
         &self.spec
     }
+
+    /// The device-resident F32 values for direct kernel consumption.
+    #[must_use]
+    pub fn data(&self) -> &CudaSlice<f32> {
+        &self.data
+    }
 }
 
 /// One opaque block-encoded tensor materialized in backend-owned CUDA memory.

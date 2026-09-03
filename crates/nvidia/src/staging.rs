@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
-use crate::cuda::{CudaQuantizedWeight, CudaWeightError, CudaWeightStore};
+use crate::cuda::{CudaF32Weight, CudaQuantizedWeight, CudaWeightError, CudaWeightStore};
 use crate::quantized::{
     CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KGemv, CudaQ5KGemv, CudaQ6KGemv,
     CudaQ8_0Gemv, CudaQuantizedKernelError,
 };
+use engine_core::weights::F32BlockStream;
 
 /// Errors returned while staging the full model onto the device.
 #[derive(Debug)]
@@ -64,17 +65,22 @@ impl From<CudaQuantizedKernelError> for CudaWeightStagingError {
     }
 }
 
-/// One tensor in the staging set: its descriptor, GGUF value type,
-/// encoded byte length, and a reader over the encoded payload.
+/// One tensor in the staging set. Two shapes are supported: an opaque
+/// encoded payload (reader + value type) for quantized weights, or a
+/// pre-decoded F32 block stream for small tensors (norms, biases, conv
+/// weights) staged through `materialize_f32`.
 pub struct StagedTensorSource<'a> {
     /// Logical tensor descriptor carrying the real dimensions.
     pub spec: engine_core::WeightTensorSpec,
-    /// GGUF value type (12 = `Q4_K`, 14 = `Q6_K`, ...).
+    /// GGUF value type (12 = `Q4_K`, 14 = `Q6_K`, ...). Unused for the F32
+    /// path.
     pub value_type: u32,
-    /// Encoded payload length in bytes.
+    /// Encoded payload length in bytes. Unused for the F32 path.
     pub encoded_bytes: u64,
-    /// Reader over the encoded payload.
+    /// Reader over the encoded payload for the quantized path.
     pub reader: Box<dyn Read + 'a>,
+    /// Pre-decoded F32 blocks for the F32 path; presence selects the path.
+    pub f32_blocks: Option<Box<dyn F32BlockStream<Error = F32SourceError> + 'a>>,
 }
 
 /// The per-value-type GEMV kernel entry compiled once during staging.
@@ -172,6 +178,15 @@ impl CudaQwen35Weights {
         let mut store = CudaWeightStore::new(stream.clone());
         let mut seen_types: Vec<u32> = Vec::new();
         for tensor in tensors {
+            if let Some(blocks) = tensor.f32_blocks {
+                store
+                    .materialize_f32(&mut DelegatingF32Stream {
+                        spec: tensor.spec,
+                        blocks,
+                    })
+                    .map_err(CudaWeightStagingError::Weight)?;
+                continue;
+            }
             let mut reader = tensor.reader;
             store
                 .materialize_quantized(
@@ -209,6 +224,12 @@ impl CudaQwen35Weights {
         Ok(Self { store, gemv })
     }
 
+    /// Look up the staged F32 tensor for a name.
+    #[must_use]
+    pub fn f32_tensor(&self, name: &str) -> Option<&CudaF32Weight> {
+        self.store.tensor(name)
+    }
+
     /// Look up the staged encoded weight for a tensor name.
     #[must_use]
     pub fn quantized_tensor(&self, name: &str) -> Option<&CudaQuantizedWeight> {
@@ -221,5 +242,75 @@ impl CudaQwen35Weights {
         self.gemv
             .iter()
             .find(|kernel| kernel.value_type() == value_type)
+    }
+}
+
+/// Adapter presenting a boxed block stream as one `F32BlockStream` for
+/// `materialize_f32`. The spec is carried alongside because the boxed
+/// stream owns the authoritative one.
+struct DelegatingF32Stream<'a> {
+    spec: engine_core::WeightTensorSpec,
+    blocks: Box<dyn F32BlockStream<Error = F32SourceError> + 'a>,
+}
+
+/// Display-string error bridging any source stream into `materialize_f32`.
+#[derive(Debug)]
+pub struct F32SourceError(String);
+
+impl std::fmt::Display for F32SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for F32SourceError {}
+
+/// Wrap any block stream so its error type becomes [`F32SourceError`],
+/// allowing heterogeneous sources to share one boxed object type.
+#[must_use]
+pub fn wrap_f32_stream<S>(stream: S) -> WrappingF32Stream<S>
+where
+    S: F32BlockStream,
+    S::Error: std::fmt::Display,
+{
+    WrappingF32Stream { inner: stream }
+}
+
+/// A stream adapter converting any `F32BlockStream`'s error into
+/// [`F32SourceError`] so heterogeneous sources share one object type.
+pub struct WrappingF32Stream<S> {
+    inner: S,
+}
+
+impl<S> F32BlockStream for WrappingF32Stream<S>
+where
+    S: F32BlockStream,
+    S::Error: std::fmt::Display,
+{
+    type Error = F32SourceError;
+
+    fn spec(&self) -> &engine_core::WeightTensorSpec {
+        self.inner.spec()
+    }
+
+    fn next_block(&mut self) -> Result<Option<Vec<f32>>, Self::Error> {
+        self.inner
+            .next_block()
+            .map(|block| block)
+            .map_err(|error| F32SourceError(error.to_string()))
+    }
+}
+
+impl engine_core::weights::F32BlockStream for DelegatingF32Stream<'_> {
+    type Error = CudaWeightError;
+
+    fn spec(&self) -> &engine_core::WeightTensorSpec {
+        &self.spec
+    }
+
+    fn next_block(&mut self) -> Result<Option<Vec<f32>>, Self::Error> {
+        self.blocks
+            .next_block()
+            .map_err(|error| CudaWeightError::Source(error.to_string()))
     }
 }
