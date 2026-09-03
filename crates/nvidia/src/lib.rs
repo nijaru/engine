@@ -39,7 +39,8 @@ pub use state::{
 
 pub use qwen_reference::{
     ATTN_HEAD_DIM, ATTN_KV_HEADS, ATTN_Q_HEADS, ATTN_ROPE_BASE, ATTN_ROT_DIMS, AttnLayerWeights,
-    GDN_D_CONV, GDN_HEAD_DIM, GDN_INNER, GDN_K_HEADS, GDN_QKV_DIM, GDN_V_HEADS, GdnLayerWeights,
-    GdnStepTrace, N_EMBD, gguf_gemv, host_full_attn_ar_step, host_gdn_ar_step,
+    AttnStepTrace, FfnLayerWeights, GDN_D_CONV, GDN_HEAD_DIM, GDN_INNER, GDN_K_HEADS, GDN_QKV_DIM,
+    GDN_V_HEADS, GdnLayerWeights, GdnStepTrace, N_EMBD, N_FF, gguf_gemv, host_ffn_step,
+    host_full_attn_ar_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
     host_gdn_ar_step_traced, l2_normalize, softplus,
 };

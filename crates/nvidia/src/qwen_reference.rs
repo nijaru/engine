@@ -327,22 +327,49 @@ pub struct AttnLayerWeights {
     pub attn_output: Vec<f32>,
 }
 
-/// One full-attention autoregressive decode step with position `pos`.
+/// Intermediate tensors from one host full-attention decode step, in ggml
+/// flat order, for empirical parity checks against llama.cpp captures.
+#[derive(Debug)]
+pub struct AttnStepTrace {
+    /// `Qcur_full` raw QG projection `[12288]`.
+    pub q_gate: Vec<f32>,
+    /// `Qcur_normed` per-head normalized q `[24][256]`.
+    pub q_normed: Vec<f32>,
+    /// `Kcur_normed` per-head normalized k `[4][256]`.
+    pub k_normed: Vec<f32>,
+    /// `Vcur` raw v `[4][256]`.
+    pub v: Vec<f32>,
+    /// `Qcur` post-rope q `[24][256]`.
+    pub q_rope: Vec<f32>,
+    /// `Kcur` post-rope k `[4][256]`.
+    pub k_rope: Vec<f32>,
+    /// `gate_sigmoid` `[6144]`.
+    pub gate_sigmoid: Vec<f32>,
+    /// `attn_pregate` pre-gate attention output `[6144]`.
+    pub attn_pregate: Vec<f32>,
+    /// `attn_gated` `[6144]`.
+    pub attn_gated: Vec<f32>,
+    /// `attn_output` post-projection `[5120]`.
+    pub out: Vec<f32>,
+}
+
+/// One full-attention autoregressive decode step with position `pos`,
+/// returning all intermediates for parity validation.
 ///
 /// `kv_keys`/`kv_values` hold all cached tokens' K/V (`[tokens][4][256]`,
-/// newest last) and are extended in place. Returns the layer output `[5120]`.
+/// newest last) and are extended in place.
 ///
 /// # Panics
 ///
 /// Panics when any weight/state slice does not match the pinned geometry.
-pub fn host_full_attn_ar_step(
+pub fn host_full_attn_ar_step_traced(
     weights: &AttnLayerWeights,
     hidden: &[f32],
     kv_keys: &mut Vec<f32>,
     kv_values: &mut Vec<f32>,
     pos: usize,
     eps: f32,
-) -> Vec<f32> {
+) -> AttnStepTrace {
     assert_eq!(hidden.len(), N_EMBD);
 
     let q_gate = gguf_gemv(&weights.attn_q, N_EMBD, hidden);
@@ -427,16 +454,80 @@ pub fn host_full_attn_ar_step(
     }
 
     // Sigmoid gate per head, elementwise.
+    let mut gate_sigmoid = vec![0.0_f32; ATTN_Q_HEADS * head_dim];
+    let mut attn_gated = attn_out.clone();
     for head in 0..ATTN_Q_HEADS {
         for i in 0..head_dim {
             let g = gate[head * head_dim + i];
             let sigmoid = 1.0 / (1.0 + (-g).exp());
-            attn_out[head * head_dim + i] *= sigmoid;
+            gate_sigmoid[head * head_dim + i] = sigmoid;
+            attn_gated[head * head_dim + i] *= sigmoid;
         }
     }
 
     // Output projection [6144 -> 5120].
-    gguf_gemv(&weights.attn_output, ATTN_Q_HEADS * head_dim, &attn_out)
+    let out = gguf_gemv(&weights.attn_output, ATTN_Q_HEADS * head_dim, &attn_gated);
+    AttnStepTrace {
+        q_gate,
+        q_normed: q.clone(),
+        k_normed: k.clone(),
+        v: v_raw.clone(),
+        q_rope: q,
+        k_rope: k,
+        gate_sigmoid,
+        attn_pregate: attn_out,
+        attn_gated,
+        out,
+    }
+}
+
+/// One full-attention autoregressive decode step with position `pos`.
+///
+/// Returns the layer output `[5120]`.
+///
+/// # Panics
+///
+/// Panics when any weight/state slice does not match the pinned geometry.
+pub fn host_full_attn_ar_step(
+    weights: &AttnLayerWeights,
+    hidden: &[f32],
+    kv_keys: &mut Vec<f32>,
+    kv_values: &mut Vec<f32>,
+    pos: usize,
+    eps: f32,
+) -> Vec<f32> {
+    host_full_attn_ar_step_traced(weights, hidden, kv_keys, kv_values, pos, eps).out
+}
+
+/// FFN hidden width (`feed_forward_length`).
+pub const N_FF: usize = 17408;
+
+/// Dequantized FFN weights for one layer, in GGUF flat order.
+pub struct FfnLayerWeights {
+    /// `ffn_gate` [5120][17408].
+    pub ffn_gate: Vec<f32>,
+    /// `ffn_up` [5120][17408].
+    pub ffn_up: Vec<f32>,
+    /// `ffn_down` [17408][5120].
+    pub ffn_down: Vec<f32>,
+}
+
+/// One gated-FFN step: `down(silu(x @ gate) * (x @ up))`.
+///
+/// # Panics
+///
+/// Panics when the hidden vector is not `[5120]`.
+#[must_use]
+pub fn host_ffn_step(weights: &FfnLayerWeights, hidden: &[f32]) -> Vec<f32> {
+    assert_eq!(hidden.len(), N_EMBD);
+    let gate = gguf_gemv(&weights.ffn_gate, N_EMBD, hidden);
+    let up = gguf_gemv(&weights.ffn_up, N_EMBD, hidden);
+    let gated: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    gguf_gemv(&weights.ffn_down, N_FF, &gated)
 }
 
 /// NEOX half-split pair stride for text rope (`n_dims/2` = 32).
