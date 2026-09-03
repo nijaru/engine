@@ -1693,7 +1693,7 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
     // is shared across the two tokens and evolves sequentially.
     let mut x_cur = embeds.clone();
     let mut attn_norm_sums = [0.0_f64; 2];
-    let mut attn_norm3_sums = [0.0_f64; 2];
+    let mut layer3_norm_sums = [0.0_f64; 2];
     let mut l_out2_sums = [0.0_f64; 2];
     let mut traces = Vec::new();
     let mut post_norm3_sums = [0.0_f64; 2];
@@ -1738,7 +1738,7 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
             let attn_w = load_attn_layer(&provider, layer);
             for (token_index, x) in x_cur.iter_mut().enumerate() {
                 let normalized = host_rms_norm(x, &attn_norm_w, eps);
-                attn_norm3_sums[token_index] = normalized.iter().map(|v| f64::from(*v)).sum();
+                layer3_norm_sums[token_index] = normalized.iter().map(|v| f64::from(*v)).sum();
                 let trace = host_full_attn_ar_step_traced(
                     &attn_w,
                     &normalized,
@@ -1816,7 +1816,7 @@ fn host_reference_full_attn_matches_llama_debug_capture() {
         ("l_out-2", l_out2_sums[0] + l_out2_sums[1], 2 * N_EMBD),
         (
             "attn_norm-3",
-            attn_norm3_sums[0] + attn_norm3_sums[1],
+            layer3_norm_sums[0] + layer3_norm_sums[1],
             2 * N_EMBD,
         ),
         (
