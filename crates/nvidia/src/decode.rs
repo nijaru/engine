@@ -197,6 +197,10 @@ impl CudaQwen35Decode {
     /// Returns [`CudaDecodeError`] when the plan is empty, epsilon is not
     /// positive and finite, a required tensor is missing from the staged
     /// set on its expected route, or kernel compilation/allocation fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one validation pass plus slot construction; splitting it hides the plan contract"
+    )]
     pub fn new(
         context: &Arc<CudaContext>,
         stream: Arc<CudaStream>,
