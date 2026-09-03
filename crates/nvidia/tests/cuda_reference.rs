@@ -3058,3 +3058,350 @@ fn decodes_four_layers_against_the_host_reference() {
         let _ = chosen;
     }
 }
+
+/// Greedy continuation llama-server produced for the raw prompt
+/// "The capital of France is" (tokens [760, 6511, 314, 9338, 369],
+/// temperature 0, no chat template), captured from the pinned artifact via
+/// the native completion endpoint with `return_tokens` and cross-checked
+/// against a tokenize of the returned text.
+const LLAMA_GREEDY_CONTINUATION: [u32; 200] = [
+    11_751_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    9564_u32,
+    369_u32,
+    19_241_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    14_898_u32,
+    369_u32,
+    21_047_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    17_163_u32,
+    369_u32,
+    23_327_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    32_208_u32,
+    369_u32,
+    77_916_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    23_655_u32,
+    369_u32,
+    44_299_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    279_u32,
+    3516_u32,
+    14_634_u32,
+    369_u32,
+    6924_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    14_227_u32,
+    369_u32,
+    31_785_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    279_u32,
+    24_844_u32,
+    369_u32,
+    36_492_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    31_868_u32,
+    369_u32,
+    35_938_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    28_169_u32,
+    369_u32,
+    13_762_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    33_741_u32,
+    369_u32,
+    44_745_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    33_200_u32,
+    369_u32,
+    60_935_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    30_466_u32,
+    369_u32,
+    55_918_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    22_466_u32,
+    369_u32,
+    50_332_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    35_057_u32,
+    369_u32,
+    73_722_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    26_707_u32,
+    369_u32,
+    69_724_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    32_050_u32,
+    5260_u32,
+    369_u32,
+    65_019_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    41_361_u32,
+    369_u32,
+    67_236_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    44_512_u32,
+    369_u32,
+    32_175_u32,
+    14_981_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    56_733_u32,
+    369_u32,
+    75_873_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    56_729_u32,
+    369_u32,
+    7580_u32,
+    6721_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    55_296_u32,
+    369_u32,
+    85_567_u32,
+    30_441_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+    75_537_u32,
+    369_u32,
+    436_u32,
+    197_935_u32,
+    50_960_u32,
+    3253_u32,
+    13_u32,
+    198_u32,
+    760_u32,
+    6511_u32,
+    314_u32,
+];
+
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+// One full-stack greedy replay; splitting it would hide where the chain
+// first diverges from llama-server.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end greedy parity gate over the full text path"
+)]
+fn decodes_greedy_tokens_matching_llama_server() {
+    use engine_nvidia::QwenLayerKind;
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+
+    // Stage the full text path: globals plus all 64 language layers.
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    let device = DeviceId::new(0);
+    for layer in 0..64_u32 {
+        let binding = provider
+            .layer_weight_binding(device, layer)
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+    let staged = Arc::new(
+        CudaQwen35Weights::stage(&context, &stream, 20_u64 << 30, tensors)
+            .expect("stage the full text path"),
+    );
+
+    // Data-only layer plan translated from the provider catalog.
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                engine_gguf::Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                engine_gguf::Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
+        .expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(1, 128, 48, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+    let mut state = engine_nvidia::CudaHybridState::from_specs(
+        stream.clone(),
+        Some(kv_spec),
+        Some(recurrent_spec),
+    )
+    .expect("physical hybrid state");
+    state.zero().expect("zero state");
+
+    let mut executor = engine_nvidia::CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("build decode executor");
+
+    // Prefill the raw prompt; the last step predicts the first continuation.
+    let mut chosen = 0_u32;
+    for (position, token) in PROMPT.iter().enumerate() {
+        chosen = executor
+            .decode_step(
+                &mut state,
+                *token,
+                u32::try_from(position).expect("fits u32"),
+            )
+            .expect("prefill step");
+    }
+    assert_eq!(
+        chosen, LLAMA_GREEDY_CONTINUATION[0],
+        "first greedy token diverged from llama-server"
+    );
+
+    // Greedy continuation: feed each expected token, compare each choice.
+    for index in 1..LLAMA_GREEDY_CONTINUATION.len() {
+        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
+        chosen = executor
+            .decode_step(&mut state, LLAMA_GREEDY_CONTINUATION[index - 1], position)
+            .expect("continuation step");
+        assert_eq!(
+            chosen, LLAMA_GREEDY_CONTINUATION[index],
+            "greedy token {} diverged from llama-server (expected {}, got {})",
+            index, LLAMA_GREEDY_CONTINUATION[index], chosen
+        );
+    }
+    eprintln!(
+        "greedy parity: {}/{} tokens match llama-server",
+        LLAMA_GREEDY_CONTINUATION.len(),
+        LLAMA_GREEDY_CONTINUATION.len()
+    );
+}
