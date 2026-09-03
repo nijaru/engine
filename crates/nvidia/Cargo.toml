@@ -18,6 +18,10 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 [dev-dependencies]
 engine-gguf = { path = "../gguf" }
 
+[[example]]
+name = "qwen_decode_bench"
+required-features = ["cuda"]
+
 [lints.rust]
 unsafe_code = "allow"
 
