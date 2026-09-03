@@ -297,6 +297,170 @@ extern "C" __global__ void sigmoid_inplace(
     }
     values[index] = 1.0f / (1.0f + expf(-values[index]));
 }
+
+extern "C" __global__ void residual_add(
+    float* accumulator,
+    const float* increment,
+    int length
+) {
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= length) {
+        return;
+    }
+    accumulator[index] += increment[index];
+}
+
+extern "C" __global__ void gdn_conv_silu(
+    const float* input,
+    const float* conv_weight,
+    float* history,
+    float* output,
+    int channels
+) {
+    // Depthwise causal 4-tap convolution per channel, then in-place history
+    // advance (drop oldest, append the new input), then SiLU. The conv output
+    // must be computed from the old history before it is overwritten.
+    const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= channels) {
+        return;
+    }
+    float* history_channel = history + channel * 3;
+    const float* weight_channel = conv_weight + channel * 4;
+    const float acc = history_channel[0] * weight_channel[0]
+        + history_channel[1] * weight_channel[1]
+        + history_channel[2] * weight_channel[2]
+        + input[channel] * weight_channel[3];
+    history_channel[0] = history_channel[1];
+    history_channel[1] = history_channel[2];
+    history_channel[2] = input[channel];
+    output[channel] = acc / (1.0f + expf(-acc));
+}
+
+extern "C" __global__ void l2_norm_heads(
+    float* values,
+    int heads,
+    int head_dim,
+    float epsilon
+) {
+    // In-place per-head l2 normalization with the ggml eps floor on the norm.
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= heads) {
+        return;
+    }
+    float* head_values = values + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_values[index] * head_values[index];
+    }
+    const float scale = 1.0f / fmaxf(sqrtf(sum), epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_values[index] *= scale;
+    }
+}
+
+extern "C" __global__ void strided_rms_norm(
+    const float* input,
+    const float* weight,
+    float* output,
+    int heads,
+    int head_dim,
+    float epsilon
+) {
+    // Per-head RMSNorm over a [heads][head_dim] buffer with shared raw
+    // (already +1'd) weights, one thread per head.
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= heads) {
+        return;
+    }
+    const float* head_input = input + (long long)head * head_dim;
+    float* head_output = output + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_output[index] = head_input[index] * inverse * weight[index];
+    }
+}
+
+extern "C" __global__ void gdn_state_update(
+    float* matrix,
+    const float* q_normed,
+    const float* k_normed,
+    const float* conv_activated,
+    const float* decay,
+    const float* beta,
+    float* output,
+    int v_heads,
+    int k_heads,
+    int head_dim,
+    int v_offset
+) {
+    // One thread per (v head, column) of the column-oriented recurrent
+    // update, matching the pinned equations: decay the state column,
+    // sk = S^T k, d = (v - sk) * beta, S += k (outer) d, then
+    // o = (S^T q) / sqrt(head_dim). q/k are l2-normalized per K head and
+    // tiled across v heads (v head vh reads K head vh % k_heads).
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = v_heads * head_dim;
+    if (index >= total) {
+        return;
+    }
+    const int v_head = index / head_dim;
+    const int col = index % head_dim;
+    const int k_head = v_head % k_heads;
+    float* state = matrix + (long long)v_head * head_dim * head_dim;
+    const float* q = q_normed + (long long)k_head * head_dim;
+    const float* k = k_normed + (long long)k_head * head_dim;
+    const float* v = conv_activated + (long long)v_offset + (long long)v_head * head_dim;
+
+    for (int row = 0; row < head_dim; ++row) {
+        state[row * head_dim + col] *= decay[v_head];
+    }
+    float sk = 0.0f;
+    for (int row = 0; row < head_dim; ++row) {
+        sk += state[row * head_dim + col] * k[row];
+    }
+    const float d = (v[col] - sk) * beta[v_head];
+    for (int row = 0; row < head_dim; ++row) {
+        state[row * head_dim + col] += k[row] * d;
+    }
+    float out = 0.0f;
+    for (int row = 0; row < head_dim; ++row) {
+        out += state[row * head_dim + col] * q[row];
+    }
+    output[(long long)v_head * head_dim + col] = out * rsqrtf((float)head_dim);
+}
+
+extern "C" __global__ void gdn_gated_norm(
+    const float* input,
+    const float* z_gate,
+    const float* ssm_norm,
+    float* output,
+    int v_heads,
+    int head_dim,
+    float epsilon
+) {
+    // Per-head gated norm: rms(input) * ssm_norm (raw, NOT +1'd) * silu(z).
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= v_heads) {
+        return;
+    }
+    const float* head_input = input + (long long)head * head_dim;
+    const float* head_gate = z_gate + (long long)head * head_dim;
+    float* head_output = output + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        const float z = head_gate[index];
+        const float silu = z / (1.0f + expf(-z));
+        head_output[index] = head_input[index] * inverse * ssm_norm[index] * silu;
+    }
+}
 "#;
 
 /// Reference-oriented elementwise operations used by Qwen-family model
@@ -312,6 +476,12 @@ pub struct CudaQwen35Ops {
     rope_neox: CudaFunction,
     sigmoid_inplace: CudaFunction,
     attn_score_gqa: CudaFunction,
+    residual_add: CudaFunction,
+    gdn_conv_silu: CudaFunction,
+    l2_norm_heads: CudaFunction,
+    strided_rms_norm: CudaFunction,
+    gdn_state_update: CudaFunction,
+    gdn_gated_norm: CudaFunction,
 }
 
 impl CudaQwen35Ops {
@@ -371,6 +541,24 @@ impl CudaQwen35Ops {
         let attn_score_gqa = module
             .load_function("attn_score_gqa")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let residual_add = module
+            .load_function("residual_add")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_conv_silu = module
+            .load_function("gdn_conv_silu")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let l2_norm_heads = module
+            .load_function("l2_norm_heads")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let strided_rms_norm = module
+            .load_function("strided_rms_norm")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_state_update = module
+            .load_function("gdn_state_update")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_gated_norm = module
+            .load_function("gdn_gated_norm")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
             argmax,
@@ -381,6 +569,12 @@ impl CudaQwen35Ops {
             rope_neox,
             sigmoid_inplace,
             attn_score_gqa,
+            residual_add,
+            gdn_conv_silu,
+            l2_norm_heads,
+            strided_rms_norm,
+            gdn_state_update,
+            gdn_gated_norm,
         })
     }
 
@@ -887,6 +1081,407 @@ impl CudaQwen35Ops {
                 .arg(&q_heads_u32)
                 .arg(&kv_heads_u32)
                 .arg(&head_dim_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Add `increment` into `accumulator` elementwise.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn residual_add(
+        &self,
+        accumulator: &mut CudaSlice<f32>,
+        increment: &CudaSlice<f32>,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != accumulator.context().as_ref()
+            || context.as_ref() != increment.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if accumulator.is_empty() || accumulator.len() != increment.len() {
+            return Err(CudaModelKernelError::InputLength {
+                expected: accumulator.len(),
+                actual: increment.len(),
+            });
+        }
+        let length =
+            u32::try_from(accumulator.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (length.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated both slices, lengths are validated, and
+        // the launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add)
+                .arg(&mut *accumulator)
+                .arg(increment)
+                .arg(&length)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Depthwise causal 4-tap convolution over `[history | input]` per
+    /// channel, advancing the 3-element history in place, then `SiLU`.
+    ///
+    /// `conv_weight` holds `(tap, channel)` at `tap + channel * 4`,
+    /// matching the GGUF `ssm_conv1d` layout.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn gdn_conv_silu(
+        &self,
+        input: &CudaSlice<f32>,
+        conv_weight: &CudaSlice<f32>,
+        history: &mut CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != conv_weight.context().as_ref()
+            || context.as_ref() != history.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        let channels = input.len();
+        if channels == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if conv_weight.len() != channels * 4
+            || history.len() != channels * 3
+            || output.len() != channels
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: channels * 4,
+                actual: conv_weight.len(),
+            });
+        }
+        let channels_u32 =
+            u32::try_from(channels).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (channels_u32.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, lengths are validated, and
+        // the launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_conv_silu)
+                .arg(input)
+                .arg(conv_weight)
+                .arg(&mut *history)
+                .arg(&mut *output)
+                .arg(&channels_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// In-place per-head l2 normalization with the ggml eps floor on the
+    /// norm over a `[heads][head_dim]` buffer.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    pub fn l2_norm_heads(
+        &self,
+        values: &mut CudaSlice<f32>,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != values.context().as_ref() {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if heads == 0 || head_dim == 0 || values.len() != heads * head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: heads * head_dim,
+                actual: values.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated the slice, geometry is validated, and the
+        // launch keeps the pointer alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.l2_norm_heads)
+                .arg(&mut *values)
+                .arg(&heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head `RMSNorm` over `[heads][head_dim]` with shared raw weights.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    pub fn strided_rms_norm(
+        &self,
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != weight.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if input.len() != heads * head_dim
+            || weight.len() != head_dim
+            || output.len() != heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: heads * head_dim,
+                actual: input.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.strided_rms_norm)
+                .arg(input)
+                .arg(weight)
+                .arg(output)
+                .arg(&heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Column-oriented recurrent state update for all GDN v heads of one
+    /// layer, in place on the device state matrix, plus the scaled output.
+    ///
+    /// `q_normed`/`k_normed` are l2-normalized `[k_heads][head_dim]` buffers
+    /// (tiled across v heads by `v_head % k_heads`); `conv_activated` is the
+    /// `SiLU`'d `[q(2048) | k(2048) | v(6144)]` conv output with the v slice at
+    /// `v_offset`; `decay`/`beta` are the per-v-head scalars.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_state_update(
+        &self,
+        matrix: &mut CudaSlice<f32>,
+        q_normed: &CudaSlice<f32>,
+        k_normed: &CudaSlice<f32>,
+        conv_activated: &CudaSlice<f32>,
+        decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        v_heads: usize,
+        k_heads: usize,
+        head_dim: usize,
+        v_offset: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != matrix.context().as_ref()
+            || context.as_ref() != q_normed.context().as_ref()
+            || context.as_ref() != k_normed.context().as_ref()
+            || context.as_ref() != conv_activated.context().as_ref()
+            || context.as_ref() != decay.context().as_ref()
+            || context.as_ref() != beta.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if v_heads == 0 || k_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !v_heads.is_multiple_of(k_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        let state_len = v_heads * head_dim * head_dim;
+        if matrix.len() != state_len
+            || q_normed.len() != k_heads * head_dim
+            || k_normed.len() != k_heads * head_dim
+            || decay.len() != v_heads
+            || beta.len() != v_heads
+            || output.len() != v_heads * head_dim
+            || conv_activated.len() < v_offset + v_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: state_len,
+                actual: matrix.len(),
+            });
+        }
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let k_heads_u32 =
+            u32::try_from(k_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let v_offset_u32 =
+            u32::try_from(v_offset).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = v_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total_u32 = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_u32.div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and
+        // the launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_state_update)
+                .arg(&mut *matrix)
+                .arg(q_normed)
+                .arg(k_normed)
+                .arg(conv_activated)
+                .arg(decay)
+                .arg(beta)
+                .arg(&mut *output)
+                .arg(&v_heads_u32)
+                .arg(&k_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&v_offset_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head gated norm `rms(input) * ssm_norm (raw) * silu(z_gate)` over
+    /// `[v_heads][head_dim]`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_gated_norm(
+        &self,
+        input: &CudaSlice<f32>,
+        z_gate: &CudaSlice<f32>,
+        ssm_norm: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        v_heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != z_gate.context().as_ref()
+            || context.as_ref() != ssm_norm.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if v_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if input.len() != v_heads * head_dim
+            || z_gate.len() != v_heads * head_dim
+            || ssm_norm.len() != head_dim
+            || output.len() != v_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: v_heads * head_dim,
+                actual: input.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (v_heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_gated_norm)
+                .arg(input)
+                .arg(z_gate)
+                .arg(ssm_norm)
+                .arg(output)
+                .arg(&v_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }

@@ -2243,3 +2243,333 @@ fn executes_q4_k_embedding_against_the_gguf_decoder() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_gdn_conv_silu_against_host_equations() {
+    const CHANNELS: usize = 512;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 777_u32;
+    let input: Vec<f32> = (0..CHANNELS)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let weight: Vec<f32> = (0..CHANNELS * 4)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let mut history: Vec<f32> = (0..CHANNELS * 3)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+
+    let input_device = stream.clone_htod(&input).expect("upload conv input");
+    let weight_device = stream.clone_htod(&weight).expect("upload conv weight");
+    let mut history_device = stream.clone_htod(&history).expect("upload conv history");
+    let mut output_device = stream
+        .alloc_zeros::<f32>(CHANNELS)
+        .expect("allocate conv output");
+    ops.gdn_conv_silu(
+        &input_device,
+        &weight_device,
+        &mut history_device,
+        &mut output_device,
+    )
+    .expect("execute conv");
+    let actual = stream
+        .clone_dtoh(&output_device)
+        .expect("download conv output");
+    let actual_history = stream
+        .clone_dtoh(&history_device)
+        .expect("download conv history");
+
+    // Host replay: tap weights sit at tap + channel*4; history is
+    // oldest-first per channel.
+    for channel in 0..CHANNELS {
+        let base = channel * 3;
+        let expected = history[base] * weight[channel * 4]
+            + history[base + 1] * weight[channel * 4 + 1]
+            + history[base + 2] * weight[channel * 4 + 2]
+            + input[channel] * weight[channel * 4 + 3];
+        let expected = expected / (1.0 + (-expected).exp());
+        assert!(
+            (actual[channel] - expected).abs() < 1e-4,
+            "conv[{channel}]: {} != {expected}",
+            actual[channel]
+        );
+        // Advanced history: drop oldest, append new input.
+        assert!((actual_history[base] - history[base + 1]).abs() < 1e-6);
+        assert!((actual_history[base + 1] - history[base + 2]).abs() < 1e-6);
+        assert!((actual_history[base + 2] - input[channel]).abs() < 1e-6);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_head_norms_against_host_equations() {
+    const HEADS: usize = 16;
+    const HEAD_DIM: usize = 128;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 4242_u32;
+    let l2_input: Vec<f32> = (0..HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let rms_input: Vec<f32> = (0..HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let norm_weight: Vec<f32> = (0..HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let eps = 1e-5_f32;
+
+    // l2_norm_heads (in place).
+    let mut l2_device = stream.clone_htod(&l2_input).expect("upload l2 heads");
+    ops.l2_norm_heads(&mut l2_device, HEADS, HEAD_DIM, eps)
+        .expect("execute l2 heads");
+    let actual = stream.clone_dtoh(&l2_device).expect("download l2 heads");
+    for head in 0..HEADS {
+        let head_values = &l2_input[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+        let sum: f32 = head_values.iter().map(|x| x * x).sum();
+        let scale = 1.0 / sum.sqrt().max(eps);
+        for (index, value) in head_values.iter().enumerate() {
+            let expected = value * scale;
+            let index = head * HEAD_DIM + index;
+            assert!(
+                (actual[index] - expected).abs() < 1e-4,
+                "l2[{index}]: {} != {expected}",
+                actual[index]
+            );
+        }
+    }
+
+    // strided_rms_norm (per-head, shared weights).
+    let input_device = stream.clone_htod(&rms_input).expect("upload rms heads");
+    let weight_device = stream.clone_htod(&norm_weight).expect("upload rms weight");
+    let mut out_device = stream
+        .alloc_zeros::<f32>(HEADS * HEAD_DIM)
+        .expect("allocate rms output");
+    ops.strided_rms_norm(
+        &input_device,
+        &weight_device,
+        &mut out_device,
+        HEADS,
+        HEAD_DIM,
+        1e-6,
+    )
+    .expect("execute strided rms");
+    let actual = stream.clone_dtoh(&out_device).expect("download rms output");
+    for head in 0..HEADS {
+        let head_values = &rms_input[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+        let sum: f32 = head_values.iter().map(|x| x * x).sum();
+        let count = f32::from(u16::try_from(HEAD_DIM).expect("head dim fits u16"));
+        let inv = (sum / count + 1e-6).sqrt().recip();
+        for (index, value) in head_values.iter().enumerate() {
+            let expected = value * inv * norm_weight[index];
+            let index = head * HEAD_DIM + index;
+            assert!(
+                (actual[index] - expected).abs() < 1e-4,
+                "rms[{index}]: {} != {expected}",
+                actual[index]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one contiguous pinned-geometry replay"
+)]
+fn executes_gdn_state_update_against_host_equations() {
+    // Full pinned geometry: 48 v heads, 16 k heads, 128 head_dim, v at 4096.
+    const V_HEADS: usize = 48;
+    const K_HEADS: usize = 16;
+    const HEAD_DIM: usize = 128;
+    const V_OFFSET: usize = 4096;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 99_u32;
+    let mut matrix: Vec<f32> = (0..V_HEADS * HEAD_DIM * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state) * 0.05)
+        .collect();
+    let conv_activated: Vec<f32> = (0..V_OFFSET + V_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let q_normed: Vec<f32> = (0..K_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let k_normed: Vec<f32> = (0..K_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let decay: Vec<f32> = (0..V_HEADS)
+        .map(|index| {
+            let index = u16::try_from(index).expect("index fits u16");
+            f32::from(index) * 0.01 + 0.5
+        })
+        .collect();
+    let beta: Vec<f32> = (0..V_HEADS)
+        .map(|index| {
+            let index = u16::try_from(index).expect("index fits u16");
+            f32::from(index) * 0.005 + 0.1
+        })
+        .collect();
+
+    let mut matrix_device = stream.clone_htod(&matrix).expect("upload state matrix");
+    let q_device = stream.clone_htod(&q_normed).expect("upload q");
+    let k_device = stream.clone_htod(&k_normed).expect("upload k");
+    let conv_device = stream.clone_htod(&conv_activated).expect("upload conv");
+    let decay_device = stream.clone_htod(&decay).expect("upload decay");
+    let beta_device = stream.clone_htod(&beta).expect("upload beta");
+    let mut output_device = stream
+        .alloc_zeros::<f32>(V_HEADS * HEAD_DIM)
+        .expect("allocate output");
+    ops.gdn_state_update(
+        &mut matrix_device,
+        &q_device,
+        &k_device,
+        &conv_device,
+        &decay_device,
+        &beta_device,
+        &mut output_device,
+        V_HEADS,
+        K_HEADS,
+        HEAD_DIM,
+        V_OFFSET,
+    )
+    .expect("execute state update");
+    let actual_out = stream.clone_dtoh(&output_device).expect("download output");
+    let actual_matrix = stream.clone_dtoh(&matrix_device).expect("download matrix");
+
+    // Host replay with the pinned equations.
+    let scale = 1.0 / f32::sqrt(f32::from(u16::try_from(HEAD_DIM).expect("dim fits u16")));
+    for v_head in 0..V_HEADS {
+        let k_head = v_head % K_HEADS;
+        let state_offset = v_head * HEAD_DIM * HEAD_DIM;
+        let q = &q_normed[k_head * HEAD_DIM..(k_head + 1) * HEAD_DIM];
+        let k = &k_normed[k_head * HEAD_DIM..(k_head + 1) * HEAD_DIM];
+        let v = &conv_activated[V_OFFSET + v_head * HEAD_DIM..V_OFFSET + (v_head + 1) * HEAD_DIM];
+        // Decay, sk, d, outer add, then output per column.
+        for row in 0..HEAD_DIM {
+            for col in 0..HEAD_DIM {
+                matrix[state_offset + row * HEAD_DIM + col] *= decay[v_head];
+            }
+        }
+        let mut sk = vec![0.0_f32; HEAD_DIM];
+        for row in 0..HEAD_DIM {
+            for col in 0..HEAD_DIM {
+                sk[col] += matrix[state_offset + row * HEAD_DIM + col] * k[row];
+            }
+        }
+        let d: Vec<f32> = (0..HEAD_DIM)
+            .map(|col| (v[col] - sk[col]) * beta[v_head])
+            .collect();
+        for row in 0..HEAD_DIM {
+            for col in 0..HEAD_DIM {
+                matrix[state_offset + row * HEAD_DIM + col] += k[row] * d[col];
+            }
+        }
+        for col in 0..HEAD_DIM {
+            let out: f32 = (0..HEAD_DIM)
+                .map(|row| matrix[state_offset + row * HEAD_DIM + col] * q[row])
+                .sum::<f32>()
+                * scale;
+            assert!(
+                (actual_out[v_head * HEAD_DIM + col] - out).abs() < 1e-2,
+                "out[{v_head}][{col}]: {} != {out}",
+                actual_out[v_head * HEAD_DIM + col]
+            );
+        }
+    }
+    // The persisted matrix must equal the host replay elementwise.
+    for (index, (actual, expected)) in actual_matrix.iter().zip(&matrix).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-2,
+            "matrix[{index}]: {actual} != {expected}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_gdn_gated_norm_and_residual_against_host_equations() {
+    const V_HEADS: usize = 48;
+    const HEAD_DIM: usize = 128;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 555_u32;
+    let input: Vec<f32> = (0..V_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let z_gate: Vec<f32> = (0..V_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let ssm_norm: Vec<f32> = (0..HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let eps = 1e-5_f32;
+
+    let input_device = stream.clone_htod(&input).expect("upload gated input");
+    let z_device = stream.clone_htod(&z_gate).expect("upload z gate");
+    let norm_device = stream.clone_htod(&ssm_norm).expect("upload ssm norm");
+    let mut out_device = stream
+        .alloc_zeros::<f32>(V_HEADS * HEAD_DIM)
+        .expect("allocate gated output");
+    ops.gdn_gated_norm(
+        &input_device,
+        &z_device,
+        &norm_device,
+        &mut out_device,
+        V_HEADS,
+        HEAD_DIM,
+        eps,
+    )
+    .expect("execute gated norm");
+    let actual = stream
+        .clone_dtoh(&out_device)
+        .expect("download gated output");
+
+    // Host replay: rms(o) * ssm_norm (raw, NOT +1'd) * silu(z) per head.
+    let head_dim_f = f32::from(u16::try_from(HEAD_DIM).expect("head dim fits u16"));
+    for head in 0..V_HEADS {
+        let head_input = &input[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+        let sum: f32 = head_input.iter().map(|x| x * x).sum();
+        let inv = (sum / head_dim_f + eps).sqrt().recip();
+        for index in 0..HEAD_DIM {
+            let zv = z_gate[head * HEAD_DIM + index];
+            let silu = zv / (1.0 + (-zv).exp());
+            let expected = head_input[index] * inv * ssm_norm[index] * silu;
+            let actual = actual[head * HEAD_DIM + index];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "gated[{head}][{index}]: {actual} != {expected}"
+            );
+        }
+    }
+
+    // residual_add on a distinct small buffer.
+    let acc: Vec<f32> = (0..100)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let inc: Vec<f32> = (0..100)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let mut acc_device = stream.clone_htod(&acc).expect("upload accumulator");
+    let inc_device = stream.clone_htod(&inc).expect("upload increment");
+    ops.residual_add(&mut acc_device, &inc_device)
+        .expect("execute residual add");
+    let actual = stream
+        .clone_dtoh(&acc_device)
+        .expect("download accumulator");
+    for (index, (actual, (a, i))) in actual.iter().zip(acc.iter().zip(&inc)).enumerate() {
+        let expected = a + i;
+        assert!((actual - expected).abs() < 1e-5, "residual[{index}]");
+    }
+}
