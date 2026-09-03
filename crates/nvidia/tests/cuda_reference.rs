@@ -2755,3 +2755,123 @@ fn stages_the_full_pinned_qwen_text_path() {
         names.len()
     );
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_q_gate_norm_against_host_equations() {
+    const Q_HEADS: usize = 24;
+    const HEAD_DIM: usize = 256;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 808_u32;
+    let q_gate: Vec<f32> = (0..Q_HEADS * 2 * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let weight: Vec<f32> = (0..HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let eps = 1e-6_f32;
+
+    let input_device = stream.clone_htod(&q_gate).expect("upload q gate");
+    let weight_device = stream.clone_htod(&weight).expect("upload q norm weight");
+    let mut out_device = stream
+        .alloc_zeros::<f32>(Q_HEADS * HEAD_DIM)
+        .expect("allocate q norm output");
+    ops.q_gate_norm(
+        &input_device,
+        &weight_device,
+        &mut out_device,
+        Q_HEADS,
+        HEAD_DIM,
+        eps,
+    )
+    .expect("execute q gate norm");
+    let actual = stream.clone_dtoh(&out_device).expect("download output");
+
+    // Host replay: norm over the first head_dim of each 2*head_dim slice.
+    let head_dim_f = f32::from(u16::try_from(HEAD_DIM).expect("head dim fits u16"));
+    for head in 0..Q_HEADS {
+        let head_input = &q_gate[head * 2 * HEAD_DIM..head * 2 * HEAD_DIM + HEAD_DIM];
+        let sum: f32 = head_input.iter().map(|x| x * x).sum();
+        let inv = (sum / head_dim_f + eps).sqrt().recip();
+        for (index, value) in head_input.iter().enumerate() {
+            let expected = value * inv * weight[index];
+            let actual = actual[head * HEAD_DIM + index];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "q_norm[{head}][{index}]: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_kv_append_f16_against_host_rounding() {
+    const KV_HEADS: usize = 4;
+    const HEAD_DIM: usize = 256;
+    const TOKENS: usize = 5;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 909_u32;
+    let keys: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+    let values: Vec<f32> = (0..KV_HEADS * HEAD_DIM)
+        .map(|_| fixture_quantized_f32(&mut state))
+        .collect();
+
+    let keys_device = stream.clone_htod(&keys).expect("upload keys");
+    let values_device = stream.clone_htod(&values).expect("upload values");
+    let mut cache_keys = stream
+        .alloc_zeros::<u16>(TOKENS * KV_HEADS * HEAD_DIM)
+        .expect("allocate key cache");
+    let mut cache_values = stream
+        .alloc_zeros::<u16>(TOKENS * KV_HEADS * HEAD_DIM)
+        .expect("allocate value cache");
+
+    // Append the same token twice at different indices; the values are
+    // exact F16 steps, so the host expectation is the identity bit pattern.
+    for token_index in [0_usize, 3] {
+        ops.kv_append_f16(
+            &keys_device,
+            &values_device,
+            &mut cache_keys,
+            &mut cache_values,
+            token_index,
+            KV_HEADS,
+            HEAD_DIM,
+        )
+        .expect("execute kv append");
+    }
+    let actual_keys = stream.clone_dtoh(&cache_keys).expect("download key cache");
+
+    for (index, value) in keys.iter().enumerate() {
+        // Token 0 row.
+        let expected = fixture_f16_bits(*value);
+        assert_eq!(
+            actual_keys[index], expected,
+            "f16 rounding mismatch at {index}"
+        );
+        // Token 3 row.
+        let row_offset = 3 * KV_HEADS * HEAD_DIM;
+        assert_eq!(
+            actual_keys[row_offset + index],
+            expected,
+            "f16 rounding mismatch in row 3 at {index}"
+        );
+    }
+    // Untouched rows stay zero.
+    for row in [1_usize, 2, 4] {
+        let offset = row * KV_HEADS * HEAD_DIM;
+        assert!(
+            actual_keys[offset..offset + KV_HEADS * HEAD_DIM]
+                .iter()
+                .all(|bits| *bits == 0)
+        );
+    }
+}

@@ -461,6 +461,97 @@ extern "C" __global__ void gdn_gated_norm(
         head_output[index] = head_input[index] * inverse * ssm_norm[index] * silu;
     }
 }
+extern "C" __global__ void q_gate_norm(
+    const float* q_gate,
+    const float* q_norm_weight,
+    float* q_normed,
+    int q_heads,
+    int head_dim,
+    float epsilon
+) {
+    // Per-head RMSNorm over the first half of each [q | gate] slice from the
+    // joint attn_q projection: input stride 2*head_dim, packed output.
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= q_heads) {
+        return;
+    }
+    const float* head_input = q_gate + (long long)head * 2 * head_dim;
+    float* head_output = q_normed + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_output[index] = head_input[index] * inverse * q_norm_weight[index];
+    }
+}
+
+__device__ __forceinline__ unsigned short f32_to_f16_bits(float value) {
+    // Round-to-nearest-even conversion matching __float2half.
+    const unsigned int bits = __float_as_int(value);
+    const unsigned int sign = (bits >> 16) & 0x8000u;
+    const int exponent = (int)((bits >> 23) & 0xffu) - 127 + 15;
+    unsigned int mantissa = bits & 0x7fffffu;
+    if (((bits >> 23) & 0xffu) == 0xffu) {
+        // Inf or NaN.
+        return sign | 0x7c00u | (mantissa ? 0x0200u : 0u);
+    }
+    if (exponent >= 31) {
+        // Overflow to infinity.
+        return sign | 0x7c00u;
+    }
+    if (exponent <= 0) {
+        // Subnormal or zero.
+        if (exponent < -10) {
+            return sign;
+        }
+        mantissa |= 0x800000u;
+        const int shift = 14 - exponent;
+        unsigned int result = mantissa >> shift;
+        const unsigned int remainder = mantissa & ((1u << shift) - 1u);
+        const unsigned int halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (result & 1u) != 0u)) {
+            result += 1u;
+        }
+        return sign | result;
+    }
+    // Normal: 23-bit mantissa to 10-bit with rounding.
+    unsigned int result = mantissa >> 13;
+    const unsigned int remainder = mantissa & 0x1fffu;
+    if (remainder > 0x1000u || (remainder == 0x1000u && (result & 1u) != 0u)) {
+        result += 1u;
+        if (result == 0x400u) {
+            result = 0;
+            if (exponent + 1 >= 31) {
+                return sign | 0x7c00u;
+            }
+            return sign | (((unsigned int)(exponent + 1)) << 10) | result;
+        }
+    }
+    return sign | (((unsigned int)exponent << 10)) | result;
+}
+
+extern "C" __global__ void kv_append_f16(
+    const float* keys,
+    const float* values,
+    unsigned short* cache_keys,
+    unsigned short* cache_values,
+    int token_index,
+    int kv_heads,
+    int head_dim
+) {
+    // Convert one token's F32 K/V [kv_heads * head_dim] to F16 and append
+    // into the [token][kv_head][dim] cache at token_index.
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = kv_heads * head_dim;
+    if (index >= total) {
+        return;
+    }
+    const long long offset = (long long)token_index * total + index;
+    cache_keys[offset] = f32_to_f16_bits(keys[index]);
+    cache_values[offset] = f32_to_f16_bits(values[index]);
+}
 "#;
 
 /// Reference-oriented elementwise operations used by Qwen-family model
@@ -482,6 +573,8 @@ pub struct CudaQwen35Ops {
     strided_rms_norm: CudaFunction,
     gdn_state_update: CudaFunction,
     gdn_gated_norm: CudaFunction,
+    q_gate_norm: CudaFunction,
+    kv_append_f16: CudaFunction,
 }
 
 impl CudaQwen35Ops {
@@ -559,6 +652,12 @@ impl CudaQwen35Ops {
         let gdn_gated_norm = module
             .load_function("gdn_gated_norm")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let q_gate_norm = module
+            .load_function("q_gate_norm")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let kv_append_f16 = module
+            .load_function("kv_append_f16")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
             argmax,
@@ -575,6 +674,8 @@ impl CudaQwen35Ops {
             strided_rms_norm,
             gdn_state_update,
             gdn_gated_norm,
+            q_gate_norm,
+            kv_append_f16,
         })
     }
 
@@ -1482,6 +1583,156 @@ impl CudaQwen35Ops {
                 .arg(&v_heads_u32)
                 .arg(&head_dim_u32)
                 .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head `RMSNorm` over the first half of each interleaved
+    /// `[q | gate]` slice from the joint `attn_q` projection, packing the
+    /// normalized query into a contiguous `[q_heads][head_dim]` output.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    pub fn q_gate_norm(
+        &self,
+        q_gate: &CudaSlice<f32>,
+        q_norm_weight: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        q_heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != q_gate.context().as_ref()
+            || context.as_ref() != q_norm_weight.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if q_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if q_gate.len() != q_heads * 2 * head_dim
+            || q_norm_weight.len() != head_dim
+            || output.len() != q_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: q_heads * 2 * head_dim,
+                actual: q_gate.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let q_heads_u32 =
+            u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (q_heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.q_gate_norm)
+                .arg(q_gate)
+                .arg(q_norm_weight)
+                .arg(output)
+                .arg(&q_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Convert one token's F32 K/V to F16 and append it into the
+    /// `[token][kv_head][head_dim]` cache at `token_index`.
+    ///
+    /// The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn kv_append_f16(
+        &self,
+        keys: &CudaSlice<f32>,
+        values: &CudaSlice<f32>,
+        cache_keys: &mut CudaSlice<u16>,
+        cache_values: &mut CudaSlice<u16>,
+        token_index: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != keys.context().as_ref()
+            || context.as_ref() != values.context().as_ref()
+            || context.as_ref() != cache_keys.context().as_ref()
+            || context.as_ref() != cache_values.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        let total = kv_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        if total == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if keys.len() != total || values.len() != total {
+            return Err(CudaModelKernelError::InputLength {
+                expected: total,
+                actual: keys.len().min(values.len()),
+            });
+        }
+        let capacity = token_index
+            .checked_add(1)
+            .and_then(|tokens| tokens.checked_mul(total))
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        if cache_keys.len() < capacity || cache_values.len() < capacity {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: capacity,
+                actual: cache_keys.len().min(cache_values.len()),
+            });
+        }
+        let token_index_u32 =
+            u32::try_from(token_index).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let kv_heads_u32 =
+            u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total_u32 = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_u32.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.kv_append_f16)
+                .arg(keys)
+                .arg(values)
+                .arg(&mut *cache_keys)
+                .arg(&mut *cache_values)
+                .arg(&token_index_u32)
+                .arg(&kv_heads_u32)
+                .arg(&head_dim_u32)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
