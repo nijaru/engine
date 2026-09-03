@@ -253,15 +253,19 @@ impl CudaQwen35Decode {
         let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
         let mut kv_count = 0_u32;
         let mut recurrent_count = 0_u32;
+        // Both slot tables are indexed by absolute layer index; a layer of
+        // one family records the next unused slot of its own family only.
         for kind in &layer_kinds {
             match kind {
                 QwenLayerKind::Recurrent => {
                     recurrent_slot.push(recurrent_count);
                     recurrent_count += 1;
+                    kv_slot.push(kv_count);
                 }
                 QwenLayerKind::FullAttention => {
                     kv_slot.push(kv_count);
                     kv_count += 1;
+                    recurrent_slot.push(recurrent_count);
                 }
             }
         }
