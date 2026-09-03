@@ -770,6 +770,10 @@ impl CudaQwen35Ops {
     ///
     /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
     /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
     pub fn attn_score_gqa(
         &self,
         q: &CudaSlice<f32>,

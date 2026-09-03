@@ -2007,8 +2007,8 @@ fn executes_rope_sigmoid_against_host_equations() {
     let base = 1.0e7_f32;
     let mut host = vec![0.0_f32; HEADS * HEAD_DIM];
     for (index, value) in host.iter_mut().enumerate() {
-        let value_u32 = u32::try_from(index % 97).expect("index fits u32");
-        *value = f32::from(value_u32) * 0.03 - 1.4;
+        let value_u16 = u16::try_from(index % 97).expect("index fits u16");
+        *value = f32::from(value_u16) * 0.03 - 1.4;
     }
     let mut device = stream.clone_htod(&host).expect("upload rope input");
     let position = 3_u64;
@@ -2019,9 +2019,9 @@ fn executes_rope_sigmoid_against_host_equations() {
     let mut expected = host.clone();
     for head in 0..HEADS {
         for pair in 0..ROT_DIMS / 2 {
-            let exponent = -(2.0 * f32::from(u32::try_from(pair).expect("pair fits u32")))
-                / f32::from(u32::try_from(ROT_DIMS).expect("rot dims fit u32"));
-            let theta = f32::from(u32::try_from(position).expect("position fits u32"))
+            let exponent = -(2.0 * f32::from(u16::try_from(pair).expect("pair fits u16")))
+                / f32::from(u16::try_from(ROT_DIMS).expect("rot dims fit u16"));
+            let theta = f32::from(u16::try_from(position).expect("position fits u16"))
                 * base.powf(exponent);
             let (sin, cos) = theta.sin_cos();
             let stride = ROT_DIMS / 2;
@@ -2080,7 +2080,7 @@ fn executes_attn_score_gqa_against_host_equations() {
     // representable in F16, so the F16 cache rounding is lossless and the
     // host replay can compare directly against the F32 equations.
     let quantized = |state: &mut u32| {
-        let steps = pseudo(state) % 64;
+        let steps = u16::try_from(pseudo(state) % 64).expect("steps fit u16");
         f32::from(steps) * 0.125 - 4.0
     };
     let q: Vec<f32> = (0..Q_HEADS * HEAD_DIM)

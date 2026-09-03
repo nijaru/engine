@@ -982,7 +982,7 @@ impl CudaIq3SEmbedding {
 
 /// A correctness-oriented `Q4_K` embedding lookup kernel.
 ///
-/// `token_embd.weight` in the pinned artifact is Q4_K `[hidden, vocab]`;
+/// `token_embd.weight` in the pinned artifact is `Q4_K` `[hidden, vocab]`;
 /// this gathers one vocabulary row into a caller-owned device vector.
 pub struct CudaQ4KEmbedding {
     inner: CudaQuantizedGemv,
@@ -1065,8 +1065,7 @@ impl CudaQ4KEmbedding {
             || !hidden_size.is_multiple_of(Q4_K_BLOCK_ELEMENTS)
         {
             return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "Q4_K embedding shape is {hidden_size}x{vocabulary_size}; hidden size must be a positive multiple of {}",
-                Q4_K_BLOCK_ELEMENTS
+                "Q4_K embedding shape is {hidden_size}x{vocabulary_size}; hidden size must be a positive multiple of {Q4_K_BLOCK_ELEMENTS}"
             )));
         }
         let blocks = hidden_size
