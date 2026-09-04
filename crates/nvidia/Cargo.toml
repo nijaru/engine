@@ -22,6 +22,10 @@ engine-gguf = { path = "../gguf" }
 name = "qwen_decode_bench"
 required-features = ["cuda"]
 
+[[example]]
+name = "qwen_serving_bench"
+required-features = ["cuda"]
+
 [lints.rust]
 unsafe_code = "allow"
 
