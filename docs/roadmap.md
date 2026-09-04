@@ -31,7 +31,7 @@ Phase 3 proves a correct native execution path. It does not establish a competit
 
 ## Phase 4 — runtime and serving foundation
 
-The architecture correction and first correctness serving loop are now in place. Core interfaces do not encode the Phase-3 Qwen state bundle, and the same runtime can drive persistent scheduled requests through the CUDA Qwen executor and expose committed output to a frontend.
+The architecture correction and first correctness serving loop are in place. Core interfaces do not encode the Phase-3 Qwen state bundle, and the same runtime can drive persistent scheduled requests through the CUDA Qwen executor and expose committed output to a frontend.
 
 The RTX 4090 remains the available local qualification machine, not a long-term architecture target.
 
@@ -44,12 +44,12 @@ The RTX 4090 remains the available local qualification machine, not a long-term 
 - Temporary core `HybridState*` compatibility aliases and NVIDIA callers were migrated.
 - Execution variants carry explicit qualified/experimental/incompatible status.
 - Runtime startup has explicit readiness states.
-- Qwen recurrent state now describes actual persistent matrix-bank and convolution-history storage rather than model projection-head geometry.
+- Qwen recurrent state describes actual persistent matrix-bank and convolution-history storage rather than model projection-head geometry.
 
 ### 4B — persistent request/runtime foundation — complete
 
 - Stable generation-tagged active-request slots.
-- Explicit waiting/runnable/in-flight/terminal lifecycle states.
+- Explicit waiting/runnable/submitting/in-flight/cancelling/terminal lifecycle states.
 - Persistent request progress and inference-state ownership.
 - Submission identity prevents a completion from updating the wrong request.
 - Core execution uses submit/poll completion semantics; logical state commits only after completion.
@@ -59,34 +59,48 @@ The RTX 4090 remains the available local qualification machine, not a long-term 
 
 Implemented correctness foundation:
 
-- Deterministic admission and persistent runnable/in-flight/terminal bookkeeping.
+- Deterministic bounded admission and persistent runnable/in-flight/terminal bookkeeping.
 - Explicit token budgets with decode priority and chunked prefill.
 - Multi-request `ExecutionBatch` submission through the backend boundary.
 - Prompt/decode token-input ownership across iterations.
-- Committed generated-token delivery separate from next-decode-input state.
+- Committed generated-token delivery separate from next-decode-input/model-state progress.
+- Multi-chunk prefill semantics in which only the final prompt chunk requests output and the following decode begins at the exact prompt boundary.
 - Cancellation of an in-flight request waits for backend completion, suppresses its output, and does not cancel peers in the same submission.
-- Submission failure, completion, terminal reclamation, logical-state release, and physical CUDA-state release are tested lifecycle paths.
+- Submission failure, completion, terminal reclamation, logical-state release, and physical CUDA-state release have explicit lifecycle paths.
 - The Qwen CUDA serving dispatcher preserves the scheduler's whole-batch boundary and persistent physical state.
+- Intermediate Qwen prefill tokens skip output normalization, the vocabulary projection, argmax, and host token readback when no sampled output is semantically required.
+- The current synchronous Qwen dispatcher explicitly waits for queued stream work before reporting completion, including error paths, so logical commit/reclamation cannot race output-free CUDA work.
+- The NVIDIA adapter has a narrow dispatcher-owned asynchronous submit/poll seam keyed by `BackendSubmissionId`; synchronous/reference dispatchers retain their existing behavior.
+- Terminal asynchronous completion failure is defined to end backend access to request state/resources before the runtime may reclaim them.
 
 Still required before 4C is complete:
 
-- Replace the current sequential batch-1 CUDA compatibility execution with a native batched path where measurements justify it.
-- Replace synchronous CUDA completion behavior with genuinely asynchronous submission/completion; no mandatory host synchronization should remain in the steady-state token loop.
+- Qualify the current source and measure the serving path on the RTX 4090.
+- Make the Qwen CUDA dispatcher genuinely asynchronous with pinned host output slots and CUDA completion events; the adapter seam exists, but Qwen still uses the eager synchronous path.
+- Replace sequential batch-1 CUDA compatibility execution with native batch-aware execution where measurements justify it.
 - Reuse/preallocate batch metadata and device-side step buffers where measurements justify it.
-- Benchmark scheduler CPU overhead, TTFT, ITL, tail latency, and throughput against matched incumbents.
-- Qualify failure/cancellation behavior on the real asynchronous CUDA path, not only the current correctness dispatcher.
+- Benchmark scheduler CPU overhead, TTFT, ITL, tail latency, throughput, GPU utilization, and memory against matched incumbents.
+- Qualify cancellation/failure behavior on the real asynchronous CUDA path, not only the eager correctness dispatcher.
+
+Current deterministic decode-first policy can theoretically starve prefill if decode work continuously consumes the entire work budget. Treat bounded fairness as a measured scheduler-policy issue; add the smallest deterministic mechanism only if real workloads require it.
 
 ### 4D — state paging and exact reuse
 
+A defensive validity guard is already present: fresh CUDA physical-state materialization at a nonzero logical prefix is rejected rather than allocating zero history and pretending it represents that prefix.
+
+Remaining work:
+
+- Implement real nonzero-prefix physical-state restoration/materialization.
 - Add block/paged KV allocation where it improves real workloads.
 - Preserve recurrent/other required state at reusable prefix boundaries.
 - Add exact prefix reuse only when the complete model-required state can be reconstructed correctly.
+- For Qwen3.8, reuse/restore must include both full-attention KV and recurrent/Gated-DeltaNet matrix plus convolution history at the same semantic prefix.
 - Make allocation/reuse/transfer costs visible to scheduling.
 - Add preemption only with explicit state ownership/reclamation semantics.
 
 ### 4E — minimal serving surface
 
-A direct local Qwen command now exercises tokenizer → scheduler → CUDA runtime → generated-token delivery → detokenizer over the same serving runtime. It is a correctness/qualification frontend, not completion of the network serving surface.
+A direct local Qwen command exercises tokenizer → scheduler → CUDA runtime → generated-token delivery → detokenizer over the same serving runtime. It is a correctness/qualification frontend, not completion of the network serving surface.
 
 Remaining work:
 
