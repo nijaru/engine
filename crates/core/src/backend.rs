@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::execution::{ExecutionEvent, ExecutionPlan, ExecutionSegment, PlanError};
+use crate::execution::{ExecutionBatch, ExecutionBatchEvent, ExecutionPlan, ExecutionSegment, PlanError};
 use crate::state::{InferenceStateSet, StateLocation};
 use crate::tensor::{DataType, Quantization};
 
@@ -187,6 +187,7 @@ pub enum BackendError {
     Unsupported(&'static str),
     PlanMismatch,
     InvalidPlan(PlanError),
+    StateCountMismatch,
     StateMismatch(&'static str),
     UnknownSubmission(BackendSubmissionId),
     ExecutionFailed(String),
@@ -198,6 +199,9 @@ impl fmt::Display for BackendError {
             Self::Unsupported(capability) => write!(f, "backend does not support {capability}"),
             Self::PlanMismatch => f.write_str("execution plan targets a different backend/device"),
             Self::InvalidPlan(error) => write!(f, "invalid execution plan: {error}"),
+            Self::StateCountMismatch => {
+                f.write_str("execution batch and inference-state counts differ")
+            }
             Self::StateMismatch(reason) => write!(f, "state does not satisfy execution: {reason}"),
             Self::UnknownSubmission(id) => write!(f, "backend submission {} is unknown", id.get()),
             Self::ExecutionFailed(reason) => write!(f, "execution failed: {reason}"),
@@ -212,21 +216,37 @@ pub trait ComputeBackend: Send {
 
     /// # Errors
     ///
-    /// Returns an error when the plan is not prepared for this backend or the
-    /// state set does not satisfy the segment.
+    /// Returns an error when the plan is not prepared for this backend or a
+    /// state set does not satisfy its request segment.
     fn validate_execution(
         &self,
         plan: &ExecutionPlan,
-        segment: &ExecutionSegment,
-        state: &InferenceStateSet,
+        batch: &ExecutionBatch,
+        states: &[InferenceStateSet],
     ) -> Result<(), BackendError> {
         if plan.backend() != self.capabilities().backend()
             || plan.device() != self.capabilities().device()
         {
             return Err(BackendError::PlanMismatch);
         }
-        plan.validate_segment(segment)
-            .map_err(BackendError::InvalidPlan)?;
+        plan.validate_batch(batch).map_err(BackendError::InvalidPlan)?;
+        if batch.len() != states.len() {
+            return Err(BackendError::StateCountMismatch);
+        }
+        for (segment, state) in batch.segments().iter().zip(states) {
+            self.validate_segment_state(segment, state)?;
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when state does not satisfy one request segment.
+    fn validate_segment_state(
+        &self,
+        segment: &ExecutionSegment,
+        state: &InferenceStateSet,
+    ) -> Result<(), BackendError> {
         if segment
             .state_requirements()
             .iter()
@@ -255,22 +275,20 @@ pub trait ComputeBackend: Send {
         Ok(())
     }
 
-    /// Submit work without requiring host synchronization with its completion.
-    /// Backends may complete immediately, but callers must use [`Self::poll`]
-    /// or [`Self::wait`] before committing the logical state transition.
+    /// Submit a multi-request batch without requiring host synchronization
+    /// with its completion.
     ///
     /// # Errors
     ///
-    /// Returns a backend error when the plan, segment, or state cannot be
-    /// submitted by this backend.
+    /// Returns a backend error when the batch cannot be submitted.
     fn submit(
         &mut self,
         plan: &ExecutionPlan,
-        segment: &ExecutionSegment,
-        state: &mut InferenceStateSet,
+        batch: &ExecutionBatch,
+        states: &mut [InferenceStateSet],
     ) -> Result<BackendSubmissionId, BackendError>;
 
-    /// Poll one submitted execution. Completion is consumed exactly once.
+    /// Poll one submitted batch. Completion is consumed exactly once.
     ///
     /// # Errors
     ///
@@ -279,16 +297,15 @@ pub trait ComputeBackend: Send {
     fn poll(
         &mut self,
         submission: BackendSubmissionId,
-    ) -> Result<Option<ExecutionEvent>, BackendError>;
+    ) -> Result<Option<ExecutionBatchEvent>, BackendError>;
 
-    /// Wait for one submitted execution. This is a convenience path for local
-    /// and correctness-oriented callers; serving code should normally poll
-    /// completions while preparing later work.
-    ///
     /// # Errors
     ///
     /// Returns a backend error from completion polling.
-    fn wait(&mut self, submission: BackendSubmissionId) -> Result<ExecutionEvent, BackendError> {
+    fn wait(
+        &mut self,
+        submission: BackendSubmissionId,
+    ) -> Result<ExecutionBatchEvent, BackendError> {
         loop {
             if let Some(event) = self.poll(submission)? {
                 return Ok(event);
@@ -297,19 +314,16 @@ pub trait ComputeBackend: Send {
         }
     }
 
-    /// Submit and wait synchronously. Kept as a convenience for small direct
-    /// callers; it is not the serving-loop contract.
-    ///
     /// # Errors
     ///
     /// Returns a backend error from submission or completion.
     fn execute(
         &mut self,
         plan: &ExecutionPlan,
-        segment: &ExecutionSegment,
-        state: &mut InferenceStateSet,
-    ) -> Result<ExecutionEvent, BackendError> {
-        let submission = self.submit(plan, segment, state)?;
+        batch: &ExecutionBatch,
+        states: &mut [InferenceStateSet],
+    ) -> Result<ExecutionBatchEvent, BackendError> {
+        let submission = self.submit(plan, batch, states)?;
         self.wait(submission)
     }
 }
