@@ -8,7 +8,7 @@ use crate::device::DeviceId;
 use crate::model::{ModelId, ModelRegionId};
 use crate::policy::PolicyVersion;
 use crate::qualification::{ExecutionVariant, QualificationStatus};
-use crate::request::RequestId;
+use crate::request::{RequestId, SamplingParams};
 use crate::residency::ModelResidencyPlan;
 use crate::state::StateRequirement;
 use crate::weights::WeightBinding;
@@ -23,13 +23,14 @@ pub enum ExecutionPhase {
     MoEExpert,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionSegment {
     request: RequestId,
     phase: ExecutionPhase,
     token_count: u32,
     state_position: u32,
     state_requirements: Vec<StateRequirement>,
+    sampling: Option<SamplingParams>,
 }
 
 impl ExecutionSegment {
@@ -58,7 +59,17 @@ impl ExecutionSegment {
             token_count,
             state_position,
             state_requirements,
+            sampling: None,
         })
+    }
+
+    /// Request one sampled token from the logits produced by this segment.
+    /// Intermediate prefill segments normally leave sampling disabled; the
+    /// final prefill segment and ordinary decode request it.
+    #[must_use]
+    pub const fn with_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = Some(sampling);
+        self
     }
 
     #[must_use]
@@ -90,9 +101,19 @@ impl ExecutionSegment {
     pub fn state_requirements(&self) -> &[StateRequirement] {
         &self.state_requirements
     }
+
+    #[must_use]
+    pub const fn sampling(&self) -> Option<SamplingParams> {
+        self.sampling
+    }
+
+    #[must_use]
+    pub const fn requests_sampling(&self) -> bool {
+        self.sampling.is_some()
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionBatch {
     segments: Vec<ExecutionSegment>,
 }
@@ -367,6 +388,7 @@ pub struct ExecutionEvent {
     phase: ExecutionPhase,
     token_count: u32,
     metrics: ExecutionMetrics,
+    output_token: Option<u32>,
 }
 
 impl ExecutionEvent {
@@ -387,8 +409,16 @@ impl ExecutionEvent {
                 phase,
                 token_count,
                 metrics,
+                output_token: None,
             })
         }
+    }
+
+    /// Attach the one committed sampled token produced by this execution.
+    #[must_use]
+    pub const fn with_output_token(mut self, token: u32) -> Self {
+        self.output_token = Some(token);
+        self
     }
 
     #[must_use]
@@ -414,6 +444,11 @@ impl ExecutionEvent {
     #[must_use]
     pub const fn metrics(self) -> ExecutionMetrics {
         self.metrics
+    }
+
+    #[must_use]
+    pub const fn output_token(self) -> Option<u32> {
+        self.output_token
     }
 }
 
