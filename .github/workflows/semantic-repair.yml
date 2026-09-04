@@ -1,0 +1,294 @@
+name: Semantic Repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/semantic-repair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Apply execution-output semantics
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/core/src/scheduler.rs')
+          s = p.read_text()
+          s = s.replace(
+'''pub struct ScheduledWork {
+    slot: RequestSlotId,
+    request: RequestId,
+    phase: ExecutionPhase,
+    token_count: u32,
+    state_position: u32,
+}''',
+'''pub struct ScheduledWork {
+    slot: RequestSlotId,
+    request: RequestId,
+    phase: ExecutionPhase,
+    token_count: u32,
+    state_position: u32,
+    sample_output: bool,
+}''')
+          s = s.replace(
+'''    pub const fn state_position(self) -> u32 {
+        self.state_position
+    }
+}''',
+'''    pub const fn state_position(self) -> u32 {
+        self.state_position
+    }
+
+    #[must_use]
+    pub const fn requests_output(self) -> bool {
+        self.sample_output
+    }
+}''', 1)
+          s = s.replace(
+'''                    completed.token_count(),
+                    state,
+                )?;''',
+'''                    completed.token_count(),
+                    completed.output_token(),
+                    state,
+                )?;''')
+          s = s.replace(
+'''            if completed.request() != item.request()
+                || completed.phase() != item.phase()
+                || completed.token_count() != item.token_count()
+                || completed.policy_version() != self.policy.version()
+            {
+                return Err(SchedulerError::CompletionMismatch);
+            }
+            let expected_position = item''',
+'''            if completed.request() != item.request()
+                || completed.phase() != item.phase()
+                || completed.token_count() != item.token_count()
+                || completed.policy_version() != self.policy.version()
+                || completed.output_token().is_some() != item.requests_output()
+            {
+                return Err(SchedulerError::CompletionMismatch);
+            }
+            let expected_position = item''')
+          s = s.replace(
+'''        slot.progress()
+            .prompt_processed()
+            .checked_add(slot.progress().generated_tokens())
+            .ok_or(SchedulerError::PositionOverflow)
+    }
+
+    fn make_work(
+        slot: &ActiveRequestSlot,
+        phase: ExecutionPhase,
+        token_count: u32,
+    ) -> Result<ScheduledWork, SchedulerError> {
+        Ok(ScheduledWork {
+            slot: slot.id(),
+            request: slot.request().id(),
+            phase,
+            token_count,
+            state_position: Self::state_position(slot)?,
+        })
+    }''',
+'''        slot.progress()
+            .prompt_processed()
+            .checked_add(slot.progress().decode_processed())
+            .ok_or(SchedulerError::PositionOverflow)
+    }
+
+    fn make_work(
+        slot: &ActiveRequestSlot,
+        phase: ExecutionPhase,
+        token_count: u32,
+    ) -> Result<ScheduledWork, SchedulerError> {
+        let sample_output = match phase {
+            ExecutionPhase::Decode => true,
+            ExecutionPhase::Prefill => slot
+                .progress()
+                .prompt_processed()
+                .checked_add(token_count)
+                .ok_or(SchedulerError::PositionOverflow)?
+                == slot.progress().prompt_tokens(),
+            ExecutionPhase::SpecDraft
+            | ExecutionPhase::SpecVerify
+            | ExecutionPhase::Encoder
+            | ExecutionPhase::MoEExpert => false,
+        };
+        Ok(ScheduledWork {
+            slot: slot.id(),
+            request: slot.request().id(),
+            phase,
+            token_count,
+            state_position: Self::state_position(slot)?,
+            sample_output,
+        })
+    }''')
+          s = s.replace(
+'''                    ExecutionEvent::new(
+                        item.request(),
+                        PolicyVersion::new(1).expect("policy version"),
+                        item.phase(),
+                        item.token_count(),
+                        ExecutionMetrics::new(1, 0, 0),
+                    )
+                    .expect("event")''',
+'''                    let event = ExecutionEvent::new(
+                        item.request(),
+                        PolicyVersion::new(1).expect("policy version"),
+                        item.phase(),
+                        item.token_count(),
+                        ExecutionMetrics::new(1, 0, 0),
+                    )
+                    .expect("event");
+                    if item.requests_output() {
+                        event.with_output_token(7)
+                    } else {
+                        event
+                    }''')
+          marker = '''    #[test]
+    fn mismatched_completion_does_not_mutate_in_flight_slots() {'''
+          test = '''    #[test]
+    fn final_prefill_output_does_not_advance_decode_input_position() {
+        let config = SchedulerConfig::new(1, 0, 4).expect("config");
+        let mut scheduler = ServingScheduler::new(policy(1, 4), config);
+        let request_id = RequestId::new(1).expect("request ID");
+        scheduler.admit(request(1, 2), state(), 3).expect("admit");
+
+        let prefill = scheduler.schedule().expect("schedule prefill");
+        assert_eq!(prefill.len(), 1);
+        assert_eq!(prefill[0].phase(), ExecutionPhase::Prefill);
+        assert_eq!(prefill[0].token_count(), 3);
+        assert!(prefill[0].requests_output());
+        let _states = scheduler.prepare_submission(&prefill).expect("prepare");
+        let submission = BackendSubmissionId::new(1).expect("submission");
+        scheduler
+            .confirm_submission(prefill.clone(), submission)
+            .expect("confirm");
+        scheduler
+            .complete_submission(submission, &batch_event(&prefill), vec![state()])
+            .expect("complete prefill");
+
+        let slot_id = scheduler.slot_for_request(request_id).expect("slot");
+        let slot = scheduler.slots().get(slot_id).expect("request");
+        assert_eq!(slot.progress().prompt_processed(), 3);
+        assert_eq!(slot.progress().decode_processed(), 0);
+        assert_eq!(slot.progress().generated_tokens(), 1);
+
+        let decode = scheduler.schedule().expect("schedule decode");
+        assert_eq!(decode.len(), 1);
+        assert_eq!(decode[0].phase(), ExecutionPhase::Decode);
+        assert_eq!(decode[0].state_position(), 3);
+        assert!(decode[0].requests_output());
+    }
+
+'''
+          if test not in s:
+              s = s.replace(marker, test + marker)
+          p.write_text(s)
+
+          p = Path('crates/core/tests/request_slots.rs')
+          s = p.read_text().replace(
+              'slot.complete_step(submission, ExecutionPhase::Decode, 1, state)',
+              'slot.complete_step(submission, ExecutionPhase::Decode, 1, None, state)'
+          )
+          p.write_text(s)
+
+          p = Path('crates/core/src/serving_runtime.rs')
+          s = p.read_text()
+          s = s.replace(
+'''    fn execution_batch(&self, work: &[ScheduledWork]) -> Result<ExecutionBatch, PlanError> {
+        let segments = work
+            .iter()
+            .map(|item| {
+                ExecutionSegment::new(
+                    item.request(),
+                    item.phase(),
+                    1,
+                    item.token_count(),
+                    item.state_position(),
+                    self.plan.state_requirements().to_vec(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ExecutionBatch::new(segments)
+    }''',
+'''    fn execution_batch(
+        &self,
+        work: &[ScheduledWork],
+    ) -> Result<ExecutionBatch, ServingRuntimeError> {
+        let segments = work
+            .iter()
+            .map(|item| {
+                let mut segment = ExecutionSegment::new(
+                    item.request(),
+                    item.phase(),
+                    1,
+                    item.token_count(),
+                    item.state_position(),
+                    self.plan.state_requirements().to_vec(),
+                )?;
+                if item.requests_output() {
+                    let slot = self
+                        .scheduler
+                        .slots()
+                        .get(item.slot())
+                        .ok_or(SchedulerError::StaleWork)?;
+                    segment = segment.with_sampling(slot.request().semantics().sampling());
+                }
+                Ok(segment)
+            })
+            .collect::<Result<Vec<_>, ServingRuntimeError>>()?;
+        Ok(ExecutionBatch::new(segments)?)
+    }''')
+          s = s.replace(
+'''                    ExecutionEvent::new(
+                        segment.request(),
+                        plan.policy_version(),
+                        segment.phase(),
+                        segment.token_count(),
+                        ExecutionMetrics::new(10, 0, 0),
+                    )
+                    .expect("non-zero segment")''',
+'''                    let event = ExecutionEvent::new(
+                        segment.request(),
+                        plan.policy_version(),
+                        segment.phase(),
+                        segment.token_count(),
+                        ExecutionMetrics::new(10, 0, 0),
+                    )
+                    .expect("non-zero segment");
+                    if segment.requests_sampling() {
+                        event.with_output_token(7)
+                    } else {
+                        event
+                    }''')
+          p.write_text(s)
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: CUDA feature clippy
+        run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates
+          if ! git diff --cached --quiet; then
+            git commit -m "Complete execution output semantics"
+            git push origin HEAD:main
+          fi
