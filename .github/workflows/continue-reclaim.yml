@@ -20,7 +20,7 @@ jobs:
           components: rustfmt, clippy
       - name: Apply logical state reclamation
         run: python .github/continue_reclaim.py
-      - name: Fix serving error mapping and test capacity
+      - name: Fix serving error mapping, test capacity, and docs
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -34,6 +34,14 @@ jobs:
           s = s.replace(
               '            LogicalStateManager::new(device, 0, 0),',
               '            LogicalStateManager::new(device, 1024, 0),',
+              1,
+          )
+          p.write_text(s)
+
+          p = Path('crates/core/src/runtime.rs')
+          s = p.read_text().replace(
+              'allocation lifecycle so request reclamation cannot leak StateManager',
+              'allocation lifecycle so request reclamation cannot leak `StateManager`',
               1,
           )
           p.write_text(s)
