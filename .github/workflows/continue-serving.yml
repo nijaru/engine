@@ -1,0 +1,334 @@
+name: Continue Serving Token Plumbing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/continue-serving.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Apply serving token plumbing
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('crates/core/src/lib.rs')
+          s = p.read_text()
+          s = s.replace(
+              'ExecutionPlan, ExecutionSegment, ExecutionStage, PlanError,',
+              'ExecutionPlan, ExecutionSegment, ExecutionStage, ExecutionTokenInput, PlanError,'
+          )
+          p.write_text(s)
+
+          p = Path('crates/core/src/serving_runtime.rs')
+          s = p.read_text()
+          s = s.replace('use std::fmt;\n', 'use std::fmt;\nuse std::sync::Arc;\n')
+          s = s.replace(
+              'use crate::execution::{ExecutionBatch, ExecutionPlan, ExecutionSegment, PlanError};',
+              'use crate::execution::{\n    ExecutionBatch, ExecutionPlan, ExecutionSegment, ExecutionTokenInput, PlanError,\n};'
+          )
+          s = s.replace(
+'''    plan: ExecutionPlan,
+    submissions: HashMap<BackendSubmissionId, RuntimeSubmission>,
+}''',
+'''    plan: ExecutionPlan,
+    submissions: HashMap<BackendSubmissionId, RuntimeSubmission>,
+    prompt_tokens: HashMap<RequestId, Arc<[u32]>>,
+    next_tokens: HashMap<RequestId, u32>,
+}''')
+          s = s.replace(
+'''            plan,
+            submissions: HashMap::new(),
+        })''',
+'''            plan,
+            submissions: HashMap::new(),
+            prompt_tokens: HashMap::new(),
+            next_tokens: HashMap::new(),
+        })''')
+          s = s.replace(
+'''    pub fn admit(
+        &mut self,
+        request: RequestSpec,
+        state: InferenceStateSet,
+        prompt_tokens: u32,
+    ) -> Result<crate::serving::RequestSlotId, ServingRuntimeError> {
+        Ok(self.scheduler.admit(request, state, prompt_tokens)?)
+    }''',
+'''    pub fn admit(
+        &mut self,
+        request: RequestSpec,
+        state: InferenceStateSet,
+        prompt_tokens: Arc<[u32]>,
+    ) -> Result<crate::serving::RequestSlotId, ServingRuntimeError> {
+        if prompt_tokens.is_empty() {
+            return Err(ServingRuntimeError::InvalidPrompt);
+        }
+        let prompt_len =
+            u32::try_from(prompt_tokens.len()).map_err(|_| ServingRuntimeError::InvalidPrompt)?;
+        let request_id = request.id();
+        let slot = self.scheduler.admit(request, state, prompt_len)?;
+        self.prompt_tokens.insert(request_id, prompt_tokens);
+        Ok(slot)
+    }''')
+          s = s.replace(
+'''    pub fn reclaim_next(&mut self) -> Result<Option<ActiveRequestSlot>, ServingRuntimeError> {
+        Ok(self.scheduler.reclaim_next()?)
+    }''',
+'''    pub fn reclaim_next(&mut self) -> Result<Option<ActiveRequestSlot>, ServingRuntimeError> {
+        let reclaimed = self.scheduler.reclaim_next()?;
+        if let Some(slot) = &reclaimed {
+            let request = slot.request().id();
+            self.prompt_tokens.remove(&request);
+            self.next_tokens.remove(&request);
+        }
+        Ok(reclaimed)
+    }''')
+          s = s.replace(
+'''                Ok(Some(completed)) => {
+                    let (event, states) = completed.into_parts();
+                    self.scheduler.complete_submission(id, &event, states)?;
+                    completed_count += 1;
+                }''',
+'''                Ok(Some(completed)) => {
+                    let (event, states) = completed.into_parts();
+                    self.scheduler.complete_submission(id, &event, states)?;
+                    for completed in event.events() {
+                        let request = completed.request();
+                        if let Some(token) = completed.output_token() {
+                            self.next_tokens.insert(request, token);
+                        }
+                        if completed.phase() == crate::execution::ExecutionPhase::Prefill {
+                            let prompt_complete = self
+                                .scheduler
+                                .slot_for_request(request)
+                                .and_then(|slot| self.scheduler.slots().get(slot))
+                                .is_some_and(|slot| {
+                                    slot.progress().prompt_processed()
+                                        == slot.progress().prompt_tokens()
+                                });
+                            if prompt_complete {
+                                self.prompt_tokens.remove(&request);
+                            }
+                        }
+                    }
+                    completed_count += 1;
+                }''')
+          old = '''        let segments = work
+            .iter()
+            .map(|item| {
+                let mut segment = ExecutionSegment::new(
+                    item.request(),
+                    item.phase(),
+                    1,
+                    item.token_count(),
+                    item.state_position(),
+                    self.plan.state_requirements().to_vec(),
+                )?;
+                if item.requests_output() {
+                    let slot = self
+                        .scheduler
+                        .slots()
+                        .get(item.slot())
+                        .ok_or(SchedulerError::StaleWork)?;
+                    segment = segment.with_sampling(slot.request().semantics().sampling());
+                }
+                Ok(segment)
+            })
+            .collect::<Result<Vec<_>, ServingRuntimeError>>()?;
+        Ok(ExecutionBatch::new(segments)?)'''
+          new = '''        let segments = work
+            .iter()
+            .map(|item| {
+                let mut segment = ExecutionSegment::new(
+                    item.request(),
+                    item.phase(),
+                    1,
+                    item.token_count(),
+                    item.state_position(),
+                    self.plan.state_requirements().to_vec(),
+                )?;
+                match item.phase() {
+                    crate::execution::ExecutionPhase::Prefill => {
+                        let prompt = self
+                            .prompt_tokens
+                            .get(&item.request())
+                            .ok_or(ServingRuntimeError::PromptMissing(item.request()))?
+                            .clone();
+                        let input = ExecutionTokenInput::prompt(
+                            prompt,
+                            item.state_position(),
+                            item.token_count(),
+                        )?;
+                        segment = segment.with_token_input(input)?;
+                    }
+                    crate::execution::ExecutionPhase::Decode => {
+                        let token = self
+                            .next_tokens
+                            .get(&item.request())
+                            .copied()
+                            .ok_or(ServingRuntimeError::DecodeTokenMissing(item.request()))?;
+                        segment = segment.with_token_input(ExecutionTokenInput::decode(token))?;
+                    }
+                    crate::execution::ExecutionPhase::SpecDraft
+                    | crate::execution::ExecutionPhase::SpecVerify
+                    | crate::execution::ExecutionPhase::Encoder
+                    | crate::execution::ExecutionPhase::MoEExpert => {}
+                }
+                if item.requests_output() {
+                    let slot = self
+                        .scheduler
+                        .slots()
+                        .get(item.slot())
+                        .ok_or(SchedulerError::StaleWork)?;
+                    segment = segment.with_sampling(slot.request().semantics().sampling());
+                }
+                Ok(segment)
+            })
+            .collect::<Result<Vec<_>, ServingRuntimeError>>()?;
+        Ok(ExecutionBatch::new(segments)?)'''
+          if old not in s:
+              raise SystemExit('execution_batch target not found')
+          s = s.replace(old, new)
+          s = s.replace(
+'''pub enum ServingRuntimeError {
+    PolicyMismatch,
+    SubmissionCollision(BackendSubmissionId),''',
+'''pub enum ServingRuntimeError {
+    PolicyMismatch,
+    InvalidPrompt,
+    PromptMissing(RequestId),
+    DecodeTokenMissing(RequestId),
+    SubmissionCollision(BackendSubmissionId),''')
+          s = s.replace(
+'''            Self::PolicyMismatch => {
+                f.write_str("scheduler and execution plan use different policy versions")
+            }
+            Self::SubmissionCollision(id) => {''',
+'''            Self::PolicyMismatch => {
+                f.write_str("scheduler and execution plan use different policy versions")
+            }
+            Self::InvalidPrompt => f.write_str("serving prompt must contain a representable token sequence"),
+            Self::PromptMissing(request) => {
+                write!(f, "prompt tokens for request {} are unavailable", request.get())
+            }
+            Self::DecodeTokenMissing(request) => {
+                write!(f, "next decode token for request {} is unavailable", request.get())
+            }
+            Self::SubmissionCollision(id) => {''')
+
+          s = s.replace(
+'''    struct DelayedBackend {
+        capabilities: BackendCapabilities,
+        next_submission: u64,
+        pending: HashMap<BackendSubmissionId, (u8, ExecutionBatchEvent)>,
+        fail_submit: bool,
+    }''',
+'''    struct DelayedBackend {
+        capabilities: BackendCapabilities,
+        next_submission: u64,
+        pending: HashMap<BackendSubmissionId, (u8, ExecutionBatchEvent)>,
+        submitted_inputs: Vec<Vec<ExecutionTokenInput>>,
+        fail_submit: bool,
+    }''')
+          s = s.replace(
+'''                next_submission: 1,
+                pending: HashMap::new(),
+                fail_submit,
+            }''',
+'''                next_submission: 1,
+                pending: HashMap::new(),
+                submitted_inputs: Vec::new(),
+                fail_submit,
+            }''')
+          s = s.replace(
+'''            if self.fail_submit {
+                return Err(BackendError::ExecutionFailed(
+                    "test submit failure".to_owned(),
+                ));
+            }
+            let id = BackendSubmissionId::new(self.next_submission)''',
+'''            if self.fail_submit {
+                return Err(BackendError::ExecutionFailed(
+                    "test submit failure".to_owned(),
+                ));
+            }
+            let inputs = batch
+                .segments()
+                .iter()
+                .map(|segment| {
+                    segment.token_input().cloned().ok_or_else(|| {
+                        BackendError::ExecutionFailed("test segment lacked token input".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.submitted_inputs.push(inputs);
+            let id = BackendSubmissionId::new(self.next_submission)''')
+          s = s.replace(
+'''    fn state() -> InferenceStateSet {
+        InferenceStateSet::new(Vec::new()).expect("state")
+    }''',
+'''    fn state() -> InferenceStateSet {
+        InferenceStateSet::new(Vec::new()).expect("state")
+    }
+
+    fn prompt(tokens: &[u32]) -> Arc<[u32]> {
+        Arc::from(tokens)
+    }''')
+          s = s.replace('serving.admit(request(1), state(), 0)', 'serving.admit(request(1), state(), prompt(&[11]))')
+          s = s.replace('serving.admit(request(2), state(), 0)', 'serving.admit(request(2), state(), prompt(&[12]))')
+          marker = '''    #[test]
+    fn cancelling_one_request_does_not_cancel_peer_in_same_submission() {'''
+          test = '''    #[test]
+    fn sampled_prefill_token_becomes_the_next_decode_input() {
+        let mut serving = fixture(false);
+        serving
+            .admit(request(1), state(), prompt(&[11, 12]))
+            .expect("request");
+
+        serving.submit_ready_batch().expect("prefill submit");
+        assert_eq!(
+            serving.runtime().backend().submitted_inputs[0][0].prompt_slice(),
+            Some(&[11, 12][..])
+        );
+        assert_eq!(serving.poll_completions().expect("pending poll"), 0);
+        assert_eq!(serving.poll_completions().expect("prefill completion"), 1);
+
+        serving.submit_ready_batch().expect("decode submit");
+        assert_eq!(
+            serving.runtime().backend().submitted_inputs[1][0].decode_token(),
+            Some(7)
+        );
+    }
+
+'''
+          if test not in s:
+              s = s.replace(marker, test + marker)
+          p.write_text(s)
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: CUDA feature clippy
+        run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - name: Commit changes and remove workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/continue-serving.yml
+          git add crates
+          git commit -m "Connect serving requests to execution token inputs"
+          git push origin HEAD:main
