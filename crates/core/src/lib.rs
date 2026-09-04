@@ -16,6 +16,7 @@ pub mod readiness;
 pub mod request;
 pub mod residency;
 pub mod runtime;
+pub mod scheduler;
 pub mod serving;
 pub mod state;
 pub mod tensor;
@@ -51,6 +52,9 @@ pub use residency::{
     ModelResidencyPlan, ModelResourceId, ResidencyError, ResidencyLocation, ResidencyOverride,
 };
 pub use runtime::{CompletedExecution, ExecutionRuntime, RuntimeError, RuntimeSubmission};
+pub use scheduler::{
+    ScheduledWork, SchedulerConfig, SchedulerCounts, SchedulerError, ServingScheduler,
+};
 pub use serving::{
     ActiveRequestSlot, RequestLifecycle, RequestProgress, RequestSlotError, RequestSlotId,
     RequestSlots,
