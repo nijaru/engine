@@ -64,7 +64,7 @@ pub use serving::{
     ActiveRequestSlot, RequestLifecycle, RequestProgress, RequestSlotError, RequestSlotId,
     RequestSlots,
 };
-pub use serving_runtime::{ServingIteration, ServingRuntime, ServingRuntimeError};
+pub use serving_runtime::{GeneratedToken, ServingIteration, ServingRuntime, ServingRuntimeError};
 pub use state::{
     ConvolutionStateShape, InferenceState, InferenceStateSet, KvState, KvStateSpec,
     LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec, StateError,
