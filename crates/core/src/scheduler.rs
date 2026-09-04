@@ -73,6 +73,7 @@ pub struct ScheduledWork {
     phase: ExecutionPhase,
     token_count: u32,
     state_position: u32,
+    sample_output: bool,
 }
 
 impl ScheduledWork {
@@ -99,6 +100,11 @@ impl ScheduledWork {
     #[must_use]
     pub const fn state_position(self) -> u32 {
         self.state_position
+    }
+
+    #[must_use]
+    pub const fn requests_output(self) -> bool {
+        self.sample_output
     }
 }
 
@@ -399,6 +405,7 @@ impl ServingScheduler {
                     submission,
                     completed.phase(),
                     completed.token_count(),
+                    completed.output_token(),
                     state,
                 )?;
 
@@ -669,6 +676,7 @@ impl ServingScheduler {
                 || completed.phase() != item.phase()
                 || completed.token_count() != item.token_count()
                 || completed.policy_version() != self.policy.version()
+                || completed.output_token().is_some() != item.requests_output()
             {
                 return Err(SchedulerError::CompletionMismatch);
             }
@@ -754,7 +762,7 @@ impl ServingScheduler {
         }
         slot.progress()
             .prompt_processed()
-            .checked_add(slot.progress().generated_tokens())
+            .checked_add(slot.progress().decode_processed())
             .ok_or(SchedulerError::PositionOverflow)
     }
 
@@ -763,12 +771,27 @@ impl ServingScheduler {
         phase: ExecutionPhase,
         token_count: u32,
     ) -> Result<ScheduledWork, SchedulerError> {
+        let sample_output = match phase {
+            ExecutionPhase::Decode => true,
+            ExecutionPhase::Prefill => {
+                slot.progress()
+                    .prompt_processed()
+                    .checked_add(token_count)
+                    .ok_or(SchedulerError::PositionOverflow)?
+                    == slot.progress().prompt_tokens()
+            }
+            ExecutionPhase::SpecDraft
+            | ExecutionPhase::SpecVerify
+            | ExecutionPhase::Encoder
+            | ExecutionPhase::MoEExpert => false,
+        };
         Ok(ScheduledWork {
             slot: slot.id(),
             request: slot.request().id(),
             phase,
             token_count,
             state_position: Self::state_position(slot)?,
+            sample_output,
         })
     }
 }
@@ -884,14 +907,19 @@ mod tests {
         ExecutionBatchEvent::new(
             work.iter()
                 .map(|item| {
-                    ExecutionEvent::new(
+                    let event = ExecutionEvent::new(
                         item.request(),
                         PolicyVersion::new(1).expect("policy version"),
                         item.phase(),
                         item.token_count(),
                         ExecutionMetrics::new(1, 0, 0),
                     )
-                    .expect("event")
+                    .expect("event");
+                    if item.requests_output() {
+                        event.with_output_token(7)
+                    } else {
+                        event
+                    }
                 })
                 .collect(),
         )
@@ -1010,6 +1038,40 @@ mod tests {
                 .state()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn final_prefill_output_does_not_advance_decode_input_position() {
+        let config = SchedulerConfig::new(1, 0, 4).expect("config");
+        let mut scheduler = ServingScheduler::new(policy(1, 4), config);
+        let request_id = RequestId::new(1).expect("request ID");
+        scheduler.admit(request(1, 2), state(), 3).expect("admit");
+
+        let prefill = scheduler.schedule().expect("schedule prefill");
+        assert_eq!(prefill.len(), 1);
+        assert_eq!(prefill[0].phase(), ExecutionPhase::Prefill);
+        assert_eq!(prefill[0].token_count(), 3);
+        assert!(prefill[0].requests_output());
+        let _states = scheduler.prepare_submission(&prefill).expect("prepare");
+        let submission = BackendSubmissionId::new(1).expect("submission");
+        scheduler
+            .confirm_submission(prefill.clone(), submission)
+            .expect("confirm");
+        scheduler
+            .complete_submission(submission, &batch_event(&prefill), vec![state()])
+            .expect("complete prefill");
+
+        let slot_id = scheduler.slot_for_request(request_id).expect("slot");
+        let slot = scheduler.slots().get(slot_id).expect("request");
+        assert_eq!(slot.progress().prompt_processed(), 3);
+        assert_eq!(slot.progress().decode_processed(), 0);
+        assert_eq!(slot.progress().generated_tokens(), 1);
+
+        let decode = scheduler.schedule().expect("schedule decode");
+        assert_eq!(decode.len(), 1);
+        assert_eq!(decode[0].phase(), ExecutionPhase::Decode);
+        assert_eq!(decode[0].state_position(), 3);
+        assert!(decode[0].requests_output());
     }
 
     #[test]

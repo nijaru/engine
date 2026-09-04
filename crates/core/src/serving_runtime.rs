@@ -187,21 +187,33 @@ where
         })
     }
 
-    fn execution_batch(&self, work: &[ScheduledWork]) -> Result<ExecutionBatch, PlanError> {
+    fn execution_batch(
+        &self,
+        work: &[ScheduledWork],
+    ) -> Result<ExecutionBatch, ServingRuntimeError> {
         let segments = work
             .iter()
             .map(|item| {
-                ExecutionSegment::new(
+                let mut segment = ExecutionSegment::new(
                     item.request(),
                     item.phase(),
                     1,
                     item.token_count(),
                     item.state_position(),
                     self.plan.state_requirements().to_vec(),
-                )
+                )?;
+                if item.requests_output() {
+                    let slot = self
+                        .scheduler
+                        .slots()
+                        .get(item.slot())
+                        .ok_or(SchedulerError::StaleWork)?;
+                    segment = segment.with_sampling(slot.request().semantics().sampling());
+                }
+                Ok(segment)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        ExecutionBatch::new(segments)
+            .collect::<Result<Vec<_>, ServingRuntimeError>>()?;
+        Ok(ExecutionBatch::new(segments)?)
     }
 }
 
@@ -342,14 +354,19 @@ mod tests {
                 .segments()
                 .iter()
                 .map(|segment| {
-                    ExecutionEvent::new(
+                    let event = ExecutionEvent::new(
                         segment.request(),
                         plan.policy_version(),
                         segment.phase(),
                         segment.token_count(),
                         ExecutionMetrics::new(10, 0, 0),
                     )
-                    .expect("non-zero segment")
+                    .expect("non-zero segment");
+                    if segment.requests_sampling() {
+                        event.with_output_token(7)
+                    } else {
+                        event
+                    }
                 })
                 .collect();
             let event = ExecutionBatchEvent::new(events).expect("batch event");

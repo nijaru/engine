@@ -64,7 +64,7 @@ fn in_flight_cancellation_waits_for_backend_completion() {
     ));
 
     let slot = slots.get_mut(id).expect("request");
-    slot.complete_step(submission, ExecutionPhase::Decode, 1, state)
+    slot.complete_step(submission, ExecutionPhase::Decode, 1, None, state)
         .expect("complete cancelled work");
     assert_eq!(slot.lifecycle(), RequestLifecycle::Cancelled);
     assert!(slot.state().is_some());
