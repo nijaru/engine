@@ -20,7 +20,7 @@ jobs:
           components: rustfmt, clippy
       - name: Apply logical state reclamation
         run: python .github/continue_reclaim.py
-      - name: Fix serving error mapping
+      - name: Fix serving error mapping and test capacity
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -29,6 +29,11 @@ jobs:
           s = s.replace(
               '        let state = reclaimed.take_terminal_state()?;\n        self.runtime.release_state_set(&state)?;',
               '        let state = reclaimed\n            .take_terminal_state()\n            .map_err(SchedulerError::from)?;\n        self.runtime\n            .release_state_set(&state)\n            .map_err(ServingRuntimeError::Runtime)?;',
+              1,
+          )
+          s = s.replace(
+              '            LogicalStateManager::new(device, 0, 0),',
+              '            LogicalStateManager::new(device, 1024, 0),',
               1,
           )
           p.write_text(s)
