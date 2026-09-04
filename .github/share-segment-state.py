@@ -37,9 +37,12 @@ s = replace_once(
     "            state_requirements: state_requirements.into(),\n            weights,\n            residency,\n",
     "plan vec constructor",
 )
+plan_start = s.index("impl ExecutionPlan {")
+head, tail = s[:plan_start], s[plan_start:]
 marker = '''    #[must_use]\n    pub fn state_requirements(&self) -> &[StateRequirement] {\n        &self.state_requirements\n    }\n'''
 replacement = '''    #[must_use]\n    pub fn state_requirements(&self) -> &[StateRequirement] {\n        &self.state_requirements\n    }\n\n    /// Clone the immutable prepared state schema without copying its entries.\n    #[must_use]\n    pub fn shared_state_requirements(&self) -> Arc<[StateRequirement]> {\n        Arc::clone(&self.state_requirements)\n    }\n'''
-s = replace_once(s, marker, replacement, "plan shared requirement getter")
+tail = replace_once(tail, marker, replacement, "plan shared requirement getter")
+s = head + tail
 execution.write_text(s)
 
 serving = Path("crates/core/src/serving_runtime.rs")
