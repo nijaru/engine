@@ -48,6 +48,7 @@ impl RequestLifecycle {
 pub struct RequestProgress {
     prompt_tokens: u32,
     prompt_processed: u32,
+    decode_processed: u32,
     generated_tokens: u32,
 }
 
@@ -57,6 +58,7 @@ impl RequestProgress {
         Self {
             prompt_tokens,
             prompt_processed: 0,
+            decode_processed: 0,
             generated_tokens: 0,
         }
     }
@@ -69,6 +71,14 @@ impl RequestProgress {
     #[must_use]
     pub const fn prompt_processed(self) -> u32 {
         self.prompt_processed
+    }
+
+    /// Number of generated-token inputs consumed by ordinary decode steps.
+    /// This is part of the model-state position and is intentionally distinct
+    /// from the number of output tokens already sampled for the caller.
+    #[must_use]
+    pub const fn decode_processed(self) -> u32 {
+        self.decode_processed
     }
 
     #[must_use]
@@ -97,8 +107,8 @@ impl RequestProgress {
                 self.prompt_processed = next;
             }
             ExecutionPhase::Decode => {
-                self.generated_tokens = self
-                    .generated_tokens
+                self.decode_processed = self
+                    .decode_processed
                     .checked_add(token_count)
                     .ok_or(RequestSlotError::ProgressOverflow)?;
             }
@@ -107,6 +117,23 @@ impl RequestProgress {
             | ExecutionPhase::Encoder
             | ExecutionPhase::MoEExpert => {}
         }
+        Ok(())
+    }
+
+    /// Record one token committed to the request's generated output stream.
+    /// Output production is not the same operation as consuming a decode input:
+    /// the final prefill segment can produce output token one without advancing
+    /// model state beyond the prompt boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::ProgressOverflow`] when the output counter
+    /// cannot be represented.
+    pub fn record_generated(&mut self) -> Result<(), RequestSlotError> {
+        self.generated_tokens = self
+            .generated_tokens
+            .checked_add(1)
+            .ok_or(RequestSlotError::ProgressOverflow)?;
         Ok(())
     }
 }
@@ -300,6 +327,7 @@ impl ActiveRequestSlot {
         submission: BackendSubmissionId,
         phase: ExecutionPhase,
         token_count: u32,
+        output_token: Option<u32>,
         state: InferenceStateSet,
     ) -> Result<(), RequestSlotError> {
         if self.state.is_some() {
@@ -308,6 +336,9 @@ impl ActiveRequestSlot {
         match self.lifecycle {
             RequestLifecycle::InFlight(actual) if actual == submission => {
                 self.progress.record(phase, token_count)?;
+                if output_token.is_some() {
+                    self.progress.record_generated()?;
+                }
                 self.state = Some(state);
                 self.lifecycle = RequestLifecycle::Runnable;
                 Ok(())
@@ -481,7 +512,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speculative_work_does_not_claim_committed_output() {
+    fn output_progress_is_distinct_from_decode_input_progress() {
         let mut progress = RequestProgress::new(8);
         progress
             .record(ExecutionPhase::Prefill, 8)
@@ -492,8 +523,17 @@ mod tests {
         progress
             .record(ExecutionPhase::SpecVerify, 4)
             .expect("verify");
+        assert_eq!(progress.decode_processed(), 0);
         assert_eq!(progress.generated_tokens(), 0);
-        progress.record(ExecutionPhase::Decode, 1).expect("decode");
+
+        progress.record_generated().expect("first output");
+        assert_eq!(progress.decode_processed(), 0);
         assert_eq!(progress.generated_tokens(), 1);
+
+        progress.record(ExecutionPhase::Decode, 1).expect("decode");
+        assert_eq!(progress.decode_processed(), 1);
+        assert_eq!(progress.generated_tokens(), 1);
+        progress.record_generated().expect("second output");
+        assert_eq!(progress.generated_tokens(), 2);
     }
 }
