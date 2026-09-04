@@ -50,15 +50,19 @@ impl RuntimeReadiness {
     pub fn transition(&mut self, next: ReadinessState) -> Result<(), ReadinessError> {
         let valid = matches!(
             (self.state, next),
-            (ReadinessState::Created, ReadinessState::Loading)
-                | (ReadinessState::Created, ReadinessState::Failed)
-                | (ReadinessState::Loading, ReadinessState::Preparing)
-                | (ReadinessState::Loading, ReadinessState::Failed)
-                | (ReadinessState::Preparing, ReadinessState::Warming)
-                | (ReadinessState::Preparing, ReadinessState::Ready)
-                | (ReadinessState::Preparing, ReadinessState::Failed)
-                | (ReadinessState::Warming, ReadinessState::Ready)
-                | (ReadinessState::Warming, ReadinessState::Failed)
+            (
+                ReadinessState::Created,
+                ReadinessState::Loading | ReadinessState::Failed
+            ) | (
+                ReadinessState::Loading,
+                ReadinessState::Preparing | ReadinessState::Failed
+            ) | (
+                ReadinessState::Preparing,
+                ReadinessState::Warming | ReadinessState::Ready | ReadinessState::Failed
+            ) | (
+                ReadinessState::Warming,
+                ReadinessState::Ready | ReadinessState::Failed
+            )
         );
         if !valid {
             return Err(ReadinessError::InvalidTransition);
@@ -82,3 +86,24 @@ impl fmt::Display for ReadinessError {
 }
 
 impl std::error::Error for ReadinessError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_only_serves_after_preparation() {
+        let mut readiness = RuntimeReadiness::default();
+        assert!(!readiness.can_serve());
+        readiness.transition(ReadinessState::Loading).expect("load");
+        readiness
+            .transition(ReadinessState::Preparing)
+            .expect("prepare");
+        readiness.transition(ReadinessState::Ready).expect("ready");
+        assert!(readiness.can_serve());
+        assert_eq!(
+            readiness.transition(ReadinessState::Loading),
+            Err(ReadinessError::InvalidTransition)
+        );
+    }
+}
