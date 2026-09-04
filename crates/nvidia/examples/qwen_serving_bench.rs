@@ -1,9 +1,10 @@
 //! Multi-request serving-runtime benchmark for the pinned Qwen3.8-27B GGUF path.
 //!
 //! This exercises Engine's real scheduler/runtime/backend boundary rather than
-//! calling the batch-1 decoder directly. The current CUDA dispatcher preserves
-//! a scheduler batch but executes its requests sequentially, so this benchmark
-//! is a qualification baseline for Phase 4C, not a native-batching claim.
+//! calling the batch-1 decoder directly. The CUDA dispatcher completes
+//! asynchronously through pinned host output slots, but still executes each
+//! scheduler-batch member sequentially through batch-1 kernels, so this
+//! benchmark measures the one-stream async path, not native batching.
 //!
 //! ```text
 //! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
@@ -278,7 +279,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "  caveat: the current CUDA serving dispatcher executes members of each scheduler batch sequentially; this measures the Phase-4C baseline before native batching/async completion"
+        "  caveat: the current CUDA serving dispatcher executes members of each scheduler batch sequentially through batch-1 kernels; async completion is landed, so this measures the one-stream async path before native batching"
     );
     Ok(())
 }

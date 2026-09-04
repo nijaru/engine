@@ -69,15 +69,14 @@ Implemented correctness foundation:
 - Submission failure, completion, terminal reclamation, logical-state release, and physical CUDA-state release have explicit lifecycle paths.
 - The Qwen CUDA serving dispatcher preserves the scheduler's whole-batch boundary and persistent physical state.
 - Intermediate Qwen prefill tokens skip output normalization, the vocabulary projection, argmax, and host token readback when no sampled output is semantically required.
-- The current synchronous Qwen dispatcher explicitly waits for queued stream work before reporting completion, including error paths, so logical commit/reclamation cannot race output-free CUDA work.
+- The Qwen dispatcher now completes asynchronously through dispatcher-owned pinned host output slots and one CUDA completion event per submission: enqueue failures flush the stream and leave no hidden async ownership, and state released while queued work still references it is deferred to completion. The eager blocking path remains the correctness fallback.
 - The NVIDIA adapter has a narrow dispatcher-owned asynchronous submit/poll seam keyed by `BackendSubmissionId`; synchronous/reference dispatchers retain their existing behavior.
 - Terminal asynchronous completion failure is defined to end backend access to request state/resources before the runtime may reclaim them.
+- Full-model async-vs-eager greedy parity against the pinned llama-server continuation passes on the RTX 4090, and identical serving sweeps before/after async adoption show unchanged ~1.8 tok/s aggregate: host-blocking removal alone does not move throughput while rows still execute sequentially through batch-1 kernels.
 
 Still required before 4C is complete:
 
-- Qualify the current source and measure the serving path on the RTX 4090.
-- Make the Qwen CUDA dispatcher genuinely asynchronous with pinned host output slots and CUDA completion events; the adapter seam exists, but Qwen still uses the eager synchronous path.
-- Replace sequential batch-1 CUDA compatibility execution with native batch-aware execution where measurements justify it.
+- Replace sequential batch-1 CUDA compatibility execution with native batch-aware execution where measurements justify it; the serving sweep shows serial batch-1 projection work dominating, so layer/op-oriented batching of quantized linear projections is the likely first target.
 - Reuse/preallocate batch metadata and device-side step buffers where measurements justify it.
 - Benchmark scheduler CPU overhead, TTFT, ITL, tail latency, throughput, GPU utilization, and memory against matched incumbents.
 - Qualify cancellation/failure behavior on the real asynchronous CUDA path, not only the eager correctness dispatcher.
