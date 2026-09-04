@@ -8,8 +8,8 @@ use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use engine_core::{
-    BackendError, DataType, ExecutionMetrics, ExecutionPlan, ExecutionSegment, F32BlockStream,
-    InferenceStateSet, NvidiaDispatcher, WeightBinding, WeightTensorSpec,
+    BackendError, DataType, ExecutionMetrics, ExecutionOutcome, ExecutionPlan, ExecutionSegment,
+    F32BlockStream, InferenceStateSet, NvidiaDispatcher, WeightBinding, WeightTensorSpec,
 };
 
 const INPUT: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
@@ -669,13 +669,14 @@ impl NvidiaDispatcher for CudaReferenceDispatcher {
         segment: &ExecutionSegment,
         weights: &WeightBinding,
         _state: &mut InferenceStateSet,
-    ) -> Result<ExecutionMetrics, BackendError> {
+    ) -> Result<ExecutionOutcome, BackendError> {
         if segment.batch_size() != 1 || segment.token_count() != 1 {
             return Err(BackendError::ExecutionFailed(
                 "CUDA reference dispatcher only accepts batch=1 token=1".to_owned(),
             ));
         }
         self.run_linear_layer(weights)
+            .map(ExecutionOutcome::new)
             .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
     }
 }

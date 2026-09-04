@@ -6,7 +6,7 @@ use crate::backend::{
     BackendCapabilities, BackendError, BackendKind, BackendSubmissionId, ComputeBackend,
 };
 use crate::execution::{
-    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPlan,
+    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionOutcome, ExecutionPlan,
     ExecutionSegment,
 };
 use crate::state::InferenceStateSet;
@@ -29,7 +29,7 @@ pub trait NvidiaDispatcher: Send {
         segment: &ExecutionSegment,
         weights: &WeightBinding,
         state: &mut InferenceStateSet,
-    ) -> Result<ExecutionMetrics, BackendError>;
+    ) -> Result<ExecutionOutcome, BackendError>;
 
     /// Dispatch one scheduler-selected multi-request batch.
     ///
@@ -49,7 +49,7 @@ pub trait NvidiaDispatcher: Send {
         batch: &ExecutionBatch,
         weights: &WeightBinding,
         states: &mut [InferenceStateSet],
-    ) -> Result<Vec<ExecutionMetrics>, BackendError> {
+    ) -> Result<Vec<ExecutionOutcome>, BackendError> {
         if batch.len() != states.len() {
             return Err(BackendError::StateCountMismatch);
         }
@@ -124,13 +124,13 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         states: &mut [InferenceStateSet],
     ) -> Result<BackendSubmissionId, BackendError> {
         self.validate_execution(plan, batch, states)?;
-        let metrics = self
+        let outcomes = self
             .dispatcher
             .dispatch_batch(plan, batch, plan.weights(), states)?;
-        if metrics.len() != batch.len() {
+        if outcomes.len() != batch.len() {
             return Err(BackendError::ExecutionFailed(format!(
-                "NVIDIA dispatcher returned {} metric records for {} request segments",
-                metrics.len(),
+                "NVIDIA dispatcher returned {} outcomes for {} request segments",
+                outcomes.len(),
                 batch.len()
             )));
         }
@@ -138,20 +138,31 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         let events = batch
             .segments()
             .iter()
-            .zip(metrics)
-            .map(|(segment, metrics)| {
-                ExecutionEvent::new(
+            .zip(outcomes)
+            .map(|(segment, outcome)| {
+                let output_token = outcome.output_token();
+                if segment.requests_sampling() != output_token.is_some() {
+                    return Err(BackendError::ExecutionFailed(format!(
+                        "NVIDIA dispatcher output-token presence did not match sampling for request {}",
+                        segment.request().get()
+                    )));
+                }
+                let event = ExecutionEvent::new(
                     segment.request(),
                     plan.policy_version(),
                     segment.phase(),
                     segment.token_count(),
-                    metrics,
+                    outcome.metrics(),
                 )
                 .ok_or_else(|| {
                     BackendError::ExecutionFailed("segment contained no tokens".to_owned())
+                })?;
+                Ok(match output_token {
+                    Some(token) => event.with_output_token(token),
+                    None => event,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, BackendError>>()?;
         let event = ExecutionBatchEvent::new(events).map_err(BackendError::InvalidPlan)?;
         let submission = self.allocate_submission()?;
         self.completed.insert(submission, event);
@@ -174,10 +185,10 @@ mod tests {
     use super::*;
     use crate::backend::{BackendFeatures, BackendId};
     use crate::device::DeviceId;
-    use crate::execution::{ExecutionPhase, ExecutionStage};
+    use crate::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};
     use crate::model::{ModelId, ModelRegionId};
     use crate::policy::PolicyVersion;
-    use crate::request::RequestId;
+    use crate::request::{RequestId, SamplingParams};
     use crate::state::{
         InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
         StateRequirement,
@@ -193,8 +204,8 @@ mod tests {
             _segment: &ExecutionSegment,
             _weights: &WeightBinding,
             _state: &mut InferenceStateSet,
-        ) -> Result<ExecutionMetrics, BackendError> {
-            Ok(ExecutionMetrics::new(12, 4, 8))
+        ) -> Result<ExecutionOutcome, BackendError> {
+            Ok(ExecutionOutcome::new(ExecutionMetrics::new(12, 4, 8)))
         }
     }
 
@@ -211,9 +222,9 @@ mod tests {
             _segment: &ExecutionSegment,
             _weights: &WeightBinding,
             _state: &mut InferenceStateSet,
-        ) -> Result<ExecutionMetrics, BackendError> {
+        ) -> Result<ExecutionOutcome, BackendError> {
             self.segment_calls += 1;
-            Ok(ExecutionMetrics::new(99, 0, 0))
+            Ok(ExecutionOutcome::new(ExecutionMetrics::new(99, 0, 0)))
         }
 
         fn dispatch_batch(
@@ -222,13 +233,13 @@ mod tests {
             batch: &ExecutionBatch,
             _weights: &WeightBinding,
             states: &mut [InferenceStateSet],
-        ) -> Result<Vec<ExecutionMetrics>, BackendError> {
+        ) -> Result<Vec<ExecutionOutcome>, BackendError> {
             if batch.len() != states.len() {
                 return Err(BackendError::StateCountMismatch);
             }
             self.batch_calls += 1;
             Ok((0..batch.len())
-                .map(|_| ExecutionMetrics::new(7, 0, 0))
+                .map(|_| ExecutionOutcome::new(ExecutionMetrics::new(7, 0, 0)))
                 .collect())
         }
     }
@@ -285,6 +296,51 @@ mod tests {
         let event = backend.wait(submission).expect("completion");
         assert_eq!(event.events()[0].metrics().elapsed_nanos(), 12);
         assert_eq!(event.events()[0].policy_version(), policy);
+    }
+
+    #[test]
+    fn backend_rejects_missing_requested_output_token() {
+        let device = DeviceId::new(0);
+        let backend_id = BackendId::new("cuda").expect("backend ID");
+        let capabilities = BackendCapabilities::new(
+            backend_id.clone(),
+            device,
+            BackendKind::Cuda,
+            24 * 1024 * 1024 * 1024,
+            BackendFeatures::new(vec![DataType::F16], vec![], false, true),
+        );
+        let mut backend = NvidiaBackend::new(capabilities, TestDispatcher).expect("CUDA backend");
+        let model = ModelId::new("test-model").expect("model ID");
+        let plan = ExecutionPlan::new(
+            model.clone(),
+            backend_id,
+            device,
+            PolicyVersion::new(1).expect("policy version"),
+            vec![ExecutionStage::new(
+                ModelRegionId::new(0),
+                ExecutionPhase::Decode,
+            )],
+            Vec::new(),
+            WeightBinding::empty(model, device),
+        )
+        .expect("plan");
+        let segment = ExecutionSegment::new(
+            RequestId::new(1).expect("request ID"),
+            ExecutionPhase::Decode,
+            1,
+            1,
+            0,
+            Vec::new(),
+        )
+        .expect("segment")
+        .with_sampling(SamplingParams::greedy(None));
+        let batch = ExecutionBatch::new(vec![segment]).expect("batch");
+        let mut states = vec![InferenceStateSet::new(Vec::new()).expect("state")];
+
+        assert!(matches!(
+            backend.submit(&plan, &batch, &mut states),
+            Err(BackendError::ExecutionFailed(_))
+        ));
     }
 
     #[test]

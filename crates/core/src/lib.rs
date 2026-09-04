@@ -29,8 +29,9 @@ pub use backend::{
 };
 pub use device::DeviceId;
 pub use execution::{
-    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPhase,
-    ExecutionPlan, ExecutionSegment, ExecutionStage, ExecutionTokenInput, PlanError,
+    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionOutcome,
+    ExecutionPhase, ExecutionPlan, ExecutionSegment, ExecutionStage, ExecutionTokenInput,
+    PlanError,
 };
 pub use model::{
     FileModelProvider, FileWeightLoader, ModelCapabilities, ModelDescription, ModelError, ModelId,

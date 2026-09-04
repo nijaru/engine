@@ -489,6 +489,38 @@ impl ExecutionMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExecutionOutcome {
+    metrics: ExecutionMetrics,
+    output_token: Option<u32>,
+}
+
+impl ExecutionOutcome {
+    #[must_use]
+    pub const fn new(metrics: ExecutionMetrics) -> Self {
+        Self {
+            metrics,
+            output_token: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_output_token(mut self, token: u32) -> Self {
+        self.output_token = Some(token);
+        self
+    }
+
+    #[must_use]
+    pub const fn metrics(self) -> ExecutionMetrics {
+        self.metrics
+    }
+
+    #[must_use]
+    pub const fn output_token(self) -> Option<u32> {
+        self.output_token
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutionEvent {
     request: RequestId,
     policy_version: PolicyVersion,

@@ -421,7 +421,7 @@ mod tests {
     use super::*;
     use crate::backend::{BackendCapabilities, BackendFeatures, BackendId, BackendKind};
     use crate::device::DeviceId;
-    use crate::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};
+    use crate::execution::{ExecutionMetrics, ExecutionOutcome, ExecutionPhase, ExecutionStage};
     use crate::model::{
         ModelCapabilities, ModelDescription, ModelId, ModelProvider, ModelRegion, ModelRegionId,
         ModelRegionKind, WeightDescription,
@@ -453,8 +453,8 @@ mod tests {
             _segment: &ExecutionSegment,
             _weights: &WeightBinding,
             _state: &mut InferenceStateSet,
-        ) -> Result<ExecutionMetrics, BackendError> {
-            Ok(ExecutionMetrics::new(20, 0, 0))
+        ) -> Result<ExecutionOutcome, BackendError> {
+            Ok(ExecutionOutcome::new(ExecutionMetrics::new(20, 0, 0)))
         }
     }
 
