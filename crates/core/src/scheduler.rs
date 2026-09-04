@@ -7,7 +7,9 @@ use crate::backend::BackendSubmissionId;
 use crate::execution::{ExecutionEvent, ExecutionPhase};
 use crate::policy::PolicySnapshot;
 use crate::request::{RequestId, RequestSpec};
-use crate::serving::{ActiveRequestSlot, RequestLifecycle, RequestSlotError, RequestSlotId, RequestSlots};
+use crate::serving::{
+    ActiveRequestSlot, RequestLifecycle, RequestSlotError, RequestSlotId, RequestSlots,
+};
 use crate::state::InferenceStateSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -30,7 +32,10 @@ impl SchedulerConfig {
         if max_active_requests == 0 || prefill_chunk_tokens == 0 {
             return Err(SchedulerError::InvalidConfig);
         }
-        if max_active_requests.checked_add(max_queued_requests).is_none() {
+        if max_active_requests
+            .checked_add(max_queued_requests)
+            .is_none()
+        {
             return Err(SchedulerError::InvalidConfig);
         }
         Ok(Self {
@@ -134,7 +139,7 @@ pub struct ServingScheduler {
     slots: RequestSlots,
     waiting: VecDeque<RequestSlotId>,
     runnable: VecDeque<RequestSlotId>,
-    in_flight: HashMap<BackendSubmissionId, RequestSlotId>,
+    in_flight: HashMap<BackendSubmissionId, ScheduledWork>,
     terminal: VecDeque<RequestSlotId>,
     requests: HashMap<RequestId, RequestSlotId>,
 }
@@ -212,9 +217,6 @@ impl ServingScheduler {
                 .make_runnable()?;
             self.runnable.push_back(id);
         } else {
-            if self.waiting.len() >= self.config.max_queued_requests() {
-                return Err(SchedulerError::Backpressure);
-            }
             self.waiting.push_back(id);
         }
         self.requests.insert(request_id, id);
@@ -242,10 +244,10 @@ impl ServingScheduler {
                 break;
             }
             let slot = self.runnable_slot(id)?;
-            if self.phase_for(slot)? != ExecutionPhase::Decode {
+            if Self::phase_for(slot)? != ExecutionPhase::Decode {
                 continue;
             }
-            work.push(self.make_work(slot, ExecutionPhase::Decode, 1)?);
+            work.push(Self::make_work(slot, ExecutionPhase::Decode, 1)?);
             token_budget -= 1;
         }
 
@@ -254,21 +256,27 @@ impl ServingScheduler {
                 break;
             }
             let slot = self.runnable_slot(id)?;
-            if self.phase_for(slot)? != ExecutionPhase::Prefill {
+            if Self::phase_for(slot)? != ExecutionPhase::Prefill {
                 continue;
             }
             let remaining = slot
                 .progress()
                 .prompt_tokens()
                 .checked_sub(slot.progress().prompt_processed())
-                .ok_or(SchedulerError::Invariant("prompt progress exceeded prompt length"))?;
+                .ok_or(SchedulerError::Invariant(
+                    "prompt progress exceeded prompt length",
+                ))?;
             let token_count = remaining
                 .min(self.config.prefill_chunk_tokens())
                 .min(token_budget);
             if token_count == 0 {
                 continue;
             }
-            work.push(self.make_work(slot, ExecutionPhase::Prefill, token_count)?);
+            work.push(Self::make_work(
+                slot,
+                ExecutionPhase::Prefill,
+                token_count,
+            )?);
             token_budget -= token_count;
         }
 
@@ -302,8 +310,8 @@ impl ServingScheduler {
                 .ok_or(SchedulerError::StaleWork)?;
             if slot.request().id() != work.request()
                 || slot.lifecycle() != RequestLifecycle::Runnable
-                || self.phase_for(slot)? != work.phase()
-                || self.state_position(slot)? != work.state_position()
+                || Self::phase_for(slot)? != work.phase()
+                || Self::state_position(slot)? != work.state_position()
             {
                 return Err(SchedulerError::StaleWork);
             }
@@ -336,7 +344,7 @@ impl ServingScheduler {
             .ok_or(SchedulerError::StaleWork)?
             .begin_submission(submission)?;
         self.runnable.remove(queue_index);
-        self.in_flight.insert(submission, work.slot());
+        self.in_flight.insert(submission, work);
         Ok(())
     }
 
@@ -353,29 +361,28 @@ impl ServingScheduler {
         event: ExecutionEvent,
         state: InferenceStateSet,
     ) -> Result<(), SchedulerError> {
-        let id = self
+        let work = self
             .in_flight
             .get(&submission)
             .copied()
             .ok_or(SchedulerError::UnknownSubmission(submission))?;
+        if event.request() != work.request()
+            || event.phase() != work.phase()
+            || event.token_count() != work.token_count()
+            || event.policy_version() != self.policy.version()
         {
-            let slot = self
-                .slots
-                .get(id)
-                .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?;
-            if slot.request().id() != event.request() {
-                return Err(SchedulerError::CompletionRequestMismatch);
-            }
+            return Err(SchedulerError::CompletionMismatch);
         }
+
         self.slots
-            .get_mut(id)
+            .get_mut(work.slot())
             .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
             .complete_step(submission, event.phase(), event.token_count(), state)?;
         self.in_flight.remove(&submission);
 
         let lifecycle = self
             .slots
-            .get(id)
+            .get(work.slot())
             .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
             .lifecycle();
         match lifecycle {
@@ -383,23 +390,26 @@ impl ServingScheduler {
                 let reached_output_limit = {
                     let slot = self
                         .slots
-                        .get(id)
+                        .get(work.slot())
                         .ok_or(SchedulerError::Invariant("completed slot disappeared"))?;
-                    slot.progress().generated_tokens() >= slot.request().semantics().max_output_tokens()
+                    slot.progress().generated_tokens()
+                        >= slot.request().semantics().max_output_tokens()
                 };
                 if reached_output_limit {
                     self.slots
-                        .get_mut(id)
+                        .get_mut(work.slot())
                         .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
                         .mark_completed()?;
-                    self.terminal.push_back(id);
+                    self.terminal.push_back(work.slot());
                     self.fill_runnable()?;
                 } else {
-                    self.runnable.push_back(id);
+                    self.runnable.push_back(work.slot());
                 }
             }
-            RequestLifecycle::Cancelled | RequestLifecycle::Failed | RequestLifecycle::Completed => {
-                self.terminal.push_back(id);
+            RequestLifecycle::Cancelled
+            | RequestLifecycle::Failed
+            | RequestLifecycle::Completed => {
+                self.terminal.push_back(work.slot());
                 self.fill_runnable()?;
             }
             RequestLifecycle::Waiting
@@ -423,17 +433,17 @@ impl ServingScheduler {
         &mut self,
         submission: BackendSubmissionId,
     ) -> Result<(), SchedulerError> {
-        let id = self
+        let work = self
             .in_flight
             .get(&submission)
             .copied()
             .ok_or(SchedulerError::UnknownSubmission(submission))?;
         self.slots
-            .get_mut(id)
+            .get_mut(work.slot())
             .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
             .fail_submission(submission)?;
         self.in_flight.remove(&submission);
-        self.terminal.push_back(id);
+        self.terminal.push_back(work.slot());
         self.fill_runnable()?;
         Ok(())
     }
@@ -560,7 +570,7 @@ impl ServingScheduler {
         Ok(slot)
     }
 
-    fn phase_for(&self, slot: &ActiveRequestSlot) -> Result<ExecutionPhase, SchedulerError> {
+    fn phase_for(slot: &ActiveRequestSlot) -> Result<ExecutionPhase, SchedulerError> {
         if slot.progress().prompt_processed() < slot.progress().prompt_tokens() {
             return Ok(ExecutionPhase::Prefill);
         }
@@ -572,7 +582,7 @@ impl ServingScheduler {
         ))
     }
 
-    fn state_position(&self, slot: &ActiveRequestSlot) -> Result<u32, SchedulerError> {
+    fn state_position(slot: &ActiveRequestSlot) -> Result<u32, SchedulerError> {
         if let Some(position) = slot.state().token_position() {
             return Ok(position);
         }
@@ -583,7 +593,6 @@ impl ServingScheduler {
     }
 
     fn make_work(
-        &self,
         slot: &ActiveRequestSlot,
         phase: ExecutionPhase,
         token_count: u32,
@@ -593,7 +602,7 @@ impl ServingScheduler {
             request: slot.request().id(),
             phase,
             token_count,
-            state_position: self.state_position(slot)?,
+            state_position: Self::state_position(slot)?,
         })
     }
 }
@@ -602,7 +611,9 @@ fn remove_id(queue: &mut VecDeque<RequestSlotId>, id: RequestSlotId) -> Result<(
     let index = queue
         .iter()
         .position(|candidate| *candidate == id)
-        .ok_or(SchedulerError::Invariant("request was absent from expected queue"))?;
+        .ok_or(SchedulerError::Invariant(
+            "request was absent from expected queue",
+        ))?;
     queue.remove(index);
     Ok(())
 }
@@ -615,7 +626,7 @@ pub enum SchedulerError {
     UnknownRequest(RequestId),
     UnknownSubmission(BackendSubmissionId),
     DuplicateSubmission(BackendSubmissionId),
-    CompletionRequestMismatch,
+    CompletionMismatch,
     InvalidLifecycle,
     StaleWork,
     PositionOverflow,
@@ -631,11 +642,15 @@ impl fmt::Display for SchedulerError {
             Self::DuplicateRequest(id) => write!(f, "request {} is already admitted", id.get()),
             Self::UnknownRequest(id) => write!(f, "request {} is unknown", id.get()),
             Self::UnknownSubmission(id) => write!(f, "submission {} is unknown", id.get()),
-            Self::DuplicateSubmission(id) => write!(f, "submission {} is already in flight", id.get()),
-            Self::CompletionRequestMismatch => {
-                f.write_str("backend completion belongs to a different request")
+            Self::DuplicateSubmission(id) => {
+                write!(f, "submission {} is already in flight", id.get())
             }
-            Self::InvalidLifecycle => f.write_str("request lifecycle does not permit this operation"),
+            Self::CompletionMismatch => {
+                f.write_str("backend completion does not match scheduled work")
+            }
+            Self::InvalidLifecycle => {
+                f.write_str("request lifecycle does not permit this operation")
+            }
             Self::StaleWork => f.write_str("scheduled work is stale or no longer runnable"),
             Self::PositionOverflow => f.write_str("request state position overflowed"),
             Self::Invariant(reason) => write!(f, "scheduler invariant failed: {reason}"),
@@ -727,8 +742,12 @@ mod tests {
         let config = SchedulerConfig::new(3, 0, 3).expect("config");
         let mut scheduler = ServingScheduler::new(policy(3, 4), config);
         scheduler.admit(request(1, 4), state(), 0).expect("decode");
-        scheduler.admit(request(2, 4), state(), 10).expect("prefill");
-        scheduler.admit(request(3, 4), state(), 10).expect("prefill");
+        scheduler
+            .admit(request(2, 4), state(), 10)
+            .expect("prefill");
+        scheduler
+            .admit(request(3, 4), state(), 10)
+            .expect("prefill");
 
         let work = scheduler.schedule().expect("schedule");
         assert_eq!(work.len(), 2);
@@ -758,6 +777,31 @@ mod tests {
         assert_eq!(scheduler.counts().terminal(), 1);
         let next = scheduler.schedule().expect("next schedule");
         assert_eq!(next[0].request(), RequestId::new(2).expect("request ID"));
+    }
+
+    #[test]
+    fn completion_identity_must_match_scheduled_work() {
+        let config = SchedulerConfig::new(1, 0, 4).expect("config");
+        let mut scheduler = ServingScheduler::new(policy(1, 4), config);
+        scheduler.admit(request(1, 2), state(), 0).expect("admit");
+        let work = scheduler.schedule().expect("schedule")[0];
+        let submission = BackendSubmissionId::new(1).expect("submission");
+        scheduler
+            .begin_submission(work, submission)
+            .expect("begin submission");
+        let wrong = ExecutionEvent::new(
+            work.request(),
+            PolicyVersion::new(1).expect("policy version"),
+            ExecutionPhase::Prefill,
+            1,
+            ExecutionMetrics::new(1, 0, 0),
+        )
+        .expect("event");
+        assert_eq!(
+            scheduler.complete_submission(submission, wrong, state()),
+            Err(SchedulerError::CompletionMismatch)
+        );
+        assert_eq!(scheduler.counts().in_flight(), 1);
     }
 
     #[test]
