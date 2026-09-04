@@ -178,6 +178,23 @@ impl ActiveRequestSlot {
         self.progress
     }
 
+    /// Take the state owned by a terminal slot after scheduler reclamation.
+    ///
+    /// This is crate-private so live request state cannot be detached through
+    /// the public serving API. [`RequestSlots::remove`] verifies terminal state
+    /// ownership before returning the slot to its serving owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::InvalidTransition`] for a non-terminal slot
+    /// or [`RequestSlotError::StateUnavailable`] when state was already taken.
+    pub(crate) fn take_terminal_state(&mut self) -> Result<InferenceStateSet, RequestSlotError> {
+        if !self.lifecycle.is_terminal() {
+            return Err(RequestSlotError::InvalidTransition);
+        }
+        self.state.take().ok_or(RequestSlotError::StateUnavailable)
+    }
+
     /// # Errors
     ///
     /// Returns [`RequestSlotError::InvalidTransition`] unless the request is

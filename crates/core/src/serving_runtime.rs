@@ -115,13 +115,19 @@ where
     ///
     /// Returns a scheduler error when terminal bookkeeping is inconsistent.
     pub fn reclaim_next(&mut self) -> Result<Option<ActiveRequestSlot>, ServingRuntimeError> {
-        let reclaimed = self.scheduler.reclaim_next()?;
-        if let Some(slot) = &reclaimed {
-            let request = slot.request().id();
-            self.prompt_tokens.remove(&request);
-            self.next_tokens.remove(&request);
-        }
-        Ok(reclaimed)
+        let Some(mut reclaimed) = self.scheduler.reclaim_next()? else {
+            return Ok(None);
+        };
+        let request = reclaimed.request().id();
+        let state = reclaimed
+            .take_terminal_state()
+            .map_err(SchedulerError::from)?;
+        self.runtime
+            .release_state_set(&state)
+            .map_err(ServingRuntimeError::Runtime)?;
+        self.prompt_tokens.remove(&request);
+        self.next_tokens.remove(&request);
+        Ok(Some(reclaimed))
     }
 
     /// Schedule and submit one multi-request batch if runnable work exists.
@@ -548,7 +554,7 @@ mod tests {
         let runtime = ExecutionRuntime::new(
             TestProvider { description },
             DelayedBackend::new(capabilities, fail_submit),
-            LogicalStateManager::new(device, 0, 0),
+            LogicalStateManager::new(device, 1024, 0),
         );
         ServingRuntime::new(scheduler, runtime, plan).expect("serving runtime")
     }
@@ -651,6 +657,46 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reclaim_releases_logical_state_capacity() {
+        let mut serving = fixture(false);
+        let device = DeviceId::new(0);
+        let spec = crate::state::KvStateSpec::new(1, 1, 2, 4, crate::tensor::DataType::F16)
+            .expect("KV spec");
+        let kv = serving
+            .runtime_mut()
+            .state_manager_mut()
+            .allocate_kv(spec, crate::state::StateLocation::Device(device))
+            .expect("KV allocation");
+        let state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
+        assert!(
+            serving
+                .runtime()
+                .state_manager()
+                .used_bytes(crate::state::StateLocation::Device(device))
+                .is_some_and(|bytes| bytes > 0)
+        );
+
+        let request_id = RequestId::new(1).expect("request ID");
+        serving
+            .admit(request(1), state, prompt(&[11]))
+            .expect("admit");
+        serving.cancel(request_id).expect("cancel");
+        let reclaimed = serving
+            .reclaim_next()
+            .expect("reclaim")
+            .expect("terminal request");
+
+        assert!(reclaimed.state().is_none());
+        assert_eq!(
+            serving
+                .runtime()
+                .state_manager()
+                .used_bytes(crate::state::StateLocation::Device(device)),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn failed_backend_submit_restores_states_before_terminalizing() {
         let mut serving = fixture(true);
         serving
@@ -671,7 +717,7 @@ mod tests {
                 .expect("reclaim")
                 .expect("terminal request")
                 .state()
-                .is_some()
+                .is_none()
         );
     }
 }

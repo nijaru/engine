@@ -182,6 +182,23 @@ where
         &mut self.state_manager
     }
 
+    /// Release every logical state allocation owned by one finished request.
+    ///
+    /// Physical backend state remains a backend concern; this closes the core
+    /// allocation lifecycle so request reclamation cannot leak `StateManager`
+    /// capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::State`] when a state handle is invalid or its
+    /// manager cannot release it.
+    pub fn release_state_set(&mut self, state: &InferenceStateSet) -> Result<(), RuntimeError> {
+        for value in state.states() {
+            self.state_manager.release(value.handle().clone())?;
+        }
+        Ok(())
+    }
+
     /// Submit a batch while preserving caller-owned logical state if model,
     /// plan, arithmetic, or backend submission validation fails.
     ///
