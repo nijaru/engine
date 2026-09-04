@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use crate::backend::{
     BackendCapabilities, BackendError, BackendKind, BackendSubmissionId, ComputeBackend,
 };
-use crate::execution::{ExecutionEvent, ExecutionMetrics, ExecutionPlan, ExecutionSegment};
+use crate::execution::{
+    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPlan,
+    ExecutionSegment,
+};
 use crate::state::InferenceStateSet;
 use crate::weights::WeightBinding;
 
@@ -26,7 +29,7 @@ pub struct NvidiaBackend<D> {
     capabilities: BackendCapabilities,
     dispatcher: D,
     next_submission: u64,
-    completed: HashMap<BackendSubmissionId, ExecutionEvent>,
+    completed: HashMap<BackendSubmissionId, ExecutionBatchEvent>,
 }
 
 impl<D> NvidiaBackend<D> {
@@ -80,21 +83,26 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
     fn submit(
         &mut self,
         plan: &ExecutionPlan,
-        segment: &ExecutionSegment,
-        state: &mut InferenceStateSet,
+        batch: &ExecutionBatch,
+        states: &mut [InferenceStateSet],
     ) -> Result<BackendSubmissionId, BackendError> {
-        self.validate_execution(plan, segment, state)?;
-        let metrics = self
-            .dispatcher
-            .dispatch(plan, segment, plan.weights(), state)?;
-        let event = ExecutionEvent::new(
-            segment.request(),
-            plan.policy_version(),
-            segment.phase(),
-            segment.token_count(),
-            metrics,
-        )
-        .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+        self.validate_execution(plan, batch, states)?;
+        let mut events = Vec::with_capacity(batch.len());
+        for (segment, state) in batch.segments().iter().zip(states) {
+            let metrics = self
+                .dispatcher
+                .dispatch(plan, segment, plan.weights(), state)?;
+            let event = ExecutionEvent::new(
+                segment.request(),
+                plan.policy_version(),
+                segment.phase(),
+                segment.token_count(),
+                metrics,
+            )
+            .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+            events.push(event);
+        }
+        let event = ExecutionBatchEvent::new(events).map_err(BackendError::InvalidPlan)?;
         let submission = self.allocate_submission()?;
         self.completed.insert(submission, event);
         Ok(submission)
@@ -103,7 +111,7 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
     fn poll(
         &mut self,
         submission: BackendSubmissionId,
-    ) -> Result<Option<ExecutionEvent>, BackendError> {
+    ) -> Result<Option<ExecutionBatchEvent>, BackendError> {
         self.completed
             .remove(&submission)
             .map(Some)
@@ -175,9 +183,15 @@ mod tests {
         )
         .expect("plan");
         let request = RequestId::new(1).expect("request ID");
-        let segment =
-            ExecutionSegment::new(request, ExecutionPhase::Decode, 1, 1, 0, vec![requirement])
-                .expect("segment");
+        let segment = ExecutionSegment::new(
+            request,
+            ExecutionPhase::Decode,
+            1,
+            0,
+            vec![requirement],
+        )
+        .expect("segment");
+        let batch = ExecutionBatch::new(vec![segment]).expect("batch");
         let spec = match requirement {
             StateRequirement::FullAttentionKv(spec) => spec,
             StateRequirement::Recurrent(_) => unreachable!(),
@@ -186,10 +200,12 @@ mod tests {
         let kv = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");
-        let mut state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
-        let submission = backend.submit(&plan, &segment, &mut state).expect("submit");
+        let state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
+        let submission = backend
+            .submit(&plan, &batch, &mut [state])
+            .expect("submit");
         let event = backend.wait(submission).expect("completion");
-        assert_eq!(event.metrics().elapsed_nanos(), 12);
-        assert_eq!(event.policy_version(), policy);
+        assert_eq!(event.events()[0].metrics().elapsed_nanos(), 12);
+        assert_eq!(event.events()[0].policy_version(), policy);
     }
 }
