@@ -20,6 +20,24 @@ jobs:
           components: rustfmt, clippy
       - name: Apply backend outcome boundary
         run: python .github/continue_outcome.py
+      - name: Fix test-only metrics import
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('crates/core/src/nvidia.rs')
+          s = p.read_text()
+          s = s.replace(
+              '    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionOutcome,\n    ExecutionPlan, ExecutionSegment,\n',
+              '    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionOutcome, ExecutionPlan,\n    ExecutionSegment,\n',
+              1,
+          )
+          s = s.replace(
+              '    use crate::execution::{ExecutionPhase, ExecutionStage};',
+              '    use crate::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};',
+              1,
+          )
+          p.write_text(s)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Test
