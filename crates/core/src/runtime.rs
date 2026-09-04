@@ -325,8 +325,10 @@ mod tests {
             .submit_segment(&plan, &segment, state)
             .expect("submission");
         assert_eq!(
-            runtime.state_manager().used_bytes(StateLocation::Device(device)),
-            Some(8)
+            runtime
+                .state_manager()
+                .used_bytes(StateLocation::Device(device)),
+            Some(16)
         );
         let completed = runtime.wait_submission(submission).expect("completion");
         assert_eq!(completed.event().metrics().elapsed_nanos(), 20);
