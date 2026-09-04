@@ -1,6 +1,10 @@
 //! NVIDIA backend adapter without a CUDA dependency in the core crate.
 
-use crate::backend::{BackendCapabilities, BackendError, BackendKind, ComputeBackend};
+use std::collections::HashMap;
+
+use crate::backend::{
+    BackendCapabilities, BackendError, BackendKind, BackendSubmissionId, ComputeBackend,
+};
 use crate::execution::{ExecutionEvent, ExecutionMetrics, ExecutionPlan, ExecutionSegment};
 use crate::state::InferenceStateSet;
 use crate::weights::WeightBinding;
@@ -21,6 +25,8 @@ pub trait NvidiaDispatcher: Send {
 pub struct NvidiaBackend<D> {
     capabilities: BackendCapabilities,
     dispatcher: D,
+    next_submission: u64,
+    completed: HashMap<BackendSubmissionId, ExecutionEvent>,
 }
 
 impl<D> NvidiaBackend<D> {
@@ -35,6 +41,8 @@ impl<D> NvidiaBackend<D> {
         Ok(Self {
             capabilities,
             dispatcher,
+            next_submission: 1,
+            completed: HashMap::new(),
         })
     }
 
@@ -52,6 +60,16 @@ impl<D> NvidiaBackend<D> {
     pub fn into_dispatcher(self) -> D {
         self.dispatcher
     }
+
+    fn allocate_submission(&mut self) -> Result<BackendSubmissionId, BackendError> {
+        let id = BackendSubmissionId::new(self.next_submission)
+            .ok_or_else(|| BackendError::ExecutionFailed("submission identity overflowed".to_owned()))?;
+        self.next_submission = self
+            .next_submission
+            .checked_add(1)
+            .ok_or_else(|| BackendError::ExecutionFailed("submission identity overflowed".to_owned()))?;
+        Ok(id)
+    }
 }
 
 impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
@@ -59,24 +77,37 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         &self.capabilities
     }
 
-    fn execute(
+    fn submit(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: &mut InferenceStateSet,
-    ) -> Result<ExecutionEvent, BackendError> {
+    ) -> Result<BackendSubmissionId, BackendError> {
         self.validate_execution(plan, segment, state)?;
         let metrics = self
             .dispatcher
             .dispatch(plan, segment, plan.weights(), state)?;
-        ExecutionEvent::new(
+        let event = ExecutionEvent::new(
             segment.request(),
             plan.policy_version(),
             segment.phase(),
             segment.token_count(),
             metrics,
         )
-        .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))
+        .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+        let submission = self.allocate_submission()?;
+        self.completed.insert(submission, event);
+        Ok(submission)
+    }
+
+    fn poll(
+        &mut self,
+        submission: BackendSubmissionId,
+    ) -> Result<Option<ExecutionEvent>, BackendError> {
+        self.completed
+            .remove(&submission)
+            .map(Some)
+            .ok_or(BackendError::UnknownSubmission(submission))
     }
 }
 
@@ -156,9 +187,10 @@ mod tests {
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");
         let mut state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
-        let event = backend
-            .execute(&plan, &segment, &mut state)
-            .expect("dispatch");
+        let submission = backend
+            .submit(&plan, &segment, &mut state)
+            .expect("submit");
+        let event = backend.wait(submission).expect("completion");
         assert_eq!(event.metrics().elapsed_nanos(), 12);
         assert_eq!(event.policy_version(), policy);
     }
