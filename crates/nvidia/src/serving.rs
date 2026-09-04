@@ -78,19 +78,25 @@ impl CudaQwen35ServingDispatcher {
                                     "prefill position overflowed".to_owned(),
                                 )
                             })?;
-                    let chosen = self
-                        .executor
-                        .decode_step(physical, token, position)
-                        .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+                    let requests_output =
+                        segment.requests_sampling() && offset + 1 == segment.token_count();
+                    if requests_output {
+                        let chosen = self
+                            .executor
+                            .decode_step(physical, token, position)
+                            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+                        output_token = Some(chosen);
+                    } else {
+                        self.executor
+                            .prefill_step(physical, token, position)
+                            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+                    }
                     let next = position.checked_add(1).ok_or_else(|| {
                         BackendError::ExecutionFailed("prefill position overflowed".to_owned())
                     })?;
                     physical
                         .advance_to(next)
                         .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
-                    if segment.requests_sampling() && offset + 1 == segment.token_count() {
-                        output_token = Some(chosen);
-                    }
                 }
             }
             ExecutionPhase::Decode => {
