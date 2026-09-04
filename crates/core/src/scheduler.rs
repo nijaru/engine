@@ -272,11 +272,7 @@ impl ServingScheduler {
             if token_count == 0 {
                 continue;
             }
-            work.push(Self::make_work(
-                slot,
-                ExecutionPhase::Prefill,
-                token_count,
-            )?);
+            work.push(Self::make_work(slot, ExecutionPhase::Prefill, token_count)?);
             token_budget -= token_count;
         }
 
@@ -608,12 +604,13 @@ impl ServingScheduler {
 }
 
 fn remove_id(queue: &mut VecDeque<RequestSlotId>, id: RequestSlotId) -> Result<(), SchedulerError> {
-    let index = queue
-        .iter()
-        .position(|candidate| *candidate == id)
-        .ok_or(SchedulerError::Invariant(
-            "request was absent from expected queue",
-        ))?;
+    let index =
+        queue
+            .iter()
+            .position(|candidate| *candidate == id)
+            .ok_or(SchedulerError::Invariant(
+                "request was absent from expected queue",
+            ))?;
     queue.remove(index);
     Ok(())
 }
