@@ -1,6 +1,6 @@
 name: Continue Physical CUDA State
 
-# retry after script correction
+# retry after clippy-only test naming fix
 on:
   push:
     branches: [main]
@@ -21,6 +21,17 @@ jobs:
           components: rustfmt, clippy
       - name: Apply physical CUDA state integration
         run: python .github/continue_physical_state.py
+      - name: Fix test counter names
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('crates/core/src/nvidia.rs')
+          s = p.read_text()
+          s = s.replace('batch_calls', 'batches')
+          s = s.replace('segment_calls', 'segments')
+          s = s.replace('release_calls', 'releases')
+          p.write_text(s)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Test
