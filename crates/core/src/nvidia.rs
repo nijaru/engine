@@ -343,10 +343,12 @@ mod tests {
         let completed = backend.wait(submission).expect("completion");
 
         assert_eq!(completed.len(), 2);
-        assert!(completed
-            .events()
-            .iter()
-            .all(|event| event.metrics().elapsed_nanos() == 7));
+        assert!(
+            completed
+                .events()
+                .iter()
+                .all(|event| event.metrics().elapsed_nanos() == 7)
+        );
         assert_eq!(backend.dispatcher().batch_calls, 1);
         assert_eq!(backend.dispatcher().segment_calls, 0);
     }
