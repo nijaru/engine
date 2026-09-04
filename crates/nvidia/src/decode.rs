@@ -137,6 +137,84 @@ impl From<CudaModelKernelError> for CudaDecodeError {
     }
 }
 
+struct CommonLayerTensorNames {
+    attn_norm: String,
+    post_attention_norm: String,
+    ffn_gate: String,
+    ffn_up: String,
+    ffn_down: String,
+}
+
+struct RecurrentLayerTensorNames {
+    attn_qkv: String,
+    attn_gate: String,
+    ssm_beta: String,
+    ssm_alpha: String,
+    ssm_dt_bias: String,
+    ssm_a: String,
+    ssm_conv1d: String,
+    ssm_norm: String,
+    ssm_out: String,
+}
+
+struct FullAttentionLayerTensorNames {
+    q: String,
+    q_norm: String,
+    k: String,
+    k_norm: String,
+    v: String,
+    output: String,
+}
+
+enum AttentionLayerTensorNames {
+    Recurrent(RecurrentLayerTensorNames),
+    FullAttention(FullAttentionLayerTensorNames),
+}
+
+struct LayerTensorNames {
+    common: CommonLayerTensorNames,
+    attention: AttentionLayerTensorNames,
+}
+
+impl LayerTensorNames {
+    fn new(layer: usize, kind: QwenLayerKind) -> Self {
+        let prefix = format!("blk.{layer}.");
+        let common = CommonLayerTensorNames {
+            attn_norm: format!("{prefix}attn_norm.weight"),
+            post_attention_norm: format!("{prefix}post_attention_norm.weight"),
+            ffn_gate: format!("{prefix}ffn_gate.weight"),
+            ffn_up: format!("{prefix}ffn_up.weight"),
+            ffn_down: format!("{prefix}ffn_down.weight"),
+        };
+        let attention = match kind {
+            QwenLayerKind::Recurrent => {
+                AttentionLayerTensorNames::Recurrent(RecurrentLayerTensorNames {
+                    attn_qkv: format!("{prefix}attn_qkv.weight"),
+                    attn_gate: format!("{prefix}attn_gate.weight"),
+                    ssm_beta: format!("{prefix}ssm_beta.weight"),
+                    ssm_alpha: format!("{prefix}ssm_alpha.weight"),
+                    ssm_dt_bias: format!("{prefix}ssm_dt.bias"),
+                    ssm_a: format!("{prefix}ssm_a"),
+                    ssm_conv1d: format!("{prefix}ssm_conv1d.weight"),
+                    ssm_norm: format!("{prefix}ssm_norm.weight"),
+                    ssm_out: format!("{prefix}ssm_out.weight"),
+                })
+            }
+            QwenLayerKind::FullAttention => {
+                AttentionLayerTensorNames::FullAttention(FullAttentionLayerTensorNames {
+                    q: format!("{prefix}attn_q.weight"),
+                    q_norm: format!("{prefix}attn_q_norm.weight"),
+                    k: format!("{prefix}attn_k.weight"),
+                    k_norm: format!("{prefix}attn_k_norm.weight"),
+                    v: format!("{prefix}attn_v.weight"),
+                    output: format!("{prefix}attn_output.weight"),
+                })
+            }
+        };
+        Self { common, attention }
+    }
+}
+
 /// Batch-1 decode-step runner for the staged Qwen3.8-27B text path.
 ///
 /// The runner owns scratch buffers sized for the pinned geometry and
@@ -155,6 +233,7 @@ pub struct CudaQwen35Decode {
     embedding: CudaQ4KEmbedding,
     weights: Arc<CudaQwen35Weights>,
     layer_kinds: Vec<QwenLayerKind>,
+    tensor_names: Arc<[LayerTensorNames]>,
     kv_slot: Vec<u32>,
     recurrent_slot: Vec<u32>,
     epsilon: f32,
@@ -254,6 +333,13 @@ impl CudaQwen35Decode {
             CudaDecodeError::InvalidPlan("output vocabulary does not fit the host".to_owned())
         })?;
 
+        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(layer, kind)| LayerTensorNames::new(layer, kind))
+            .collect::<Vec<_>>()
+            .into();
         let mut kv_slot = Vec::with_capacity(layer_kinds.len());
         let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
         let mut kv_count = 0_u32;
@@ -288,6 +374,7 @@ impl CudaQwen35Decode {
             embedding,
             weights,
             layer_kinds,
+            tensor_names,
             kv_slot,
             recurrent_slot,
             epsilon,
@@ -362,40 +449,37 @@ impl CudaQwen35Decode {
         self.embedding
             .execute(embedding_weight, token, &mut self.hidden)?;
 
-        for layer in 0..self.layer_kinds.len() {
-            let prefix = format!("blk.{layer}.");
+        let tensor_names = Arc::clone(&self.tensor_names);
+        for (layer, names) in tensor_names.iter().enumerate() {
             self.ops.rms_norm(
                 &self.hidden,
-                f32_slice(&self.weights, &format!("{prefix}attn_norm.weight"))?,
+                f32_slice(&self.weights, &names.common.attn_norm)?,
                 &mut self.normed,
                 self.epsilon,
             )?;
-            match self.layer_kinds[layer] {
-                QwenLayerKind::Recurrent => {
-                    self.recurrent_layer(state, layer, &prefix)?;
+            match &names.attention {
+                AttentionLayerTensorNames::Recurrent(attention) => {
+                    self.recurrent_layer(state, layer, attention)?;
                 }
-                QwenLayerKind::FullAttention => {
-                    self.full_attention_layer(state, layer, &prefix, position)?;
+                AttentionLayerTensorNames::FullAttention(attention) => {
+                    self.full_attention_layer(state, layer, attention, position)?;
                 }
             }
             self.ops.rms_norm(
                 &self.hidden,
-                f32_slice(
-                    &self.weights,
-                    &format!("{prefix}post_attention_norm.weight"),
-                )?,
+                f32_slice(&self.weights, &names.common.post_attention_norm)?,
                 &mut self.normed,
                 self.epsilon,
             )?;
             gemv(
                 &self.weights,
-                &format!("{prefix}ffn_gate.weight"),
+                &names.common.ffn_gate,
                 &self.normed,
                 &mut self.ffn_gate_buf,
             )?;
             gemv(
                 &self.weights,
-                &format!("{prefix}ffn_up.weight"),
+                &names.common.ffn_up,
                 &self.normed,
                 &mut self.ffn_up_buf,
             )?;
@@ -403,7 +487,7 @@ impl CudaQwen35Decode {
                 .silu_mul(&self.ffn_gate_buf, &self.ffn_up_buf, &mut self.ffn_act)?;
             gemv(
                 &self.weights,
-                &format!("{prefix}ffn_down.weight"),
+                &names.common.ffn_down,
                 &self.ffn_act,
                 &mut self.ffn_incr,
             )?;
@@ -453,7 +537,7 @@ impl CudaQwen35Decode {
         &mut self,
         state: &mut CudaHybridState,
         layer: usize,
-        prefix: &str,
+        names: &RecurrentLayerTensorNames,
     ) -> Result<(), CudaDecodeError> {
         let slot = self.recurrent_slot[layer];
         let recurrent = state.recurrent_mut().ok_or(missing_recurrent())?;
@@ -469,32 +553,32 @@ impl CudaQwen35Decode {
 
         gemv(
             &self.weights,
-            &format!("{prefix}attn_qkv.weight"),
+            &names.attn_qkv,
             &self.normed,
             &mut self.qkv_mixed,
         )?;
         gemv(
             &self.weights,
-            &format!("{prefix}attn_gate.weight"),
+            &names.attn_gate,
             &self.normed,
             &mut self.z_gate,
         )?;
         gemv(
             &self.weights,
-            &format!("{prefix}ssm_beta.weight"),
+            &names.ssm_beta,
             &self.normed,
             &mut self.beta_raw,
         )?;
         gemv(
             &self.weights,
-            &format!("{prefix}ssm_alpha.weight"),
+            &names.ssm_alpha,
             &self.normed,
             &mut self.alpha_raw,
         )?;
-        let dt_bias = f32_slice(&self.weights, &format!("{prefix}ssm_dt.bias"))?;
-        let ssm_a = f32_slice(&self.weights, &format!("{prefix}ssm_a"))?;
-        let conv_weight = f32_slice(&self.weights, &format!("{prefix}ssm_conv1d.weight"))?;
-        let ssm_norm = f32_slice(&self.weights, &format!("{prefix}ssm_norm.weight"))?;
+        let dt_bias = f32_slice(&self.weights, &names.ssm_dt_bias)?;
+        let ssm_a = f32_slice(&self.weights, &names.ssm_a)?;
+        let conv_weight = f32_slice(&self.weights, &names.ssm_conv1d)?;
+        let ssm_norm = f32_slice(&self.weights, &names.ssm_norm)?;
 
         self.ops.gdn_scalar_gate(
             &self.alpha_raw,
@@ -548,7 +632,7 @@ impl CudaQwen35Decode {
         )?;
         gemv(
             &self.weights,
-            &format!("{prefix}ssm_out.weight"),
+            &names.ssm_out,
             &self.gated,
             &mut self.attn_incr,
         )?;
@@ -564,17 +648,12 @@ impl CudaQwen35Decode {
         &mut self,
         state: &mut CudaHybridState,
         layer: usize,
-        prefix: &str,
+        names: &FullAttentionLayerTensorNames,
         position: u32,
     ) -> Result<(), CudaDecodeError> {
         let slot = self.kv_slot[layer];
-        gemv(
-            &self.weights,
-            &format!("{prefix}attn_q.weight"),
-            &self.normed,
-            &mut self.q_raw,
-        )?;
-        let q_norm = f32_slice(&self.weights, &format!("{prefix}attn_q_norm.weight"))?;
+        gemv(&self.weights, &names.q, &self.normed, &mut self.q_raw)?;
+        let q_norm = f32_slice(&self.weights, &names.q_norm)?;
         self.ops.q_gate_norm(
             &self.q_raw,
             q_norm,
@@ -583,13 +662,8 @@ impl CudaQwen35Decode {
             ATTN_HEAD_DIM,
             self.epsilon,
         )?;
-        gemv(
-            &self.weights,
-            &format!("{prefix}attn_k.weight"),
-            &self.normed,
-            &mut self.k_raw,
-        )?;
-        let k_norm = f32_slice(&self.weights, &format!("{prefix}attn_k_norm.weight"))?;
+        gemv(&self.weights, &names.k, &self.normed, &mut self.k_raw)?;
+        let k_norm = f32_slice(&self.weights, &names.k_norm)?;
         self.ops.strided_rms_norm(
             &self.k_raw,
             k_norm,
@@ -598,12 +672,7 @@ impl CudaQwen35Decode {
             ATTN_HEAD_DIM,
             self.epsilon,
         )?;
-        gemv(
-            &self.weights,
-            &format!("{prefix}attn_v.weight"),
-            &self.normed,
-            &mut self.v_raw,
-        )?;
+        gemv(&self.weights, &names.v, &self.normed, &mut self.v_raw)?;
         self.ops.rope_neox(
             &mut self.q_packed,
             u64::from(position),
@@ -668,7 +737,7 @@ impl CudaQwen35Decode {
         )?;
         gemv(
             &self.weights,
-            &format!("{prefix}attn_output.weight"),
+            &names.output,
             &self.attn_out,
             &mut self.attn_incr,
         )?;
