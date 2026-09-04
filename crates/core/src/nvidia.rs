@@ -39,13 +39,19 @@ impl<D> NvidiaBackend<D> {
     }
 
     #[must_use]
-    pub fn dispatcher(&self) -> &D { &self.dispatcher }
+    pub fn dispatcher(&self) -> &D {
+        &self.dispatcher
+    }
 
     #[must_use]
-    pub fn dispatcher_mut(&mut self) -> &mut D { &mut self.dispatcher }
+    pub fn dispatcher_mut(&mut self) -> &mut D {
+        &mut self.dispatcher
+    }
 
     #[must_use]
-    pub fn into_dispatcher(self) -> D { self.dispatcher }
+    pub fn into_dispatcher(self) -> D {
+        self.dispatcher
+    }
 }
 
 impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
