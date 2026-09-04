@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 use engine_core::{
-    DataType, DeviceId, HybridStateSet, KvState, KvStateSpec, RecurrentState, RecurrentStateSpec,
-    StateLocation,
+    DataType, DeviceId, InferenceStateSet, KvState, KvStateSpec, RecurrentState,
+    RecurrentStateSpec, StateLocation,
 };
 
 /// A typed device allocation for one inference-state family component.
@@ -408,7 +408,7 @@ impl CudaRecurrentState {
     }
 }
 
-/// Backend-owned physical counterpart to a core [`HybridStateSet`]. It is a
+/// Backend-owned physical counterpart to a core [`InferenceStateSet`]. It is a
 /// storage primitive only: core handles remain authoritative for identity,
 /// placement, and lifecycle, while this value owns device allocations.
 pub struct CudaHybridState {
@@ -474,7 +474,7 @@ impl CudaHybridState {
     /// allocation is unsupported.
     pub fn from_state_set(
         stream: Arc<CudaStream>,
-        state: &HybridStateSet,
+        state: &InferenceStateSet,
     ) -> Result<Self, CudaStateError> {
         if let Some(location) = state.location() {
             let StateLocation::Device(device) = location else {

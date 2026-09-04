@@ -351,7 +351,9 @@ mod tests {
     #[test]
     fn speculative_work_does_not_claim_committed_output() {
         let mut progress = RequestProgress::new(8);
-        progress.record(ExecutionPhase::Prefill, 8).expect("prefill");
+        progress
+            .record(ExecutionPhase::Prefill, 8)
+            .expect("prefill");
         progress
             .record(ExecutionPhase::SpecDraft, 4)
             .expect("draft");

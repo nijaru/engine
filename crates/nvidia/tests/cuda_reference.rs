@@ -7,7 +7,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, ConvolutionStateShape, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage,
-    HybridStateSet, LogicalStateManager, ModelCapabilities, ModelDescription, ModelId,
+    InferenceStateSet, LogicalStateManager, ModelCapabilities, ModelDescription, ModelId,
     ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion,
     Quantization, RecurrentMatrixShape, RecurrentStateSpec, StateLocation, StateManager,
     WeightBinding, WeightDescription, WeightFormat, WeightTensorSpec,
@@ -147,7 +147,7 @@ fn executes_reference_linear_layer_through_core_runtime() {
         .execute_segment(
             &plan,
             &segment,
-            HybridStateSet::try_new(None, None).expect("state"),
+            InferenceStateSet::try_new(None, None).expect("state"),
         )
         .expect("reference execution");
 
@@ -242,7 +242,7 @@ fn materializes_a_bounded_gguf_tensor_before_reference_execution() {
         .execute_segment(
             &plan,
             &segment,
-            HybridStateSet::try_new(None, None).expect("state"),
+            InferenceStateSet::try_new(None, None).expect("state"),
         )
         .expect("reference execution");
 
@@ -1170,7 +1170,7 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
     let recurrent = manager
         .allocate_recurrent(recurrent_spec, StateLocation::Device(device))
         .expect("recurrent allocation");
-    let core_state = HybridStateSet::try_new(Some(kv), Some(recurrent)).expect("hybrid state");
+    let core_state = InferenceStateSet::try_new(Some(kv), Some(recurrent)).expect("hybrid state");
 
     let mut physical = CudaHybridState::from_state_set(stream.clone(), &core_state)
         .expect("physical hybrid state");

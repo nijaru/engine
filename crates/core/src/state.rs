@@ -515,11 +515,6 @@ impl InferenceStateSet {
     }
 }
 
-// Temporary source-compatibility names for the Phase-3 NVIDIA path. Phase-4
-// scheduler/runtime code should use the generic names above.
-pub type HybridState = InferenceState;
-pub type HybridStateSet = InferenceStateSet;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StateSpecError {
     ZeroDimension,

@@ -9,7 +9,7 @@ use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use engine_core::{
     BackendError, DataType, ExecutionMetrics, ExecutionPlan, ExecutionSegment, F32BlockStream,
-    HybridStateSet, NvidiaDispatcher, WeightBinding, WeightTensorSpec,
+    InferenceStateSet, NvidiaDispatcher, WeightBinding, WeightTensorSpec,
 };
 
 const INPUT: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
@@ -668,7 +668,7 @@ impl NvidiaDispatcher for CudaReferenceDispatcher {
         _plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         weights: &WeightBinding,
-        _state: &mut HybridStateSet,
+        _state: &mut InferenceStateSet,
     ) -> Result<ExecutionMetrics, BackendError> {
         if segment.batch_size() != 1 || segment.token_count() != 1 {
             return Err(BackendError::ExecutionFailed(
