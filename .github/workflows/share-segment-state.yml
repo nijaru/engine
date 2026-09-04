@@ -1,5 +1,6 @@
 name: Share Segment State Requirements
 
+# one-shot migration; removed on success
 on:
   push:
     branches: [main]
