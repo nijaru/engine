@@ -37,7 +37,10 @@ const PREFILL_CHUNK_TOKENS: u32 = 16;
 const WEIGHT_BUDGET_BYTES: u64 = 20_u64 << 30;
 const EPSILON: f32 = 1.0e-6;
 
-#[allow(clippy::too_many_lines, reason = "one explicit serving benchmark composition root")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one explicit serving benchmark composition root"
+)]
 fn main() {
     if let Err(error) = run() {
         eprintln!("qwen_serving_bench: {error}");
@@ -45,7 +48,10 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "one explicit serving benchmark composition root")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one explicit serving benchmark composition root"
+)]
 fn run() -> Result<(), String> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let concurrency = parse_usize(&arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
@@ -76,14 +82,8 @@ fn run() -> Result<(), String> {
     let staged = Arc::new(stage_weights(&provider, device, &context, &stream)?);
     let stage_elapsed = stage_started.elapsed();
     let layer_kinds = qwen_layer_kinds(&provider)?;
-    let executor = CudaQwen35Decode::new(
-        &context,
-        stream.clone(),
-        staged,
-        layer_kinds,
-        EPSILON,
-    )
-    .map_err(|error| error.to_string())?;
+    let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
+        .map_err(|error| error.to_string())?;
     let dispatcher = CudaQwen35ServingDispatcher::new(executor, stream);
 
     let description = provider.description();
@@ -124,9 +124,12 @@ fn run() -> Result<(), String> {
             true,
         ),
     );
-    let backend = NvidiaBackend::new(capabilities, dispatcher).map_err(|error| error.to_string())?;
-    let policy_version = PolicyVersion::new(1).ok_or_else(|| "invalid policy version".to_owned())?;
-    let batch_size = u32::try_from(concurrency).map_err(|_| "concurrency exceeds u32".to_owned())?;
+    let backend =
+        NvidiaBackend::new(capabilities, dispatcher).map_err(|error| error.to_string())?;
+    let policy_version =
+        PolicyVersion::new(1).ok_or_else(|| "invalid policy version".to_owned())?;
+    let batch_size =
+        u32::try_from(concurrency).map_err(|_| "concurrency exceeds u32".to_owned())?;
     let batch_tokens = batch_size
         .checked_mul(PREFILL_CHUNK_TOKENS)
         .ok_or_else(|| "batch token budget overflowed".to_owned())?;
@@ -159,7 +162,8 @@ fn run() -> Result<(), String> {
         .map(|_| allocate_state(&mut state_manager, &state_requirements, device))
         .collect::<Result<Vec<_>, _>>()?;
     let runtime = ExecutionRuntime::new(provider, backend, state_manager);
-    let mut serving = ServingRuntime::new(scheduler, runtime, plan).map_err(|error| error.to_string())?;
+    let mut serving =
+        ServingRuntime::new(scheduler, runtime, plan).map_err(|error| error.to_string())?;
     let prompt: Arc<[u32]> = Arc::from(PROMPT);
     for (index, state) in states.into_iter().enumerate() {
         let request_id = request_id(index)?;
@@ -170,7 +174,11 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
         serving
-            .admit(RequestSpec::new(request_id, model.clone(), semantics), state, prompt.clone())
+            .admit(
+                RequestSpec::new(request_id, model.clone(), semantics),
+                state,
+                prompt.clone(),
+            )
             .map_err(|error| error.to_string())?;
     }
 
@@ -182,7 +190,9 @@ fn run() -> Result<(), String> {
     let mut remaining = concurrency;
 
     while remaining > 0 {
-        let completed = serving.poll_completions().map_err(|error| error.to_string())?;
+        let completed = serving
+            .poll_completions()
+            .map_err(|error| error.to_string())?;
         while let Some(generated) = serving.pop_generated_token() {
             let now = benchmark_started.elapsed();
             let index = request_index(generated.request(), concurrency)?;
@@ -211,7 +221,9 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         if completed == 0 && submitted.is_none() {
             if serving.submission_count() == 0 {
-                return Err("serving benchmark stalled without runnable or in-flight work".to_owned());
+                return Err(
+                    "serving benchmark stalled without runnable or in-flight work".to_owned(),
+                );
             }
             std::thread::yield_now();
         }
@@ -240,9 +252,13 @@ fn run() -> Result<(), String> {
     println!("  staged weights: {:.2} s", stage_elapsed.as_secs_f64());
     println!("  request-state bytes: {per_request_state_bytes} each, {state_capacity} aggregate");
     println!("  elapsed: {:.3} s", elapsed.as_secs_f64());
+    let generated_tokens_f64 = f64::from(
+        u32::try_from(generated_tokens)
+            .map_err(|_| "generated-token count exceeds benchmark reporting range".to_owned())?,
+    );
     println!(
         "  aggregate throughput: {:.2} tok/s",
-        generated_tokens as f64 / elapsed.as_secs_f64()
+        generated_tokens_f64 / elapsed.as_secs_f64()
     );
     println!(
         "  observed TTFT: mean {:.3} s, max {:.3} s",
@@ -309,7 +325,8 @@ fn duration_mean_max(values: &[Duration]) -> (Duration, Duration) {
         return (Duration::ZERO, Duration::ZERO);
     }
     let total = values.iter().map(Duration::as_secs_f64).sum::<f64>();
-    let mean = Duration::from_secs_f64(total / values.len() as f64);
+    let count = u32::try_from(values.len()).expect("benchmark sample count fits u32");
+    let mean = Duration::from_secs_f64(total / f64::from(count));
     let max = values.iter().copied().max().unwrap_or(Duration::ZERO);
     (mean, max)
 }
@@ -333,12 +350,19 @@ fn stage_weights(
         let binding = provider
             .layer_weight_binding(device, layer)
             .map_err(|error| error.to_string())?;
-        names.extend(binding.tensors().iter().map(|tensor| tensor.name().to_owned()));
+        names.extend(
+            binding
+                .tensors()
+                .iter()
+                .map(|tensor| tensor.name().to_owned()),
+        );
     }
     let tensors = names
         .iter()
         .map(|name| {
-            let reader = provider.open_tensor(name).map_err(|error| error.to_string())?;
+            let reader = provider
+                .open_tensor(name)
+                .map_err(|error| error.to_string())?;
             let spec = reader.spec().clone();
             let value_type = reader.value_type();
             let encoded_bytes = reader.remaining();
