@@ -4,12 +4,8 @@ use engine_core::{
 };
 
 fn request(id: u64) -> RequestSpec {
-    let semantics = RequestSemantics::new(
-        8,
-        SamplingParams::greedy(Some(42)),
-        ThinkingMode::Off,
-    )
-    .expect("request semantics");
+    let semantics = RequestSemantics::new(8, SamplingParams::greedy(Some(42)), ThinkingMode::Off)
+        .expect("request semantics");
     RequestSpec::new(
         RequestId::new(id).expect("request ID"),
         ModelId::new("test/model").expect("model ID"),
