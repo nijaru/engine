@@ -3486,6 +3486,10 @@ fn placeholder_state() -> InferenceStateSet {
     clippy::too_many_lines,
     reason = "one end-to-end async parity gate staging the full model"
 )]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the eager/async position counters track model state, not iteration"
+)]
 fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     use engine_core::{
         BackendCapabilities, BackendFeatures, BackendKind, ComputeBackend, DataType,
@@ -3625,21 +3629,29 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
                         phase: ExecutionPhase,
                         tokens: Arc<[u32]>,
                         position: u32,
-                        sample: bool|
+                        token_count: u32|
      -> u32 {
+        // One serving step: a prefill chunk samples only on its final token;
+        // a decode step always samples. Everything here samples, so the
+        // completion event must carry exactly one output token.
         let input = if phase == ExecutionPhase::Prefill {
-            engine_core::ExecutionTokenInput::prompt(tokens.clone(), 0, 1).expect("prompt input")
+            engine_core::ExecutionTokenInput::prompt(tokens, 0, token_count).expect("prompt input")
         } else {
+            assert_eq!(token_count, 1);
             engine_core::ExecutionTokenInput::decode(tokens[0])
         };
-        let mut segment =
-            ExecutionSegment::new(request, phase, 1, 1, position, state_requirements.clone())
-                .expect("segment")
-                .with_token_input(input)
-                .expect("token input");
-        if sample {
-            segment = segment.with_sampling(greedy);
-        }
+        let segment = ExecutionSegment::new(
+            request,
+            phase,
+            1,
+            token_count,
+            position,
+            state_requirements.clone(),
+        )
+        .expect("segment")
+        .with_token_input(input)
+        .expect("token input")
+        .with_sampling(greedy);
         let batch = ExecutionBatch::new(vec![segment]).expect("batch");
         let submission = backend
             .submit(&plan, &batch, std::slice::from_mut(state))
@@ -3651,8 +3663,9 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
                 Ok(Some(event)) => {
                     // Commit the advanced prefix position through the state
                     // manager, mirroring the serving runtime's completion.
+                    let next = position + token_count;
                     let committed = manager
-                        .commit(std::mem::replace(state, placeholder_state()), position + 1)
+                        .commit(std::mem::replace(state, placeholder_state()), next)
                         .expect("commit position");
                     *state = committed;
                     return event
@@ -3674,60 +3687,54 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         }
     };
 
-    // Phase one: prefill the shared prompt on both backends. Only the final
-    // prompt token samples; the rest advance state without output.
-    let mut eager_position = 0_u32;
-    let mut async_position = 0_u32;
-    let mut last_eager_token = 0_u32;
-    for (offset, &token) in PROMPT.iter().enumerate() {
-        let sample = offset + 1 == PROMPT.len();
-        let eager_token = run_one_step(
-            &mut eager_backend,
-            &mut eager_manager,
-            &mut eager_state,
-            ExecutionPhase::Prefill,
-            Arc::from([token]),
-            eager_position,
-            sample,
-        );
-        let async_token = run_one_step(
-            &mut async_backend,
-            &mut async_manager,
-            &mut async_state,
-            ExecutionPhase::Prefill,
-            Arc::from([token]),
-            async_position,
-            sample,
-        );
-        if sample {
-            assert_eq!(eager_token, LLAMA_GREEDY_CONTINUATION[0]);
-            assert_eq!(
-                async_token, eager_token,
-                "async prefill sampling diverged from the eager path"
-            );
-        }
-        last_eager_token = eager_token;
-        eager_position += 1;
-        async_position += 1;
-    }
-
+    // Phase one: prefill the whole prompt as one chunk on both backends, with
+    // sampling on the final prompt token, exactly like a serving prefill
+    // segment.
+    let prompt: Arc<[u32]> = Arc::from(PROMPT);
+    let eager_token = run_one_step(
+        &mut eager_backend,
+        &mut eager_manager,
+        &mut eager_state,
+        ExecutionPhase::Prefill,
+        Arc::clone(&prompt),
+        0,
+        u32::try_from(PROMPT.len()).expect("fits u32"),
+    );
+    let async_token = run_one_step(
+        &mut async_backend,
+        &mut async_manager,
+        &mut async_state,
+        ExecutionPhase::Prefill,
+        Arc::clone(&prompt),
+        0,
+        u32::try_from(PROMPT.len()).expect("fits u32"),
+    );
+    assert_eq!(eager_token, LLAMA_GREEDY_CONTINUATION[0]);
+    assert_eq!(
+        async_token, eager_token,
+        "async prefill sampling diverged from the eager path"
+    );
     // Phase two: greedy decode, feeding each path its own previous token.
-    let mut fed_eager = last_eager_token;
-    let mut fed_async = last_eager_token;
+    // Decode position i advances the prompt end by i, so the absolute state
+    // position is derived from the loop index rather than a counter.
+    let prompt_len = u32::try_from(PROMPT.len()).expect("fits u32");
+    let mut fed_eager = eager_token;
+    let mut fed_async = async_token;
     for (index, expected) in LLAMA_GREEDY_CONTINUATION
         .iter()
         .enumerate()
         .take(COMPARE_TOKENS)
         .skip(1)
     {
+        let position = prompt_len + u32::try_from(index).expect("fits u32") - 1;
         let eager_token = run_one_step(
             &mut eager_backend,
             &mut eager_manager,
             &mut eager_state,
             ExecutionPhase::Decode,
             Arc::from([fed_eager]),
-            eager_position,
-            true,
+            position,
+            1,
         );
         let async_token = run_one_step(
             &mut async_backend,
@@ -3735,8 +3742,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
             &mut async_state,
             ExecutionPhase::Decode,
             Arc::from([fed_async]),
-            async_position,
-            true,
+            position,
+            1,
         );
         assert_eq!(
             eager_token, *expected,
@@ -3748,8 +3755,6 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         );
         fed_eager = eager_token;
         fed_async = async_token;
-        eager_position += 1;
-        async_position += 1;
     }
 
     // The async dispatcher must not leak submissions or physical state.
