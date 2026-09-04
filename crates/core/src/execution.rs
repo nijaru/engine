@@ -35,14 +35,20 @@ pub struct ExecutionSegment {
 impl ExecutionSegment {
     /// # Errors
     ///
-    /// Returns [`PlanError::ZeroWork`] when `token_count` is zero.
+    /// Returns [`PlanError::InvalidSegmentBatchSize`] unless `batch_size` is
+    /// one or [`PlanError::ZeroWork`] when `token_count` is zero. Multi-request
+    /// batching is represented by [`ExecutionBatch`].
     pub fn new(
         request: RequestId,
         phase: ExecutionPhase,
+        batch_size: u32,
         token_count: u32,
         state_position: u32,
         state_requirements: Vec<StateRequirement>,
     ) -> Result<Self, PlanError> {
+        if batch_size != 1 {
+            return Err(PlanError::InvalidSegmentBatchSize);
+        }
         if token_count == 0 {
             return Err(PlanError::ZeroWork);
         }
@@ -63,6 +69,11 @@ impl ExecutionSegment {
     #[must_use]
     pub const fn phase(&self) -> ExecutionPhase {
         self.phase
+    }
+
+    #[must_use]
+    pub const fn batch_size(&self) -> u32 {
+        1
     }
 
     #[must_use]
@@ -122,9 +133,9 @@ impl ExecutionBatch {
 
     #[must_use]
     pub fn total_tokens(&self) -> Option<u32> {
-        self.segments
-            .iter()
-            .try_fold(0_u32, |total, segment| total.checked_add(segment.token_count()))
+        self.segments.iter().try_fold(0_u32, |total, segment| {
+            total.checked_add(segment.token_count())
+        })
     }
 }
 
@@ -450,6 +461,7 @@ pub enum PlanError {
     EmptyStages,
     EmptyBatch,
     DuplicateBatchRequest,
+    InvalidSegmentBatchSize,
     ZeroWork,
     SegmentPhaseMismatch,
     SegmentStateUndeclared,
@@ -465,6 +477,9 @@ impl fmt::Display for PlanError {
             Self::EmptyBatch => f.write_str("execution batch must contain at least one segment"),
             Self::DuplicateBatchRequest => {
                 f.write_str("execution batch contains duplicate request work")
+            }
+            Self::InvalidSegmentBatchSize => {
+                f.write_str("an execution segment describes exactly one request")
             }
             Self::ZeroWork => f.write_str("execution segment must contain non-zero work"),
             Self::SegmentPhaseMismatch => {
