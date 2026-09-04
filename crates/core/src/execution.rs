@@ -1,5 +1,6 @@
 //! Narrow inference execution descriptions and prepared plans.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::backend::BackendId;
@@ -26,7 +27,6 @@ pub enum ExecutionPhase {
 pub struct ExecutionSegment {
     request: RequestId,
     phase: ExecutionPhase,
-    batch_size: u32,
     token_count: u32,
     state_position: u32,
     state_requirements: Vec<StateRequirement>,
@@ -35,22 +35,20 @@ pub struct ExecutionSegment {
 impl ExecutionSegment {
     /// # Errors
     ///
-    /// Returns [`PlanError::ZeroWork`] when either work dimension is zero.
+    /// Returns [`PlanError::ZeroWork`] when `token_count` is zero.
     pub fn new(
         request: RequestId,
         phase: ExecutionPhase,
-        batch_size: u32,
         token_count: u32,
         state_position: u32,
         state_requirements: Vec<StateRequirement>,
     ) -> Result<Self, PlanError> {
-        if batch_size == 0 || token_count == 0 {
+        if token_count == 0 {
             return Err(PlanError::ZeroWork);
         }
         Ok(Self {
             request,
             phase,
-            batch_size,
             token_count,
             state_position,
             state_requirements,
@@ -68,11 +66,6 @@ impl ExecutionSegment {
     }
 
     #[must_use]
-    pub const fn batch_size(&self) -> u32 {
-        self.batch_size
-    }
-
-    #[must_use]
     pub const fn token_count(&self) -> u32 {
         self.token_count
     }
@@ -85,6 +78,53 @@ impl ExecutionSegment {
     #[must_use]
     pub fn state_requirements(&self) -> &[StateRequirement] {
         &self.state_requirements
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionBatch {
+    segments: Vec<ExecutionSegment>,
+}
+
+impl ExecutionBatch {
+    /// # Errors
+    ///
+    /// Returns [`PlanError::EmptyBatch`] for no work or
+    /// [`PlanError::DuplicateBatchRequest`] when a request appears more than
+    /// once in the same submission.
+    pub fn new(segments: Vec<ExecutionSegment>) -> Result<Self, PlanError> {
+        if segments.is_empty() {
+            return Err(PlanError::EmptyBatch);
+        }
+        let mut requests = HashSet::with_capacity(segments.len());
+        for segment in &segments {
+            if !requests.insert(segment.request()) {
+                return Err(PlanError::DuplicateBatchRequest);
+            }
+        }
+        Ok(Self { segments })
+    }
+
+    #[must_use]
+    pub fn segments(&self) -> &[ExecutionSegment] {
+        &self.segments
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u32> {
+        self.segments
+            .iter()
+            .try_fold(0_u32, |total, segment| total.checked_add(segment.token_count()))
     }
 }
 
@@ -182,9 +222,7 @@ impl ExecutionPlan {
         Ok(self)
     }
 
-    /// Check that a request segment belongs to this prepared plan. A segment
-    /// may use a subset of the plan's state for a model region, but it cannot
-    /// introduce undeclared state or an undeclared execution phase.
+    /// Check that a request segment belongs to this prepared plan.
     ///
     /// # Errors
     ///
@@ -204,6 +242,16 @@ impl ExecutionPlan {
             .any(|requirement| !self.state_requirements.contains(requirement))
         {
             return Err(PlanError::SegmentStateUndeclared);
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns the first segment validation error in the batch.
+    pub fn validate_batch(&self, batch: &ExecutionBatch) -> Result<(), PlanError> {
+        for segment in batch.segments() {
+            self.validate_segment(segment)?;
         }
         Ok(())
     }
@@ -301,8 +349,6 @@ impl ExecutionMetrics {
     }
 }
 
-/// Completed work carries enough identity for a profiler/metrics sink to
-/// attribute time and state movement without querying global mutable state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutionEvent {
     request: RequestId,
@@ -360,9 +406,50 @@ impl ExecutionEvent {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionBatchEvent {
+    events: Vec<ExecutionEvent>,
+}
+
+impl ExecutionBatchEvent {
+    /// # Errors
+    ///
+    /// Returns [`PlanError::EmptyBatch`] when the completion has no events or
+    /// [`PlanError::DuplicateBatchRequest`] when a request occurs twice.
+    pub fn new(events: Vec<ExecutionEvent>) -> Result<Self, PlanError> {
+        if events.is_empty() {
+            return Err(PlanError::EmptyBatch);
+        }
+        let mut requests = HashSet::with_capacity(events.len());
+        for event in &events {
+            if !requests.insert(event.request()) {
+                return Err(PlanError::DuplicateBatchRequest);
+            }
+        }
+        Ok(Self { events })
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[ExecutionEvent] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PlanError {
     EmptyStages,
+    EmptyBatch,
+    DuplicateBatchRequest,
     ZeroWork,
     SegmentPhaseMismatch,
     SegmentStateUndeclared,
@@ -375,6 +462,10 @@ impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyStages => f.write_str("execution plan must contain at least one stage"),
+            Self::EmptyBatch => f.write_str("execution batch must contain at least one segment"),
+            Self::DuplicateBatchRequest => {
+                f.write_str("execution batch contains duplicate request work")
+            }
             Self::ZeroWork => f.write_str("execution segment must contain non-zero work"),
             Self::SegmentPhaseMismatch => {
                 f.write_str("execution segment phase is not in the prepared plan")
