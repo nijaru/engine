@@ -99,7 +99,9 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
                 segment.token_count(),
                 metrics,
             )
-            .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+            .ok_or_else(|| {
+                BackendError::ExecutionFailed("segment contained no tokens".to_owned())
+            })?;
             events.push(event);
         }
         let event = ExecutionBatchEvent::new(events).map_err(BackendError::InvalidPlan)?;
@@ -183,15 +185,9 @@ mod tests {
         )
         .expect("plan");
         let request = RequestId::new(1).expect("request ID");
-        let segment = ExecutionSegment::new(
-            request,
-            ExecutionPhase::Decode,
-            1,
-            1,
-            0,
-            vec![requirement],
-        )
-        .expect("segment");
+        let segment =
+            ExecutionSegment::new(request, ExecutionPhase::Decode, 1, 1, 0, vec![requirement])
+                .expect("segment");
         let batch = ExecutionBatch::new(vec![segment]).expect("batch");
         let spec = match requirement {
             StateRequirement::FullAttentionKv(spec) => spec,
@@ -202,9 +198,7 @@ mod tests {
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");
         let state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
-        let submission = backend
-            .submit(&plan, &batch, &mut [state])
-            .expect("submit");
+        let submission = backend.submit(&plan, &batch, &mut [state]).expect("submit");
         let event = backend.wait(submission).expect("completion");
         assert_eq!(event.events()[0].metrics().elapsed_nanos(), 12);
         assert_eq!(event.events()[0].policy_version(), policy);
