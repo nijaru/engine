@@ -2,8 +2,8 @@
 //!
 //! These interfaces describe inference semantics and execution ownership without
 //! committing the core to a checkpoint format, device backend, or scheduler
-//! implementation. In particular, hybrid models expose distinct KV and
-//! recurrent state families rather than treating every state buffer as KV.
+//! implementation. Model state remains typed without baking one model family's
+//! state bundle into the runtime boundary.
 
 pub mod backend;
 pub mod device;
@@ -40,9 +40,9 @@ pub use request::{
 };
 pub use runtime::{ExecutionRuntime, RuntimeError};
 pub use state::{
-    ConvolutionStateShape, HybridState, HybridStateSet, KvState, KvStateSpec, LogicalStateManager,
-    RecurrentMatrixShape, RecurrentState, RecurrentStateSpec, StateError, StateHandle, StateId,
-    StateLocation, StateManager, StateRequirement, StateSpecError,
+    ConvolutionStateShape, HybridState, HybridStateSet, InferenceState, InferenceStateSet, KvState,
+    KvStateSpec, LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec,
+    StateError, StateHandle, StateId, StateLocation, StateManager, StateRequirement, StateSpecError,
 };
 pub use tensor::{DataType, Quantization, WeightFormat};
 pub use weights::{
@@ -213,7 +213,7 @@ mod tests {
         );
         let kv_state = KvState::new(kv_handle, spec).expect("valid KV state");
         assert_eq!(
-            HybridStateSet::try_new(Some(kv_state), Some(recurrent_state)),
+            InferenceStateSet::try_new(Some(kv_state), Some(recurrent_state)),
             Err(StateError::PositionMismatch)
         );
     }
@@ -310,7 +310,7 @@ mod tests {
             Err(StateError::CapacityExceeded { .. })
         ));
 
-        let state_set = HybridStateSet::try_new(Some(state), None).expect("state set");
+        let state_set = InferenceStateSet::try_new(Some(state), None).expect("state set");
         let committed = manager.commit(state_set, 4).expect("commit");
         assert_eq!(committed.token_position(), Some(4));
         manager
