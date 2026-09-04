@@ -408,11 +408,16 @@ impl CudaRecurrentState {
     }
 }
 
+/// Identity of one logical state set, used to key backend-owned physical
+/// state. Sorted [`StateId`] handles rather than request IDs keep scheduling
+/// identity and model-state identity separate.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CudaStateKey(Vec<StateId>);
+pub struct CudaStateKey(Vec<StateId>);
 
 impl CudaStateKey {
-    fn from_state_set(state: &InferenceStateSet) -> Self {
+    /// Derive the registry key for one logical state set.
+    #[must_use]
+    pub fn from_state_set(state: &InferenceStateSet) -> Self {
         let mut ids = state
             .states()
             .iter()
@@ -481,9 +486,13 @@ impl CudaStateRegistry {
     /// Drop any physical allocation associated with this logical state set.
     /// Missing state is a valid no-op for requests cancelled before first use.
     pub fn release(&mut self, state: &InferenceStateSet) -> bool {
-        self.states
-            .remove(&CudaStateKey::from_state_set(state))
-            .is_some()
+        self.release_key(&CudaStateKey::from_state_set(state))
+    }
+
+    /// Drop any physical allocation associated with a state key.
+    /// Missing state is a valid no-op for requests cancelled before first use.
+    pub fn release_key(&mut self, key: &CudaStateKey) -> bool {
+        self.states.remove(key).is_some()
     }
 
     #[must_use]

@@ -17,7 +17,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, PinnedHostSlice};
 use engine_core::DataType;
 
 use crate::cuda::CudaF32Weight;
@@ -449,6 +449,32 @@ impl CudaQwen35Decode {
         self.select_greedy_token()
     }
 
+    /// Run one full forward pass for `token` at absolute sequence
+    /// `position` and stream-order the greedy selection into one `u32` of
+    /// pinned host memory.
+    ///
+    /// Unlike [`Self::decode_step`], the host is not blocked on the result:
+    /// the device-to-host copy is enqueued on the decoder stream and the
+    /// caller reads `destination` only after a recorded completion event
+    /// covers it. The shared device argmax slot is reused by later rows, so
+    /// each row needs its own pinned destination to preserve its result
+    /// until completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when state/geometry is invalid or execution
+    /// or the stream-ordered copy fails.
+    pub fn decode_step_into_pinned(
+        &mut self,
+        state: &mut CudaHybridState,
+        token: u32,
+        position: u32,
+        destination: &mut PinnedHostSlice<u32>,
+    ) -> Result<(), CudaDecodeError> {
+        self.run_step(state, token, position)?;
+        self.select_greedy_token_into_pinned(destination)
+    }
+
     fn run_step(
         &mut self,
         state: &mut CudaHybridState,
@@ -526,6 +552,50 @@ impl CudaQwen35Decode {
     }
 
     fn select_greedy_token(&mut self) -> Result<u32, CudaDecodeError> {
+        self.run_output_head()?;
+        // The host needs the selected token before it can schedule the next
+        // autoregressive step, so this remains an intentional blocking
+        // completion boundary. Copy into stack storage rather than allocating
+        // a new Vec for every token.
+        let mut selected = [0_u32; 1];
+        self.stream
+            .memcpy_dtoh(&self.selected_token, &mut selected)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        Ok(selected[0])
+    }
+
+    /// Run the output head and stream-order an async greedy selection copy
+    /// into one `u32` of pinned host memory.
+    ///
+    /// Unlike [`Self::decode_step`], the host is not blocked on the selected
+    /// token: the copy is enqueued on the decoder stream, and the caller reads
+    /// `destination` only after a recorded completion event covers it. The
+    /// shared device argmax slot is reused by later rows; the pinned
+    /// destination preserves each row's result until completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when the output head or the stream-ordered
+    /// copy into pinned memory fails.
+    fn select_greedy_token_into_pinned(
+        &mut self,
+        destination: &mut PinnedHostSlice<u32>,
+    ) -> Result<(), CudaDecodeError> {
+        self.run_output_head()?;
+        self.stream
+            .memcpy_dtoh(&self.selected_token, destination)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Output `RMSNorm`, vocabulary projection, and device-side argmax over the
+    /// current residual stream, writing the winning token into the shared
+    /// device result slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when a kernel launch fails.
+    fn run_output_head(&mut self) -> Result<(), CudaDecodeError> {
         self.ops.rms_norm(
             &self.hidden,
             f32_slice(&self.weights, "output_norm.weight")?,
@@ -540,15 +610,7 @@ impl CudaQwen35Decode {
         )?;
         self.ops
             .argmax_into(&self.logits, &mut self.selected_token)?;
-        // The host needs the selected token before it can schedule the next
-        // autoregressive step, so this remains an intentional blocking
-        // completion boundary. Copy into stack storage rather than allocating
-        // a new Vec for every token.
-        let mut selected = [0_u32; 1];
-        self.stream
-            .memcpy_dtoh(&self.selected_token, &mut selected)
-            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
-        Ok(selected[0])
+        Ok(())
     }
 
     /// Copy the current residual stream to the host. The copy is
@@ -561,6 +623,24 @@ impl CudaQwen35Decode {
     pub fn copy_hidden(&self) -> Result<Vec<f32>, CudaDecodeError> {
         self.stream
             .clone_dtoh(&self.hidden)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))
+    }
+
+    /// Record a completion event covering everything queued on the decoder
+    /// stream so far.
+    ///
+    /// The event is a single one-stream ordering point: all kernels and
+    /// stream-ordered copies of the submission, including pinned output
+    /// copies, precede it. Polling the event's completion therefore covers
+    /// every resource the submission still owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError::Driver`] when event creation or recording
+    /// fails.
+    pub fn record_completion_event(&self) -> Result<CudaEvent, CudaDecodeError> {
+        self.stream
+            .record_event(None)
             .map_err(|error| CudaDecodeError::Driver(error.to_string()))
     }
 

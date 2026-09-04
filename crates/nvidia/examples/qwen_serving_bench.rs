@@ -84,7 +84,12 @@ fn run() -> Result<(), String> {
     let layer_kinds = qwen_layer_kinds(&provider)?;
     let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
         .map_err(|error| error.to_string())?;
-    let dispatcher = CudaQwen35ServingDispatcher::new(executor, stream);
+    // Pinned output slots cover every scheduler row that can be in flight at
+    // once: one full scheduler batch of `concurrency` sampling rows plus a
+    // safety multiple for overlapping submissions during state transitions.
+    let pinned_rows = concurrency.saturating_mul(4).max(8);
+    let dispatcher = CudaQwen35ServingDispatcher::new(&context, executor, stream, pinned_rows)
+        .map_err(|error| error.to_string())?;
 
     let description = provider.description();
     let model = description.id().clone();

@@ -83,7 +83,10 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let layer_kinds = qwen_layer_kinds(&provider)?;
     let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
         .map_err(|error| error.to_string())?;
-    let dispatcher = CudaQwen35ServingDispatcher::new(executor, stream);
+    // The local single-request path needs one pinned output slot per
+    // potentially in-flight sampling row; keep a small pool.
+    let dispatcher = CudaQwen35ServingDispatcher::new(&context, executor, stream, 8)
+        .map_err(|error| error.to_string())?;
 
     let description = provider.description();
     let model = description.id().clone();

@@ -50,7 +50,7 @@ pub use decode::{CudaDecodeError, CudaQwen35Decode, QwenLayerKind};
 #[cfg(feature = "cuda")]
 pub use state::{
     CudaHybridState, CudaKvState, CudaRecurrentState, CudaStateBuffer, CudaStateError,
-    CudaStateRegistry,
+    CudaStateKey, CudaStateRegistry,
 };
 
 pub use qwen_reference::{

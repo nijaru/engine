@@ -3415,3 +3415,340 @@ fn decodes_greedy_tokens_matching_llama_server() {
         LLAMA_GREEDY_CONTINUATION.len()
     );
 }
+
+/// Full staging helper shared by the serving-level tests: globals plus every
+/// language layer of the pinned artifact, through the validated provider
+/// bindings.
+fn stage_full_text_path(
+    provider: &Qwen35ModelProvider,
+    context: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+) -> Arc<CudaQwen35Weights> {
+    let device = DeviceId::new(0);
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    for layer in 0..64_u32 {
+        let binding = provider
+            .layer_weight_binding(device, layer)
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+    Arc::new(
+        CudaQwen35Weights::stage(context, stream, 20_u64 << 30, tensors)
+            .expect("stage the full text path"),
+    )
+}
+
+/// Asynchronous Qwen serving parity: the one-stream async dispatcher must
+/// produce the same greedy tokens as the eager reference path from identical
+/// fresh state, through the real `NvidiaBackend` submit/poll seam.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end async parity gate staging the full model"
+)]
+fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
+    use engine_core::{
+        BackendCapabilities, BackendFeatures, BackendKind, ComputeBackend, DataType,
+        ExecutionBatch, ExecutionPhase, ExecutionPlan, ExecutionStage, InferenceState,
+        LogicalStateManager, ModelProvider, NvidiaBackend, PolicyVersion, Quantization, RequestId,
+        SamplingParams, StateLocation, StateManager, StateRequirement,
+    };
+    use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
+    use std::time::Duration;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+    const COMPARE_TOKENS: usize = 16;
+
+    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+        GGUF,
+        u32::try_from(PROMPT.len() + COMPARE_TOKENS + 4).expect("fits u32"),
+    )
+    .expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let device = DeviceId::new(0);
+    let description = provider.description();
+    let state_requirements = description.state_requirements().to_vec();
+    let execution_stages = [ExecutionPhase::Prefill, ExecutionPhase::Decode]
+        .into_iter()
+        .flat_map(|phase| {
+            description
+                .regions()
+                .iter()
+                .map(move |region| ExecutionStage::new(region.id(), phase))
+        })
+        .collect::<Vec<_>>();
+
+    let backend_id = BackendId::new("cuda").expect("backend ID");
+    let state_bytes: u64 = state_requirements
+        .iter()
+        .map(|requirement| requirement.byte_size().expect("state size"))
+        .sum();
+    let capabilities = BackendCapabilities::new(
+        backend_id.clone(),
+        device,
+        BackendKind::Cuda,
+        (20_u64 << 30) + state_bytes * 4,
+        BackendFeatures::new(
+            vec![DataType::F16, DataType::F32],
+            vec![Quantization::GgufQ4Km],
+            false,
+            true,
+        ),
+    );
+
+    let plan = ExecutionPlan::new(
+        description.id().clone(),
+        backend_id.clone(),
+        device,
+        PolicyVersion::new(1).expect("policy version"),
+        execution_stages,
+        state_requirements.clone(),
+        WeightBinding::empty(description.id().clone(), device),
+    )
+    .expect("plan");
+
+    let allocate_states = |manager: &mut LogicalStateManager| {
+        (0..2)
+            .map(|_| {
+                let states = state_requirements
+                    .iter()
+                    .map(|requirement| match *requirement {
+                        StateRequirement::FullAttentionKv(spec) => manager
+                            .allocate_kv(spec, StateLocation::Device(device))
+                            .map(InferenceState::from),
+                        StateRequirement::Recurrent(spec) => manager
+                            .allocate_recurrent(spec, StateLocation::Device(device))
+                            .map(InferenceState::from),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("allocate state");
+                InferenceStateSet::new(states).expect("state set")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Reference: eager dispatcher, driven through the same backend boundary.
+    let mut eager_states = {
+        let mut manager = LogicalStateManager::new(device, state_bytes * 2, 0);
+        let states = allocate_states(&mut manager);
+        std::mem::forget(manager);
+        states
+    };
+    let eager_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("eager executor");
+    let eager_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, eager_executor, stream.clone(), 8)
+            .expect("eager dispatcher");
+    let mut eager_backend =
+        NvidiaBackend::new(capabilities.clone(), eager_dispatcher).expect("eager backend");
+
+    // Async: the new pinned-output completion path.
+    let mut async_states = {
+        let mut manager = LogicalStateManager::new(device, state_bytes * 2, 0);
+        let states = allocate_states(&mut manager);
+        std::mem::forget(manager);
+        states
+    };
+    let async_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("async executor");
+    let async_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, async_executor, stream.clone(), 8)
+            .expect("async dispatcher");
+    let mut async_backend =
+        NvidiaBackend::new(capabilities, async_dispatcher).expect("async backend");
+
+    // Drive both backends through submit/poll with the same token sequence:
+    // the shared prompt, then the eager path's own greedy choices, so the
+    // async path must reproduce them exactly.
+    let request = RequestId::new(1).expect("request ID");
+    let greedy = SamplingParams::greedy(None);
+
+    let run_one_step = |backend: &mut NvidiaBackend<CudaQwen35ServingDispatcher>,
+                        states: &mut Vec<InferenceStateSet>,
+                        phase: ExecutionPhase,
+                        tokens: Arc<[u32]>,
+                        position: u32,
+                        sample: bool|
+     -> u32 {
+        let input = if phase == ExecutionPhase::Prefill {
+            engine_core::ExecutionTokenInput::prompt(tokens.clone(), 0, 1).expect("prompt input")
+        } else {
+            engine_core::ExecutionTokenInput::decode(tokens[0])
+        };
+        let mut segment =
+            ExecutionSegment::new(request, phase, 1, 1, position, state_requirements.clone())
+                .expect("segment")
+                .with_token_input(input)
+                .expect("token input");
+        if sample {
+            segment = segment.with_sampling(greedy);
+        }
+        let batch = ExecutionBatch::new(vec![segment]).expect("batch");
+        let submission = backend.submit(&plan, &batch, states).expect("submit");
+        let deadline = Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        loop {
+            match backend.poll(submission) {
+                Ok(Some(event)) => {
+                    return event
+                        .events()
+                        .first()
+                        .expect("one event")
+                        .output_token()
+                        .expect("sampled token");
+                }
+                Ok(None) => {
+                    assert!(
+                        started.elapsed() < deadline,
+                        "asynchronous submission did not complete in time"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("poll failed: {error:?}"),
+            }
+        }
+    };
+
+    // Phase one: prefill the shared prompt on both backends. Only the final
+    // prompt token samples; the rest advance state without output.
+    let mut eager_position = 0_u32;
+    let mut async_position = 0_u32;
+    let mut last_eager_token = 0_u32;
+    for (offset, &token) in PROMPT.iter().enumerate() {
+        let sample = offset + 1 == PROMPT.len();
+        let eager_token = run_one_step(
+            &mut eager_backend,
+            &mut eager_states,
+            ExecutionPhase::Prefill,
+            Arc::from([token]),
+            eager_position,
+            sample,
+        );
+        let async_token = run_one_step(
+            &mut async_backend,
+            &mut async_states,
+            ExecutionPhase::Prefill,
+            Arc::from([token]),
+            async_position,
+            sample,
+        );
+        if sample {
+            assert_eq!(eager_token, LLAMA_GREEDY_CONTINUATION[0]);
+            assert_eq!(
+                async_token, eager_token,
+                "async prefill sampling diverged from the eager path"
+            );
+        }
+        last_eager_token = eager_token;
+        eager_position += 1;
+        async_position += 1;
+    }
+
+    // Phase two: greedy decode, feeding each path its own previous token.
+    let mut fed_eager = last_eager_token;
+    let mut fed_async = last_eager_token;
+    for (index, expected) in LLAMA_GREEDY_CONTINUATION
+        .iter()
+        .enumerate()
+        .take(COMPARE_TOKENS)
+        .skip(1)
+    {
+        let eager_token = run_one_step(
+            &mut eager_backend,
+            &mut eager_states,
+            ExecutionPhase::Decode,
+            Arc::from([fed_eager]),
+            eager_position,
+            true,
+        );
+        let async_token = run_one_step(
+            &mut async_backend,
+            &mut async_states,
+            ExecutionPhase::Decode,
+            Arc::from([fed_async]),
+            async_position,
+            true,
+        );
+        assert_eq!(
+            eager_token, *expected,
+            "eager token diverged from llama-server"
+        );
+        assert_eq!(
+            async_token, eager_token,
+            "async decode diverged from the eager path at token {index}"
+        );
+        fed_eager = eager_token;
+        fed_async = async_token;
+        eager_position += 1;
+        async_position += 1;
+    }
+
+    // The async dispatcher must not leak submissions or physical state.
+    assert_eq!(async_backend.dispatcher().pending_submissions(), 0);
+    for state in &async_states {
+        async_backend
+            .release_inference_state(state)
+            .expect("release state");
+    }
+    assert_eq!(async_backend.dispatcher().state_registry().len(), 0);
+}
