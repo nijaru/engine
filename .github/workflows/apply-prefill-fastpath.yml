@@ -1,0 +1,34 @@
+name: Apply Qwen Prefill Fastpath
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-prefill-fastpath.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-prefill-fastpath:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - run: python .github/skip-prefill-output.py
+      - run: cargo fmt --all
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - run: cargo clippy -p engine-server --features cuda --all-targets -- -D warnings
+      - name: Commit source changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/skip-prefill-output.py .github/workflows/skip-prefill-output.yml .github/workflows/apply-prefill-fastpath.yml
+          git add crates/nvidia
+          git commit -m "Skip output head for intermediate Qwen prefill tokens"
+          git push origin HEAD:main
