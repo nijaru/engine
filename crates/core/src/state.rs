@@ -27,7 +27,6 @@ pub enum StateLocation {
     Host,
 }
 
-/// Full-attention KV state is described independently from recurrent state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KvStateSpec {
     layer_count: u16,
@@ -40,8 +39,7 @@ pub struct KvStateSpec {
 impl KvStateSpec {
     /// # Errors
     ///
-    /// Returns [`StateSpecError::ZeroDimension`] when any state dimension is
-    /// zero.
+    /// Returns [`StateSpecError::ZeroDimension`] when any state dimension is zero.
     pub fn new(
         layer_count: u16,
         kv_heads: u16,
@@ -62,29 +60,15 @@ impl KvStateSpec {
     }
 
     #[must_use]
-    pub const fn layer_count(self) -> u16 {
-        self.layer_count
-    }
-
+    pub const fn layer_count(self) -> u16 { self.layer_count }
     #[must_use]
-    pub const fn kv_heads(self) -> u16 {
-        self.kv_heads
-    }
-
+    pub const fn kv_heads(self) -> u16 { self.kv_heads }
     #[must_use]
-    pub const fn head_dim(self) -> u16 {
-        self.head_dim
-    }
-
+    pub const fn head_dim(self) -> u16 { self.head_dim }
     #[must_use]
-    pub const fn block_tokens(self) -> u32 {
-        self.block_tokens
-    }
-
+    pub const fn block_tokens(self) -> u32 { self.block_tokens }
     #[must_use]
-    pub const fn dtype(self) -> DataType {
-        self.dtype
-    }
+    pub const fn dtype(self) -> DataType { self.dtype }
 
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
@@ -97,8 +81,6 @@ impl KvStateSpec {
     }
 }
 
-/// Matrix dimensions for the recurrent/linear-attention state. Qwen3.8 uses
-/// 16 key heads × 128 key width and 48 value heads × 128 value width.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RecurrentMatrixShape {
     key_heads: u16,
@@ -128,24 +110,13 @@ impl RecurrentMatrixShape {
     }
 
     #[must_use]
-    pub const fn key_heads(self) -> u16 {
-        self.key_heads
-    }
-
+    pub const fn key_heads(self) -> u16 { self.key_heads }
     #[must_use]
-    pub const fn key_head_dim(self) -> u16 {
-        self.key_head_dim
-    }
-
+    pub const fn key_head_dim(self) -> u16 { self.key_head_dim }
     #[must_use]
-    pub const fn value_heads(self) -> u16 {
-        self.value_heads
-    }
-
+    pub const fn value_heads(self) -> u16 { self.value_heads }
     #[must_use]
-    pub const fn value_head_dim(self) -> u16 {
-        self.value_head_dim
-    }
+    pub const fn value_head_dim(self) -> u16 { self.value_head_dim }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -165,18 +136,11 @@ impl ConvolutionStateShape {
     }
 
     #[must_use]
-    pub const fn channels(self) -> u32 {
-        self.channels
-    }
-
+    pub const fn channels(self) -> u32 { self.channels }
     #[must_use]
-    pub const fn kernel(self) -> u16 {
-        self.kernel
-    }
+    pub const fn kernel(self) -> u16 { self.kernel }
 }
 
-/// Recurrent/Gated-DeltaNet state includes the matrix state and convolution
-/// history. It is not interchangeable with KV state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RecurrentStateSpec {
     layer_count: u16,
@@ -210,29 +174,15 @@ impl RecurrentStateSpec {
     }
 
     #[must_use]
-    pub const fn layer_count(self) -> u16 {
-        self.layer_count
-    }
-
+    pub const fn layer_count(self) -> u16 { self.layer_count }
     #[must_use]
-    pub const fn matrix(self) -> RecurrentMatrixShape {
-        self.matrix
-    }
-
+    pub const fn matrix(self) -> RecurrentMatrixShape { self.matrix }
     #[must_use]
-    pub const fn convolution(self) -> ConvolutionStateShape {
-        self.convolution
-    }
-
+    pub const fn convolution(self) -> ConvolutionStateShape { self.convolution }
     #[must_use]
-    pub const fn matrix_dtype(self) -> DataType {
-        self.matrix_dtype
-    }
-
+    pub const fn matrix_dtype(self) -> DataType { self.matrix_dtype }
     #[must_use]
-    pub const fn convolution_dtype(self) -> DataType {
-        self.convolution_dtype
-    }
+    pub const fn convolution_dtype(self) -> DataType { self.convolution_dtype }
 
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
@@ -276,9 +226,6 @@ impl StateRequirement {
     }
 }
 
-/// A handle identifies backend-owned storage. Handles are manager-issued and
-/// opaque to callers; the core does not pretend that a handle contains tensor
-/// data or provide a fake allocator implementation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StateHandle {
     id: StateId,
@@ -304,24 +251,13 @@ impl StateHandle {
     }
 
     #[must_use]
-    pub const fn id(&self) -> StateId {
-        self.id
-    }
-
+    pub const fn id(&self) -> StateId { self.id }
     #[must_use]
-    pub const fn requirement(&self) -> StateRequirement {
-        self.requirement
-    }
-
+    pub const fn requirement(&self) -> StateRequirement { self.requirement }
     #[must_use]
-    pub const fn location(&self) -> StateLocation {
-        self.location
-    }
-
+    pub const fn location(&self) -> StateLocation { self.location }
     #[must_use]
-    pub const fn token_position(&self) -> u32 {
-        self.token_position
-    }
+    pub const fn token_position(&self) -> u32 { self.token_position }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -342,14 +278,9 @@ impl KvState {
     }
 
     #[must_use]
-    pub const fn handle(&self) -> &StateHandle {
-        &self.handle
-    }
-
+    pub const fn handle(&self) -> &StateHandle { &self.handle }
     #[must_use]
-    pub const fn spec(&self) -> KvStateSpec {
-        self.spec
-    }
+    pub const fn spec(&self) -> KvStateSpec { self.spec }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -369,24 +300,18 @@ impl RecurrentState {
     }
 
     #[must_use]
-    pub const fn handle(&self) -> &StateHandle {
-        &self.handle
-    }
-
+    pub const fn handle(&self) -> &StateHandle { &self.handle }
     #[must_use]
-    pub const fn spec(&self) -> RecurrentStateSpec {
-        self.spec
-    }
+    pub const fn spec(&self) -> RecurrentStateSpec { self.spec }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum HybridState {
+pub enum InferenceState {
     Kv(KvState),
     Recurrent(RecurrentState),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-impl HybridState {
+impl InferenceState {
     #[must_use]
     pub const fn handle(&self) -> &StateHandle {
         match self {
@@ -394,76 +319,132 @@ impl HybridState {
             Self::Recurrent(state) => state.handle(),
         }
     }
+
+    #[must_use]
+    pub const fn requirement(&self) -> StateRequirement {
+        self.handle().requirement()
+    }
+
+    fn with_position(&self, token_position: u32) -> Result<Self, StateError> {
+        let handle = StateHandle::new(
+            self.handle().id(),
+            self.handle().requirement(),
+            self.handle().location(),
+            token_position,
+        );
+        match self {
+            Self::Kv(state) => KvState::new(handle, state.spec())
+                .map(Self::Kv)
+                .ok_or(StateError::InvalidHandle),
+            Self::Recurrent(state) => RecurrentState::new(handle, state.spec())
+                .map(Self::Recurrent)
+                .ok_or(StateError::InvalidHandle),
+        }
+    }
 }
 
-/// The first Qwen3.8 path needs both families at once. Keeping them in named
-/// optional fields prevents an accidental KV-only representation and validates
-/// that a shared prefix boundary has one position and one placement.
+impl From<KvState> for InferenceState {
+    fn from(value: KvState) -> Self {
+        Self::Kv(value)
+    }
+}
+
+impl From<RecurrentState> for InferenceState {
+    fn from(value: RecurrentState) -> Self {
+        Self::Recurrent(value)
+    }
+}
+
+/// Typed state at one semantic prefix boundary. New state families extend
+/// [`InferenceState`] rather than changing scheduler/backend signatures.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct HybridStateSet {
-    kv: Option<KvState>,
-    recurrent: Option<RecurrentState>,
+pub struct InferenceStateSet {
+    states: Vec<InferenceState>,
 }
 
-impl HybridStateSet {
+impl InferenceStateSet {
     /// # Errors
     ///
-    /// Returns a state error when both families are present but disagree on
-    /// token position or placement.
+    /// Returns a state error when states disagree on token position or location,
+    /// or when the same state requirement appears more than once.
+    pub fn new(states: Vec<InferenceState>) -> Result<Self, StateError> {
+        if let Some(first) = states.first() {
+            let position = first.handle().token_position();
+            let location = first.handle().location();
+            for (index, state) in states.iter().enumerate() {
+                if state.handle().token_position() != position {
+                    return Err(StateError::PositionMismatch);
+                }
+                if state.handle().location() != location {
+                    return Err(StateError::LocationMismatch);
+                }
+                if states[..index]
+                    .iter()
+                    .any(|known| known.requirement() == state.requirement())
+                {
+                    return Err(StateError::DuplicateRequirement);
+                }
+            }
+        }
+        Ok(Self { states })
+    }
+
+    /// Convenience constructor for the current Qwen hybrid path.
     pub fn try_new(
         kv: Option<KvState>,
         recurrent: Option<RecurrentState>,
     ) -> Result<Self, StateError> {
-        if let (Some(kv), Some(recurrent)) = (&kv, &recurrent) {
-            if kv.handle().token_position() != recurrent.handle().token_position() {
-                return Err(StateError::PositionMismatch);
-            }
-            if kv.handle().location() != recurrent.handle().location() {
-                return Err(StateError::LocationMismatch);
-            }
+        let mut states = Vec::with_capacity(2);
+        if let Some(state) = kv {
+            states.push(state.into());
         }
-        Ok(Self { kv, recurrent })
+        if let Some(state) = recurrent {
+            states.push(state.into());
+        }
+        Self::new(states)
     }
 
     #[must_use]
+    pub fn states(&self) -> &[InferenceState] { &self.states }
+
+    #[must_use]
     pub fn kv(&self) -> Option<&KvState> {
-        self.kv.as_ref()
+        self.states.iter().find_map(|state| match state {
+            InferenceState::Kv(value) => Some(value),
+            InferenceState::Recurrent(_) => None,
+        })
     }
 
     #[must_use]
     pub fn recurrent(&self) -> Option<&RecurrentState> {
-        self.recurrent.as_ref()
+        self.states.iter().find_map(|state| match state {
+            InferenceState::Kv(_) => None,
+            InferenceState::Recurrent(value) => Some(value),
+        })
     }
 
     #[must_use]
     pub fn token_position(&self) -> Option<u32> {
-        self.kv()
-            .map(|state| state.handle().token_position())
-            .or_else(|| {
-                self.recurrent()
-                    .map(|state| state.handle().token_position())
-            })
+        self.states.first().map(|state| state.handle().token_position())
     }
 
     #[must_use]
     pub fn location(&self) -> Option<StateLocation> {
-        self.kv()
-            .map(|state| state.handle().location())
-            .or_else(|| self.recurrent().map(|state| state.handle().location()))
+        self.states.first().map(|state| state.handle().location())
     }
 
     #[must_use]
     pub fn contains(&self, requirement: StateRequirement) -> bool {
-        match requirement {
-            StateRequirement::FullAttentionKv(spec) => {
-                self.kv().is_some_and(|state| state.spec() == spec)
-            }
-            StateRequirement::Recurrent(spec) => {
-                self.recurrent().is_some_and(|state| state.spec() == spec)
-            }
-        }
+        self.states
+            .iter()
+            .any(|state| state.requirement() == requirement)
     }
 }
+
+// Temporary source-compatibility names for the Phase-3 NVIDIA path. Phase-4
+// scheduler/runtime code should use the generic names above.
+pub type HybridState = InferenceState;
+pub type HybridStateSet = InferenceStateSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StateSpecError {
@@ -490,6 +471,7 @@ pub enum StateError {
     },
     SizeOverflow,
     InvalidHandle,
+    DuplicateRequirement,
     PositionMismatch,
     LocationMismatch,
     PositionRegression,
@@ -511,6 +493,7 @@ impl fmt::Display for StateError {
             ),
             Self::SizeOverflow => f.write_str("state size calculation overflowed"),
             Self::InvalidHandle => f.write_str("state handle is invalid or already released"),
+            Self::DuplicateRequirement => f.write_str("state requirement appears more than once"),
             Self::PositionMismatch => f.write_str("state families have different token positions"),
             Self::LocationMismatch => f.write_str("state families have different placements"),
             Self::PositionRegression => f.write_str("state token position cannot move backwards"),
@@ -520,10 +503,6 @@ impl fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
-/// A dependency-free state manager that owns typed allocation metadata and
-/// lifecycle. It deliberately does not allocate tensor storage; a backend can
-/// use its handles to attach device buffers without turning this core crate into
-/// a CUDA or GGUF dependency.
 #[derive(Debug)]
 pub struct LogicalStateManager {
     device: DeviceId,
@@ -558,9 +537,7 @@ impl LogicalStateManager {
     }
 
     #[must_use]
-    pub const fn device(&self) -> DeviceId {
-        self.device
-    }
+    pub const fn device(&self) -> DeviceId { self.device }
 
     #[must_use]
     pub fn capacity_bytes(&self, location: StateLocation) -> Option<u64> {
@@ -602,16 +579,19 @@ impl LogicalStateManager {
                 available_bytes: available,
             });
         }
+
         let id = StateId::new(self.next_id).ok_or(StateError::InvalidHandle)?;
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or(StateError::InvalidHandle)?;
+
         if matches!(location, StateLocation::Device(_)) {
             self.device_used_bytes += bytes;
         } else {
             self.host_used_bytes += bytes;
         }
+
         self.allocations.insert(
             id,
             AllocationRecord {
@@ -637,30 +617,21 @@ impl LogicalStateManager {
         Ok(*record)
     }
 
-    fn state_handles(state: &HybridStateSet) -> impl Iterator<Item = &StateHandle> {
-        state
-            .kv()
-            .map(KvState::handle)
-            .into_iter()
-            .chain(state.recurrent().map(RecurrentState::handle))
-    }
-
     fn update_position(
         &mut self,
-        state: &HybridStateSet,
+        state: &InferenceStateSet,
         token_position: u32,
     ) -> Result<(), StateError> {
-        let handles = Self::state_handles(state).collect::<Vec<_>>();
-        for handle in &handles {
-            let record = self.record_for(handle)?;
+        for value in state.states() {
+            let record = self.record_for(value.handle())?;
             if token_position < record.token_position {
                 return Err(StateError::PositionRegression);
             }
         }
-        for handle in handles {
+        for value in state.states() {
             let record = self
                 .allocations
-                .get_mut(&handle.id())
+                .get_mut(&value.handle().id())
                 .ok_or(StateError::InvalidHandle)?;
             record.token_position = token_position;
         }
@@ -689,35 +660,16 @@ impl StateManager for LogicalStateManager {
 
     fn commit(
         &mut self,
-        state: HybridStateSet,
+        state: InferenceStateSet,
         token_position: u32,
-    ) -> Result<HybridStateSet, StateError> {
+    ) -> Result<InferenceStateSet, StateError> {
         self.update_position(&state, token_position)?;
-        let kv = state
-            .kv()
-            .map(|value| {
-                let handle = StateHandle::new(
-                    value.handle().id(),
-                    value.handle().requirement(),
-                    value.handle().location(),
-                    token_position,
-                );
-                KvState::new(handle, value.spec()).ok_or(StateError::InvalidHandle)
-            })
-            .transpose()?;
-        let recurrent = state
-            .recurrent()
-            .map(|value| {
-                let handle = StateHandle::new(
-                    value.handle().id(),
-                    value.handle().requirement(),
-                    value.handle().location(),
-                    token_position,
-                );
-                RecurrentState::new(handle, value.spec()).ok_or(StateError::InvalidHandle)
-            })
-            .transpose()?;
-        HybridStateSet::try_new(kv, recurrent)
+        let states = state
+            .states()
+            .iter()
+            .map(|value| value.with_position(token_position))
+            .collect::<Result<Vec<_>, _>>()?;
+        InferenceStateSet::new(states)
     }
 
     fn release(&mut self, handle: StateHandle) -> Result<(), StateError> {
@@ -732,8 +684,6 @@ impl StateManager for LogicalStateManager {
     }
 }
 
-/// Storage/lifecycle implementations own allocation, transfer, checkpointing,
-/// and reclamation. Separate methods preserve the type distinction at the API.
 pub trait StateManager: Send {
     /// # Errors
     ///
@@ -746,30 +696,24 @@ pub trait StateManager: Send {
 
     /// # Errors
     ///
-    /// Returns [`StateError`] when storage cannot satisfy the recurrent
-    /// allocation.
+    /// Returns [`StateError`] when storage cannot satisfy the recurrent allocation.
     fn allocate_recurrent(
         &mut self,
         spec: RecurrentStateSpec,
         location: StateLocation,
     ) -> Result<RecurrentState, StateError>;
 
-    /// Commit a model-defined transition for all state families in one prefix
-    /// boundary and return the manager-issued handles for that boundary.
-    ///
     /// # Errors
     ///
-    /// Returns [`StateError`] when the transition cannot be committed or the
-    /// resulting families cannot share one position and placement.
+    /// Returns [`StateError`] when the state transition cannot be committed.
     fn commit(
         &mut self,
-        state: HybridStateSet,
+        state: InferenceStateSet,
         token_position: u32,
-    ) -> Result<HybridStateSet, StateError>;
+    ) -> Result<InferenceStateSet, StateError>;
 
     /// # Errors
     ///
-    /// Returns [`StateError::InvalidHandle`] when the handle is unknown or was
-    /// already released.
+    /// Returns [`StateError::InvalidHandle`] when the handle is unknown or was released.
     fn release(&mut self, handle: StateHandle) -> Result<(), StateError>;
 }
