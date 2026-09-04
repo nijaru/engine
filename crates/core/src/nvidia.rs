@@ -62,12 +62,12 @@ impl<D> NvidiaBackend<D> {
     }
 
     fn allocate_submission(&mut self) -> Result<BackendSubmissionId, BackendError> {
-        let id = BackendSubmissionId::new(self.next_submission)
-            .ok_or_else(|| BackendError::ExecutionFailed("submission identity overflowed".to_owned()))?;
-        self.next_submission = self
-            .next_submission
-            .checked_add(1)
-            .ok_or_else(|| BackendError::ExecutionFailed("submission identity overflowed".to_owned()))?;
+        let id = BackendSubmissionId::new(self.next_submission).ok_or_else(|| {
+            BackendError::ExecutionFailed("submission identity overflowed".to_owned())
+        })?;
+        self.next_submission = self.next_submission.checked_add(1).ok_or_else(|| {
+            BackendError::ExecutionFailed("submission identity overflowed".to_owned())
+        })?;
         Ok(id)
     }
 }
@@ -187,9 +187,7 @@ mod tests {
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");
         let mut state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
-        let submission = backend
-            .submit(&plan, &segment, &mut state)
-            .expect("submit");
+        let submission = backend.submit(&plan, &segment, &mut state).expect("submit");
         let event = backend.wait(submission).expect("completion");
         assert_eq!(event.metrics().elapsed_nanos(), 12);
         assert_eq!(event.policy_version(), policy);
