@@ -126,15 +126,19 @@ fn main() {
         .expect("build decode executor");
 
     let prefill_start = Instant::now();
+    let last_prompt_index = PROMPT.len() - 1;
     let mut chosen = 0_u32;
     for (position, token) in PROMPT.iter().enumerate() {
-        chosen = executor
-            .decode_step(
-                &mut state,
-                *token,
-                u32::try_from(position).expect("fits u32"),
-            )
-            .expect("prefill step");
+        let position = u32::try_from(position).expect("fits u32");
+        if usize::try_from(position).expect("position fits usize") == last_prompt_index {
+            chosen = executor
+                .decode_step(&mut state, *token, position)
+                .expect("final prefill step");
+        } else {
+            executor
+                .prefill_step(&mut state, *token, position)
+                .expect("prefill step");
+        }
     }
     stream.synchronize().expect("sync after prefill");
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
