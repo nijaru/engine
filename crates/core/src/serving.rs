@@ -78,7 +78,11 @@ impl RequestProgress {
     ///
     /// Returns [`RequestSlotError::ProgressOverflow`] when counters overflow or
     /// prefill work exceeds the declared prompt length.
-    pub fn record(&mut self, phase: ExecutionPhase, token_count: u32) -> Result<(), RequestSlotError> {
+    pub fn record(
+        &mut self,
+        phase: ExecutionPhase,
+        token_count: u32,
+    ) -> Result<(), RequestSlotError> {
         match phase {
             ExecutionPhase::Prefill => {
                 let next = self
@@ -90,13 +94,16 @@ impl RequestProgress {
                 }
                 self.prompt_processed = next;
             }
-            ExecutionPhase::Decode | ExecutionPhase::SpecVerify => {
+            ExecutionPhase::Decode => {
                 self.generated_tokens = self
                     .generated_tokens
                     .checked_add(token_count)
                     .ok_or(RequestSlotError::ProgressOverflow)?;
             }
-            ExecutionPhase::SpecDraft | ExecutionPhase::Encoder | ExecutionPhase::MoEExpert => {}
+            ExecutionPhase::SpecDraft
+            | ExecutionPhase::SpecVerify
+            | ExecutionPhase::Encoder
+            | ExecutionPhase::MoEExpert => {}
         }
         Ok(())
     }
@@ -149,16 +156,16 @@ impl ActiveRequestSlot {
     pub fn transition(&mut self, next: RequestLifecycle) -> Result<(), RequestSlotError> {
         let valid = matches!(
             (self.lifecycle, next),
-            (RequestLifecycle::Waiting, RequestLifecycle::Runnable)
-                | (RequestLifecycle::Waiting, RequestLifecycle::Cancelled)
-                | (RequestLifecycle::Waiting, RequestLifecycle::Failed)
-                | (RequestLifecycle::Runnable, RequestLifecycle::InFlight(_))
-                | (RequestLifecycle::Runnable, RequestLifecycle::Cancelled)
-                | (RequestLifecycle::Runnable, RequestLifecycle::Failed)
-                | (RequestLifecycle::InFlight(_), RequestLifecycle::Runnable)
+            (
+                RequestLifecycle::Waiting | RequestLifecycle::InFlight(_),
+                RequestLifecycle::Runnable
+            ) | (
+                RequestLifecycle::Waiting
+                    | RequestLifecycle::Runnable
+                    | RequestLifecycle::InFlight(_),
+                RequestLifecycle::Cancelled | RequestLifecycle::Failed
+            ) | (RequestLifecycle::Runnable, RequestLifecycle::InFlight(_))
                 | (RequestLifecycle::InFlight(_), RequestLifecycle::Completed)
-                | (RequestLifecycle::InFlight(_), RequestLifecycle::Cancelled)
-                | (RequestLifecycle::InFlight(_), RequestLifecycle::Failed)
         );
         if !valid {
             return Err(RequestSlotError::InvalidTransition);
@@ -203,7 +210,10 @@ struct SlotCell {
 impl RequestSlots {
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.value.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|slot| slot.value.is_some())
+            .count()
     }
 
     #[must_use]
@@ -234,7 +244,8 @@ impl RequestSlots {
         let index = if let Some(index) = self.free.pop() {
             index
         } else {
-            let index = u32::try_from(self.slots.len()).map_err(|_| RequestSlotError::SlotOverflow)?;
+            let index =
+                u32::try_from(self.slots.len()).map_err(|_| RequestSlotError::SlotOverflow)?;
             self.slots.push(SlotCell {
                 generation: 0,
                 value: None,
@@ -322,7 +333,9 @@ impl fmt::Display for RequestSlotError {
             Self::UnknownSlot => f.write_str("request slot is unknown or stale"),
             Self::SlotOverflow => f.write_str("request slot table overflowed"),
             Self::InvalidTransition => f.write_str("request lifecycle transition is invalid"),
-            Self::SubmissionMismatch => f.write_str("completed submission does not own this request"),
+            Self::SubmissionMismatch => {
+                f.write_str("completed submission does not own this request")
+            }
             Self::ProgressOverflow => f.write_str("request progress is invalid or overflowed"),
             Self::RequestStillActive => f.write_str("request slot cannot be removed while active"),
         }
@@ -330,3 +343,23 @@ impl fmt::Display for RequestSlotError {
 }
 
 impl std::error::Error for RequestSlotError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speculative_work_does_not_claim_committed_output() {
+        let mut progress = RequestProgress::new(8);
+        progress.record(ExecutionPhase::Prefill, 8).expect("prefill");
+        progress
+            .record(ExecutionPhase::SpecDraft, 4)
+            .expect("draft");
+        progress
+            .record(ExecutionPhase::SpecVerify, 4)
+            .expect("verify");
+        assert_eq!(progress.generated_tokens(), 0);
+        progress.record(ExecutionPhase::Decode, 1).expect("decode");
+        assert_eq!(progress.generated_tokens(), 1);
+    }
+}
