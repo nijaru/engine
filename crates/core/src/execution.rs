@@ -109,7 +109,7 @@ pub struct ExecutionSegment {
     phase: ExecutionPhase,
     token_count: u32,
     state_position: u32,
-    state_requirements: Vec<StateRequirement>,
+    state_requirements: Arc<[StateRequirement]>,
     token_input: Option<ExecutionTokenInput>,
     sampling: Option<SamplingParams>,
 }
@@ -127,6 +127,41 @@ impl ExecutionSegment {
         token_count: u32,
         state_position: u32,
         state_requirements: Vec<StateRequirement>,
+    ) -> Result<Self, PlanError> {
+        if batch_size != 1 {
+            return Err(PlanError::InvalidSegmentBatchSize);
+        }
+        if token_count == 0 {
+            return Err(PlanError::ZeroWork);
+        }
+        Ok(Self {
+            request,
+            phase,
+            token_count,
+            state_position,
+            state_requirements: state_requirements.into(),
+            token_input: None,
+            sampling: None,
+        })
+    }
+
+    /// Construct a segment over an already shared state-requirement set.
+    ///
+    /// This is the steady-state serving constructor: prepared plans can share
+    /// one immutable requirement array across every request/iteration instead
+    /// of allocating a new `Vec` for each segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanError::InvalidSegmentBatchSize`] unless `batch_size` is
+    /// one or [`PlanError::ZeroWork`] when `token_count` is zero.
+    pub fn new_shared(
+        request: RequestId,
+        phase: ExecutionPhase,
+        batch_size: u32,
+        token_count: u32,
+        state_position: u32,
+        state_requirements: Arc<[StateRequirement]>,
     ) -> Result<Self, PlanError> {
         if batch_size != 1 {
             return Err(PlanError::InvalidSegmentBatchSize);
@@ -297,7 +332,7 @@ pub struct ExecutionPlan {
     device: DeviceId,
     policy_version: PolicyVersion,
     stages: Vec<ExecutionStage>,
-    state_requirements: Vec<StateRequirement>,
+    state_requirements: Arc<[StateRequirement]>,
     weights: WeightBinding,
     residency: ModelResidencyPlan,
     variant: ExecutionVariant,
@@ -330,7 +365,7 @@ impl ExecutionPlan {
             device,
             policy_version,
             stages,
-            state_requirements,
+            state_requirements: state_requirements.into(),
             weights,
             residency,
             variant: ExecutionVariant::baseline(),
@@ -423,6 +458,12 @@ impl ExecutionPlan {
     #[must_use]
     pub fn state_requirements(&self) -> &[StateRequirement] {
         &self.state_requirements
+    }
+
+    /// Clone the immutable prepared state schema without copying its entries.
+    #[must_use]
+    pub fn shared_state_requirements(&self) -> Arc<[StateRequirement]> {
+        Arc::clone(&self.state_requirements)
     }
 
     #[must_use]

@@ -281,13 +281,13 @@ where
         let segments = work
             .iter()
             .map(|item| {
-                let mut segment = ExecutionSegment::new(
+                let mut segment = ExecutionSegment::new_shared(
                     item.request(),
                     item.phase(),
                     1,
                     item.token_count(),
                     item.state_position(),
-                    self.plan.state_requirements().to_vec(),
+                    self.plan.shared_state_requirements(),
                 )?;
                 match item.phase() {
                     crate::execution::ExecutionPhase::Prefill => {
