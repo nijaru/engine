@@ -34,8 +34,12 @@ jobs:
               'self.validate_completion(submission, &work, event, &states)?;'
           )
           text = text.replace(
-              '.complete_submission(submission, batch_event(&work), vec![state(), state()])',
-              '.complete_submission(submission, &batch_event(&work), vec![state(), state()])'
+              '                batch_event(&work),',
+              '                &batch_event(&work),'
+          )
+          text = text.replace(
+              'scheduler.complete_submission(submission, wrong, vec![state()])',
+              'scheduler.complete_submission(submission, &wrong, vec![state()])'
           )
           scheduler.write_text(text)
 
