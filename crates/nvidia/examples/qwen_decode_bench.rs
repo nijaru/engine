@@ -31,7 +31,7 @@ const EPS: f32 = 1.0e-6;
 #[allow(clippy::too_many_lines, reason = "one linear bench script")]
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let token_count = args
+    let token_count: u32 = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--tokens="))
         .map_or(64, |value| {
@@ -144,14 +144,13 @@ fn main() {
         prefill_seconds / f64::from(u32::try_from(PROMPT.len()).expect("fits u32"))
     );
 
-    #[allow(clippy::cast_precision_loss, reason = "token counts are tiny")]
-    let tokens_f64 = token_count as f64;
+    let tokens_f64 = f64::from(token_count);
     let decode_start = Instant::now();
     let mut next_token = chosen;
     let first_decode_position = u32::try_from(PROMPT.len()).expect("prompt length fits u32");
     for step in 0..token_count {
         let position = first_decode_position
-            .checked_add(u32::try_from(step).expect("decode length fits u32"))
+            .checked_add(step)
             .expect("decode position fits u32");
         next_token = executor
             .decode_step(&mut state, next_token, position)
