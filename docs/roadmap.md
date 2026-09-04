@@ -31,7 +31,7 @@ Phase 3 proves a correct native execution path. It does not establish a competit
 
 ## Phase 4 — runtime and serving foundation
 
-The pre-scheduler architecture correction is complete. Core interfaces no longer encode the Phase-3 Qwen state bundle, and the serving/runtime foundation now has stable request-slot, residency, qualification, readiness, and submission/completion contracts.
+The architecture correction and first correctness serving loop are now in place. Core interfaces do not encode the Phase-3 Qwen state bundle, and the same runtime can drive persistent scheduled requests through the CUDA Qwen executor and expose committed output to a frontend.
 
 The RTX 4090 remains the available local qualification machine, not a long-term architecture target.
 
@@ -44,6 +44,7 @@ The RTX 4090 remains the available local qualification machine, not a long-term 
 - Temporary core `HybridState*` compatibility aliases and NVIDIA callers were migrated.
 - Execution variants carry explicit qualified/experimental/incompatible status.
 - Runtime startup has explicit readiness states.
+- Qwen recurrent state now describes actual persistent matrix-bank and convolution-history storage rather than model projection-head geometry.
 
 ### 4B — persistent request/runtime foundation — complete
 
@@ -52,20 +53,28 @@ The RTX 4090 remains the available local qualification machine, not a long-term 
 - Persistent request progress and inference-state ownership.
 - Submission identity prevents a completion from updating the wrong request.
 - Core execution uses submit/poll completion semantics; logical state commits only after completion.
+- Backend physical state is keyed by stable logical state identity and explicitly released before logical reclamation.
 
-These are contracts and data structures, not yet a complete serving scheduler.
+### 4C — scheduler and serving loop — in progress
 
-### 4C — scheduler and async serving loop — next
+Implemented correctness foundation:
 
-- Integrate admission and `RequestSlots` into one deterministic scheduler loop.
-- Maintain ready/runnable/in-flight sets without rebuilding request metadata each iteration.
-- Schedule under explicit token/work budgets.
-- Prioritize latency-sensitive decode according to policy and fill remaining budget with chunked prefill.
-- Poll completions while preparing later work; do not introduce a mandatory per-step host/device synchronization point.
-- Make cancellation, failure, completion, and state/resource reclamation complete and testable at every lifecycle state.
+- Deterministic admission and persistent runnable/in-flight/terminal bookkeeping.
+- Explicit token budgets with decode priority and chunked prefill.
+- Multi-request `ExecutionBatch` submission through the backend boundary.
+- Prompt/decode token-input ownership across iterations.
+- Committed generated-token delivery separate from next-decode-input state.
+- Cancellation of an in-flight request waits for backend completion, suppresses its output, and does not cancel peers in the same submission.
+- Submission failure, completion, terminal reclamation, logical-state release, and physical CUDA-state release are tested lifecycle paths.
+- The Qwen CUDA serving dispatcher preserves the scheduler's whole-batch boundary and persistent physical state.
+
+Still required before 4C is complete:
+
+- Replace the current sequential batch-1 CUDA compatibility execution with a native batched path where measurements justify it.
+- Replace synchronous CUDA completion behavior with genuinely asynchronous submission/completion; no mandatory host synchronization should remain in the steady-state token loop.
 - Reuse/preallocate batch metadata and device-side step buffers where measurements justify it.
-- Replace the current synchronous NVIDIA compatibility-dispatch behavior with genuinely asynchronous CUDA submission when the serving loop can consume it.
 - Benchmark scheduler CPU overhead, TTFT, ITL, tail latency, and throughput against matched incumbents.
+- Qualify failure/cancellation behavior on the real asynchronous CUDA path, not only the current correctness dispatcher.
 
 ### 4D — state paging and exact reuse
 
@@ -77,11 +86,14 @@ These are contracts and data structures, not yet a complete serving scheduler.
 
 ### 4E — minimal serving surface
 
-- Serve the same runtime used by direct/local inference.
-- Streaming request/response lifecycle with cancellation and backpressure.
+A direct local Qwen command now exercises tokenizer → scheduler → CUDA runtime → generated-token delivery → detokenizer over the same serving runtime. It is a correctness/qualification frontend, not completion of the network serving surface.
+
+Remaining work:
+
+- Streaming request/response lifecycle with cancellation and bounded backpressure.
 - OpenAI-compatible surface where useful without coupling core semantics to that protocol.
-- Tokenization/detokenization and chat-template work stays outside the device hot path and is bounded under load.
-- Readiness reflects required preparation/warmup rather than process liveness.
+- Keep tokenization/detokenization and chat-template work outside the device hot path and bounded under load.
+- Readiness must reflect required preparation/warmup rather than process liveness.
 
 ## Phase 5 — performance system
 
