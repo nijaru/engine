@@ -421,6 +421,7 @@ mod tests {
             crate::request::RequestId::new(1).expect("request ID"),
             ExecutionPhase::Decode,
             1,
+            1,
             0,
             vec![requirement],
         )
