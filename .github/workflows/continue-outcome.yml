@@ -1,0 +1,38 @@
+name: Continue Backend Outcome
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/continue-outcome.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Apply backend outcome boundary
+        run: python .github/continue_outcome.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: CUDA feature clippy
+        run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - name: Commit changes and remove one-shot files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/continue_outcome.py .github/workflows/continue-outcome.yml
+          git add crates
+          git commit -m "Carry backend execution outcomes through NVIDIA dispatch"
+          git push origin HEAD:main
