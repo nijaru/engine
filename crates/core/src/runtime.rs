@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::backend::{BackendError, ComputeBackend};
+use crate::backend::{BackendError, BackendSubmissionId, ComputeBackend};
 use crate::execution::{ExecutionEvent, ExecutionPlan, ExecutionSegment};
 use crate::model::{ModelError, ModelProvider};
 use crate::state::{InferenceStateSet, StateError, StateManager};
@@ -11,6 +11,43 @@ pub struct ExecutionRuntime<P, B, S> {
     provider: P,
     backend: B,
     state_manager: S,
+}
+
+#[derive(Debug)]
+pub struct RuntimeSubmission {
+    backend_submission: BackendSubmissionId,
+    state: Option<InferenceStateSet>,
+    next_position: u32,
+}
+
+impl RuntimeSubmission {
+    #[must_use]
+    pub const fn backend_submission(&self) -> BackendSubmissionId {
+        self.backend_submission
+    }
+}
+
+#[derive(Debug)]
+pub struct CompletedExecution {
+    event: ExecutionEvent,
+    state: InferenceStateSet,
+}
+
+impl CompletedExecution {
+    #[must_use]
+    pub const fn event(&self) -> ExecutionEvent {
+        self.event
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &InferenceStateSet {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ExecutionEvent, InferenceStateSet) {
+        (self.event, self.state)
+    }
 }
 
 impl<P, B, S> ExecutionRuntime<P, B, S>
@@ -53,24 +90,88 @@ where
         &mut self.state_manager
     }
 
+    /// Submit one execution segment without committing its logical prefix
+    /// transition until the backend reports completion.
+    ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] when model validation, backend dispatch, state
-    /// commitment, or position arithmetic fails.
-    pub fn execute_segment(
+    /// Returns [`RuntimeError`] when model validation, position arithmetic, or
+    /// backend submission fails.
+    pub fn submit_segment(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         mut state: InferenceStateSet,
-    ) -> Result<(ExecutionEvent, InferenceStateSet), RuntimeError> {
+    ) -> Result<RuntimeSubmission, RuntimeError> {
         self.provider.validate_plan(plan)?;
         let next_position = segment
             .state_position()
             .checked_add(segment.token_count())
             .ok_or(RuntimeError::PositionOverflow)?;
-        let event = self.backend.execute(plan, segment, &mut state)?;
-        let committed = self.state_manager.commit(state, next_position)?;
-        Ok((event, committed))
+        let backend_submission = self.backend.submit(plan, segment, &mut state)?;
+        Ok(RuntimeSubmission {
+            backend_submission,
+            state: Some(state),
+            next_position,
+        })
+    }
+
+    /// Poll a submitted segment. The logical state manager commits the new
+    /// prefix position only after device/backend completion is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when completion polling or state commitment
+    /// fails, or when a completed submission is consumed twice.
+    pub fn poll_submission(
+        &mut self,
+        submission: &mut RuntimeSubmission,
+    ) -> Result<Option<CompletedExecution>, RuntimeError> {
+        let Some(event) = self.backend.poll(submission.backend_submission)? else {
+            return Ok(None);
+        };
+        let state = submission
+            .state
+            .take()
+            .ok_or(RuntimeError::SubmissionConsumed)?;
+        let state = self.state_manager.commit(state, submission.next_position)?;
+        Ok(Some(CompletedExecution { event, state }))
+    }
+
+    /// Wait for a submitted segment and commit its logical state transition.
+    /// This is useful for direct/local inference and tests; serving loops can
+    /// poll multiple submissions while preparing later work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] from completion or state commitment.
+    pub fn wait_submission(
+        &mut self,
+        mut submission: RuntimeSubmission,
+    ) -> Result<CompletedExecution, RuntimeError> {
+        loop {
+            if let Some(completed) = self.poll_submission(&mut submission)? {
+                return Ok(completed);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Submit and wait synchronously. This preserves the simple direct
+    /// inference path without making synchronous execution the serving-loop
+    /// architecture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] from submission, completion, or state commit.
+    pub fn execute_segment(
+        &mut self,
+        plan: &ExecutionPlan,
+        segment: &ExecutionSegment,
+        state: InferenceStateSet,
+    ) -> Result<(ExecutionEvent, InferenceStateSet), RuntimeError> {
+        let submission = self.submit_segment(plan, segment, state)?;
+        Ok(self.wait_submission(submission)?.into_parts())
     }
 }
 
@@ -80,6 +181,7 @@ pub enum RuntimeError {
     Backend(BackendError),
     State(StateError),
     PositionOverflow,
+    SubmissionConsumed,
 }
 
 impl fmt::Display for RuntimeError {
@@ -89,6 +191,7 @@ impl fmt::Display for RuntimeError {
             Self::Backend(error) => write!(f, "backend execution failed: {error}"),
             Self::State(error) => write!(f, "state commitment failed: {error}"),
             Self::PositionOverflow => f.write_str("execution position overflowed"),
+            Self::SubmissionConsumed => f.write_str("runtime submission was already consumed"),
         }
     }
 }
@@ -157,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_commits_state_after_backend_success() {
+    fn execution_commits_state_only_after_completion() {
         let device = DeviceId::new(0);
         let model = ModelId::new("test-model").expect("model ID");
         let requirement = StateRequirement::FullAttentionKv(
@@ -218,10 +321,15 @@ mod tests {
         let mut runtime =
             ExecutionRuntime::new(TestProvider { description }, backend, state_manager);
 
-        let (event, committed) = runtime
-            .execute_segment(&plan, &segment, state)
-            .expect("execution");
-        assert_eq!(event.metrics().elapsed_nanos(), 20);
-        assert_eq!(committed.token_position(), Some(1));
+        let submission = runtime
+            .submit_segment(&plan, &segment, state)
+            .expect("submission");
+        assert_eq!(
+            runtime.state_manager().used_bytes(StateLocation::Device(device)),
+            Some(8)
+        );
+        let completed = runtime.wait_submission(submission).expect("completion");
+        assert_eq!(completed.event().metrics().elapsed_nanos(), 20);
+        assert_eq!(completed.state().token_position(), Some(1));
     }
 }
