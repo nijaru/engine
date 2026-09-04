@@ -190,9 +190,12 @@ impl ActiveRequestSlot {
     pub fn request_cancel(&mut self) -> Result<(), RequestSlotError> {
         self.lifecycle = match self.lifecycle {
             RequestLifecycle::Waiting | RequestLifecycle::Runnable => RequestLifecycle::Cancelled,
-            RequestLifecycle::InFlight(submission) => RequestLifecycle::Cancelling(submission),
-            RequestLifecycle::Cancelling(submission) => RequestLifecycle::Cancelling(submission),
-            RequestLifecycle::Completed | RequestLifecycle::Cancelled | RequestLifecycle::Failed => {
+            RequestLifecycle::InFlight(submission) | RequestLifecycle::Cancelling(submission) => {
+                RequestLifecycle::Cancelling(submission)
+            }
+            RequestLifecycle::Completed
+            | RequestLifecycle::Cancelled
+            | RequestLifecycle::Failed => {
                 return Err(RequestSlotError::InvalidTransition);
             }
         };
