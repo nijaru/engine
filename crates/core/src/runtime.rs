@@ -1,15 +1,11 @@
 //! Stateful execution orchestration shared by local and serving frontends.
-//!
-//! This layer intentionally stops at the backend dispatcher: tokenization,
-//! model kernels, and CUDA runtime calls belong to provider/backend
-//! implementations rather than being simulated by the core.
 
 use std::fmt;
 
 use crate::backend::{BackendError, ComputeBackend};
 use crate::execution::{ExecutionEvent, ExecutionPlan, ExecutionSegment};
 use crate::model::{ModelError, ModelProvider};
-use crate::state::{HybridStateSet, StateError, StateManager};
+use crate::state::{InferenceStateSet, StateError, StateManager};
 
 pub struct ExecutionRuntime<P, B, S> {
     provider: P,
@@ -33,37 +29,20 @@ where
     }
 
     #[must_use]
-    pub const fn provider(&self) -> &P {
-        &self.provider
-    }
+    pub const fn provider(&self) -> &P { &self.provider }
 
     #[must_use]
-    pub const fn backend(&self) -> &B {
-        &self.backend
-    }
+    pub const fn backend(&self) -> &B { &self.backend }
 
     #[must_use]
-    pub const fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
-    }
+    pub const fn backend_mut(&mut self) -> &mut B { &mut self.backend }
 
     #[must_use]
-    pub const fn state_manager(&self) -> &S {
-        &self.state_manager
-    }
+    pub const fn state_manager(&self) -> &S { &self.state_manager }
 
     #[must_use]
-    pub const fn state_manager_mut(&mut self) -> &mut S {
-        &mut self.state_manager
-    }
+    pub const fn state_manager_mut(&mut self) -> &mut S { &mut self.state_manager }
 
-    /// Validate the provider/plan boundary, execute one bounded segment, and
-    /// commit the resulting prefix boundary through the state manager.
-    ///
-    /// The segment's `state_position` is the input prefix position; its token
-    /// count advances the committed boundary. The backend must provide the
-    /// actual execution metrics before this method reports success.
-    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError`] when model validation, backend dispatch, state
@@ -72,8 +51,8 @@ where
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
-        mut state: HybridStateSet,
-    ) -> Result<(ExecutionEvent, HybridStateSet), RuntimeError> {
+        mut state: InferenceStateSet,
+    ) -> Result<(ExecutionEvent, InferenceStateSet), RuntimeError> {
         self.provider.validate_plan(plan)?;
         let next_position = segment
             .state_position()
@@ -107,21 +86,15 @@ impl fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 impl From<ModelError> for RuntimeError {
-    fn from(error: ModelError) -> Self {
-        Self::Model(error)
-    }
+    fn from(error: ModelError) -> Self { Self::Model(error) }
 }
 
 impl From<BackendError> for RuntimeError {
-    fn from(error: BackendError) -> Self {
-        Self::Backend(error)
-    }
+    fn from(error: BackendError) -> Self { Self::Backend(error) }
 }
 
 impl From<StateError> for RuntimeError {
-    fn from(error: StateError) -> Self {
-        Self::State(error)
-    }
+    fn from(error: StateError) -> Self { Self::State(error) }
 }
 
 #[cfg(test)]
@@ -137,20 +110,18 @@ mod tests {
     use crate::nvidia::{NvidiaBackend, NvidiaDispatcher};
     use crate::policy::PolicyVersion;
     use crate::state::{
-        HybridStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
+        InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
         StateRequirement,
     };
     use crate::tensor::{DataType, Quantization, WeightFormat};
-    use crate::weights::WeightBinding;
+    use crate::weights::{WeightBinding, WeightDescription as _};
 
     struct TestProvider {
         description: ModelDescription,
     }
 
     impl ModelProvider for TestProvider {
-        fn description(&self) -> &ModelDescription {
-            &self.description
-        }
+        fn description(&self) -> &ModelDescription { &self.description }
     }
 
     struct TestDispatcher;
@@ -161,7 +132,7 @@ mod tests {
             _plan: &ExecutionPlan,
             _segment: &ExecutionSegment,
             _weights: &WeightBinding,
-            _state: &mut HybridStateSet,
+            _state: &mut InferenceStateSet,
         ) -> Result<ExecutionMetrics, BackendError> {
             Ok(ExecutionMetrics::new(20, 0, 0))
         }
@@ -183,7 +154,7 @@ mod tests {
             )],
             vec![requirement],
             ModelCapabilities::new(None, false),
-            WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
+            crate::model::WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
         )
         .expect("model description");
         let backend_id = BackendId::new("cuda").expect("backend ID");
@@ -220,15 +191,12 @@ mod tests {
         let mut state_manager = LogicalStateManager::new(device, 1024, 0);
         let kv_spec = match requirement {
             StateRequirement::FullAttentionKv(spec) => spec,
-            // The fixture builder above only produces the KV requirement.
-            StateRequirement::Recurrent(_) => {
-                unimplemented!("test fixtures only exercise the full-attention KV requirement")
-            }
+            StateRequirement::Recurrent(_) => unreachable!(),
         };
         let kv = state_manager
             .allocate_kv(kv_spec, StateLocation::Device(device))
             .expect("state allocation");
-        let state = HybridStateSet::try_new(Some(kv), None).expect("state set");
+        let state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
         let mut runtime =
             ExecutionRuntime::new(TestProvider { description }, backend, state_manager);
 
