@@ -47,11 +47,7 @@ impl ExecutionTokenInput {
     ///
     /// Returns [`PlanError::InvalidTokenInput`] when the range is empty,
     /// overflows, or falls outside the shared prompt buffer.
-    pub fn prompt(
-        tokens: Arc<[u32]>,
-        start: u32,
-        token_count: u32,
-    ) -> Result<Self, PlanError> {
+    pub fn prompt(tokens: Arc<[u32]>, start: u32, token_count: u32) -> Result<Self, PlanError> {
         if token_count == 0 {
             return Err(PlanError::InvalidTokenInput);
         }

@@ -2,9 +2,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::backend::{BackendSubmissionId, ComputeBackend};
-use crate::execution::{ExecutionBatch, ExecutionPlan, ExecutionSegment, PlanError};
+use crate::execution::{
+    ExecutionBatch, ExecutionPlan, ExecutionSegment, ExecutionTokenInput, PlanError,
+};
 use crate::model::ModelProvider;
 use crate::request::{RequestId, RequestSpec};
 use crate::runtime::{ExecutionRuntime, RuntimeError, RuntimeSubmission};
@@ -17,6 +20,8 @@ pub struct ServingRuntime<P, B, S> {
     runtime: ExecutionRuntime<P, B, S>,
     plan: ExecutionPlan,
     submissions: HashMap<BackendSubmissionId, RuntimeSubmission>,
+    prompt_tokens: HashMap<RequestId, Arc<[u32]>>,
+    next_tokens: HashMap<RequestId, u32>,
 }
 
 impl<P, B, S> ServingRuntime<P, B, S>
@@ -42,6 +47,8 @@ where
             runtime,
             plan,
             submissions: HashMap::new(),
+            prompt_tokens: HashMap::new(),
+            next_tokens: HashMap::new(),
         })
     }
 
@@ -77,9 +84,17 @@ where
         &mut self,
         request: RequestSpec,
         state: InferenceStateSet,
-        prompt_tokens: u32,
+        prompt_tokens: Arc<[u32]>,
     ) -> Result<crate::serving::RequestSlotId, ServingRuntimeError> {
-        Ok(self.scheduler.admit(request, state, prompt_tokens)?)
+        if prompt_tokens.is_empty() {
+            return Err(ServingRuntimeError::InvalidPrompt);
+        }
+        let prompt_len =
+            u32::try_from(prompt_tokens.len()).map_err(|_| ServingRuntimeError::InvalidPrompt)?;
+        let request_id = request.id();
+        let slot = self.scheduler.admit(request, state, prompt_len)?;
+        self.prompt_tokens.insert(request_id, prompt_tokens);
+        Ok(slot)
     }
 
     /// # Errors
@@ -100,7 +115,13 @@ where
     ///
     /// Returns a scheduler error when terminal bookkeeping is inconsistent.
     pub fn reclaim_next(&mut self) -> Result<Option<ActiveRequestSlot>, ServingRuntimeError> {
-        Ok(self.scheduler.reclaim_next()?)
+        let reclaimed = self.scheduler.reclaim_next()?;
+        if let Some(slot) = &reclaimed {
+            let request = slot.request().id();
+            self.prompt_tokens.remove(&request);
+            self.next_tokens.remove(&request);
+        }
+        Ok(reclaimed)
     }
 
     /// Schedule and submit one multi-request batch if runnable work exists.
@@ -159,6 +180,25 @@ where
                 Ok(Some(completed)) => {
                     let (event, states) = completed.into_parts();
                     self.scheduler.complete_submission(id, &event, states)?;
+                    for completed in event.events() {
+                        let request = completed.request();
+                        if let Some(token) = completed.output_token() {
+                            self.next_tokens.insert(request, token);
+                        }
+                        if completed.phase() == crate::execution::ExecutionPhase::Prefill {
+                            let prompt_complete = self
+                                .scheduler
+                                .slot_for_request(request)
+                                .and_then(|slot| self.scheduler.slots().get(slot))
+                                .is_some_and(|slot| {
+                                    slot.progress().prompt_processed()
+                                        == slot.progress().prompt_tokens()
+                                });
+                            if prompt_complete {
+                                self.prompt_tokens.remove(&request);
+                            }
+                        }
+                    }
                     completed_count += 1;
                 }
                 Err(error) => match submission.take_uncommitted_states() {
@@ -202,6 +242,33 @@ where
                     item.state_position(),
                     self.plan.state_requirements().to_vec(),
                 )?;
+                match item.phase() {
+                    crate::execution::ExecutionPhase::Prefill => {
+                        let prompt = self
+                            .prompt_tokens
+                            .get(&item.request())
+                            .ok_or(ServingRuntimeError::PromptMissing(item.request()))?
+                            .clone();
+                        let input = ExecutionTokenInput::prompt(
+                            prompt,
+                            item.state_position(),
+                            item.token_count(),
+                        )?;
+                        segment = segment.with_token_input(input)?;
+                    }
+                    crate::execution::ExecutionPhase::Decode => {
+                        let token = self
+                            .next_tokens
+                            .get(&item.request())
+                            .copied()
+                            .ok_or(ServingRuntimeError::DecodeTokenMissing(item.request()))?;
+                        segment = segment.with_token_input(ExecutionTokenInput::decode(token))?;
+                    }
+                    crate::execution::ExecutionPhase::SpecDraft
+                    | crate::execution::ExecutionPhase::SpecVerify
+                    | crate::execution::ExecutionPhase::Encoder
+                    | crate::execution::ExecutionPhase::MoEExpert => {}
+                }
                 if item.requests_output() {
                     let slot = self
                         .scheduler
@@ -238,6 +305,9 @@ impl ServingIteration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServingRuntimeError {
     PolicyMismatch,
+    InvalidPrompt,
+    PromptMissing(RequestId),
+    DecodeTokenMissing(RequestId),
     SubmissionCollision(BackendSubmissionId),
     SubmissionMissing(BackendSubmissionId),
     Plan(PlanError),
@@ -250,6 +320,23 @@ impl fmt::Display for ServingRuntimeError {
         match self {
             Self::PolicyMismatch => {
                 f.write_str("scheduler and execution plan use different policy versions")
+            }
+            Self::InvalidPrompt => {
+                f.write_str("serving prompt must contain a representable token sequence")
+            }
+            Self::PromptMissing(request) => {
+                write!(
+                    f,
+                    "prompt tokens for request {} are unavailable",
+                    request.get()
+                )
+            }
+            Self::DecodeTokenMissing(request) => {
+                write!(
+                    f,
+                    "next decode token for request {} is unavailable",
+                    request.get()
+                )
             }
             Self::SubmissionCollision(id) => {
                 write!(f, "backend reused live submission identity {}", id.get())
@@ -313,6 +400,7 @@ mod tests {
         capabilities: BackendCapabilities,
         next_submission: u64,
         pending: HashMap<BackendSubmissionId, (u8, ExecutionBatchEvent)>,
+        submitted_inputs: Vec<Vec<ExecutionTokenInput>>,
         fail_submit: bool,
     }
 
@@ -322,6 +410,7 @@ mod tests {
                 capabilities,
                 next_submission: 1,
                 pending: HashMap::new(),
+                submitted_inputs: Vec::new(),
                 fail_submit,
             }
         }
@@ -344,6 +433,18 @@ mod tests {
                     "test submit failure".to_owned(),
                 ));
             }
+            let inputs = batch
+                .segments()
+                .iter()
+                .map(|segment| {
+                    segment.token_input().cloned().ok_or_else(|| {
+                        BackendError::ExecutionFailed(
+                            "test serving segment lacked token input".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.submitted_inputs.push(inputs);
             let id = BackendSubmissionId::new(self.next_submission)
                 .ok_or_else(|| BackendError::ExecutionFailed("submission overflow".to_owned()))?;
             self.next_submission = self
@@ -465,13 +566,21 @@ mod tests {
         InferenceStateSet::new(Vec::new()).expect("state")
     }
 
+    fn prompt(tokens: &[u32]) -> Arc<[u32]> {
+        Arc::from(tokens)
+    }
+
     #[test]
     fn one_runtime_submission_owns_multiple_slots_until_completion() {
         let mut serving = fixture(false);
         let first = RequestId::new(1).expect("request ID");
         let second = RequestId::new(2).expect("request ID");
-        serving.admit(request(1), state(), 0).expect("first");
-        serving.admit(request(2), state(), 0).expect("second");
+        serving
+            .admit(request(1), state(), prompt(&[11]))
+            .expect("first");
+        serving
+            .admit(request(2), state(), prompt(&[12]))
+            .expect("second");
 
         let submission = serving
             .submit_ready_batch()
@@ -502,11 +611,37 @@ mod tests {
     }
 
     #[test]
+    fn sampled_prefill_token_becomes_the_next_decode_input() {
+        let mut serving = fixture(false);
+        serving
+            .admit(request(1), state(), prompt(&[11, 12]))
+            .expect("request");
+
+        serving.submit_ready_batch().expect("prefill submit");
+        assert_eq!(
+            serving.runtime().backend().submitted_inputs[0][0].prompt_slice(),
+            Some(&[11, 12][..])
+        );
+        assert_eq!(serving.poll_completions().expect("pending poll"), 0);
+        assert_eq!(serving.poll_completions().expect("prefill completion"), 1);
+
+        serving.submit_ready_batch().expect("decode submit");
+        assert_eq!(
+            serving.runtime().backend().submitted_inputs[1][0].decode_token(),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn cancelling_one_request_does_not_cancel_peer_in_same_submission() {
         let mut serving = fixture(false);
         let first = RequestId::new(1).expect("request ID");
-        serving.admit(request(1), state(), 0).expect("first");
-        serving.admit(request(2), state(), 0).expect("second");
+        serving
+            .admit(request(1), state(), prompt(&[11]))
+            .expect("first");
+        serving
+            .admit(request(2), state(), prompt(&[12]))
+            .expect("second");
         serving.submit_ready_batch().expect("submit");
         serving.cancel(first).expect("cancel");
         serving.poll_completions().expect("pending poll");
@@ -518,8 +653,12 @@ mod tests {
     #[test]
     fn failed_backend_submit_restores_states_before_terminalizing() {
         let mut serving = fixture(true);
-        serving.admit(request(1), state(), 0).expect("first");
-        serving.admit(request(2), state(), 0).expect("second");
+        serving
+            .admit(request(1), state(), prompt(&[11]))
+            .expect("first");
+        serving
+            .admit(request(2), state(), prompt(&[12]))
+            .expect("second");
         assert!(matches!(
             serving.submit_ready_batch(),
             Err(ServingRuntimeError::Runtime(RuntimeError::Backend(_)))

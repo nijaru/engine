@@ -30,7 +30,7 @@ pub use backend::{
 pub use device::DeviceId;
 pub use execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPhase,
-    ExecutionPlan, ExecutionSegment, ExecutionStage, PlanError,
+    ExecutionPlan, ExecutionSegment, ExecutionStage, ExecutionTokenInput, PlanError,
 };
 pub use model::{
     FileModelProvider, FileWeightLoader, ModelCapabilities, ModelDescription, ModelError, ModelId,
