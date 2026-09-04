@@ -155,10 +155,7 @@ impl CudaQwen35ServingDispatcher {
         })
     }
 
-    fn finish_synchronous<T>(
-        &self,
-        result: Result<T, BackendError>,
-    ) -> Result<T, BackendError> {
+    fn finish_synchronous<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
         match (result, self.synchronize_completion()) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),

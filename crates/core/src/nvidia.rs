@@ -240,13 +240,9 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
     ) -> Result<BackendSubmissionId, BackendError> {
         self.validate_execution(plan, batch, states)?;
         let submission = self.allocate_submission()?;
-        let result = self.dispatcher.submit_batch(
-            submission,
-            plan,
-            batch,
-            plan.weights(),
-            states,
-        )?;
+        let result =
+            self.dispatcher
+                .submit_batch(submission, plan, batch, plan.weights(), states)?;
         match result {
             Some(outcomes) => {
                 let event = completion_event(batch, plan.policy_version(), outcomes)?;
@@ -461,7 +457,14 @@ mod tests {
         }
     }
 
-    fn empty_decode_fixture<D: NvidiaDispatcher>(dispatcher: D) -> (NvidiaBackend<D>, ExecutionPlan, ExecutionBatch, Vec<InferenceStateSet>) {
+    fn empty_decode_fixture<D: NvidiaDispatcher>(
+        dispatcher: D,
+    ) -> (
+        NvidiaBackend<D>,
+        ExecutionPlan,
+        ExecutionBatch,
+        Vec<InferenceStateSet>,
+    ) {
         let device = DeviceId::new(0);
         let backend_id = BackendId::new("cuda").expect("backend ID");
         let capabilities = BackendCapabilities::new(
@@ -689,7 +692,8 @@ mod tests {
 
     #[test]
     fn backend_supports_dispatcher_owned_async_completion() {
-        let (mut backend, plan, batch, mut states) = empty_decode_fixture(AsyncDispatcher::default());
+        let (mut backend, plan, batch, mut states) =
+            empty_decode_fixture(AsyncDispatcher::default());
 
         let submission = backend.submit(&plan, &batch, &mut states).expect("submit");
         assert_eq!(backend.dispatcher().submits, 1);

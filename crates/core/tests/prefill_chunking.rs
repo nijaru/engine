@@ -18,10 +18,7 @@ fn request() -> RequestSpec {
     )
 }
 
-fn completion(
-    work: engine_core::ScheduledWork,
-    output_token: Option<u32>,
-) -> ExecutionBatchEvent {
+fn completion(work: engine_core::ScheduledWork, output_token: Option<u32>) -> ExecutionBatchEvent {
     let event = ExecutionEvent::new(
         work.request(),
         PolicyVersion::new(1).expect("policy version"),
@@ -67,11 +64,7 @@ fn only_the_final_prefill_chunk_requests_an_output_token() {
         .confirm_submission(first.clone(), first_submission)
         .expect("confirm first chunk");
     scheduler
-        .complete_submission(
-            first_submission,
-            &completion(first[0], None),
-            first_states,
-        )
+        .complete_submission(first_submission, &completion(first[0], None), first_states)
         .expect("complete first chunk");
 
     let second = scheduler.schedule().expect("second schedule");
