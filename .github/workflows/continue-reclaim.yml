@@ -20,6 +20,19 @@ jobs:
           components: rustfmt, clippy
       - name: Apply logical state reclamation
         run: python .github/continue_reclaim.py
+      - name: Fix serving error mapping
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('crates/core/src/serving_runtime.rs')
+          s = p.read_text()
+          s = s.replace(
+              '        let state = reclaimed.take_terminal_state()?;\n        self.runtime.release_state_set(&state)?;',
+              '        let state = reclaimed\n            .take_terminal_state()\n            .map_err(SchedulerError::from)?;\n        self.runtime\n            .release_state_set(&state)\n            .map_err(ServingRuntimeError::Runtime)?;',
+              1,
+          )
+          p.write_text(s)
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Test
