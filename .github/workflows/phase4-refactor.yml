@@ -1,0 +1,63 @@
+name: Phase 4 compatibility cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Migrate compatibility names and format
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for name in [
+              "crates/nvidia/src/state.rs",
+              "crates/nvidia/src/cuda.rs",
+              "crates/nvidia/tests/cuda_reference.rs",
+          ]:
+              path = Path(name)
+              text = path.read_text()
+              text = text.replace("HybridStateSet", "InferenceStateSet")
+              path.write_text(text)
+
+          state = Path("crates/core/src/state.rs")
+          text = state.read_text()
+          compatibility = """// Temporary source-compatibility names for the Phase-3 NVIDIA path. Phase-4
+          // scheduler/runtime code should use the generic names above.
+          pub type HybridState = InferenceState;
+          pub type HybridStateSet = InferenceStateSet;
+
+          """
+          if compatibility not in text:
+              raise SystemExit("expected core compatibility alias block was not found")
+          state.write_text(text.replace(compatibility, ""))
+
+          lib = Path("crates/core/src/lib.rs")
+          text = lib.read_text()
+          text = text.replace("HybridState, HybridStateSet, ", "")
+          lib.write_text(text)
+          PY
+          cargo fmt --all
+          git diff --check
+      - name: Commit cleanup
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/core crates/nvidia
+          git commit -m "Complete Phase 4 generic state migration"
+          git push
