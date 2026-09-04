@@ -162,7 +162,7 @@ needle = """        fn dispatch_batch(
                 .collect())
         }
 """
-replacement = needle[:-2] + """
+replacement = needle + """
 
         fn release_inference_state(
             &mut self,
@@ -171,7 +171,6 @@ replacement = needle[:-2] + """
             self.release_calls += 1;
             Ok(())
         }
-    }
 """
 s = replace_once(s, needle, replacement, "batch-aware release implementation")
 marker = """    #[test]
