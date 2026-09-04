@@ -129,14 +129,14 @@ fn main() {
     let last_prompt_index = PROMPT.len() - 1;
     let mut chosen = 0_u32;
     for (position, token) in PROMPT.iter().enumerate() {
-        let position = u32::try_from(position).expect("fits u32");
-        if usize::try_from(position).expect("position fits usize") == last_prompt_index {
+        let position_u32 = u32::try_from(position).expect("fits u32");
+        if position == last_prompt_index {
             chosen = executor
-                .decode_step(&mut state, *token, position)
+                .decode_step(&mut state, *token, position_u32)
                 .expect("final prefill step");
         } else {
             executor
-                .prefill_step(&mut state, *token, position)
+                .prefill_step(&mut state, *token, position_u32)
                 .expect("prefill step");
         }
     }
