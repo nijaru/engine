@@ -1,18 +1,11 @@
 //! NVIDIA backend adapter without a CUDA dependency in the core crate.
-//!
-//! A platform crate supplies [`NvidiaDispatcher`] with actual CUDA kernels or
-//! runtime calls. This adapter owns capability validation and event creation;
-//! it never reports successful work without a dispatcher-provided metric.
 
 use crate::backend::{BackendCapabilities, BackendError, BackendKind, ComputeBackend};
 use crate::execution::{ExecutionEvent, ExecutionMetrics, ExecutionPlan, ExecutionSegment};
-use crate::state::HybridStateSet;
+use crate::state::InferenceStateSet;
 use crate::weights::WeightBinding;
 
 pub trait NvidiaDispatcher: Send {
-    /// Dispatch one already validated segment and return measured execution
-    /// metrics. The dispatcher may update backend-owned state through `state`.
-    ///
     /// # Errors
     ///
     /// Returns a backend error when CUDA dispatch or state mutation fails.
@@ -21,13 +14,10 @@ pub trait NvidiaDispatcher: Send {
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         weights: &WeightBinding,
-        state: &mut HybridStateSet,
+        state: &mut InferenceStateSet,
     ) -> Result<ExecutionMetrics, BackendError>;
 }
 
-/// Capability-checked NVIDIA execution adapter. CUDA initialization and kernel
-/// ownership stay in the injected dispatcher so `engine-core` remains
-/// dependency-free and testable on non-NVIDIA hosts.
 pub struct NvidiaBackend<D> {
     capabilities: BackendCapabilities,
     dispatcher: D,
@@ -49,19 +39,13 @@ impl<D> NvidiaBackend<D> {
     }
 
     #[must_use]
-    pub fn dispatcher(&self) -> &D {
-        &self.dispatcher
-    }
+    pub fn dispatcher(&self) -> &D { &self.dispatcher }
 
     #[must_use]
-    pub fn dispatcher_mut(&mut self) -> &mut D {
-        &mut self.dispatcher
-    }
+    pub fn dispatcher_mut(&mut self) -> &mut D { &mut self.dispatcher }
 
     #[must_use]
-    pub fn into_dispatcher(self) -> D {
-        self.dispatcher
-    }
+    pub fn into_dispatcher(self) -> D { self.dispatcher }
 }
 
 impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
@@ -73,7 +57,7 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
-        state: &mut HybridStateSet,
+        state: &mut InferenceStateSet,
     ) -> Result<ExecutionEvent, BackendError> {
         self.validate_execution(plan, segment, state)?;
         let metrics = self
@@ -100,7 +84,7 @@ mod tests {
     use crate::policy::PolicyVersion;
     use crate::request::RequestId;
     use crate::state::{
-        HybridStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
+        InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
         StateRequirement,
     };
     use crate::tensor::{DataType, Quantization};
@@ -113,7 +97,7 @@ mod tests {
             _plan: &ExecutionPlan,
             _segment: &ExecutionSegment,
             _weights: &WeightBinding,
-            _state: &mut HybridStateSet,
+            _state: &mut InferenceStateSet,
         ) -> Result<ExecutionMetrics, BackendError> {
             Ok(ExecutionMetrics::new(12, 4, 8))
         }
@@ -159,16 +143,13 @@ mod tests {
                 .expect("segment");
         let spec = match requirement {
             StateRequirement::FullAttentionKv(spec) => spec,
-            // The fixture builder above only produces the KV requirement.
-            StateRequirement::Recurrent(_) => {
-                unimplemented!("test fixtures only exercise the full-attention KV requirement")
-            }
+            StateRequirement::Recurrent(_) => unreachable!(),
         };
         let mut manager = LogicalStateManager::new(device, 1024, 0);
         let kv = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");
-        let mut state = HybridStateSet::try_new(Some(kv), None).expect("state set");
+        let mut state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
         let event = backend
             .execute(&plan, &segment, &mut state)
             .expect("dispatch");
