@@ -3471,6 +3471,12 @@ fn stage_full_text_path(
     )
 }
 
+/// A fresh empty state set used only as a swap placeholder while a completed
+/// state set is committed through its manager.
+fn placeholder_state() -> InferenceStateSet {
+    InferenceStateSet::new(Vec::new()).expect("empty state set")
+}
+
 /// Asynchronous Qwen serving parity: the one-stream async dispatcher must
 /// produce the same greedy tokens as the eager reference path from identical
 /// fresh state, through the real `NvidiaBackend` submit/poll seam.
@@ -3555,33 +3561,27 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     )
     .expect("plan");
 
-    let allocate_states = |manager: &mut LogicalStateManager| {
-        (0..2)
-            .map(|_| {
-                let states = state_requirements
-                    .iter()
-                    .map(|requirement| match *requirement {
-                        StateRequirement::FullAttentionKv(spec) => manager
-                            .allocate_kv(spec, StateLocation::Device(device))
-                            .map(InferenceState::from),
-                        StateRequirement::Recurrent(spec) => manager
-                            .allocate_recurrent(spec, StateLocation::Device(device))
-                            .map(InferenceState::from),
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("allocate state");
-                InferenceStateSet::new(states).expect("state set")
+    let allocate_state = |manager: &mut LogicalStateManager| {
+        let states = state_requirements
+            .iter()
+            .map(|requirement| match *requirement {
+                StateRequirement::FullAttentionKv(spec) => manager
+                    .allocate_kv(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
+                StateRequirement::Recurrent(spec) => manager
+                    .allocate_recurrent(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("allocate state");
+        InferenceStateSet::new(states).expect("state set")
     };
 
     // Reference: eager dispatcher, driven through the same backend boundary.
-    let mut eager_states = {
-        let mut manager = LogicalStateManager::new(device, state_bytes * 2, 0);
-        let states = allocate_states(&mut manager);
-        std::mem::forget(manager);
-        states
-    };
+    // The logical state manager stays alive so each completed step can commit
+    // its new prefix position, exactly like the serving runtime does.
+    let mut eager_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut eager_state = allocate_state(&mut eager_manager);
     let eager_executor = CudaQwen35Decode::new(
         &context,
         stream.clone(),
@@ -3597,12 +3597,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         NvidiaBackend::new(capabilities.clone(), eager_dispatcher).expect("eager backend");
 
     // Async: the new pinned-output completion path.
-    let mut async_states = {
-        let mut manager = LogicalStateManager::new(device, state_bytes * 2, 0);
-        let states = allocate_states(&mut manager);
-        std::mem::forget(manager);
-        states
-    };
+    let mut async_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut async_state = allocate_state(&mut async_manager);
     let async_executor = CudaQwen35Decode::new(
         &context,
         stream.clone(),
@@ -3624,7 +3620,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     let greedy = SamplingParams::greedy(None);
 
     let run_one_step = |backend: &mut NvidiaBackend<CudaQwen35ServingDispatcher>,
-                        states: &mut Vec<InferenceStateSet>,
+                        manager: &mut LogicalStateManager,
+                        state: &mut InferenceStateSet,
                         phase: ExecutionPhase,
                         tokens: Arc<[u32]>,
                         position: u32,
@@ -3644,12 +3641,20 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
             segment = segment.with_sampling(greedy);
         }
         let batch = ExecutionBatch::new(vec![segment]).expect("batch");
-        let submission = backend.submit(&plan, &batch, states).expect("submit");
+        let submission = backend
+            .submit(&plan, &batch, std::slice::from_mut(state))
+            .expect("submit");
         let deadline = Duration::from_secs(120);
         let started = std::time::Instant::now();
         loop {
             match backend.poll(submission) {
                 Ok(Some(event)) => {
+                    // Commit the advanced prefix position through the state
+                    // manager, mirroring the serving runtime's completion.
+                    let committed = manager
+                        .commit(std::mem::replace(state, placeholder_state()), position + 1)
+                        .expect("commit position");
+                    *state = committed;
                     return event
                         .events()
                         .first()
@@ -3678,7 +3683,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         let sample = offset + 1 == PROMPT.len();
         let eager_token = run_one_step(
             &mut eager_backend,
-            &mut eager_states,
+            &mut eager_manager,
+            &mut eager_state,
             ExecutionPhase::Prefill,
             Arc::from([token]),
             eager_position,
@@ -3686,7 +3692,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         );
         let async_token = run_one_step(
             &mut async_backend,
-            &mut async_states,
+            &mut async_manager,
+            &mut async_state,
             ExecutionPhase::Prefill,
             Arc::from([token]),
             async_position,
@@ -3715,7 +3722,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     {
         let eager_token = run_one_step(
             &mut eager_backend,
-            &mut eager_states,
+            &mut eager_manager,
+            &mut eager_state,
             ExecutionPhase::Decode,
             Arc::from([fed_eager]),
             eager_position,
@@ -3723,7 +3731,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         );
         let async_token = run_one_step(
             &mut async_backend,
-            &mut async_states,
+            &mut async_manager,
+            &mut async_state,
             ExecutionPhase::Decode,
             Arc::from([fed_async]),
             async_position,
@@ -3745,10 +3754,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
 
     // The async dispatcher must not leak submissions or physical state.
     assert_eq!(async_backend.dispatcher().pending_submissions(), 0);
-    for state in &async_states {
-        async_backend
-            .release_inference_state(state)
-            .expect("release state");
-    }
+    async_backend
+        .release_inference_state(&async_state)
+        .expect("release state");
     assert_eq!(async_backend.dispatcher().state_registry().len(), 0);
 }
