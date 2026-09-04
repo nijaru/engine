@@ -5,9 +5,10 @@
 //! timing prefill and decode separately. Correctness gating lives in the
 //! `decodes_greedy_tokens_matching_llama_server` test; this example only
 //! measures and reports host-driven, batch-1, unoptimized throughput with
-//! explicit caveats. Run on the desktop with:
+//! explicit caveats.
 //!
 //! ```text
+//! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
 //! cargo run --release -p engine-nvidia --features cuda --example qwen_decode_bench -- --tokens=64
 //! ```
 
@@ -24,21 +25,25 @@ use engine_nvidia::{
     CudaHybridState, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource,
 };
 
-const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
 const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 const EPS: f32 = 1.0e-6;
 
 #[allow(clippy::too_many_lines, reason = "one linear bench script")]
 fn main() {
-    let token_count: usize = std::env::args()
-        .nth(1)
-        .as_deref()
-        .and_then(|argument| argument.strip_prefix("--tokens="))
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let token_count = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--tokens="))
         .map_or(64, |value| {
             value.parse().expect("--tokens expects a number")
         });
+    let model_path = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--model=").map(str::to_owned))
+        .or_else(|| std::env::var("ENGINE_QWEN_GGUF").ok())
+        .expect("set ENGINE_QWEN_GGUF or pass --model=/path/to/model.gguf");
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = Qwen35ModelProvider::open(&model_path).expect("open Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
 
@@ -120,7 +125,6 @@ fn main() {
     let mut executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPS)
         .expect("build decode executor");
 
-    // Prefill: host-driven AR loop through the decode path (no chunked prefill yet).
     let prefill_start = Instant::now();
     let mut chosen = 0_u32;
     for (position, token) in PROMPT.iter().enumerate() {
@@ -140,14 +144,17 @@ fn main() {
         prefill_seconds / f64::from(u32::try_from(PROMPT.len()).expect("fits u32"))
     );
 
-    // Decode: greedy continuation, timing per step.
     #[allow(clippy::cast_precision_loss, reason = "token counts are tiny")]
     let tokens_f64 = token_count as f64;
     let decode_start = Instant::now();
-    let mut first_token = chosen;
-    for _ in 0..token_count {
-        first_token = executor
-            .decode_step(&mut state, first_token, 5)
+    let mut next_token = chosen;
+    let first_decode_position = u32::try_from(PROMPT.len()).expect("prompt length fits u32");
+    for step in 0..token_count {
+        let position = first_decode_position
+            .checked_add(u32::try_from(step).expect("decode length fits u32"))
+            .expect("decode position fits u32");
+        next_token = executor
+            .decode_step(&mut state, next_token, position)
             .expect("decode step");
     }
     stream.synchronize().expect("sync after decode");
@@ -165,11 +172,9 @@ fn main() {
     );
 }
 
-/// Rough launch count for one decode step: per-layer GEMV/norm/gate/conv/state
-/// launches plus embedding/FFN/output.
 fn per_step_launches() -> usize {
-    let gdn_layer = 10; // qkv, gate, beta, alpha GEMVs + gate/conv/norms/state/gated/out
-    let attn_layer = 11; // q/k/v GEMVs + norms + rope + append + scores + output + residual
-    let ffn = 5; // post-norm + gate/up GEMVs + silu_mul + down GEMV
+    let gdn_layer = 10;
+    let attn_layer = 11;
+    let ffn = 5;
     48 * (gdn_layer + ffn) + 16 * (attn_layer + ffn) + 4
 }
