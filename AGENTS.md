@@ -1,70 +1,51 @@
-# Engine
+# Engine agent guidance
 
-Rust-first model inference runtime and serving engine. `engine` is a temporary working name.
+Engine is a Rust-first model inference runtime and serving engine. `engine` is a temporary working name.
 
-## Persistent context
+## Repository workflow
 
-Durable project context is centralized at:
+Work directly on `main` unless the maintainer asks for a branch or pull request. Keep commits narrow and leave the tree green.
 
-`~/github/nijaru/agent-context/projects/github.com/nijaru/engine/ai/`
-
-Do not recreate a repository-local `ai/` tree or duplicate product/design/roadmap prose here.
-
-## Current repository workflow
-
-During current private R&D, work directly on `main`. Do not open pull requests unless the user explicitly asks for one.
+If maintainer-local companion context is available, use it for private planning and handoff details, but do not make repository behavior depend on unavailable private files. Public architecture and roadmap decisions belong in `docs/`.
 
 ## Session start
 
-1. Read centralized `brief.md`.
-2. Read `STATUS.md` before making implementation claims.
-3. For the current local implementation continuation, read `HANDOFF.md`.
-4. Read the canonical context file relevant to the task.
-5. Check `git status` before editing.
-6. Keep implementation claims benchmark-backed.
-
-## Context load map
-
-| Task | Read |
-|---|---|
-| Product/architecture/scope | `design/runtime-scope.md`, then `spec.md` |
-| Current local-session continuation | `HANDOFF.md` |
-| Current implementation | `STATUS.md`, then code/tests |
-| Current implementation sequence | `PLAN.md` |
-| Durable choices | `DECISIONS.md` |
-| Origin/product/business strategy | `research/origin-product-and-market-2026-09-01.md` |
-| Benchmark methodology/Qwen3.8 target | `research/benchmark-tooling-2026-09-01.md`, then repository `benchmarks/` |
-| Archon/external orchestration boundary | `design/orchestrator-boundary.md` |
-| Ecosystem/training research | `research/ecosystem-and-adjacent-runtimes-2026-09-01.md` |
+1. Read `README.md`.
+2. Read `docs/architecture.md` and `docs/roadmap.md` for work that changes runtime boundaries or sequencing.
+3. Inspect the code and tests relevant to the task.
+4. Check repository status before editing.
+5. Keep implementation and performance claims evidence-backed.
 
 ## Current first target
 
-- Qwen3.8-27B, text language path first.
-- RTX 4090 is the first performance machine.
-- The user already has an Unsloth Q4 Qwen3.8-27B GGUF running with llama.cpp; inspect and pin that exact local artifact/configuration before selecting another quant or recording benchmarks.
-- Qwen3.8 requires hybrid recurrent/linear-attention state plus full-attention KV state. Do not design a KV-only StateManager.
-- GGUF is an initial local artifact, not a permanent core Engine representation.
+- Qwen3.8-27B, text path first.
+- NVIDIA single-GPU execution is the first implementation path; the RTX 4090 is development and qualification hardware, not an architectural target.
+- The first artifact is a Q4 GGUF used for same-artifact parity against llama.cpp. GGUF is a loader concern, not a required core representation.
+- Qwen3.8 requires recurrent/linear-attention state plus full-attention KV state. Do not design a KV-only runtime boundary.
 
 ## Architecture guardrails
 
-- Engine owns the inference-engine/runtime layer itself: model loading/execution, quantized/local/offline inference, serving, scheduling/batching, model-local state/cache, backends/kernels, profiling/runtime policy, and eventually distributed inference.
-- Engine must remain independently deployable under bare metal, containers, Kubernetes, Slurm, Archon, or another orchestrator.
-- External orchestrators own physical resource allocation, machine placement, fleet health, and datacenter-wide resource policy.
-- Do not import Archon implementation types into Engine core.
-- Keep semantic model/request state distinct from performance policy.
-- Keep the fast request scheduler cheap; planning/autotuning must not become a global optimizer in the token/work hot path.
-- Optimize hardware through backend-specific implementations rather than a lowest-common-denominator core.
-- Do not require every model implementation or every kernel to be Rust.
+- Engine owns inference execution: model loading/execution, quantized/local inference, serving, scheduling/batching, inference state, backends/kernels, profiling/runtime policy, and eventually distributed inference.
+- Engine must remain independently deployable under bare metal, containers, Kubernetes, Slurm, or another orchestrator.
+- External orchestrators own physical resource allocation and fleet policy.
+- Keep semantic request/model state distinct from performance policy.
+- Keep the fast request scheduler cheap. Expensive planning, profiling, and tuning stay off the per-step hot path.
+- Prefer persistent request state, incremental metadata updates, and asynchronous host/device execution over rebuilding work each step.
+- Optimize hardware through backend-specific implementations rather than a lowest-common-denominator backend.
+- Do not require every model implementation or kernel to be Rust.
 - Do not assume all inference state is KV.
-- Do not make GGUF, Python, Mojo/MAX, or another framework a mandatory engine-wide dependency merely because it is useful for one provider/backend.
+- Keep inference state separate from model-residency/weight-placement concerns.
+- Do not make GGUF, Python, CUDA, or another provider/backend technology mandatory in the engine-wide core merely because it is useful for one path.
 - Do not build a general ML compiler, training runtime, or datacenter scheduler as part of the initial engine.
-- Preserve cheap low-level compatibility with a possible future training runtime, but do not distort inference abstractions around hypothetical training requirements.
-- Benchmark before claiming performance, simplicity, or overhead advantages.
+- Optimized execution variants must be correctness-qualified before automatic selection.
+- Benchmark before claiming performance, simplicity, memory, latency, or overhead advantages.
 
-## Initial verification
+## Verification
 
 ```text
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+CUDA-specific checks are run separately on a compatible NVIDIA host.
