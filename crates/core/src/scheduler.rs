@@ -1,10 +1,10 @@
 //! Deterministic request scheduling and admission for the serving runtime.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::backend::BackendSubmissionId;
-use crate::execution::{ExecutionEvent, ExecutionPhase};
+use crate::execution::{ExecutionBatchEvent, ExecutionPhase};
 use crate::policy::PolicySnapshot;
 use crate::request::{RequestId, RequestSpec};
 use crate::serving::{
@@ -106,6 +106,7 @@ impl ScheduledWork {
 pub struct SchedulerCounts {
     waiting: usize,
     runnable: usize,
+    prepared: usize,
     in_flight: usize,
     terminal: usize,
 }
@@ -119,6 +120,11 @@ impl SchedulerCounts {
     #[must_use]
     pub const fn runnable(self) -> usize {
         self.runnable
+    }
+
+    #[must_use]
+    pub const fn prepared(self) -> usize {
+        self.prepared
     }
 
     #[must_use]
@@ -139,7 +145,8 @@ pub struct ServingScheduler {
     slots: RequestSlots,
     waiting: VecDeque<RequestSlotId>,
     runnable: VecDeque<RequestSlotId>,
-    in_flight: HashMap<BackendSubmissionId, ScheduledWork>,
+    prepared: HashMap<RequestSlotId, ScheduledWork>,
+    in_flight: HashMap<BackendSubmissionId, Vec<ScheduledWork>>,
     terminal: VecDeque<RequestSlotId>,
     requests: HashMap<RequestId, RequestSlotId>,
 }
@@ -153,6 +160,7 @@ impl ServingScheduler {
             slots: RequestSlots::default(),
             waiting: VecDeque::new(),
             runnable: VecDeque::new(),
+            prepared: HashMap::new(),
             in_flight: HashMap::new(),
             terminal: VecDeque::new(),
             requests: HashMap::new(),
@@ -179,7 +187,8 @@ impl ServingScheduler {
         SchedulerCounts {
             waiting: self.waiting.len(),
             runnable: self.runnable.len(),
-            in_flight: self.in_flight.len(),
+            prepared: self.prepared.len(),
+            in_flight: self.in_flight_request_count(),
             terminal: self.terminal.len(),
         }
     }
@@ -189,8 +198,6 @@ impl ServingScheduler {
         self.requests.get(&request).copied()
     }
 
-    /// Admit one request into scheduler-owned persistent state.
-    ///
     /// # Errors
     ///
     /// Returns [`SchedulerError::Backpressure`] when resident capacity is
@@ -225,12 +232,10 @@ impl ServingScheduler {
 
     /// Select one deterministic scheduling iteration. Decode work is selected
     /// first; remaining sequence/token budget is filled with chunked prefill.
-    /// Selection does not mutate request lifecycle until submission begins.
     ///
     /// # Errors
     ///
-    /// Returns a scheduler invariant error if queue state and persistent slots
-    /// disagree.
+    /// Returns an invariant error if queue state and persistent slots disagree.
     pub fn schedule(&self) -> Result<Vec<ScheduledWork>, SchedulerError> {
         let sequence_limit = self
             .config
@@ -279,176 +284,218 @@ impl ServingScheduler {
         Ok(work)
     }
 
-    /// Associate selected work with the backend submission that now owns its
-    /// inference state.
+    /// Transfer state for a selected batch out of request slots before backend
+    /// submission. All work is validated before any slot is mutated.
     ///
     /// # Errors
     ///
-    /// Returns an error for stale work, duplicate submission identity, or a
-    /// lifecycle/queue mismatch.
-    pub fn begin_submission(
+    /// Returns [`SchedulerError::StaleWork`] when selection is no longer valid.
+    pub fn prepare_submission(
         &mut self,
-        work: ScheduledWork,
+        work: &[ScheduledWork],
+    ) -> Result<Vec<InferenceStateSet>, SchedulerError> {
+        if work.is_empty() {
+            return Err(SchedulerError::EmptyWork);
+        }
+        self.validate_work_set(work)?;
+
+        let mut states = Vec::with_capacity(work.len());
+        for item in work {
+            remove_id(&mut self.runnable, item.slot())?;
+            let state = self
+                .slots
+                .get_mut(item.slot())
+                .ok_or(SchedulerError::StaleWork)?
+                .prepare_submission()?;
+            self.prepared.insert(item.slot(), *item);
+            states.push(state);
+        }
+        Ok(states)
+    }
+
+    /// Associate a prepared batch with one backend submission identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown prepared item, duplicate submission, or
+    /// lifecycle mismatch.
+    pub fn confirm_submission(
+        &mut self,
+        work: Vec<ScheduledWork>,
         submission: BackendSubmissionId,
     ) -> Result<(), SchedulerError> {
+        if work.is_empty() {
+            return Err(SchedulerError::EmptyWork);
+        }
         if self.in_flight.contains_key(&submission) {
             return Err(SchedulerError::DuplicateSubmission(submission));
         }
-        let queue_index = self
-            .runnable
-            .iter()
-            .position(|candidate| *candidate == work.slot())
-            .ok_or(SchedulerError::StaleWork)?;
-        {
-            let slot = self
-                .slots
-                .get(work.slot())
-                .ok_or(SchedulerError::StaleWork)?;
-            if slot.request().id() != work.request()
-                || slot.lifecycle() != RequestLifecycle::Runnable
-                || Self::phase_for(slot)? != work.phase()
-                || Self::state_position(slot)? != work.state_position()
-            {
-                return Err(SchedulerError::StaleWork);
-            }
-            match work.phase() {
-                ExecutionPhase::Decode if work.token_count() != 1 => {
-                    return Err(SchedulerError::StaleWork);
-                }
-                ExecutionPhase::Prefill => {
-                    let remaining = slot
-                        .progress()
-                        .prompt_tokens()
-                        .checked_sub(slot.progress().prompt_processed())
-                        .ok_or(SchedulerError::StaleWork)?;
-                    if work.token_count() == 0
-                        || work.token_count() > remaining
-                        || work.token_count() > self.config.prefill_chunk_tokens()
-                    {
-                        return Err(SchedulerError::StaleWork);
-                    }
-                }
-                ExecutionPhase::SpecDraft
-                | ExecutionPhase::SpecVerify
-                | ExecutionPhase::Encoder
-                | ExecutionPhase::MoEExpert => return Err(SchedulerError::StaleWork),
-                ExecutionPhase::Decode => {}
-            }
+        self.validate_prepared(&work)?;
+
+        for item in &work {
+            self.slots
+                .get_mut(item.slot())
+                .ok_or(SchedulerError::StaleWork)?
+                .confirm_submission(submission)?;
+            self.prepared.remove(&item.slot());
         }
-        self.slots
-            .get_mut(work.slot())
-            .ok_or(SchedulerError::StaleWork)?
-            .begin_submission(submission)?;
-        self.runnable.remove(queue_index);
         self.in_flight.insert(submission, work);
         Ok(())
     }
 
-    /// Apply a backend completion and return the request to the runnable queue
-    /// or its terminal queue.
+    /// Restore a prepared batch after backend submission failed before taking
+    /// ownership of its state.
     ///
     /// # Errors
     ///
-    /// Returns an error when the submission/request identity is stale or the
-    /// completed progress is invalid.
-    pub fn complete_submission(
+    /// Returns an error when work/state identity no longer matches the prepared
+    /// scheduler state.
+    pub fn fail_prepared(
         &mut self,
-        submission: BackendSubmissionId,
-        event: ExecutionEvent,
-        state: InferenceStateSet,
+        work: &[ScheduledWork],
+        states: Vec<InferenceStateSet>,
     ) -> Result<(), SchedulerError> {
-        let work = self
-            .in_flight
-            .get(&submission)
-            .copied()
-            .ok_or(SchedulerError::UnknownSubmission(submission))?;
-        if event.request() != work.request()
-            || event.phase() != work.phase()
-            || event.token_count() != work.token_count()
-            || event.policy_version() != self.policy.version()
-        {
-            return Err(SchedulerError::CompletionMismatch);
+        if work.len() != states.len() || work.is_empty() {
+            return Err(SchedulerError::StateCountMismatch);
         }
+        self.validate_prepared(work)?;
 
-        self.slots
-            .get_mut(work.slot())
-            .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
-            .complete_step(submission, event.phase(), event.token_count(), state)?;
-        self.in_flight.remove(&submission);
-
-        let lifecycle = self
-            .slots
-            .get(work.slot())
-            .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
-            .lifecycle();
-        match lifecycle {
-            RequestLifecycle::Runnable => {
-                let reached_output_limit = {
-                    let slot = self
-                        .slots
-                        .get(work.slot())
-                        .ok_or(SchedulerError::Invariant("completed slot disappeared"))?;
-                    slot.progress().generated_tokens()
-                        >= slot.request().semantics().max_output_tokens()
-                };
-                if reached_output_limit {
-                    self.slots
-                        .get_mut(work.slot())
-                        .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
-                        .mark_completed()?;
-                    self.terminal.push_back(work.slot());
-                    self.fill_runnable()?;
-                } else {
-                    self.runnable.push_back(work.slot());
-                }
-            }
-            RequestLifecycle::Cancelled
-            | RequestLifecycle::Failed
-            | RequestLifecycle::Completed => {
-                self.terminal.push_back(work.slot());
-                self.fill_runnable()?;
-            }
-            RequestLifecycle::Waiting
-            | RequestLifecycle::InFlight(_)
-            | RequestLifecycle::Cancelling(_) => {
-                return Err(SchedulerError::Invariant(
-                    "completion left request in a non-completable lifecycle",
-                ));
-            }
+        for (item, state) in work.iter().zip(states) {
+            self.slots
+                .get_mut(item.slot())
+                .ok_or(SchedulerError::StaleWork)?
+                .fail_prepared(state)?;
+            self.prepared.remove(&item.slot());
+            self.terminal.push_back(item.slot());
         }
-        Ok(())
-    }
-
-    /// Mark an in-flight request failed after the backend reports release of
-    /// submission ownership.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown submission or lifecycle mismatch.
-    pub fn fail_submission(
-        &mut self,
-        submission: BackendSubmissionId,
-    ) -> Result<(), SchedulerError> {
-        let work = self
-            .in_flight
-            .get(&submission)
-            .copied()
-            .ok_or(SchedulerError::UnknownSubmission(submission))?;
-        self.slots
-            .get_mut(work.slot())
-            .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
-            .fail_submission(submission)?;
-        self.in_flight.remove(&submission);
-        self.terminal.push_back(work.slot());
         self.fill_runnable()?;
         Ok(())
     }
 
-    /// Request cancellation by semantic request identity.
+    /// Apply one completed backend batch and restore scheduler-owned state.
     ///
     /// # Errors
     ///
-    /// Returns an error for unknown or terminal requests.
+    /// Returns an error when completion identity, state count, or lifecycle no
+    /// longer matches the submitted batch.
+    pub fn complete_submission(
+        &mut self,
+        submission: BackendSubmissionId,
+        event: ExecutionBatchEvent,
+        states: Vec<InferenceStateSet>,
+    ) -> Result<(), SchedulerError> {
+        let work = self
+            .in_flight
+            .get(&submission)
+            .cloned()
+            .ok_or(SchedulerError::UnknownSubmission(submission))?;
+        self.validate_completion(submission, &work, &event, &states)?;
+
+        for ((item, completed), state) in work.iter().zip(event.events()).zip(states) {
+            self.slots
+                .get_mut(item.slot())
+                .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
+                .complete_step(
+                    submission,
+                    completed.phase(),
+                    completed.token_count(),
+                    state,
+                )?;
+
+            let lifecycle = self
+                .slots
+                .get(item.slot())
+                .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
+                .lifecycle();
+            match lifecycle {
+                RequestLifecycle::Runnable => {
+                    let reached_output_limit = {
+                        let slot = self
+                            .slots
+                            .get(item.slot())
+                            .ok_or(SchedulerError::Invariant("completed slot disappeared"))?;
+                        slot.progress().generated_tokens()
+                            >= slot.request().semantics().max_output_tokens()
+                    };
+                    if reached_output_limit {
+                        self.slots
+                            .get_mut(item.slot())
+                            .ok_or(SchedulerError::Invariant("completed slot disappeared"))?
+                            .mark_completed()?;
+                        self.terminal.push_back(item.slot());
+                    } else {
+                        self.runnable.push_back(item.slot());
+                    }
+                }
+                RequestLifecycle::Cancelled
+                | RequestLifecycle::Failed
+                | RequestLifecycle::Completed => self.terminal.push_back(item.slot()),
+                RequestLifecycle::Waiting
+                | RequestLifecycle::Submitting
+                | RequestLifecycle::InFlight(_)
+                | RequestLifecycle::Cancelling(_) => {
+                    return Err(SchedulerError::Invariant(
+                        "completion left request in a non-completable lifecycle",
+                    ));
+                }
+            }
+        }
+
+        self.in_flight.remove(&submission);
+        self.fill_runnable()?;
+        Ok(())
+    }
+
+    /// Restore state and terminalize every request in a backend submission that
+    /// failed after taking ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown submission or state-count mismatch.
+    pub fn fail_submission(
+        &mut self,
+        submission: BackendSubmissionId,
+        states: Vec<InferenceStateSet>,
+    ) -> Result<(), SchedulerError> {
+        let work = self
+            .in_flight
+            .get(&submission)
+            .cloned()
+            .ok_or(SchedulerError::UnknownSubmission(submission))?;
+        if work.len() != states.len() {
+            return Err(SchedulerError::StateCountMismatch);
+        }
+        for item in &work {
+            let lifecycle = self
+                .slots
+                .get(item.slot())
+                .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
+                .lifecycle();
+            if !matches!(
+                lifecycle,
+                RequestLifecycle::InFlight(actual) | RequestLifecycle::Cancelling(actual)
+                    if actual == submission
+            ) {
+                return Err(SchedulerError::SubmissionMismatch);
+            }
+        }
+
+        for (item, state) in work.iter().zip(states) {
+            self.slots
+                .get_mut(item.slot())
+                .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
+                .fail_submission(submission, state)?;
+            self.terminal.push_back(item.slot());
+        }
+        self.in_flight.remove(&submission);
+        self.fill_runnable()?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error for unknown, terminal, or transiently submitting
+    /// requests.
     pub fn cancel(&mut self, request: RequestId) -> Result<(), SchedulerError> {
         let id = self
             .requests
@@ -460,6 +507,9 @@ impl ServingScheduler {
             .get(id)
             .ok_or(SchedulerError::Invariant("request index points to no slot"))?
             .lifecycle();
+        if before == RequestLifecycle::Submitting {
+            return Err(SchedulerError::InvalidLifecycle);
+        }
         self.slots
             .get_mut(id)
             .ok_or(SchedulerError::Invariant("request index points to no slot"))?
@@ -486,9 +536,6 @@ impl ServingScheduler {
         Ok(())
     }
 
-    /// Mark a runnable request complete for a semantic stop condition such as
-    /// EOS before its maximum output budget.
-    ///
     /// # Errors
     ///
     /// Returns an error unless the request is currently runnable.
@@ -535,8 +582,124 @@ impl ServingScheduler {
         Ok(Some(slot))
     }
 
+    fn validate_work_set(&self, work: &[ScheduledWork]) -> Result<(), SchedulerError> {
+        let mut seen = HashSet::with_capacity(work.len());
+        for item in work {
+            if !seen.insert(item.slot()) {
+                return Err(SchedulerError::StaleWork);
+            }
+            if !self.runnable.iter().any(|candidate| *candidate == item.slot()) {
+                return Err(SchedulerError::StaleWork);
+            }
+            self.validate_work(*item)?;
+        }
+        Ok(())
+    }
+
+    fn validate_work(&self, work: ScheduledWork) -> Result<(), SchedulerError> {
+        let slot = self
+            .slots
+            .get(work.slot())
+            .ok_or(SchedulerError::StaleWork)?;
+        if slot.request().id() != work.request()
+            || slot.lifecycle() != RequestLifecycle::Runnable
+            || slot.state().is_none()
+            || Self::phase_for(slot)? != work.phase()
+            || Self::state_position(slot)? != work.state_position()
+        {
+            return Err(SchedulerError::StaleWork);
+        }
+        match work.phase() {
+            ExecutionPhase::Decode if work.token_count() != 1 => Err(SchedulerError::StaleWork),
+            ExecutionPhase::Prefill => {
+                let remaining = slot
+                    .progress()
+                    .prompt_tokens()
+                    .checked_sub(slot.progress().prompt_processed())
+                    .ok_or(SchedulerError::StaleWork)?;
+                if work.token_count() == 0
+                    || work.token_count() > remaining
+                    || work.token_count() > self.config.prefill_chunk_tokens()
+                {
+                    Err(SchedulerError::StaleWork)
+                } else {
+                    Ok(())
+                }
+            }
+            ExecutionPhase::SpecDraft
+            | ExecutionPhase::SpecVerify
+            | ExecutionPhase::Encoder
+            | ExecutionPhase::MoEExpert => Err(SchedulerError::StaleWork),
+            ExecutionPhase::Decode => Ok(()),
+        }
+    }
+
+    fn validate_prepared(&self, work: &[ScheduledWork]) -> Result<(), SchedulerError> {
+        let mut seen = HashSet::with_capacity(work.len());
+        for item in work {
+            if !seen.insert(item.slot())
+                || self.prepared.get(&item.slot()) != Some(item)
+                || self
+                    .slots
+                    .get(item.slot())
+                    .is_none_or(|slot| slot.lifecycle() != RequestLifecycle::Submitting)
+            {
+                return Err(SchedulerError::StaleWork);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_completion(
+        &self,
+        submission: BackendSubmissionId,
+        work: &[ScheduledWork],
+        event: &ExecutionBatchEvent,
+        states: &[InferenceStateSet],
+    ) -> Result<(), SchedulerError> {
+        if work.len() != event.len() || work.len() != states.len() {
+            return Err(SchedulerError::CompletionMismatch);
+        }
+        for ((item, completed), state) in work.iter().zip(event.events()).zip(states) {
+            if completed.request() != item.request()
+                || completed.phase() != item.phase()
+                || completed.token_count() != item.token_count()
+                || completed.policy_version() != self.policy.version()
+            {
+                return Err(SchedulerError::CompletionMismatch);
+            }
+            let expected_position = item
+                .state_position()
+                .checked_add(item.token_count())
+                .ok_or(SchedulerError::PositionOverflow)?;
+            if state
+                .token_position()
+                .is_some_and(|position| position != expected_position)
+            {
+                return Err(SchedulerError::CompletionMismatch);
+            }
+            let lifecycle = self
+                .slots
+                .get(item.slot())
+                .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
+                .lifecycle();
+            if !matches!(
+                lifecycle,
+                RequestLifecycle::InFlight(actual) | RequestLifecycle::Cancelling(actual)
+                    if actual == submission
+            ) {
+                return Err(SchedulerError::SubmissionMismatch);
+            }
+        }
+        Ok(())
+    }
+
     fn active_count(&self) -> usize {
-        self.runnable.len() + self.in_flight.len()
+        self.runnable.len() + self.prepared.len() + self.in_flight_request_count()
+    }
+
+    fn in_flight_request_count(&self) -> usize {
+        self.in_flight.values().map(Vec::len).sum()
     }
 
     fn fill_runnable(&mut self) -> Result<(), SchedulerError> {
@@ -558,9 +721,9 @@ impl ServingScheduler {
             .slots
             .get(id)
             .ok_or(SchedulerError::Invariant("runnable slot disappeared"))?;
-        if slot.lifecycle() != RequestLifecycle::Runnable {
+        if slot.lifecycle() != RequestLifecycle::Runnable || slot.state().is_none() {
             return Err(SchedulerError::Invariant(
-                "runnable queue contains non-runnable request",
+                "runnable queue contains request without slot-owned state",
             ));
         }
         Ok(slot)
@@ -579,7 +742,10 @@ impl ServingScheduler {
     }
 
     fn state_position(slot: &ActiveRequestSlot) -> Result<u32, SchedulerError> {
-        if let Some(position) = slot.state().token_position() {
+        let state = slot.state().ok_or(SchedulerError::Invariant(
+            "runnable request does not own inference state",
+        ))?;
+        if let Some(position) = state.token_position() {
             return Ok(position);
         }
         slot.progress()
@@ -604,13 +770,12 @@ impl ServingScheduler {
 }
 
 fn remove_id(queue: &mut VecDeque<RequestSlotId>, id: RequestSlotId) -> Result<(), SchedulerError> {
-    let index =
-        queue
-            .iter()
-            .position(|candidate| *candidate == id)
-            .ok_or(SchedulerError::Invariant(
-                "request was absent from expected queue",
-            ))?;
+    let index = queue
+        .iter()
+        .position(|candidate| *candidate == id)
+        .ok_or(SchedulerError::Invariant(
+            "request was absent from expected queue",
+        ))?;
     queue.remove(index);
     Ok(())
 }
@@ -618,11 +783,14 @@ fn remove_id(queue: &mut VecDeque<RequestSlotId>, id: RequestSlotId) -> Result<(
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SchedulerError {
     InvalidConfig,
+    EmptyWork,
     Backpressure,
     DuplicateRequest(RequestId),
     UnknownRequest(RequestId),
     UnknownSubmission(BackendSubmissionId),
     DuplicateSubmission(BackendSubmissionId),
+    StateCountMismatch,
+    SubmissionMismatch,
     CompletionMismatch,
     InvalidLifecycle,
     StaleWork,
@@ -635,12 +803,19 @@ impl fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig => f.write_str("scheduler configuration is invalid"),
+            Self::EmptyWork => f.write_str("scheduler submission must contain work"),
             Self::Backpressure => f.write_str("scheduler admission capacity is exhausted"),
             Self::DuplicateRequest(id) => write!(f, "request {} is already admitted", id.get()),
             Self::UnknownRequest(id) => write!(f, "request {} is unknown", id.get()),
             Self::UnknownSubmission(id) => write!(f, "submission {} is unknown", id.get()),
             Self::DuplicateSubmission(id) => {
                 write!(f, "submission {} is already in flight", id.get())
+            }
+            Self::StateCountMismatch => {
+                f.write_str("scheduler work and inference-state counts differ")
+            }
+            Self::SubmissionMismatch => {
+                f.write_str("request lifecycle does not match backend submission ownership")
             }
             Self::CompletionMismatch => {
                 f.write_str("backend completion does not match scheduled work")
@@ -667,7 +842,7 @@ impl From<RequestSlotError> for SchedulerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::ExecutionMetrics;
+    use crate::execution::{ExecutionEvent, ExecutionMetrics};
     use crate::model::ModelId;
     use crate::policy::{PolicyVersion, SpeculationPolicy, StateTierPreference};
     use crate::request::{RequestSemantics, SamplingParams, ThinkingMode};
@@ -700,15 +875,22 @@ mod tests {
         InferenceStateSet::new(Vec::new()).expect("empty state")
     }
 
-    fn event(work: ScheduledWork) -> ExecutionEvent {
-        ExecutionEvent::new(
-            work.request(),
-            PolicyVersion::new(1).expect("policy version"),
-            work.phase(),
-            work.token_count(),
-            ExecutionMetrics::new(1, 0, 0),
+    fn batch_event(work: &[ScheduledWork]) -> ExecutionBatchEvent {
+        ExecutionBatchEvent::new(
+            work.iter()
+                .map(|item| {
+                    ExecutionEvent::new(
+                        item.request(),
+                        PolicyVersion::new(1).expect("policy version"),
+                        item.phase(),
+                        item.token_count(),
+                        ExecutionMetrics::new(1, 0, 0),
+                    )
+                    .expect("event")
+                })
+                .collect(),
         )
-        .expect("event")
+        .expect("batch event")
     }
 
     #[test]
@@ -757,75 +939,104 @@ mod tests {
     }
 
     #[test]
-    fn completion_rotates_runnable_requests_and_finishes_output_budget() {
+    fn one_submission_owns_multiple_request_slots() {
         let config = SchedulerConfig::new(2, 0, 4).expect("config");
         let mut scheduler = ServingScheduler::new(policy(2, 2), config);
-        scheduler.admit(request(1, 1), state(), 0).expect("first");
+        scheduler.admit(request(1, 2), state(), 0).expect("first");
         scheduler.admit(request(2, 2), state(), 0).expect("second");
         let work = scheduler.schedule().expect("schedule");
-        let first = work[0];
+        let states = scheduler.prepare_submission(&work).expect("prepare");
+        assert_eq!(scheduler.counts().prepared(), 2);
+        assert_eq!(states.len(), 2);
         let submission = BackendSubmissionId::new(1).expect("submission");
         scheduler
-            .begin_submission(first, submission)
-            .expect("begin submission");
+            .confirm_submission(work.clone(), submission)
+            .expect("confirm");
+        assert_eq!(scheduler.counts().prepared(), 0);
+        assert_eq!(scheduler.counts().in_flight(), 2);
+
         scheduler
-            .complete_submission(submission, event(first), state())
+            .complete_submission(
+                submission,
+                batch_event(&work),
+                vec![state(), state()],
+            )
             .expect("complete");
-        assert_eq!(scheduler.counts().terminal(), 1);
-        let next = scheduler.schedule().expect("next schedule");
-        assert_eq!(next[0].request(), RequestId::new(2).expect("request ID"));
+        assert_eq!(scheduler.counts().in_flight(), 0);
+        assert_eq!(scheduler.counts().runnable(), 2);
     }
 
     #[test]
-    fn completion_identity_must_match_scheduled_work() {
+    fn cancelling_one_request_in_batch_does_not_cancel_its_peer() {
+        let config = SchedulerConfig::new(2, 0, 4).expect("config");
+        let mut scheduler = ServingScheduler::new(policy(2, 2), config);
+        let first_id = RequestId::new(1).expect("request ID");
+        scheduler.admit(request(1, 2), state(), 0).expect("first");
+        scheduler.admit(request(2, 2), state(), 0).expect("second");
+        let work = scheduler.schedule().expect("schedule");
+        let _states = scheduler.prepare_submission(&work).expect("prepare");
+        let submission = BackendSubmissionId::new(1).expect("submission");
+        scheduler
+            .confirm_submission(work.clone(), submission)
+            .expect("confirm");
+        scheduler.cancel(first_id).expect("cancel first");
+
+        scheduler
+            .complete_submission(
+                submission,
+                batch_event(&work),
+                vec![state(), state()],
+            )
+            .expect("complete");
+        assert_eq!(scheduler.counts().terminal(), 1);
+        assert_eq!(scheduler.counts().runnable(), 1);
+    }
+
+    #[test]
+    fn failed_prepare_restores_state_and_terminalizes_requests() {
+        let config = SchedulerConfig::new(2, 0, 4).expect("config");
+        let mut scheduler = ServingScheduler::new(policy(2, 2), config);
+        scheduler.admit(request(1, 2), state(), 0).expect("first");
+        scheduler.admit(request(2, 2), state(), 0).expect("second");
+        let work = scheduler.schedule().expect("schedule");
+        let states = scheduler.prepare_submission(&work).expect("prepare");
+        scheduler.fail_prepared(&work, states).expect("fail prepared");
+        assert_eq!(scheduler.counts().prepared(), 0);
+        assert_eq!(scheduler.counts().terminal(), 2);
+        assert!(scheduler
+            .reclaim_next()
+            .expect("reclaim")
+            .expect("terminal")
+            .state()
+            .is_some());
+    }
+
+    #[test]
+    fn mismatched_completion_does_not_mutate_in_flight_slots() {
         let config = SchedulerConfig::new(1, 0, 4).expect("config");
         let mut scheduler = ServingScheduler::new(policy(1, 4), config);
         scheduler.admit(request(1, 2), state(), 0).expect("admit");
-        let work = scheduler.schedule().expect("schedule")[0];
+        let work = scheduler.schedule().expect("schedule");
+        let _states = scheduler.prepare_submission(&work).expect("prepare");
         let submission = BackendSubmissionId::new(1).expect("submission");
         scheduler
-            .begin_submission(work, submission)
-            .expect("begin submission");
-        let wrong = ExecutionEvent::new(
-            work.request(),
-            PolicyVersion::new(1).expect("policy version"),
-            ExecutionPhase::Prefill,
-            1,
-            ExecutionMetrics::new(1, 0, 0),
-        )
-        .expect("event");
+            .confirm_submission(work.clone(), submission)
+            .expect("confirm");
+        let wrong = ExecutionBatchEvent::new(vec![
+            ExecutionEvent::new(
+                work[0].request(),
+                PolicyVersion::new(1).expect("policy version"),
+                ExecutionPhase::Prefill,
+                1,
+                ExecutionMetrics::new(1, 0, 0),
+            )
+            .expect("event"),
+        ])
+        .expect("batch event");
         assert_eq!(
-            scheduler.complete_submission(submission, wrong, state()),
+            scheduler.complete_submission(submission, wrong, vec![state()]),
             Err(SchedulerError::CompletionMismatch)
         );
         assert_eq!(scheduler.counts().in_flight(), 1);
-    }
-
-    #[test]
-    fn in_flight_cancel_waits_for_backend_completion_before_reclaim() {
-        let config = SchedulerConfig::new(1, 0, 4).expect("config");
-        let mut scheduler = ServingScheduler::new(policy(1, 1), config);
-        let request_id = RequestId::new(1).expect("request ID");
-        scheduler.admit(request(1, 4), state(), 0).expect("admit");
-        let work = scheduler.schedule().expect("schedule")[0];
-        let submission = BackendSubmissionId::new(1).expect("submission");
-        scheduler
-            .begin_submission(work, submission)
-            .expect("begin submission");
-        scheduler.cancel(request_id).expect("cancel");
-        assert_eq!(scheduler.counts().in_flight(), 1);
-        assert_eq!(scheduler.counts().terminal(), 0);
-        assert!(scheduler.reclaim_next().expect("reclaim").is_none());
-
-        scheduler
-            .complete_submission(submission, event(work), state())
-            .expect("completion");
-        assert_eq!(scheduler.counts().in_flight(), 0);
-        assert_eq!(scheduler.counts().terminal(), 1);
-        let reclaimed = scheduler
-            .reclaim_next()
-            .expect("reclaim")
-            .expect("terminal request");
-        assert_eq!(reclaimed.request().id(), request_id);
     }
 }
