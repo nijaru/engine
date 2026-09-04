@@ -7,8 +7,15 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+cuda = ["dep:cudarc", "dep:engine-gguf", "dep:engine-nvidia", "engine-nvidia/cuda"]
+
 [dependencies]
 engine-core = { path = "../core" }
+engine-gguf = { path = "../gguf", optional = true }
+engine-nvidia = { path = "../nvidia", optional = true }
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
 
 [lints]
 workspace = true

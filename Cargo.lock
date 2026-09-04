@@ -51,7 +51,10 @@ dependencies = [
 name = "engine-server"
 version = "0.0.0"
 dependencies = [
+ "cudarc",
  "engine-core",
+ "engine-gguf",
+ "engine-nvidia",
 ]
 
 [[package]]

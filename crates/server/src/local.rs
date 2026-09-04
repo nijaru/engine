@@ -1,6 +1,4 @@
-from pathlib import Path
-
-LOCAL_RS = r'''use std::io;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,8 +13,7 @@ use engine_core::{
     ThinkingMode, WeightBinding,
 };
 use engine_gguf::{
-    ChatMessage, ChatTemplateOptions, GgufFile, GgufTokenizer, Qwen35LayerKind,
-    Qwen35ModelProvider,
+    ChatMessage, ChatTemplateOptions, GgufFile, Qwen35LayerKind, Qwen35ModelProvider,
 };
 use engine_nvidia::{
     CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
@@ -38,14 +35,24 @@ struct LocalOptions {
     device: u16,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "direct CLI composition root wires the complete runtime explicitly"
+)]
 pub fn run(arguments: &[String]) -> Result<(), String> {
-    if arguments.iter().any(|argument| matches!(argument.as_str(), "-h" | "--help")) {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
         println!("{USAGE}");
         return Ok(());
     }
     let options = parse_options(arguments)?;
-    let tokenizer_file = GgufFile::open(options.model.clone()).map_err(|error| error.to_string())?;
-    let tokenizer = tokenizer_file.tokenizer().map_err(|error| error.to_string())?;
+    let tokenizer_file =
+        GgufFile::open(options.model.clone()).map_err(|error| error.to_string())?;
+    let tokenizer = tokenizer_file
+        .tokenizer()
+        .map_err(|error| error.to_string())?;
     let prompt_tokens = tokenizer
         .encode_chat(
             &[ChatMessage::new("user", options.prompt)],
@@ -69,7 +76,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     }
 
     let device = DeviceId::new(options.device);
-    let context = CudaContext::new(usize::from(options.device)).map_err(|error| error.to_string())?;
+    let context =
+        CudaContext::new(usize::from(options.device)).map_err(|error| error.to_string())?;
     let stream = context.default_stream();
     let staged = Arc::new(stage_weights(&provider, device, &context, &stream)?);
     let layer_kinds = qwen_layer_kinds(&provider)?;
@@ -80,7 +88,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let description = provider.description();
     let model = description.id().clone();
     let state_requirements = description.state_requirements().to_vec();
-    let stages = [ExecutionPhase::Prefill, ExecutionPhase::Decode]
+    let execution_stages = [ExecutionPhase::Prefill, ExecutionPhase::Decode]
         .into_iter()
         .flat_map(|phase| {
             description
@@ -89,14 +97,17 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
                 .map(move |region| ExecutionStage::new(region.id(), phase))
         })
         .collect::<Vec<_>>();
-    let state_capacity = state_requirements.iter().try_fold(0_u64, |total, requirement| {
-        total.checked_add(
-            requirement
-                .byte_size()
-                .ok_or_else(|| "inference-state size overflowed".to_owned())?,
-        )
-        .ok_or_else(|| "inference-state capacity overflowed".to_owned())
-    })?;
+    let state_capacity = state_requirements
+        .iter()
+        .try_fold(0_u64, |total, requirement| {
+            total
+                .checked_add(
+                    requirement
+                        .byte_size()
+                        .ok_or_else(|| "inference-state size overflowed".to_owned())?,
+                )
+                .ok_or_else(|| "inference-state capacity overflowed".to_owned())
+        })?;
     let memory_budget = WEIGHT_BUDGET_BYTES
         .checked_add(state_capacity)
         .ok_or_else(|| "CUDA memory budget overflowed".to_owned())?;
@@ -113,7 +124,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             true,
         ),
     );
-    let backend = NvidiaBackend::new(capabilities, dispatcher).map_err(|error| error.to_string())?;
+    let backend =
+        NvidiaBackend::new(capabilities, dispatcher).map_err(|error| error.to_string())?;
     let version = PolicyVersion::new(1).ok_or_else(|| "invalid policy version".to_owned())?;
     let policy = PolicySnapshot::new(
         version,
@@ -133,7 +145,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         backend_id,
         device,
         version,
-        stages,
+        execution_stages,
         state_requirements.clone(),
         WeightBinding::empty(model.clone(), device),
     )
@@ -142,7 +154,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let mut state_manager = LogicalStateManager::new(device, state_capacity, 0);
     let state = allocate_state(&mut state_manager, &state_requirements, device)?;
     let runtime = ExecutionRuntime::new(provider, backend, state_manager);
-    let mut serving = ServingRuntime::new(scheduler, runtime, plan).map_err(|error| error.to_string())?;
+    let mut serving =
+        ServingRuntime::new(scheduler, runtime, plan).map_err(|error| error.to_string())?;
     let request_id = RequestId::new(1).ok_or_else(|| "invalid request identity".to_owned())?;
     let semantics = RequestSemantics::new(
         options.max_tokens,
@@ -159,8 +172,15 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .admit(request, state, Arc::from(prompt_tokens))
         .map_err(|error| error.to_string())?;
 
-    let output_tokens = generate(&mut serving, request_id, tokenizer.eos_token_id(), options.max_tokens)?;
-    let text = tokenizer.decode(&output_tokens).map_err(|error| error.to_string())?;
+    let output_tokens = generate(
+        &mut serving,
+        request_id,
+        tokenizer.eos_token_id(),
+        options.max_tokens,
+    )?;
+    let text = tokenizer
+        .decode(&output_tokens)
+        .map_err(|error| error.to_string())?;
     println!("{text}");
     Ok(())
 }
@@ -223,13 +243,24 @@ fn stage_weights(
         let binding = provider
             .layer_weight_binding(device, layer)
             .map_err(|error| error.to_string())?;
-        names.extend(binding.tensors().iter().map(|tensor| tensor.name().to_owned()));
+        names.extend(
+            binding
+                .tensors()
+                .iter()
+                .map(|tensor| tensor.name().to_owned()),
+        );
     }
-    eprintln!("staging {} Qwen tensors on CUDA device {}", names.len(), device.get());
+    eprintln!(
+        "staging {} Qwen tensors on CUDA device {}",
+        names.len(),
+        device.get()
+    );
     let tensors = names
         .iter()
         .map(|name| {
-            let reader = provider.open_tensor(name).map_err(|error| error.to_string())?;
+            let reader = provider
+                .open_tensor(name)
+                .map_err(|error| error.to_string())?;
             let spec = reader.spec().clone();
             let value_type = reader.value_type();
             let encoded_bytes = reader.remaining();
@@ -310,7 +341,9 @@ where
 {
     let mut output = Vec::new();
     loop {
-        let completed = serving.poll_completions().map_err(|error| error.to_string())?;
+        let completed = serving
+            .poll_completions()
+            .map_err(|error| error.to_string())?;
         let mut reached_eos = false;
         while let Some(generated) = serving.pop_generated_token() {
             if generated.request() != request {
@@ -333,7 +366,10 @@ where
             .map_err(|error| error.to_string())?;
         if completed == 0 && submitted.is_none() {
             if serving.submission_count() == 0 {
-                return Err("direct inference runtime stalled with no runnable or in-flight work".to_owned());
+                return Err(
+                    "direct inference runtime stalled with no runnable or in-flight work"
+                        .to_owned(),
+                );
             }
             std::thread::yield_now();
         }
@@ -347,74 +383,3 @@ where
     }
     Ok(output)
 }
-'''
-
-MAIN_RS = r'''#[cfg(feature = "cuda")]
-mod local;
-
-const USAGE: &str = "engine-server <command>\n\ncommands:\n  local    run one local Qwen3.8 GGUF request on CUDA";
-
-fn main() {
-    let mut arguments = std::env::args().skip(1);
-    let command = arguments.next();
-    let rest = arguments.collect::<Vec<_>>();
-    let result = match command.as_deref() {
-        None | Some("-h" | "--help") => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        Some("local") => run_local(&rest),
-        Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}")),
-    };
-    if let Err(error) = result {
-        eprintln!("engine-server: {error}");
-        std::process::exit(2);
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn run_local(arguments: &[String]) -> Result<(), String> {
-    local::run(arguments)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn run_local(_arguments: &[String]) -> Result<(), String> {
-    Err("local CUDA inference requires building engine-server with --features cuda".to_owned())
-}
-'''
-
-CARGO_TOML = r'''[package]
-name = "engine-server"
-version = "0.0.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-publish = false
-
-[features]
-default = []
-cuda = ["dep:cudarc", "dep:engine-gguf", "dep:engine-nvidia", "engine-nvidia/cuda"]
-
-[dependencies]
-engine-core = { path = "../core" }
-engine-gguf = { path = "../gguf", optional = true }
-engine-nvidia = { path = "../nvidia", optional = true }
-cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
-
-[lints]
-workspace = true
-'''
-
-Path("crates/server/src/local.rs").write_text(LOCAL_RS)
-Path("crates/server/src/main.rs").write_text(MAIN_RS)
-Path("crates/server/Cargo.toml").write_text(CARGO_TOML)
-
-p = Path(".github/workflows/ci.yml")
-s = p.read_text()
-needle = "      - run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings\n"
-replacement = needle + "      - run: cargo clippy -p engine-server --features cuda --all-targets -- -D warnings\n"
-if needle not in s:
-    raise SystemExit("CUDA CI step target not found")
-s = s.replace(needle, replacement, 1)
-p.write_text(s)
