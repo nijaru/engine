@@ -1,5 +1,6 @@
 name: Continue Physical CUDA State
 
+# retry after script correction
 on:
   push:
     branches: [main]
