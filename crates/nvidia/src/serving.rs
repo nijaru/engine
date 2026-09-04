@@ -16,9 +16,17 @@ use crate::state::CudaStateRegistry;
 /// initially executes its entries sequentially with one batch-1 Qwen executor;
 /// that is intentional. It validates persistent state and serving semantics
 /// before true batched kernels or overlapping streams are introduced.
+///
+/// The dispatcher is still the synchronous compatibility path. A successful
+/// dispatch therefore means all queued CUDA work for the submitted batch has
+/// completed. Output-producing decode steps already synchronize through token
+/// readback; output-free prefill requires an explicit batch-boundary stream
+/// synchronization so core does not commit/reclaim logical state while device
+/// kernels still own it.
 pub struct CudaQwen35ServingDispatcher {
     executor: CudaQwen35Decode,
     states: CudaStateRegistry,
+    stream: Arc<CudaStream>,
 }
 
 impl CudaQwen35ServingDispatcher {
@@ -26,13 +34,20 @@ impl CudaQwen35ServingDispatcher {
     pub fn new(executor: CudaQwen35Decode, stream: Arc<CudaStream>) -> Self {
         Self {
             executor,
-            states: CudaStateRegistry::new(stream),
+            states: CudaStateRegistry::new(stream.clone()),
+            stream,
         }
     }
 
     #[must_use]
     pub const fn state_registry(&self) -> &CudaStateRegistry {
         &self.states
+    }
+
+    fn synchronize_completion(&self) -> Result<(), BackendError> {
+        self.stream
+            .synchronize()
+            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
     }
 
     fn dispatch_segment(
@@ -139,6 +154,20 @@ impl CudaQwen35ServingDispatcher {
             None => outcome,
         })
     }
+
+    fn finish_synchronous<T>(
+        &self,
+        result: Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        match (result, self.synchronize_completion()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(sync_error)) => Err(sync_error),
+            (Err(error), Err(sync_error)) => Err(BackendError::ExecutionFailed(format!(
+                "{error}; CUDA completion synchronization also failed: {sync_error}"
+            ))),
+        }
+    }
 }
 
 impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
@@ -149,7 +178,8 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         _weights: &WeightBinding,
         state: &mut InferenceStateSet,
     ) -> Result<ExecutionOutcome, BackendError> {
-        self.dispatch_segment(segment, state)
+        let result = self.dispatch_segment(segment, state);
+        self.finish_synchronous(result)
     }
 
     fn dispatch_batch(
@@ -162,12 +192,13 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         if batch.len() != states.len() {
             return Err(BackendError::StateCountMismatch);
         }
-        batch
+        let result = batch
             .segments()
             .iter()
             .zip(states)
             .map(|(segment, state)| self.dispatch_segment(segment, state))
-            .collect()
+            .collect();
+        self.finish_synchronous(result)
     }
 
     fn release_inference_state(&mut self, state: &InferenceStateSet) -> Result<(), BackendError> {
