@@ -53,7 +53,9 @@ pub trait NvidiaDispatcher: Send {
     /// # Errors
     ///
     /// Returns [`BackendError::StateCountMismatch`] when request/state counts
-    /// differ, or propagates a segment dispatch failure.
+    /// differ, or propagates a segment dispatch failure. A synchronous
+    /// implementation must not return while device work can still access the
+    /// supplied request state.
     fn dispatch_batch(
         &mut self,
         plan: &ExecutionPlan,
@@ -82,7 +84,10 @@ pub trait NvidiaDispatcher: Send {
     ///
     /// # Errors
     ///
-    /// Returns a backend error when the batch cannot be accepted.
+    /// Returns a backend error when the batch cannot be accepted. Returning an
+    /// error means the dispatcher did not retain asynchronous ownership: no
+    /// queued work may still access the supplied request state or transient
+    /// submission resources after this method returns.
     fn submit_batch(
         &mut self,
         _submission: BackendSubmissionId,
@@ -102,7 +107,10 @@ pub trait NvidiaDispatcher: Send {
     ///
     /// # Errors
     ///
-    /// Returns a backend error when completion polling fails.
+    /// Returns a backend error for terminal completion failure. An error is a
+    /// terminal result for this submission: before returning it, the dispatcher
+    /// must have relinquished all asynchronous access to request state and
+    /// submission-local resources so the runtime may safely reclaim them.
     fn poll_batch(
         &mut self,
         _submission: BackendSubmissionId,
@@ -203,7 +211,9 @@ fn completion_event(
                 segment.token_count(),
                 outcome.metrics(),
             )
-            .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+            .ok_or_else(|| {
+                BackendError::ExecutionFailed("segment contained no tokens".to_owned())
+            })?;
             Ok(match output_token {
                 Some(token) => event.with_output_token(token),
                 None => event,
@@ -265,8 +275,13 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         if !self.pending.contains_key(&submission) {
             return Err(BackendError::UnknownSubmission(submission));
         }
-        let Some(outcomes) = self.dispatcher.poll_batch(submission)? else {
-            return Ok(None);
+        let outcomes = match self.dispatcher.poll_batch(submission) {
+            Ok(None) => return Ok(None),
+            Ok(Some(outcomes)) => outcomes,
+            Err(error) => {
+                self.pending.remove(&submission);
+                return Err(error);
+            }
         };
         let pending = self
             .pending
@@ -400,6 +415,91 @@ mod tests {
                     .collect(),
             ))
         }
+    }
+
+    #[derive(Default)]
+    struct FailingAsyncDispatcher {
+        pending: HashMap<BackendSubmissionId, ()>,
+    }
+
+    impl NvidiaDispatcher for FailingAsyncDispatcher {
+        fn dispatch(
+            &mut self,
+            _plan: &ExecutionPlan,
+            _segment: &ExecutionSegment,
+            _weights: &WeightBinding,
+            _state: &mut InferenceStateSet,
+        ) -> Result<ExecutionOutcome, BackendError> {
+            unreachable!("failing async dispatcher does not synchronously dispatch")
+        }
+
+        fn submit_batch(
+            &mut self,
+            submission: BackendSubmissionId,
+            _plan: &ExecutionPlan,
+            batch: &ExecutionBatch,
+            _weights: &WeightBinding,
+            states: &mut [InferenceStateSet],
+        ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+            if batch.len() != states.len() {
+                return Err(BackendError::StateCountMismatch);
+            }
+            self.pending.insert(submission, ());
+            Ok(None)
+        }
+
+        fn poll_batch(
+            &mut self,
+            submission: BackendSubmissionId,
+        ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+            self.pending
+                .remove(&submission)
+                .ok_or(BackendError::UnknownSubmission(submission))?;
+            Err(BackendError::ExecutionFailed(
+                "terminal async failure".to_owned(),
+            ))
+        }
+    }
+
+    fn empty_decode_fixture<D: NvidiaDispatcher>(dispatcher: D) -> (NvidiaBackend<D>, ExecutionPlan, ExecutionBatch, Vec<InferenceStateSet>) {
+        let device = DeviceId::new(0);
+        let backend_id = BackendId::new("cuda").expect("backend ID");
+        let capabilities = BackendCapabilities::new(
+            backend_id.clone(),
+            device,
+            BackendKind::Cuda,
+            24 * 1024 * 1024 * 1024,
+            BackendFeatures::new(vec![DataType::F16], vec![], false, true),
+        );
+        let backend = NvidiaBackend::new(capabilities, dispatcher).expect("CUDA backend");
+        let model = ModelId::new("test-model").expect("model ID");
+        let plan = ExecutionPlan::new(
+            model.clone(),
+            backend_id,
+            device,
+            PolicyVersion::new(1).expect("policy version"),
+            vec![ExecutionStage::new(
+                ModelRegionId::new(0),
+                ExecutionPhase::Decode,
+            )],
+            Vec::new(),
+            WeightBinding::empty(model, device),
+        )
+        .expect("plan");
+        let batch = ExecutionBatch::new(vec![
+            ExecutionSegment::new(
+                RequestId::new(1).expect("request ID"),
+                ExecutionPhase::Decode,
+                1,
+                1,
+                0,
+                Vec::new(),
+            )
+            .expect("segment"),
+        ])
+        .expect("batch");
+        let states = vec![InferenceStateSet::new(Vec::new()).expect("state")];
+        (backend, plan, batch, states)
     }
 
     #[test]
@@ -589,44 +689,7 @@ mod tests {
 
     #[test]
     fn backend_supports_dispatcher_owned_async_completion() {
-        let device = DeviceId::new(0);
-        let backend_id = BackendId::new("cuda").expect("backend ID");
-        let capabilities = BackendCapabilities::new(
-            backend_id.clone(),
-            device,
-            BackendKind::Cuda,
-            24 * 1024 * 1024 * 1024,
-            BackendFeatures::new(vec![DataType::F16], vec![], false, true),
-        );
-        let mut backend =
-            NvidiaBackend::new(capabilities, AsyncDispatcher::default()).expect("CUDA backend");
-        let model = ModelId::new("test-model").expect("model ID");
-        let plan = ExecutionPlan::new(
-            model.clone(),
-            backend_id,
-            device,
-            PolicyVersion::new(1).expect("policy version"),
-            vec![ExecutionStage::new(
-                ModelRegionId::new(0),
-                ExecutionPhase::Decode,
-            )],
-            Vec::new(),
-            WeightBinding::empty(model, device),
-        )
-        .expect("plan");
-        let batch = ExecutionBatch::new(vec![
-            ExecutionSegment::new(
-                RequestId::new(1).expect("request ID"),
-                ExecutionPhase::Decode,
-                1,
-                1,
-                0,
-                Vec::new(),
-            )
-            .expect("segment"),
-        ])
-        .expect("batch");
-        let mut states = vec![InferenceStateSet::new(Vec::new()).expect("state")];
+        let (mut backend, plan, batch, mut states) = empty_decode_fixture(AsyncDispatcher::default());
 
         let submission = backend.submit(&plan, &batch, &mut states).expect("submit");
         assert_eq!(backend.dispatcher().submits, 1);
@@ -638,5 +701,25 @@ mod tests {
             .expect("completion");
         assert_eq!(completed.events()[0].metrics().elapsed_nanos(), 5);
         assert_eq!(backend.dispatcher().polls, 1);
+        assert!(backend.pending.is_empty());
+    }
+
+    #[test]
+    fn terminal_async_failure_releases_backend_pending_metadata() {
+        let (mut backend, plan, batch, mut states) =
+            empty_decode_fixture(FailingAsyncDispatcher::default());
+        let submission = backend.submit(&plan, &batch, &mut states).expect("submit");
+        assert_eq!(backend.pending.len(), 1);
+
+        assert!(matches!(
+            backend.poll(submission),
+            Err(BackendError::ExecutionFailed(_))
+        ));
+        assert!(backend.pending.is_empty());
+        assert!(backend.dispatcher().pending.is_empty());
+        assert!(matches!(
+            backend.poll(submission),
+            Err(BackendError::UnknownSubmission(actual)) if actual == submission
+        ));
     }
 }
