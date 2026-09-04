@@ -18,7 +18,7 @@ jobs:
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
-      - name: Fix batch completion borrowing
+      - name: Repair batch runtime call sites
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -49,6 +49,13 @@ jobs:
               'self.scheduler.complete_submission(id, &event, states)?;'
           )
           serving.write_text(text)
+
+          cuda_test = Path('crates/nvidia/tests/cuda_reference.rs')
+          text = cuda_test.read_text().replace(
+              '.expect("reference execution");',
+              '.expect("reference execution")\n        .into_parts();'
+          )
+          cuda_test.write_text(text)
           PY
       - name: Format
         run: cargo fmt --all
