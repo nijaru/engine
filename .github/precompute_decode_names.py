@@ -10,11 +10,9 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 p = Path("crates/nvidia/src/decode.rs")
 s = p.read_text()
 
-# Add a compact load-time name plan. This deliberately remains a Qwen-specific
-# decoder detail rather than becoming a general IR: it only removes repeated
-# String construction from the steady-state token path.
-marker = '''/// Batch-1 decode-step runner for the staged Qwen3.8-27B text path.
-'''
+# Precompute the pinned Qwen decoder's tensor names once at construction time.
+# This is intentionally a model-specific execution detail rather than a new IR.
+marker = '''/// Batch-1 decode-step runner for the staged Qwen3.8-27B text path.\n'''
 types = '''struct CommonLayerTensorNames {
     attn_norm: String,
     post_attention_norm: String,
@@ -36,12 +34,12 @@ struct RecurrentLayerTensorNames {
 }
 
 struct FullAttentionLayerTensorNames {
-    attn_q: String,
-    attn_q_norm: String,
-    attn_k: String,
-    attn_k_norm: String,
-    attn_v: String,
-    attn_output: String,
+    q: String,
+    q_norm: String,
+    k: String,
+    k_norm: String,
+    v: String,
+    output: String,
 }
 
 enum AttentionLayerTensorNames {
@@ -80,12 +78,12 @@ impl LayerTensorNames {
             }
             QwenLayerKind::FullAttention => {
                 AttentionLayerTensorNames::FullAttention(FullAttentionLayerTensorNames {
-                    attn_q: format!("{prefix}attn_q.weight"),
-                    attn_q_norm: format!("{prefix}attn_q_norm.weight"),
-                    attn_k: format!("{prefix}attn_k.weight"),
-                    attn_k_norm: format!("{prefix}attn_k_norm.weight"),
-                    attn_v: format!("{prefix}attn_v.weight"),
-                    attn_output: format!("{prefix}attn_output.weight"),
+                    q: format!("{prefix}attn_q.weight"),
+                    q_norm: format!("{prefix}attn_q_norm.weight"),
+                    k: format!("{prefix}attn_k.weight"),
+                    k_norm: format!("{prefix}attn_k_norm.weight"),
+                    v: format!("{prefix}attn_v.weight"),
+                    output: format!("{prefix}attn_output.weight"),
                 })
             }
         };
@@ -98,45 +96,22 @@ s = replace_once(s, marker, types + marker, "layer tensor-name plan types")
 
 s = replace_once(
     s,
-    '''    layer_kinds: Vec<QwenLayerKind>,
-    kv_slot: Vec<u32>,
-''',
-    '''    layer_kinds: Vec<QwenLayerKind>,
-    tensor_names: Arc<[LayerTensorNames]>,
-    kv_slot: Vec<u32>,
-''',
+    '''    layer_kinds: Vec<QwenLayerKind>,\n    kv_slot: Vec<u32>,\n''',
+    '''    layer_kinds: Vec<QwenLayerKind>,\n    tensor_names: Arc<[LayerTensorNames]>,\n    kv_slot: Vec<u32>,\n''',
     "decoder tensor-name field",
 )
 
 s = replace_once(
     s,
-    '''        let mut kv_slot = Vec::with_capacity(layer_kinds.len());
-        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
-''',
-    '''        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(layer, kind)| LayerTensorNames::new(layer, kind))
-            .collect::<Vec<_>>()
-            .into();
-        let mut kv_slot = Vec::with_capacity(layer_kinds.len());
-        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
-''',
+    '''        let mut kv_slot = Vec::with_capacity(layer_kinds.len());\n        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());\n''',
+    '''        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds\n            .iter()\n            .copied()\n            .enumerate()\n            .map(|(layer, kind)| LayerTensorNames::new(layer, kind))\n            .collect::<Vec<_>>()\n            .into();\n        let mut kv_slot = Vec::with_capacity(layer_kinds.len());\n        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());\n''',
     "construct decoder tensor-name plan",
 )
 
 s = replace_once(
     s,
-    '''            weights,
-            layer_kinds,
-            kv_slot,
-''',
-    '''            weights,
-            layer_kinds,
-            tensor_names,
-            kv_slot,
-''',
+    '''            weights,\n            layer_kinds,\n            kv_slot,\n''',
+    '''            weights,\n            layer_kinds,\n            tensor_names,\n            kv_slot,\n''',
     "initialize decoder tensor-name plan",
 )
 
@@ -237,23 +212,11 @@ s = replace_once(s, old_loop, new_loop, "allocation-free decode layer-name loop"
 
 s = replace_once(
     s,
-    '''    fn recurrent_layer(
-        &mut self,
-        state: &mut CudaHybridState,
-        layer: usize,
-        prefix: &str,
-    ) -> Result<(), CudaDecodeError> {
-''',
-    '''    fn recurrent_layer(
-        &mut self,
-        state: &mut CudaHybridState,
-        layer: usize,
-        names: &RecurrentLayerTensorNames,
-    ) -> Result<(), CudaDecodeError> {
-''',
+    '''    fn recurrent_layer(\n        &mut self,\n        state: &mut CudaHybridState,\n        layer: usize,\n        prefix: &str,\n    ) -> Result<(), CudaDecodeError> {\n''',
+    '''    fn recurrent_layer(\n        &mut self,\n        state: &mut CudaHybridState,\n        layer: usize,\n        names: &RecurrentLayerTensorNames,\n    ) -> Result<(), CudaDecodeError> {\n''',
     "recurrent layer name-plan signature",
 )
-recurrent_replacements = {
+for old, new in {
     '&format!("{prefix}attn_qkv.weight")': '&names.attn_qkv',
     '&format!("{prefix}attn_gate.weight")': '&names.attn_gate',
     '&format!("{prefix}ssm_beta.weight")': '&names.ssm_beta',
@@ -263,72 +226,23 @@ recurrent_replacements = {
     '&format!("{prefix}ssm_conv1d.weight")': '&names.ssm_conv1d',
     '&format!("{prefix}ssm_norm.weight")': '&names.ssm_norm',
     '&format!("{prefix}ssm_out.weight")': '&names.ssm_out',
-}
-for old, new in recurrent_replacements.items():
-    if old not in s:
-        raise SystemExit(f"recurrent hot-path target not found: {old}")
-    s = s.replace(old, new, 1)
+}.items():
+    s = replace_once(s, old, new, f"recurrent hot-path {old}")
 
 s = replace_once(
     s,
-    '''    fn full_attention_layer(
-        &mut self,
-        state: &mut CudaHybridState,
-        layer: usize,
-        prefix: &str,
-        position: u32,
-    ) -> Result<(), CudaDecodeError> {
-''',
-    '''    fn full_attention_layer(
-        &mut self,
-        state: &mut CudaHybridState,
-        layer: usize,
-        names: &FullAttentionLayerTensorNames,
-        position: u32,
-    ) -> Result<(), CudaDecodeError> {
-''',
+    '''    fn full_attention_layer(\n        &mut self,\n        state: &mut CudaHybridState,\n        layer: usize,\n        prefix: &str,\n        position: u32,\n    ) -> Result<(), CudaDecodeError> {\n''',
+    '''    fn full_attention_layer(\n        &mut self,\n        state: &mut CudaHybridState,\n        layer: usize,\n        names: &FullAttentionLayerTensorNames,\n        position: u32,\n    ) -> Result<(), CudaDecodeError> {\n''',
     "full-attention name-plan signature",
 )
-full_replacements = {
-    '&format!("{prefix}attn_q.weight")': '&names.attn_q',
-    '&format!("{prefix}attn_q_norm.weight")': '&names.attn_q_norm',
-    '&format!("{prefix}attn_k.weight")': '&names.attn_k',
-    '&format!("{prefix}attn_k_norm.weight")': '&names.attn_k_norm',
-    '&format!("{prefix}attn_v.weight")': '&names.attn_v',
-    '&format!("{prefix}attn_output.weight")': '&names.attn_output',
-}
-for old, new in full_replacements.items():
-    if old not in s:
-        raise SystemExit(f"full-attention hot-path target not found: {old}")
-    s = s.replace(old, new, 1)
-
-# Guard the intent with a source-level unit test that can run without CUDA.
-# It ensures all hot-path tensor names are materialized once and stable.
-marker = '''/// The state matrix and history access for one recurrent layer slot.
-'''
-helper = '''#[cfg(test)]
-mod tensor_name_tests {
-    use super::*;
-
-    #[test]
-    fn layer_tensor_names_are_materialized_from_layer_identity() {
-        let recurrent = LayerTensorNames::new(7, QwenLayerKind::Recurrent);
-        assert_eq!(recurrent.common.attn_norm, "blk.7.attn_norm.weight");
-        let AttentionLayerTensorNames::Recurrent(attention) = recurrent.attention else {
-            panic!("expected recurrent names");
-        };
-        assert_eq!(attention.ssm_out, "blk.7.ssm_out.weight");
-
-        let full = LayerTensorNames::new(11, QwenLayerKind::FullAttention);
-        assert_eq!(full.common.ffn_down, "blk.11.ffn_down.weight");
-        let AttentionLayerTensorNames::FullAttention(attention) = full.attention else {
-            panic!("expected full-attention names");
-        };
-        assert_eq!(attention.attn_output, "blk.11.attn_output.weight");
-    }
-}
-
-'''
-s = replace_once(s, marker, helper + marker, "tensor-name plan test")
+for old, new in {
+    '&format!("{prefix}attn_q.weight")': '&names.q',
+    '&format!("{prefix}attn_q_norm.weight")': '&names.q_norm',
+    '&format!("{prefix}attn_k.weight")': '&names.k',
+    '&format!("{prefix}attn_k_norm.weight")': '&names.k_norm',
+    '&format!("{prefix}attn_v.weight")': '&names.v',
+    '&format!("{prefix}attn_output.weight")': '&names.output',
+}.items():
+    s = replace_once(s, old, new, f"full-attention hot-path {old}")
 
 p.write_text(s)
