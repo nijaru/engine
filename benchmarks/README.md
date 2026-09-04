@@ -78,6 +78,25 @@ Start with deterministic synthetic workloads because they isolate engine behavio
 
 Add multimodal, MoE, speculation-specific, trace-replay, and distributed cases only when the corresponding Engine capability exists.
 
+## Native Qwen serving sweep
+
+The first Engine-only serving qualification sweep exercises the real scheduler/runtime/backend boundary with the pinned Qwen3.8 GGUF path:
+
+```text
+ENGINE_QWEN_GGUF=/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  bash benchmarks/run-qwen-serving-sweep.sh
+```
+
+Defaults are 32 output tokens at concurrency 1, 2, 4, and 8. Override them with `TOKENS` and `CONCURRENCIES`, for example:
+
+```text
+TOKENS=64 CONCURRENCIES="1 4 8" \
+  ENGINE_QWEN_GGUF=/path/to/model.gguf \
+  bash benchmarks/run-qwen-serving-sweep.sh
+```
+
+The script captures the Engine commit and local environment, builds the benchmark once, and writes one raw log per concurrency under a timestamped `benchmarks/results/` directory. The current CUDA dispatcher executes scheduler-selected batches sequentially internally, so these results qualify the serving boundary and expose its current scaling behavior; they are not a native CUDA batching claim.
+
 ## Baseline run shape
 
 For an OpenAI-compatible completion endpoint, a current AIPerf synthetic example is conceptually:
