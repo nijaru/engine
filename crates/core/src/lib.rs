@@ -11,14 +11,19 @@ pub mod execution;
 pub mod model;
 pub mod nvidia;
 pub mod policy;
+pub mod qualification;
+pub mod readiness;
 pub mod request;
+pub mod residency;
 pub mod runtime;
+pub mod serving;
 pub mod state;
 pub mod tensor;
 pub mod weights;
 
 pub use backend::{
-    BackendCapabilities, BackendError, BackendFeatures, BackendId, BackendKind, ComputeBackend,
+    BackendCapabilities, BackendError, BackendFeatures, BackendId, BackendKind, BackendSubmissionId,
+    ComputeBackend,
 };
 pub use device::DeviceId;
 pub use execution::{
@@ -34,11 +39,24 @@ pub use nvidia::{NvidiaBackend, NvidiaDispatcher};
 pub use policy::{
     PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
 };
+pub use qualification::{
+    ExecutionVariant, ExecutionVariantId, ExecutionVariantIdError, QualificationStatus,
+};
+pub use readiness::{ReadinessError, ReadinessState, RuntimeReadiness};
 pub use request::{
     PromptFormat, PromptPolicy, RequestError, RequestId, RequestSemantics, RequestSpec,
     SamplingError, SamplingParams, SpecialTokenPolicy, ThinkingMode,
 };
-pub use runtime::{ExecutionRuntime, RuntimeError};
+pub use residency::{
+    ModelResidencyPlan, ModelResourceId, ResidencyError, ResidencyLocation, ResidencyOverride,
+};
+pub use runtime::{
+    CompletedExecution, ExecutionRuntime, RuntimeError, RuntimeSubmission,
+};
+pub use serving::{
+    ActiveRequestSlot, RequestLifecycle, RequestProgress, RequestSlotError, RequestSlotId,
+    RequestSlots,
+};
 pub use state::{
     ConvolutionStateShape, HybridState, HybridStateSet, InferenceState, InferenceStateSet, KvState,
     KvStateSpec, LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec,
@@ -113,6 +131,11 @@ mod tests {
 
         assert!(plan.requires_kv_state());
         assert!(plan.requires_recurrent_state());
+        assert!(plan.variant().eligible_for_automatic_selection());
+        assert_eq!(
+            plan.residency().default_location(),
+            ResidencyLocation::Device(DeviceId::new(0))
+        );
         assert_eq!(
             description
                 .capabilities()
