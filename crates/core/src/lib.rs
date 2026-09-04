@@ -42,7 +42,8 @@ pub use runtime::{ExecutionRuntime, RuntimeError};
 pub use state::{
     ConvolutionStateShape, HybridState, HybridStateSet, InferenceState, InferenceStateSet, KvState,
     KvStateSpec, LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec,
-    StateError, StateHandle, StateId, StateLocation, StateManager, StateRequirement, StateSpecError,
+    StateError, StateHandle, StateId, StateLocation, StateManager, StateRequirement,
+    StateSpecError,
 };
 pub use tensor::{DataType, Quantization, WeightFormat};
 pub use weights::{
