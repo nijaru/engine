@@ -1,21 +1,11 @@
 #!/usr/bin/env bash
-# Capture layer-0 Gated-DeltaNet tensors from genuine llama.cpp inference
-# for the Engine host-reference parity test
-# (crates/nvidia/tests/cuda_reference.rs host_reference_gdn_matches_llama_debug_capture).
-#
-# Run on the desktop against the pinned llama.cpp build 10684 checkout:
-#   bash scripts/llama-gdn-capture.sh
-# Produces /tmp/qwen-gdn-layer0-capture.txt.
-#
-# The prompt "Hi" is a single token (12675, no BOS for this model), which
-# forces the autoregressive GDN path with a zero initial state on a fresh
-# context, matching the Rust test's zero-state fixture. Single-threaded CPU
-# execution keeps the reference deterministic.
+# Capture layer-0 Gated-DeltaNet tensors from genuine llama.cpp inference for
+# the Engine host-reference parity test.
 
 set -euo pipefail
 
 LLAMA_CPP="${LLAMA_CPP:-$HOME/github/ggml-org/llama.cpp}"
-MODEL="${MODEL:-/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf}"
+MODEL="${MODEL:-$HOME/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf}"
 OUT="${OUT:-/tmp/qwen-gdn-layer0-capture.txt}"
 
 "$LLAMA_CPP/build/bin/llama-debug" \
