@@ -5,9 +5,10 @@
 //! sequencing across [`CudaHybridState`], FFN, and the greedy output head.
 //! Layer sequencing mirrors `host_gdn_ar_step`/`host_full_attn_ar_step`,
 //! which are llama.cpp-verified at `cc83d7b48`; each launch is the
-//! corresponding parity-tested CUDA kernel. Prefill runs this same loop
-//! autoregressively, one token at a time, exactly as the host reference
-//! does.
+//! corresponding parity-tested CUDA kernel. Prefill uses the same
+//! state-advancing model body autoregressively, one token at a time, but can
+//! skip the output head for intermediate prompt tokens whose successor is
+//! already known.
 //!
 //! The executor defines its own [`QwenLayerKind`] so `engine-gguf` remains
 //! optional; model providers translate their layer catalogs into this
@@ -218,11 +219,9 @@ impl LayerTensorNames {
 /// Batch-1 decode-step runner for the staged Qwen3.8-27B text path.
 ///
 /// The runner owns scratch buffers sized for the pinned geometry and
-/// sequences one token's full forward pass: embed → layer blocks (GDN or
-/// full attention by [`QwenLayerKind`]) → greedy output head. The caller
-/// owns the physical state, the token loop, and positions; `decode_step`
-/// returns the greedy token choice for the input `token` at
-/// `position`.
+/// sequences one token's model-state transition: embed → layer blocks (GDN or
+/// full attention by [`QwenLayerKind`]) and optionally the greedy output head.
+/// The caller owns the physical state, token loop, and positions.
 ///
 /// State layer mapping matches the distinct state families: full-attention
 /// layers share one KV family indexed by their order among full-attention
@@ -409,24 +408,53 @@ impl CudaQwen35Decode {
         })
     }
 
-    /// Run one full forward pass for `token` at absolute sequence
-    /// `position` and return the greedy token choice.
+    /// Advance model state for one known prompt token without producing logits.
     ///
-    /// All kernel launches are stream-ordered; the returned token comes
-    /// from a synchronized argmax, so state mutations from this step are
-    /// visible to subsequent steps.
+    /// Intermediate prefill tokens do not need an output projection or sampled
+    /// token: the next input is already supplied by the prompt. This path
+    /// therefore skips output RMSNorm, vocabulary projection, argmax, and the
+    /// device-to-host token copy. Launches remain ordered on the decoder stream,
+    /// so a following prefill or decode step observes the updated model state.
     ///
     /// # Errors
     ///
-    /// Returns [`CudaDecodeError`] when the physical state does not match
-    /// the layer plan geometry, the position exceeds the KV capacity, or
-    /// any launch fails.
+    /// Returns [`CudaDecodeError`] when state/geometry is invalid or execution
+    /// fails.
+    pub fn prefill_step(
+        &mut self,
+        state: &mut CudaHybridState,
+        token: u32,
+        position: u32,
+    ) -> Result<(), CudaDecodeError> {
+        self.run_step(state, token, position)
+    }
+
+    /// Run one full forward pass for `token` at absolute sequence `position`
+    /// and return the greedy token choice.
+    ///
+    /// The output-token readback is an intentional blocking host boundary on
+    /// the current correctness path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when state/geometry is invalid or execution
+    /// or output selection fails.
     pub fn decode_step(
         &mut self,
         state: &mut CudaHybridState,
         token: u32,
         position: u32,
     ) -> Result<u32, CudaDecodeError> {
+        self.run_step(state, token, position)?;
+        self.select_greedy_token()
+    }
+
+    fn run_step(
+        &mut self,
+        state: &mut CudaHybridState,
+        token: u32,
+        position: u32,
+    ) -> Result<(), CudaDecodeError> {
         self.validate_state(state)?;
         let capacity = state.kv().map_or(u32::MAX, |kv| kv.spec().block_tokens());
         if position >= capacity {
@@ -494,6 +522,10 @@ impl CudaQwen35Decode {
             self.ops.residual_add(&mut self.hidden, &self.ffn_incr)?;
         }
 
+        Ok(())
+    }
+
+    fn select_greedy_token(&mut self) -> Result<u32, CudaDecodeError> {
         self.ops.rms_norm(
             &self.hidden,
             f32_slice(&self.weights, "output_norm.weight")?,
