@@ -15,6 +15,8 @@ mod model_ops;
 #[cfg(feature = "cuda")]
 mod quantized;
 #[cfg(feature = "cuda")]
+mod serving;
+#[cfg(feature = "cuda")]
 mod staging;
 #[cfg(feature = "cuda")]
 mod state;
@@ -48,6 +50,7 @@ pub use decode::{CudaDecodeError, CudaQwen35Decode, QwenLayerKind};
 #[cfg(feature = "cuda")]
 pub use state::{
     CudaHybridState, CudaKvState, CudaRecurrentState, CudaStateBuffer, CudaStateError,
+    CudaStateRegistry,
 };
 
 pub use qwen_reference::{
@@ -57,3 +60,6 @@ pub use qwen_reference::{
     host_full_attn_ar_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
     host_gdn_ar_step_traced, l2_normalize, rms_norm_raw, softplus,
 };
+
+#[cfg(feature = "cuda")]
+pub use serving::CudaQwen35ServingDispatcher;

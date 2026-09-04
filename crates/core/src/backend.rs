@@ -278,6 +278,19 @@ pub trait ComputeBackend: Send {
         Ok(())
     }
 
+    /// Release backend-owned physical resources associated with one logical
+    /// inference-state set. Stateless backends may keep the default no-op.
+    ///
+    /// This is a lifecycle operation, not model execution. Callers must not
+    /// release state while a submission still owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when physical state cannot be released safely.
+    fn release_inference_state(&mut self, _state: &InferenceStateSet) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Submit a multi-request batch without requiring host synchronization
     /// with its completion.
     ///

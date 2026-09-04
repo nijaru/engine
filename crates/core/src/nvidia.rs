@@ -31,6 +31,16 @@ pub trait NvidiaDispatcher: Send {
         state: &mut InferenceStateSet,
     ) -> Result<ExecutionOutcome, BackendError>;
 
+    /// Release dispatcher-owned physical state associated with one logical
+    /// inference-state set. Stateless/reference dispatchers use the no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when the dispatcher cannot release the state.
+    fn release_inference_state(&mut self, _state: &InferenceStateSet) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Dispatch one scheduler-selected multi-request batch.
     ///
     /// The default implementation preserves reference/single-request
@@ -115,6 +125,10 @@ impl<D> NvidiaBackend<D> {
 impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
     fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
+    }
+
+    fn release_inference_state(&mut self, state: &InferenceStateSet) -> Result<(), BackendError> {
+        self.dispatcher.release_inference_state(state)
     }
 
     fn submit(
@@ -211,8 +225,9 @@ mod tests {
 
     #[derive(Default)]
     struct BatchAwareDispatcher {
-        batch_calls: usize,
-        segment_calls: usize,
+        batches: usize,
+        segments: usize,
+        releases: usize,
     }
 
     impl NvidiaDispatcher for BatchAwareDispatcher {
@@ -223,7 +238,7 @@ mod tests {
             _weights: &WeightBinding,
             _state: &mut InferenceStateSet,
         ) -> Result<ExecutionOutcome, BackendError> {
-            self.segment_calls += 1;
+            self.segments += 1;
             Ok(ExecutionOutcome::new(ExecutionMetrics::new(99, 0, 0)))
         }
 
@@ -237,10 +252,18 @@ mod tests {
             if batch.len() != states.len() {
                 return Err(BackendError::StateCountMismatch);
             }
-            self.batch_calls += 1;
+            self.batches += 1;
             Ok((0..batch.len())
                 .map(|_| ExecutionOutcome::new(ExecutionMetrics::new(7, 0, 0)))
                 .collect())
+        }
+
+        fn release_inference_state(
+            &mut self,
+            _state: &InferenceStateSet,
+        ) -> Result<(), BackendError> {
+            self.releases += 1;
+            Ok(())
         }
     }
 
@@ -344,6 +367,26 @@ mod tests {
     }
 
     #[test]
+    fn backend_forwards_state_release_to_the_dispatcher() {
+        let device = DeviceId::new(0);
+        let capabilities = BackendCapabilities::new(
+            BackendId::new("cuda").expect("backend ID"),
+            device,
+            BackendKind::Cuda,
+            24 * 1024 * 1024 * 1024,
+            BackendFeatures::new(vec![DataType::F16], vec![], false, true),
+        );
+        let mut backend = NvidiaBackend::new(capabilities, BatchAwareDispatcher::default())
+            .expect("CUDA backend");
+        let state = InferenceStateSet::new(Vec::new()).expect("state");
+
+        backend
+            .release_inference_state(&state)
+            .expect("release state");
+        assert_eq!(backend.dispatcher().releases, 1);
+    }
+
+    #[test]
     fn backend_forwards_the_whole_scheduler_batch_to_the_dispatcher() {
         let device = DeviceId::new(0);
         let backend_id = BackendId::new("cuda").expect("backend ID");
@@ -405,7 +448,7 @@ mod tests {
                 .iter()
                 .all(|event| event.metrics().elapsed_nanos() == 7)
         );
-        assert_eq!(backend.dispatcher().batch_calls, 1);
-        assert_eq!(backend.dispatcher().segment_calls, 0);
+        assert_eq!(backend.dispatcher().batches, 1);
+        assert_eq!(backend.dispatcher().segments, 0);
     }
 }

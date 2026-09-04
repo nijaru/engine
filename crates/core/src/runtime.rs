@@ -182,17 +182,21 @@ where
         &mut self.state_manager
     }
 
-    /// Release every logical state allocation owned by one finished request.
+    /// Release backend-owned physical state, then release the logical state
+    /// identities and capacity owned by one finished request.
     ///
-    /// Physical backend state remains a backend concern; this closes the core
-    /// allocation lifecycle so request reclamation cannot leak `StateManager`
-    /// capacity.
+    /// Keeping this ordering preserves the logical handles needed by a backend
+    /// to find its physical allocations. If physical release fails, logical
+    /// identity is retained rather than silently orphaning device memory.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::State`] when a state handle is invalid or its
-    /// manager cannot release it.
+    /// Returns [`RuntimeError::Backend`] when physical state release fails or
+    /// [`RuntimeError::State`] when a logical state handle cannot be released.
     pub fn release_state_set(&mut self, state: &InferenceStateSet) -> Result<(), RuntimeError> {
+        self.backend
+            .release_inference_state(state)
+            .map_err(RuntimeError::Backend)?;
         for value in state.states() {
             self.state_manager.release(value.handle().clone())?;
         }

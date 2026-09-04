@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 use engine_core::{
     DataType, DeviceId, InferenceStateSet, KvState, KvStateSpec, RecurrentState,
-    RecurrentStateSpec, StateLocation,
+    RecurrentStateSpec, StateId, StateLocation,
 };
 
 /// A typed device allocation for one inference-state family component.
@@ -408,6 +409,88 @@ impl CudaRecurrentState {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CudaStateKey(Vec<StateId>);
+
+impl CudaStateKey {
+    fn from_state_set(state: &InferenceStateSet) -> Self {
+        let mut ids = state
+            .states()
+            .iter()
+            .map(|value| value.handle().id())
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by_key(|id| id.get());
+        Self(ids)
+    }
+}
+
+/// Persistent backend ownership for physical CUDA request state.
+///
+/// Logical [`StateId`] values are the identity boundary. Request IDs are not
+/// used because scheduling/lifecycle identity and model state identity are
+/// deliberately separate in core.
+pub struct CudaStateRegistry {
+    stream: Arc<CudaStream>,
+    states: HashMap<CudaStateKey, CudaHybridState>,
+}
+
+impl CudaStateRegistry {
+    #[must_use]
+    pub fn new(stream: Arc<CudaStream>) -> Self {
+        Self {
+            stream,
+            states: HashMap::new(),
+        }
+    }
+
+    /// Materialize physical state on first use and reuse it on later steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaStateError`] when CUDA allocation fails or the persistent
+    /// physical prefix no longer matches the authoritative logical prefix.
+    pub fn get_or_create(
+        &mut self,
+        state: &InferenceStateSet,
+    ) -> Result<&mut CudaHybridState, CudaStateError> {
+        let key = CudaStateKey::from_state_set(state);
+        let expected = state.token_position().unwrap_or(0);
+        if !self.states.contains_key(&key) {
+            let physical = CudaHybridState::from_state_set(self.stream.clone(), state)?;
+            self.states.insert(key.clone(), physical);
+        }
+        let physical = self
+            .states
+            .get_mut(&key)
+            .ok_or(CudaStateError::RegistryInvariant)?;
+        if physical.token_position() != expected {
+            return Err(CudaStateError::PositionMismatch {
+                logical: expected,
+                physical: physical.token_position(),
+            });
+        }
+        Ok(physical)
+    }
+
+    /// Drop any physical allocation associated with this logical state set.
+    /// Missing state is a valid no-op for requests cancelled before first use.
+    pub fn release(&mut self, state: &InferenceStateSet) -> bool {
+        self.states
+            .remove(&CudaStateKey::from_state_set(state))
+            .is_some()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+}
+
 /// Backend-owned physical counterpart to a core [`InferenceStateSet`]. It is a
 /// storage primitive only: core handles remain authoritative for identity,
 /// placement, and lifecycle, while this value owns device allocations.
@@ -807,6 +890,11 @@ pub enum CudaStateError {
         current: u32,
         requested: u32,
     },
+    PositionMismatch {
+        logical: u32,
+        physical: u32,
+    },
+    RegistryInvariant,
     MissingFamily {
         family: &'static str,
     },
@@ -851,6 +939,11 @@ impl fmt::Display for CudaStateError {
                 f,
                 "physical state position cannot move from {current} back to {requested}"
             ),
+            Self::PositionMismatch { logical, physical } => write!(
+                f,
+                "logical state is at position {logical}, but persistent CUDA state is at {physical}"
+            ),
+            Self::RegistryInvariant => f.write_str("CUDA state registry lost a materialized entry"),
             Self::MissingFamily { family } => write!(f, "physical state has no {family} family"),
             Self::IndexOverflow { family } => write!(f, "{family} index overflowed"),
             Self::IndexOutOfBounds {
