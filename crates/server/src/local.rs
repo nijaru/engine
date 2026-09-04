@@ -172,12 +172,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .admit(request, state, Arc::from(prompt_tokens))
         .map_err(|error| error.to_string())?;
 
-    let output_tokens = generate(
-        &mut serving,
-        request_id,
-        tokenizer.eos_token_id(),
-        options.max_tokens,
-    )?;
+    let output_tokens = generate(&mut serving, request_id, tokenizer.eos_token_id())?;
     let text = tokenizer
         .decode(&output_tokens)
         .map_err(|error| error.to_string())?;
@@ -332,7 +327,6 @@ fn generate<P, B, S>(
     serving: &mut ServingRuntime<P, B, S>,
     request: RequestId,
     eos_token: u32,
-    max_tokens: u32,
 ) -> Result<Vec<u32>, String>
 where
     P: ModelProvider,
@@ -355,7 +349,7 @@ where
                 output.push(generated.token());
             }
         }
-        if reached_eos && u32::try_from(output.len()).unwrap_or(u32::MAX) < max_tokens {
+        if reached_eos && serving.scheduler().counts().terminal() == 0 {
             serving.finish(request).map_err(|error| error.to_string())?;
         }
         if serving.scheduler().counts().terminal() > 0 {

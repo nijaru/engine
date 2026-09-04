@@ -1271,7 +1271,7 @@ fn hybrid_state_fixture() -> (engine_core::KvStateSpec, RecurrentStateSpec) {
         engine_core::KvStateSpec::new(1, 2, 4, 4, engine_core::DataType::F16).expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         1,
-        RecurrentMatrixShape::new(1, 2, 2, 2).expect("matrix shape"),
+        RecurrentMatrixShape::new(2, 2, 2).expect("matrix shape"),
         ConvolutionStateShape::new(3, 2).expect("convolution shape"),
         engine_core::DataType::F32,
         engine_core::DataType::F32,
@@ -2956,7 +2956,7 @@ fn decodes_four_layers_against_the_host_reference() {
     let kv_spec = KvStateSpec::new(1, 4, 256, 8, DataType::F16).expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         3,
-        RecurrentMatrixShape::new(1, 128, 48, 128).expect("matrix shape"),
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
         ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
         DataType::F32,
         DataType::F32,
@@ -3350,7 +3350,7 @@ fn decodes_greedy_tokens_matching_llama_server() {
         .expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         48,
-        RecurrentMatrixShape::new(1, 128, 48, 128).expect("matrix shape"),
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
         ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
         engine_core::DataType::F32,
         engine_core::DataType::F32,

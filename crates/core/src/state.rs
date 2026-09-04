@@ -95,68 +95,66 @@ impl KvStateSpec {
     }
 }
 
+/// Storage geometry for a bank of recurrent state matrices.
+///
+/// This describes physical semantic state as `[matrix][row][column]`. Model
+/// projection head counts are deliberately absent: a Gated-DeltaNet model can
+/// tile projected key heads across state matrices without multiplying the
+/// persistent state allocation by the projection-head count.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RecurrentMatrixShape {
-    key_heads: u16,
-    key_head_dim: u16,
-    value_heads: u16,
-    value_head_dim: u16,
+    matrix_count: u16,
+    rows: u16,
+    columns: u16,
 }
 
 impl RecurrentMatrixShape {
     #[must_use]
-    pub const fn new(
-        key_heads: u16,
-        key_head_dim: u16,
-        value_heads: u16,
-        value_head_dim: u16,
-    ) -> Option<Self> {
-        if key_heads == 0 || key_head_dim == 0 || value_heads == 0 || value_head_dim == 0 {
+    pub const fn new(matrix_count: u16, rows: u16, columns: u16) -> Option<Self> {
+        if matrix_count == 0 || rows == 0 || columns == 0 {
             None
         } else {
             Some(Self {
-                key_heads,
-                key_head_dim,
-                value_heads,
-                value_head_dim,
+                matrix_count,
+                rows,
+                columns,
             })
         }
     }
 
     #[must_use]
-    pub const fn key_heads(self) -> u16 {
-        self.key_heads
+    pub const fn matrix_count(self) -> u16 {
+        self.matrix_count
     }
 
     #[must_use]
-    pub const fn key_head_dim(self) -> u16 {
-        self.key_head_dim
+    pub const fn rows(self) -> u16 {
+        self.rows
     }
 
     #[must_use]
-    pub const fn value_heads(self) -> u16 {
-        self.value_heads
-    }
-
-    #[must_use]
-    pub const fn value_head_dim(self) -> u16 {
-        self.value_head_dim
+    pub const fn columns(self) -> u16 {
+        self.columns
     }
 }
 
+/// Persistent causal-convolution history as `[channel][history_token]`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ConvolutionStateShape {
     channels: u32,
-    kernel: u16,
+    history_tokens: u16,
 }
 
 impl ConvolutionStateShape {
     #[must_use]
-    pub const fn new(channels: u32, kernel: u16) -> Option<Self> {
-        if channels == 0 || kernel == 0 {
+    pub const fn new(channels: u32, history_tokens: u16) -> Option<Self> {
+        if channels == 0 || history_tokens == 0 {
             None
         } else {
-            Some(Self { channels, kernel })
+            Some(Self {
+                channels,
+                history_tokens,
+            })
         }
     }
 
@@ -166,8 +164,8 @@ impl ConvolutionStateShape {
     }
 
     #[must_use]
-    pub const fn kernel(self) -> u16 {
-        self.kernel
+    pub const fn history_tokens(self) -> u16 {
+        self.history_tokens
     }
 }
 
@@ -230,13 +228,12 @@ impl RecurrentStateSpec {
 
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
-        let matrix_elements = u64::from(self.matrix.key_heads())
-            .checked_mul(u64::from(self.matrix.key_head_dim()))?
-            .checked_mul(u64::from(self.matrix.value_heads()))?
-            .checked_mul(u64::from(self.matrix.value_head_dim()))?
+        let matrix_elements = u64::from(self.matrix.matrix_count())
+            .checked_mul(u64::from(self.matrix.rows()))?
+            .checked_mul(u64::from(self.matrix.columns()))?
             .checked_mul(u64::from(self.layer_count))?;
         let convolution_elements = u64::from(self.convolution.channels())
-            .checked_mul(u64::from(self.convolution.kernel()))?
+            .checked_mul(u64::from(self.convolution.history_tokens()))?
             .checked_mul(u64::from(self.layer_count))?;
         matrix_elements
             .checked_mul(self.matrix_dtype.byte_width())?

@@ -1420,12 +1420,11 @@ fn qwen35_model_description(
         GgufError::InvalidModelConfiguration("full-attention state dimensions are invalid")
     })?;
     let matrix = RecurrentMatrixShape::new(
-        narrow_u16(config.ssm_group_count(), "recurrent key head count")?,
-        narrow_u16(config.ssm_state_size(), "recurrent key head dimension")?,
-        narrow_u16(config.ssm_time_step_rank(), "recurrent value head count")?,
+        narrow_u16(config.ssm_time_step_rank(), "recurrent matrix count")?,
+        narrow_u16(config.ssm_state_size(), "recurrent matrix row dimension")?,
         narrow_u16(
             config.ssm_inner_size() / config.ssm_time_step_rank(),
-            "recurrent value head dimension",
+            "recurrent matrix column dimension",
         )?,
     )
     .ok_or(GgufError::InvalidModelConfiguration(
@@ -1444,12 +1443,19 @@ fn qwen35_model_description(
         .ok_or(GgufError::InvalidModelConfiguration(
             "recurrent convolution dimensions overflow",
         ))?;
+    let convolution_history =
+        config
+            .ssm_conv_kernel()
+            .checked_sub(1)
+            .ok_or(GgufError::InvalidModelConfiguration(
+                "recurrent convolution kernel has no history",
+            ))?;
     let recurrent_spec = RecurrentStateSpec::new(
         narrow_u16(recurrent_layers, "recurrent layer count")?,
         matrix,
         ConvolutionStateShape::new(
             convolution_channels,
-            narrow_u16(config.ssm_conv_kernel(), "recurrent convolution kernel")?,
+            narrow_u16(convolution_history, "recurrent convolution history")?,
         )
         .ok_or(GgufError::InvalidModelConfiguration(
             "recurrent convolution dimensions are invalid",
@@ -2582,6 +2588,19 @@ mod tests {
         assert_eq!(description.id().as_str(), "Qwen/Qwen3.8-27B");
         assert_eq!(description.regions().len(), 5);
         assert_eq!(description.state_requirements().len(), 2);
+        let recurrent = description
+            .state_requirements()
+            .iter()
+            .find_map(|requirement| match requirement {
+                StateRequirement::Recurrent(spec) => Some(*spec),
+                StateRequirement::FullAttentionKv(_) => None,
+            })
+            .expect("recurrent state");
+        assert_eq!(recurrent.matrix().matrix_count(), 48);
+        assert_eq!(recurrent.matrix().rows(), 128);
+        assert_eq!(recurrent.matrix().columns(), 128);
+        assert_eq!(recurrent.convolution().channels(), 10_240);
+        assert_eq!(recurrent.convolution().history_tokens(), 3);
         assert!(
             description
                 .state_requirements()

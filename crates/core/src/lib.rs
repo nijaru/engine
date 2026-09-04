@@ -92,9 +92,9 @@ mod tests {
     fn qwen_description() -> ModelDescription {
         let model = ModelId::new("Qwen/Qwen3.8-27B").expect("valid model identity");
         let kv = KvStateSpec::new(16, 4, 256, 16, DataType::F16).expect("valid KV spec");
-        let matrix = RecurrentMatrixShape::new(16, 128, 48, 128).expect("valid matrix shape");
+        let matrix = RecurrentMatrixShape::new(48, 128, 128).expect("valid matrix shape");
         let convolution =
-            ConvolutionStateShape::new(10_240, 4).expect("valid convolution state shape");
+            ConvolutionStateShape::new(10_240, 3).expect("valid convolution state shape");
         let recurrent =
             RecurrentStateSpec::new(48, matrix, convolution, DataType::F16, DataType::F32)
                 .expect("valid recurrent spec");
@@ -214,9 +214,9 @@ mod tests {
         );
         assert!(KvState::new(handle, spec).is_some());
 
-        let matrix = RecurrentMatrixShape::new(16, 128, 48, 128).expect("valid matrix shape");
+        let matrix = RecurrentMatrixShape::new(48, 128, 128).expect("valid matrix shape");
         let convolution =
-            ConvolutionStateShape::new(10_240, 4).expect("valid convolution state shape");
+            ConvolutionStateShape::new(10_240, 3).expect("valid convolution state shape");
         let recurrent =
             RecurrentStateSpec::new(48, matrix, convolution, DataType::F16, DataType::F32)
                 .expect("valid recurrent spec");

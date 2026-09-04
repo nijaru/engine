@@ -690,12 +690,11 @@ impl CudaQwen35Decode {
             // buffer holds d_conv - 1 history elements per channel
             // (`gdn_conv_silu` validates channels * 3).
             if usize::from(spec.layer_count()) != recurrent_count
-                || usize::from(matrix.key_heads()) != 1
-                || usize::from(matrix.key_head_dim()) != GDN_HEAD_DIM
-                || usize::from(matrix.value_heads()) != GDN_V_HEADS
-                || usize::from(matrix.value_head_dim()) != GDN_HEAD_DIM
+                || usize::from(matrix.matrix_count()) != GDN_V_HEADS
+                || usize::from(matrix.rows()) != GDN_HEAD_DIM
+                || usize::from(matrix.columns()) != GDN_HEAD_DIM
                 || u64::from(convolution.channels()) != GDN_QKV_DIM as u64
-                || usize::from(convolution.kernel()) != GDN_D_CONV - 1
+                || usize::from(convolution.history_tokens()) != GDN_D_CONV - 1
                 || spec.matrix_dtype() != DataType::F32
                 || spec.convolution_dtype() != DataType::F32
             {

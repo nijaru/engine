@@ -254,9 +254,9 @@ impl CudaKvState {
 /// history have independent buffers and are never represented as KV pages.
 pub struct CudaRecurrentState {
     spec: RecurrentStateSpec,
-    /// Per-layer `[k_heads][k_dim][v_heads][v_dim]` state matrices.
+    /// Per-layer `[matrix][row][column]` recurrent state matrices.
     matrix: Vec<CudaStateBuffer>,
-    /// Per-layer `[channels][kernel - 1]` convolution histories.
+    /// Per-layer `[channel][history_token]` convolution histories.
     convolution: Vec<CudaStateBuffer>,
 }
 
@@ -342,17 +342,16 @@ impl CudaRecurrentState {
         let matrix_shape = spec.matrix();
         let matrix_width = checked_product(
             [
-                u64::from(matrix_shape.key_heads()),
-                u64::from(matrix_shape.key_head_dim()),
-                u64::from(matrix_shape.value_heads()),
-                u64::from(matrix_shape.value_head_dim()),
+                u64::from(matrix_shape.matrix_count()),
+                u64::from(matrix_shape.rows()),
+                u64::from(matrix_shape.columns()),
             ],
             "recurrent matrix layer",
         )?;
         let convolution_width = checked_product(
             [
                 u64::from(spec.convolution().channels()),
-                u64::from(spec.convolution().kernel()),
+                u64::from(spec.convolution().history_tokens()),
             ],
             "recurrent convolution layer",
         )?;
@@ -732,10 +731,9 @@ fn allocate_recurrent(
     let matrix_shape = spec.matrix();
     let matrix_elements = checked_product(
         [
-            u64::from(matrix_shape.key_heads()),
-            u64::from(matrix_shape.key_head_dim()),
-            u64::from(matrix_shape.value_heads()),
-            u64::from(matrix_shape.value_head_dim()),
+            u64::from(matrix_shape.matrix_count()),
+            u64::from(matrix_shape.rows()),
+            u64::from(matrix_shape.columns()),
         ],
         "recurrent matrix",
     )?;
@@ -743,7 +741,7 @@ fn allocate_recurrent(
     let convolution_elements = checked_product(
         [
             u64::from(convolution_shape.channels()),
-            u64::from(convolution_shape.kernel()),
+            u64::from(convolution_shape.history_tokens()),
         ],
         "recurrent convolution history",
     )?;

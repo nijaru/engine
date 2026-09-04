@@ -111,7 +111,7 @@ fn main() {
     let kv_spec = KvStateSpec::new(16, 4, 256, 512, DataType::F16).expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         48,
-        RecurrentMatrixShape::new(1, 128, 48, 128).expect("matrix shape"),
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
         ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
         DataType::F32,
         DataType::F32,
