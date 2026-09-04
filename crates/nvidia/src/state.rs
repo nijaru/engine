@@ -444,10 +444,16 @@ impl CudaStateRegistry {
 
     /// Materialize physical state on first use and reuse it on later steps.
     ///
+    /// Fresh materialization is valid only at prefix zero. A future state
+    /// restore/reuse path must supply the real KV and recurrent history for a
+    /// nonzero logical prefix instead of allocating zeroed buffers and merely
+    /// copying the logical token position.
+    ///
     /// # Errors
     ///
-    /// Returns [`CudaStateError`] when CUDA allocation fails or the persistent
-    /// physical prefix no longer matches the authoritative logical prefix.
+    /// Returns [`CudaStateError`] when CUDA allocation fails, a nonzero prefix
+    /// has no physical materialization, or the persistent physical prefix no
+    /// longer matches the authoritative logical prefix.
     pub fn get_or_create(
         &mut self,
         state: &InferenceStateSet,
@@ -455,6 +461,7 @@ impl CudaStateRegistry {
         let key = CudaStateKey::from_state_set(state);
         let expected = state.token_position().unwrap_or(0);
         if !self.states.contains_key(&key) {
+            validate_fresh_materialization(state)?;
             let physical = CudaHybridState::from_state_set(self.stream.clone(), state)?;
             self.states.insert(key.clone(), physical);
         }
@@ -546,18 +553,20 @@ impl CudaHybridState {
         recurrent.write_layer(layer, matrix, convolution, &self.stream)
     }
 
-    /// Allocate physical buffers matching the families present in a core state
-    /// set. Host-resident state is rejected because this type owns CUDA device
-    /// storage; a later transfer tier can use a separate owner.
+    /// Allocate fresh physical buffers matching a core state set at prefix zero.
+    /// Host-resident state is rejected because this type owns CUDA device
+    /// storage; a later transfer tier can use a separate owner. Nonzero-prefix
+    /// restoration requires a separate path carrying actual physical history.
     ///
     /// # Errors
     ///
-    /// Returns [`CudaStateError`] when placement, dtype, dimensions, or CUDA
-    /// allocation is unsupported.
+    /// Returns [`CudaStateError`] when placement, prefix, dtype, dimensions, or
+    /// CUDA allocation is unsupported.
     pub fn from_state_set(
         stream: Arc<CudaStream>,
         state: &InferenceStateSet,
     ) -> Result<Self, CudaStateError> {
+        validate_fresh_materialization(state)?;
         if let Some(location) = state.location() {
             let StateLocation::Device(device) = location else {
                 return Err(CudaStateError::UnsupportedLocation);
@@ -570,15 +579,11 @@ impl CudaHybridState {
                 });
             }
         }
-        let physical = Self::from_specs(
+        Self::from_specs(
             stream,
             state.kv().map(KvState::spec),
             state.recurrent().map(RecurrentState::spec),
-        )?;
-        Ok(Self {
-            token_position: state.token_position().unwrap_or(0),
-            ..physical
-        })
+        )
     }
 
     /// Allocate physical buffers directly from typed state specifications.
@@ -690,6 +695,15 @@ impl CudaHybridState {
         }
         self.token_position = token_position;
         Ok(())
+    }
+}
+
+fn validate_fresh_materialization(state: &InferenceStateSet) -> Result<(), CudaStateError> {
+    let position = state.token_position().unwrap_or(0);
+    if position == 0 {
+        Ok(())
+    } else {
+        Err(CudaStateError::UnmaterializedPrefix { position })
     }
 }
 
@@ -884,6 +898,9 @@ pub enum CudaStateError {
         message: String,
     },
     Driver(String),
+    UnmaterializedPrefix {
+        position: u32,
+    },
     PositionRegression {
         current: u32,
         requested: u32,
@@ -933,6 +950,10 @@ impl fmt::Display for CudaStateError {
                 write!(f, "could not allocate {family} state: {message}")
             }
             Self::Driver(message) => write!(f, "CUDA state driver error: {message}"),
+            Self::UnmaterializedPrefix { position } => write!(
+                f,
+                "cannot allocate fresh CUDA state at nonzero prefix {position} without restoring physical history"
+            ),
             Self::PositionRegression { current, requested } => write!(
                 f,
                 "physical state position cannot move from {current} back to {requested}"
@@ -959,3 +980,27 @@ impl fmt::Display for CudaStateError {
 }
 
 impl std::error::Error for CudaStateError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine_core::{LogicalStateManager, StateManager};
+
+    #[test]
+    fn fresh_materialization_rejects_nonzero_logical_prefix() {
+        let device = DeviceId::new(0);
+        let spec = KvStateSpec::new(1, 1, 2, 8, DataType::F16).expect("KV spec");
+        let mut manager = LogicalStateManager::new(device, 1024, 0);
+        let kv = manager
+            .allocate_kv(spec, StateLocation::Device(device))
+            .expect("logical KV state");
+        let zero = InferenceStateSet::try_new(Some(kv), None).expect("state set");
+        assert!(validate_fresh_materialization(&zero).is_ok());
+
+        let advanced = manager.commit(zero, 3).expect("advance logical prefix");
+        assert!(matches!(
+            validate_fresh_materialization(&advanced),
+            Err(CudaStateError::UnmaterializedPrefix { position: 3 })
+        ));
+    }
+}
