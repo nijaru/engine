@@ -205,10 +205,32 @@ where
                     self.scheduler.complete_submission(id, &event, states)?;
                     for completed in event.events() {
                         let request = completed.request();
+                        let lifecycle = self
+                            .scheduler
+                            .slot_for_request(request)
+                            .and_then(|slot| self.scheduler.slots().get(slot))
+                            .ok_or(ServingRuntimeError::RequestMissing(request))?
+                            .lifecycle();
                         if let Some(token) = completed.output_token() {
-                            self.next_tokens.insert(request, token);
-                            self.generated_tokens
-                                .push_back(GeneratedToken::new(request, token));
+                            match lifecycle {
+                                crate::serving::RequestLifecycle::Runnable => {
+                                    self.next_tokens.insert(request, token);
+                                    self.generated_tokens
+                                        .push_back(GeneratedToken::new(request, token));
+                                }
+                                crate::serving::RequestLifecycle::Completed => {
+                                    self.generated_tokens
+                                        .push_back(GeneratedToken::new(request, token));
+                                }
+                                crate::serving::RequestLifecycle::Cancelled
+                                | crate::serving::RequestLifecycle::Failed => {}
+                                crate::serving::RequestLifecycle::Waiting
+                                | crate::serving::RequestLifecycle::Submitting
+                                | crate::serving::RequestLifecycle::InFlight(_)
+                                | crate::serving::RequestLifecycle::Cancelling(_) => {
+                                    return Err(ServingRuntimeError::CompletionLifecycle(request));
+                                }
+                            }
                         }
                         if completed.phase() == crate::execution::ExecutionPhase::Prefill {
                             let prompt_complete = self
@@ -357,6 +379,8 @@ pub enum ServingRuntimeError {
     InvalidPrompt,
     PromptMissing(RequestId),
     DecodeTokenMissing(RequestId),
+    RequestMissing(RequestId),
+    CompletionLifecycle(RequestId),
     SubmissionCollision(BackendSubmissionId),
     SubmissionMissing(BackendSubmissionId),
     Plan(PlanError),
@@ -387,6 +411,14 @@ impl fmt::Display for ServingRuntimeError {
                     request.get()
                 )
             }
+            Self::RequestMissing(request) => {
+                write!(f, "request {} disappeared during completion", request.get())
+            }
+            Self::CompletionLifecycle(request) => write!(
+                f,
+                "request {} remained in a transient lifecycle after completion",
+                request.get()
+            ),
             Self::SubmissionCollision(id) => {
                 write!(f, "backend reused live submission identity {}", id.get())
             }
@@ -706,6 +738,15 @@ mod tests {
         serving.poll_completions().expect("completion poll");
         assert_eq!(serving.scheduler().counts().terminal(), 1);
         assert_eq!(serving.scheduler().counts().runnable(), 1);
+        assert_eq!(serving.generated_token_count(), 1);
+        assert_eq!(
+            serving.pop_generated_token(),
+            Some(GeneratedToken::new(
+                RequestId::new(2).expect("request ID"),
+                7
+            ))
+        );
+        assert_eq!(serving.generated_token_count(), 0);
     }
 
     #[test]
