@@ -148,7 +148,10 @@ impl fmt::Display for ResidencyError {
         match self {
             Self::EmptyResource => f.write_str("model resource identity must not be empty"),
             Self::DuplicateResource(resource) => {
-                write!(f, "model residency overrides resource {resource:?} more than once")
+                write!(
+                    f,
+                    "model residency overrides resource {resource:?} more than once"
+                )
             }
         }
     }
