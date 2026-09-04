@@ -30,6 +30,7 @@ pub enum RequestLifecycle {
     Waiting,
     Runnable,
     InFlight(BackendSubmissionId),
+    Cancelling(BackendSubmissionId),
     Completed,
     Cancelled,
     Failed,
@@ -149,35 +150,120 @@ impl ActiveRequestSlot {
         self.progress
     }
 
+    /// Move an admitted request into the runnable set.
+    ///
     /// # Errors
     ///
-    /// Returns [`RequestSlotError::InvalidTransition`] when the lifecycle
-    /// transition would violate request ownership.
-    pub fn transition(&mut self, next: RequestLifecycle) -> Result<(), RequestSlotError> {
-        let valid = matches!(
-            (self.lifecycle, next),
-            (
-                RequestLifecycle::Waiting | RequestLifecycle::InFlight(_),
-                RequestLifecycle::Runnable
-            ) | (
-                RequestLifecycle::Waiting
-                    | RequestLifecycle::Runnable
-                    | RequestLifecycle::InFlight(_),
-                RequestLifecycle::Cancelled | RequestLifecycle::Failed
-            ) | (RequestLifecycle::Runnable, RequestLifecycle::InFlight(_))
-                | (RequestLifecycle::InFlight(_), RequestLifecycle::Completed)
-        );
-        if !valid {
+    /// Returns [`RequestSlotError::InvalidTransition`] unless the request is
+    /// currently waiting.
+    pub fn make_runnable(&mut self) -> Result<(), RequestSlotError> {
+        if self.lifecycle != RequestLifecycle::Waiting {
             return Err(RequestSlotError::InvalidTransition);
         }
-        self.lifecycle = next;
+        self.lifecycle = RequestLifecycle::Runnable;
         Ok(())
     }
 
+    /// Associate runnable request state with one backend submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::InvalidTransition`] unless the request is
+    /// currently runnable.
+    pub fn begin_submission(
+        &mut self,
+        submission: BackendSubmissionId,
+    ) -> Result<(), RequestSlotError> {
+        if self.lifecycle != RequestLifecycle::Runnable {
+            return Err(RequestSlotError::InvalidTransition);
+        }
+        self.lifecycle = RequestLifecycle::InFlight(submission);
+        Ok(())
+    }
+
+    /// Request cancellation without reclaiming state still owned by an
+    /// in-flight backend submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::InvalidTransition`] for terminal requests.
+    pub fn request_cancel(&mut self) -> Result<(), RequestSlotError> {
+        self.lifecycle = match self.lifecycle {
+            RequestLifecycle::Waiting | RequestLifecycle::Runnable => RequestLifecycle::Cancelled,
+            RequestLifecycle::InFlight(submission) => RequestLifecycle::Cancelling(submission),
+            RequestLifecycle::Cancelling(submission) => RequestLifecycle::Cancelling(submission),
+            RequestLifecycle::Completed | RequestLifecycle::Cancelled | RequestLifecycle::Failed => {
+                return Err(RequestSlotError::InvalidTransition);
+            }
+        };
+        Ok(())
+    }
+
+    /// Mark a runnable request semantically complete after its final completed
+    /// execution has already updated state/progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::InvalidTransition`] unless the request is
+    /// runnable and has no backend submission owning its state.
+    pub fn mark_completed(&mut self) -> Result<(), RequestSlotError> {
+        if self.lifecycle != RequestLifecycle::Runnable {
+            return Err(RequestSlotError::InvalidTransition);
+        }
+        self.lifecycle = RequestLifecycle::Completed;
+        Ok(())
+    }
+
+    /// Mark a non-in-flight request failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::InvalidTransition`] while a backend
+    /// submission still owns the request state or after terminal completion.
+    pub fn mark_failed(&mut self) -> Result<(), RequestSlotError> {
+        match self.lifecycle {
+            RequestLifecycle::Waiting | RequestLifecycle::Runnable => {
+                self.lifecycle = RequestLifecycle::Failed;
+                Ok(())
+            }
+            RequestLifecycle::InFlight(_)
+            | RequestLifecycle::Cancelling(_)
+            | RequestLifecycle::Completed
+            | RequestLifecycle::Cancelled
+            | RequestLifecycle::Failed => Err(RequestSlotError::InvalidTransition),
+        }
+    }
+
+    /// Mark an in-flight backend submission failed after the backend has
+    /// reported that it no longer owns or may access the request state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestSlotError::SubmissionMismatch`] when a different
+    /// submission owns the slot.
+    pub fn fail_submission(
+        &mut self,
+        submission: BackendSubmissionId,
+    ) -> Result<(), RequestSlotError> {
+        match self.lifecycle {
+            RequestLifecycle::InFlight(actual) | RequestLifecycle::Cancelling(actual)
+                if actual == submission =>
+            {
+                self.lifecycle = RequestLifecycle::Failed;
+                Ok(())
+            }
+            _ => Err(RequestSlotError::SubmissionMismatch),
+        }
+    }
+
+    /// Apply one completed backend step. A cancellation requested while the
+    /// step was in flight becomes terminal only after that completion releases
+    /// backend ownership.
+    ///
     /// # Errors
     ///
     /// Returns [`RequestSlotError`] when the completed work does not match the
-    /// in-flight submission or progress cannot be advanced safely.
+    /// owning submission or progress cannot be advanced safely.
     pub fn complete_step(
         &mut self,
         submission: BackendSubmissionId,
@@ -185,13 +271,20 @@ impl ActiveRequestSlot {
         token_count: u32,
         state: InferenceStateSet,
     ) -> Result<(), RequestSlotError> {
-        if self.lifecycle != RequestLifecycle::InFlight(submission) {
-            return Err(RequestSlotError::SubmissionMismatch);
+        match self.lifecycle {
+            RequestLifecycle::InFlight(actual) if actual == submission => {
+                self.progress.record(phase, token_count)?;
+                self.state = state;
+                self.lifecycle = RequestLifecycle::Runnable;
+                Ok(())
+            }
+            RequestLifecycle::Cancelling(actual) if actual == submission => {
+                self.state = state;
+                self.lifecycle = RequestLifecycle::Cancelled;
+                Ok(())
+            }
+            _ => Err(RequestSlotError::SubmissionMismatch),
         }
-        self.progress.record(phase, token_count)?;
-        self.state = state;
-        self.lifecycle = RequestLifecycle::Runnable;
-        Ok(())
     }
 }
 
