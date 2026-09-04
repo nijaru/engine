@@ -1060,6 +1060,14 @@ fn executes_qwen_elementwise_ops_against_host_equations() {
         ops.argmax(&logits_device).expect("select greedy token"),
         401
     );
+    let mut selected = stream.alloc_zeros::<u32>(1).expect("argmax output");
+    ops.argmax_into(&logits_device, &mut selected)
+        .expect("launch reusable argmax");
+    stream.synchronize().expect("argmax synchronization");
+    assert_eq!(
+        stream.clone_dtoh(&selected).expect("read argmax output"),
+        vec![401]
+    );
 }
 
 #[test]

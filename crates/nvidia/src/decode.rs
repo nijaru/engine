@@ -183,6 +183,7 @@ pub struct CudaQwen35Decode {
     ffn_up_buf: CudaSlice<f32>,
     ffn_act: CudaSlice<f32>,
     logits: CudaSlice<f32>,
+    selected_token: CudaSlice<u32>,
     /// Attention score scratch, `[q_heads][token capacity]`, allocated on
     /// first use once the KV capacity is known.
     scores: Option<CudaSlice<f32>>,
@@ -277,6 +278,9 @@ impl CudaQwen35Decode {
         let ops = Arc::new(CudaQwen35Ops::from_context(context, stream.clone())?);
         let embedding = CudaQ4KEmbedding::from_context(context, stream.clone())?;
         let scratch = alloc_scratch(&stream, vocab)?;
+        let selected_token = stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
 
         Ok(Self {
             stream,
@@ -314,6 +318,7 @@ impl CudaQwen35Decode {
             ffn_up_buf: scratch.ffn_up_buf,
             ffn_act: scratch.ffn_act,
             logits: scratch.logits,
+            selected_token,
         })
     }
 
@@ -417,7 +422,18 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.logits,
         )?;
-        Ok(self.ops.argmax(&self.logits)?)
+        self.ops
+            .argmax_into(&self.logits, &mut self.selected_token)?;
+        self.stream
+            .synchronize()
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        let selected = self
+            .stream
+            .clone_dtoh(&self.selected_token)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        selected.first().copied().ok_or_else(|| {
+            CudaDecodeError::InvalidPlan("greedy token result slot was empty".to_owned())
+        })
     }
 
     /// Copy the current residual stream to the host. The copy is

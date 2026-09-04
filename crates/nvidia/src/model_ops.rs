@@ -697,34 +697,44 @@ impl CudaQwen35Ops {
 
     /// Select the first index with the greatest finite logit value.
     ///
-    /// This is a blocking host read because token selection is the boundary
-    /// between device logits and the next request token. The launch itself is
-    /// submitted asynchronously before the result is copied back.
+    /// Launch greedy token selection into one caller-owned device result slot.
+    ///
+    /// The launch is asynchronous with respect to the host. Keeping result
+    /// storage caller-owned lets a long-lived decoder reuse it across steps
+    /// instead of allocating device memory in the steady-state token path.
     ///
     /// # Errors
     ///
-    /// Returns [`CudaModelKernelError`] when the context, input, or launch is
-    /// invalid.
-    pub fn argmax(&self, logits: &CudaSlice<f32>) -> Result<u32, CudaModelKernelError> {
-        if self.stream.context().as_ref() != logits.context().as_ref() {
+    /// Returns [`CudaModelKernelError`] when the context, input/output shape,
+    /// or launch is invalid.
+    pub fn argmax_into(
+        &self,
+        logits: &CudaSlice<f32>,
+        selected: &mut CudaSlice<u32>,
+    ) -> Result<(), CudaModelKernelError> {
+        if self.stream.context().as_ref() != logits.context().as_ref()
+            || self.stream.context().as_ref() != selected.context().as_ref()
+        {
             return Err(CudaModelKernelError::ContextMismatch);
         }
         if logits.is_empty() {
             return Err(CudaModelKernelError::EmptyInput);
         }
+        if selected.len() != 1 {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: 1,
+                actual: selected.len(),
+            });
+        }
         let length =
             u32::try_from(logits.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let mut selected = self
-            .stream
-            .alloc_zeros::<u32>(1)
-            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
-        // Safety: cudarc allocated both slices, the length is checked, and the
+        // Safety: cudarc allocated both slices, lengths are checked, and the
         // single-thread launch writes exactly one result element.
         unsafe {
             self.stream
                 .launch_builder(&self.argmax)
                 .arg(logits)
-                .arg(&mut selected)
+                .arg(selected)
                 .arg(&length)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
@@ -733,6 +743,25 @@ impl CudaQwen35Ops {
                 })
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Select the greedy token and return it to the host.
+    ///
+    /// This convenience path is blocking because token selection crosses the
+    /// device/host boundary. Long-lived execution should prefer
+    /// [`Self::argmax_into`] with reusable result storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when allocation, launch, synchronization,
+    /// or the device-to-host copy fails.
+    pub fn argmax(&self, logits: &CudaSlice<f32>) -> Result<u32, CudaModelKernelError> {
+        let mut selected = self
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        self.argmax_into(logits, &mut selected)?;
         self.stream
             .synchronize()
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
