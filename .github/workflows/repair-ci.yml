@@ -1,0 +1,65 @@
+name: Repair CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/repair-ci.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Fix batch completion borrowing
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          scheduler = Path('crates/core/src/scheduler.rs')
+          text = scheduler.read_text()
+          text = text.replace(
+              '        event: ExecutionBatchEvent,\n        states: Vec<InferenceStateSet>,',
+              '        event: &ExecutionBatchEvent,\n        states: Vec<InferenceStateSet>,'
+          )
+          text = text.replace(
+              'self.validate_completion(submission, &work, &event, &states)?;',
+              'self.validate_completion(submission, &work, event, &states)?;'
+          )
+          text = text.replace(
+              '.complete_submission(submission, batch_event(&work), vec![state(), state()])',
+              '.complete_submission(submission, &batch_event(&work), vec![state(), state()])'
+          )
+          scheduler.write_text(text)
+
+          serving = Path('crates/core/src/serving_runtime.rs')
+          text = serving.read_text().replace(
+              'self.scheduler.complete_submission(id, event, states)?;',
+              'self.scheduler.complete_submission(id, &event, states)?;'
+          )
+          serving.write_text(text)
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: CUDA feature clippy
+        run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates
+          if ! git diff --cached --quiet; then
+            git commit -m "Format and harden batch serving runtime"
+            git push origin HEAD:main
+          fi
