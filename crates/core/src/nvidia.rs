@@ -301,6 +301,7 @@ mod tests {
         StateRequirement,
     };
     use crate::tensor::{DataType, Quantization};
+    use std::collections::HashSet;
 
     struct TestDispatcher;
 
@@ -415,7 +416,7 @@ mod tests {
 
     #[derive(Default)]
     struct FailingAsyncDispatcher {
-        pending: HashMap<BackendSubmissionId, ()>,
+        pending: HashSet<BackendSubmissionId>,
     }
 
     impl NvidiaDispatcher for FailingAsyncDispatcher {
@@ -440,7 +441,7 @@ mod tests {
             if batch.len() != states.len() {
                 return Err(BackendError::StateCountMismatch);
             }
-            self.pending.insert(submission, ());
+            self.pending.insert(submission);
             Ok(None)
         }
 

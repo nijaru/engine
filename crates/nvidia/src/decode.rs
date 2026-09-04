@@ -412,7 +412,7 @@ impl CudaQwen35Decode {
     ///
     /// Intermediate prefill tokens do not need an output projection or sampled
     /// token: the next input is already supplied by the prompt. This path
-    /// therefore skips output RMSNorm, vocabulary projection, argmax, and the
+    /// therefore skips output `RMSNorm`, vocabulary projection, argmax, and the
     /// device-to-host token copy. Launches remain ordered on the decoder stream,
     /// so a following prefill or decode step observes the updated model state.
     ///
