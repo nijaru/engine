@@ -30,51 +30,65 @@ manager         ↓
 
 ### Persistent request state
 
-Active requests should occupy stable runtime slots where practical. Per-step work mutates or gathers from persistent state instead of rebuilding large request/batch structures from scratch.
+Active requests occupy stable generation-tagged runtime slots. Prompt progress, generated progress, lifecycle, and inference-state ownership persist across steps rather than being reconstructed from transient batches.
+
+The scheduler will gather work from these slots and update only what changes. Cancellation, failure, completion, and reclamation are explicit lifecycle transitions.
 
 ### Async-first execution
 
-The normal execution loop should avoid gratuitous CPU/GPU synchronization. CPU preparation for the next step should be able to overlap device execution of the current step when dependencies permit it.
+The core backend contract is submission/completion based. Submitting a segment does not imply host synchronization with device completion, and logical inference-state position is committed only after completion becomes visible.
+
+This lets a serving loop prepare step N+1 while device work for step N is in flight when dependencies permit it. The current NVIDIA compatibility dispatcher may still complete synchronously internally; that is an implementation limitation, not the core runtime contract.
 
 ### Typed inference state
 
-Inference state is not synonymous with KV cache. The core models state as typed families collected at a semantic prefix boundary. Current families include full-attention KV and recurrent/linear-attention state; future model families may add sliding KV, encoder, draft/speculation, adapter, or other state without changing scheduler/backend signatures.
+Inference state is not synonymous with KV cache. The core models state as typed families collected at a semantic prefix boundary. Current families include full-attention KV and recurrent/linear-attention state. New state families should be added only when a real model requires them, without changing scheduler/backend container signatures.
 
-Logical identity and lifecycle stay separate from backend-owned physical layout and storage.
+Logical identity and lifecycle stay separate from backend-owned physical layout and storage. Backend-specific physical structures may remain model-specialized where that is useful.
 
 ### Inference state is not model residency
 
-Request state and model residency are separate resource planes. KV/recurrent/draft state follows request semantics and prefix lifecycle. Weights and model-owned resources may be device-resident, host-resident, sharded, prefetched, packed, or otherwise prepared independently.
+Request state and model residency are separate resource planes. KV/recurrent/draft state follows request semantics and prefix lifecycle. Weights and other model-owned resources may be device-resident, host-resident, mapped, sharded, prefetched, or packed independently.
+
+`ModelResidencyPlan` captures this distinction without turning model resources into request state or a generic object store.
 
 ### Narrow execution description
 
-Model providers expose inference-oriented regions and requirements. The core does not attempt to be MLIR/TVM/LLVM or an arbitrary tensor compiler.
+Model providers expose inference-oriented regions and requirements. Model regions describe model structure; execution phases describe serving work. They are deliberately separate concepts.
 
-Execution plans may describe model regions, state dependencies, placement, batch/work dimensions, graph/capture regions, communication, and execution choices.
+The core does not attempt to be MLIR/TVM/LLVM or an arbitrary tensor compiler. Execution plans contain only information the runtime needs to prepare and execute inference efficiently.
 
 ### Capability-driven backends
 
-Backends advertise concrete capabilities. Hardware-specific paths may use vendor libraries, external kernels, custom kernels, JIT/AOT code, graph capture, or fused/persistent execution when those choices are qualified and measured.
+`ComputeBackend` is a coarse semantic boundary: validate, submit, and observe completion. The core owns common request/state/plan semantics; a backend owns device resources, runner mechanics, streams/queues, graph capture, transfers, collectives, and hardware-specific execution choices.
+
+Inside a backend, share behavior when semantics are genuinely common and keep replaceable hardware mechanisms and kernel/variant selection target-specific. Do not create a universal backend-component framework before a second backend exposes real duplication.
 
 Portability does not mean one lowest-common-denominator kernel stack.
 
 ### Qualified execution variants
 
-An optimized path is eligible for automatic selection only when its semantic compatibility and correctness have been established for the relevant combination of model/revision, hardware/runtime, quantization, state representation, graph/capture mode, speculation mode, and distributed layout.
+Execution variants carry an explicit qualification status:
 
-Unknown combinations must fall back safely or fail explicitly. Throughput is not a correctness test.
+- `Qualified`: eligible for automatic selection;
+- `Experimental`: available only through an explicit choice or experiment;
+- `Incompatible`: rejected for the prepared plan.
+
+Qualification is scoped to the compatibility identity that matters for correctness: model/revision, hardware/runtime, quantization, state representation, graph/capture mode, speculation mode, and distributed layout as applicable. Supporting each feature individually is not evidence that their combination is correct.
 
 ### Cheap fast scheduler
 
-The request scheduler operates from persistent request state, available work/token budget, state availability, and a current policy snapshot. Expensive search, profiling, compilation, or autotuning stays off the per-step hot path.
+The request scheduler operates from persistent request slots, available work/token budget, inference-state availability, and a current policy snapshot. Expensive search, profiling, compilation, or autotuning stays off the per-step hot path.
 
-### Transparent preparation
+The initial scheduler should be deterministic and simple: admit work, prioritize latency-sensitive decode according to policy, use remaining budget for chunked prefill, submit work asynchronously, and reclaim completions. More sophisticated policy must earn its complexity in measurements.
 
-Prepared kernels, graphs, packed weights, profiles, and similar artifacts are caches/derived runtime assets, not a mandatory user-visible compile ceremony. Cache identity and invalidation must be exact enough to preserve correctness and reproducibility.
+### Transparent preparation and readiness
 
-### Explicit readiness
+Packed weights, compiled/JIT kernels, graph products, profiles, and similar artifacts are derived runtime assets, not a mandatory user-visible compile ceremony. Preparation should normally be transparent and cached; explicit preparation can exist for deterministic deployment later.
 
-Model readiness is staged. Process startup, weights mapped, device resources prepared, execution variants qualified/prepared, warmup complete, and semantic readiness are distinct states where they matter.
+Runtime readiness is explicit: created, loading, preparing, optional warming, then ready. A live process is not necessarily able to serve. Required execution paths should be prepared or have a qualified safe fallback before readiness is reported.
+
+The prepared-artifact cache itself is later performance-system work; the current architecture establishes its identity/readiness boundary without putting it in the Phase 4 scheduler critical path.
 
 ## Model-provider boundary
 
@@ -84,9 +98,9 @@ The first native path is Qwen3.8-27B. Compatibility providers may later use exte
 
 ## Hardware boundary
 
-The first implementation path is NVIDIA single-GPU CUDA. The RTX 4090 is development and benchmark hardware, not an architectural constraint.
+The RTX 4090 is the available initial qualification and development machine. It is useful for free local correctness and performance work, but the architecture is not optimized around that device or its 24-GiB memory limit.
 
-Future NVIDIA generations, AMD, Metal, and other devices should use the same capability-driven conceptual boundary with target-specific implementations.
+Future NVIDIA generations, AMD, Metal, and other devices should pressure-test the same semantic contracts while using target-specific execution mechanisms.
 
 ## Distributed boundary
 
@@ -96,4 +110,4 @@ Physical machine allocation, fleet health, and datacenter-wide scheduling remain
 
 ## Optimization stance
 
-The common path should first become fast by removing work: stable slots, preallocation, incremental metadata, asynchronous enqueue, suitable state layouts, and avoiding synchronization. More complex policy and autotuning are layered on top of measured costs rather than used to compensate for avoidable runtime overhead.
+The common path should first become fast by removing avoidable work: stable slots, preallocation, incremental metadata, asynchronous submission, suitable state layouts, fewer copies, and fewer synchronization points. Complex policy, compilation, and autotuning are layered on top of measured costs rather than used to compensate for avoidable runtime overhead.
