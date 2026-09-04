@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::backend::BackendId;
 use crate::device::DeviceId;
@@ -23,6 +24,89 @@ pub enum ExecutionPhase {
     MoEExpert,
 }
 
+/// Token payload consumed by one text-model execution segment.
+///
+/// Prompt chunks borrow their backing storage through an [`Arc`] and carry a
+/// range, so chunked prefill does not copy prompt tokens for every scheduling
+/// iteration. Decode carries the single generated token that advances the
+/// autoregressive state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionTokenInput {
+    Prompt {
+        tokens: Arc<[u32]>,
+        start: u32,
+        token_count: u32,
+    },
+    Decode {
+        token: u32,
+    },
+}
+
+impl ExecutionTokenInput {
+    /// # Errors
+    ///
+    /// Returns [`PlanError::InvalidTokenInput`] when the range is empty,
+    /// overflows, or falls outside the shared prompt buffer.
+    pub fn prompt(
+        tokens: Arc<[u32]>,
+        start: u32,
+        token_count: u32,
+    ) -> Result<Self, PlanError> {
+        if token_count == 0 {
+            return Err(PlanError::InvalidTokenInput);
+        }
+        let start_index = usize::try_from(start).map_err(|_| PlanError::InvalidTokenInput)?;
+        let count = usize::try_from(token_count).map_err(|_| PlanError::InvalidTokenInput)?;
+        let end = start_index
+            .checked_add(count)
+            .ok_or(PlanError::InvalidTokenInput)?;
+        if end > tokens.len() {
+            return Err(PlanError::InvalidTokenInput);
+        }
+        Ok(Self::Prompt {
+            tokens,
+            start,
+            token_count,
+        })
+    }
+
+    #[must_use]
+    pub const fn decode(token: u32) -> Self {
+        Self::Decode { token }
+    }
+
+    #[must_use]
+    pub const fn token_count(&self) -> u32 {
+        match self {
+            Self::Prompt { token_count, .. } => *token_count,
+            Self::Decode { .. } => 1,
+        }
+    }
+
+    #[must_use]
+    pub fn prompt_slice(&self) -> Option<&[u32]> {
+        let Self::Prompt {
+            tokens,
+            start,
+            token_count,
+        } = self
+        else {
+            return None;
+        };
+        let start = usize::try_from(*start).ok()?;
+        let count = usize::try_from(*token_count).ok()?;
+        tokens.get(start..start.checked_add(count)?)
+    }
+
+    #[must_use]
+    pub const fn decode_token(&self) -> Option<u32> {
+        match self {
+            Self::Decode { token } => Some(*token),
+            Self::Prompt { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionSegment {
     request: RequestId,
@@ -30,6 +114,7 @@ pub struct ExecutionSegment {
     token_count: u32,
     state_position: u32,
     state_requirements: Vec<StateRequirement>,
+    token_input: Option<ExecutionTokenInput>,
     sampling: Option<SamplingParams>,
 }
 
@@ -59,8 +144,29 @@ impl ExecutionSegment {
             token_count,
             state_position,
             state_requirements,
+            token_input: None,
             sampling: None,
         })
+    }
+
+    /// Attach the token payload consumed by this segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanError::InvalidTokenInput`] when the input family does not
+    /// match prefill/decode semantics or its token count differs from the
+    /// scheduled segment.
+    pub fn with_token_input(mut self, input: ExecutionTokenInput) -> Result<Self, PlanError> {
+        let phase_matches = matches!(
+            (&self.phase, &input),
+            (ExecutionPhase::Prefill, ExecutionTokenInput::Prompt { .. })
+                | (ExecutionPhase::Decode, ExecutionTokenInput::Decode { .. })
+        );
+        if !phase_matches || input.token_count() != self.token_count {
+            return Err(PlanError::InvalidTokenInput);
+        }
+        self.token_input = Some(input);
+        Ok(self)
     }
 
     /// Request one sampled token from the logits produced by this segment.
@@ -100,6 +206,11 @@ impl ExecutionSegment {
     #[must_use]
     pub fn state_requirements(&self) -> &[StateRequirement] {
         &self.state_requirements
+    }
+
+    #[must_use]
+    pub const fn token_input(&self) -> Option<&ExecutionTokenInput> {
+        self.token_input.as_ref()
     }
 
     #[must_use]
@@ -497,6 +608,7 @@ pub enum PlanError {
     EmptyBatch,
     DuplicateBatchRequest,
     InvalidSegmentBatchSize,
+    InvalidTokenInput,
     ZeroWork,
     SegmentPhaseMismatch,
     SegmentStateUndeclared,
@@ -515,6 +627,9 @@ impl fmt::Display for PlanError {
             }
             Self::InvalidSegmentBatchSize => {
                 f.write_str("an execution segment describes exactly one request")
+            }
+            Self::InvalidTokenInput => {
+                f.write_str("execution token input does not match the scheduled segment")
             }
             Self::ZeroWork => f.write_str("execution segment must contain non-zero work"),
             Self::SegmentPhaseMismatch => {
