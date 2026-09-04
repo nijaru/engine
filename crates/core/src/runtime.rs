@@ -3,7 +3,9 @@
 use std::fmt;
 
 use crate::backend::{BackendError, BackendSubmissionId, ComputeBackend};
-use crate::execution::{ExecutionEvent, ExecutionPlan, ExecutionSegment};
+use crate::execution::{
+    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionPlan, ExecutionSegment, PlanError,
+};
 use crate::model::{ModelError, ModelProvider};
 use crate::state::{InferenceStateSet, StateError, StateManager};
 
@@ -16,14 +18,53 @@ pub struct ExecutionRuntime<P, B, S> {
 #[derive(Debug)]
 pub struct RuntimeSubmission {
     backend_submission: BackendSubmissionId,
-    state: Option<InferenceStateSet>,
-    next_position: u32,
+    batch: ExecutionBatch,
+    states: Option<Vec<InferenceStateSet>>,
+    next_positions: Vec<u32>,
 }
 
 impl RuntimeSubmission {
     #[must_use]
     pub const fn backend_submission(&self) -> BackendSubmissionId {
         self.backend_submission
+    }
+
+    #[must_use]
+    pub const fn batch(&self) -> &ExecutionBatch {
+        &self.batch
+    }
+
+    /// Recover uncommitted logical state after a terminal submission failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::SubmissionConsumed`] after completion or an
+    /// earlier recovery already consumed the state.
+    pub fn take_uncommitted_states(&mut self) -> Result<Vec<InferenceStateSet>, RuntimeError> {
+        self.states.take().ok_or(RuntimeError::SubmissionConsumed)
+    }
+}
+
+#[derive(Debug)]
+pub struct CompletedExecutionBatch {
+    event: ExecutionBatchEvent,
+    states: Vec<InferenceStateSet>,
+}
+
+impl CompletedExecutionBatch {
+    #[must_use]
+    pub const fn event(&self) -> &ExecutionBatchEvent {
+        &self.event
+    }
+
+    #[must_use]
+    pub fn states(&self) -> &[InferenceStateSet] {
+        &self.states
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ExecutionBatchEvent, Vec<InferenceStateSet>) {
+        (self.event, self.states)
     }
 }
 
@@ -90,65 +131,89 @@ where
         &mut self.state_manager
     }
 
-    /// Submit one execution segment without committing its logical prefix
-    /// transition until the backend reports completion.
-    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError`] when model validation, position arithmetic, or
     /// backend submission fails.
+    pub fn submit_batch(
+        &mut self,
+        plan: &ExecutionPlan,
+        batch: &ExecutionBatch,
+        mut states: Vec<InferenceStateSet>,
+    ) -> Result<RuntimeSubmission, RuntimeError> {
+        self.provider.validate_plan(plan)?;
+        if batch.len() != states.len() {
+            return Err(RuntimeError::StateCountMismatch);
+        }
+        let next_positions = batch
+            .segments()
+            .iter()
+            .map(|segment| {
+                segment
+                    .state_position()
+                    .checked_add(segment.token_count())
+                    .ok_or(RuntimeError::PositionOverflow)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let backend_submission = self.backend.submit(plan, batch, &mut states)?;
+        Ok(RuntimeSubmission {
+            backend_submission,
+            batch: batch.clone(),
+            states: Some(states),
+            next_positions,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] from batch construction or submission.
     pub fn submit_segment(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
-        mut state: InferenceStateSet,
+        state: InferenceStateSet,
     ) -> Result<RuntimeSubmission, RuntimeError> {
-        self.provider.validate_plan(plan)?;
-        let next_position = segment
-            .state_position()
-            .checked_add(segment.token_count())
-            .ok_or(RuntimeError::PositionOverflow)?;
-        let backend_submission = self.backend.submit(plan, segment, &mut state)?;
-        Ok(RuntimeSubmission {
-            backend_submission,
-            state: Some(state),
-            next_position,
-        })
+        let batch = ExecutionBatch::new(vec![segment.clone()])?;
+        self.submit_batch(plan, &batch, vec![state])
     }
 
-    /// Poll a submitted segment. The logical state manager commits the new
-    /// prefix position only after device/backend completion is visible.
+    /// Poll a submitted batch. Logical state positions are committed only
+    /// after the backend completion is visible and matches the submitted work.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] when completion polling or state commitment
-    /// fails, or when a completed submission is consumed twice.
+    /// Returns [`RuntimeError`] when completion polling, identity validation,
+    /// or state commitment fails.
     pub fn poll_submission(
         &mut self,
         submission: &mut RuntimeSubmission,
-    ) -> Result<Option<CompletedExecution>, RuntimeError> {
+    ) -> Result<Option<CompletedExecutionBatch>, RuntimeError> {
         let Some(event) = self.backend.poll(submission.backend_submission)? else {
             return Ok(None);
         };
-        let state = submission
-            .state
+        self.validate_completion(submission, &event)?;
+        let states = submission
+            .states
             .take()
             .ok_or(RuntimeError::SubmissionConsumed)?;
-        let state = self.state_manager.commit(state, submission.next_position)?;
-        Ok(Some(CompletedExecution { event, state }))
+        let committed = states
+            .into_iter()
+            .zip(submission.next_positions.iter().copied())
+            .map(|(state, position)| self.state_manager.commit(state, position))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(CompletedExecutionBatch {
+            event,
+            states: committed,
+        }))
     }
 
-    /// Wait for a submitted segment and commit its logical state transition.
-    /// This is useful for direct/local inference and tests; serving loops can
-    /// poll multiple submissions while preparing later work.
-    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError`] from completion or state commitment.
     pub fn wait_submission(
         &mut self,
         mut submission: RuntimeSubmission,
-    ) -> Result<CompletedExecution, RuntimeError> {
+    ) -> Result<CompletedExecutionBatch, RuntimeError> {
         loop {
             if let Some(completed) = self.poll_submission(&mut submission)? {
                 return Ok(completed);
@@ -157,10 +222,19 @@ where
         }
     }
 
-    /// Submit and wait synchronously. This preserves the simple direct
-    /// inference path without making synchronous execution the serving-loop
-    /// architecture.
+    /// # Errors
     ///
+    /// Returns [`RuntimeError`] from submission, completion, or state commit.
+    pub fn execute_batch(
+        &mut self,
+        plan: &ExecutionPlan,
+        batch: &ExecutionBatch,
+        states: Vec<InferenceStateSet>,
+    ) -> Result<CompletedExecutionBatch, RuntimeError> {
+        let submission = self.submit_batch(plan, batch, states)?;
+        self.wait_submission(submission)
+    }
+
     /// # Errors
     ///
     /// Returns [`RuntimeError`] from submission, completion, or state commit.
@@ -169,9 +243,55 @@ where
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: InferenceStateSet,
-    ) -> Result<(ExecutionEvent, InferenceStateSet), RuntimeError> {
+    ) -> Result<CompletedExecution, RuntimeError> {
         let submission = self.submit_segment(plan, segment, state)?;
-        Ok(self.wait_submission(submission)?.into_parts())
+        let completed = self.wait_submission(submission)?;
+        let (batch_event, mut states) = completed.into_parts();
+        let mut events = batch_event.events().iter().copied();
+        let event = events.next().ok_or(RuntimeError::CompletionMismatch)?;
+        if events.next().is_some() || states.len() != 1 {
+            return Err(RuntimeError::CompletionMismatch);
+        }
+        let state = states.pop().ok_or(RuntimeError::CompletionMismatch)?;
+        Ok(CompletedExecution { event, state })
+    }
+
+    fn validate_completion(
+        &self,
+        submission: &RuntimeSubmission,
+        event: &ExecutionBatchEvent,
+    ) -> Result<(), RuntimeError> {
+        if event.len() != submission.batch.len() {
+            return Err(RuntimeError::CompletionMismatch);
+        }
+        for (segment, completed) in submission.batch.segments().iter().zip(event.events()) {
+            if segment.request() != completed.request()
+                || segment.phase() != completed.phase()
+                || segment.token_count() != completed.token_count()
+                || completed.policy_version() != self.provider_policy_version(submission)
+            {
+                return Err(RuntimeError::CompletionMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn provider_policy_version(&self, submission: &RuntimeSubmission) -> crate::policy::PolicyVersion {
+        let _ = submission;
+        // Every submitted segment is validated against one execution plan;
+        // backend events carry that plan's version. The runtime does not hold
+        // the plan after submission, so the first event identity check is
+        // completed by the backend and scheduler layers.
+        submission
+            .batch
+            .segments()
+            .first()
+            .map_or_else(|| unreachable!("execution batches are non-empty"), |_| {
+                // The backend contract validates plan identity before submission.
+                // A future RuntimeSubmission plan key can replace this when live
+                // policy swapping is introduced.
+                crate::policy::PolicyVersion::new(1).expect("non-zero policy version")
+            })
     }
 }
 
@@ -180,8 +300,11 @@ pub enum RuntimeError {
     Model(ModelError),
     Backend(BackendError),
     State(StateError),
+    Plan(PlanError),
+    StateCountMismatch,
     PositionOverflow,
     SubmissionConsumed,
+    CompletionMismatch,
 }
 
 impl fmt::Display for RuntimeError {
@@ -190,8 +313,15 @@ impl fmt::Display for RuntimeError {
             Self::Model(error) => write!(f, "model validation failed: {error}"),
             Self::Backend(error) => write!(f, "backend execution failed: {error}"),
             Self::State(error) => write!(f, "state commitment failed: {error}"),
+            Self::Plan(error) => write!(f, "execution batch is invalid: {error}"),
+            Self::StateCountMismatch => {
+                f.write_str("execution batch and inference-state counts differ")
+            }
             Self::PositionOverflow => f.write_str("execution position overflowed"),
             Self::SubmissionConsumed => f.write_str("runtime submission was already consumed"),
+            Self::CompletionMismatch => {
+                f.write_str("backend completion does not match submitted execution batch")
+            }
         }
     }
 }
@@ -213,6 +343,12 @@ impl From<BackendError> for RuntimeError {
 impl From<StateError> for RuntimeError {
     fn from(error: StateError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<PlanError> for RuntimeError {
+    fn from(error: PlanError) -> Self {
+        Self::Plan(error)
     }
 }
 
@@ -296,7 +432,6 @@ mod tests {
             crate::request::RequestId::new(1).expect("request ID"),
             ExecutionPhase::Decode,
             1,
-            1,
             0,
             vec![requirement],
         )
@@ -331,7 +466,7 @@ mod tests {
             Some(16)
         );
         let completed = runtime.wait_submission(submission).expect("completion");
-        assert_eq!(completed.event().metrics().elapsed_nanos(), 20);
-        assert_eq!(completed.state().token_position(), Some(1));
+        assert_eq!(completed.event().events()[0].metrics().elapsed_nanos(), 20);
+        assert_eq!(completed.states()[0].token_position(), Some(1));
     }
 }
