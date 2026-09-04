@@ -53,6 +53,50 @@ impl RuntimeSubmission {
 }
 
 #[derive(Debug)]
+pub struct RuntimeSubmitError {
+    error: RuntimeError,
+    states: Vec<InferenceStateSet>,
+}
+
+impl RuntimeSubmitError {
+    fn new(error: RuntimeError, states: Vec<InferenceStateSet>) -> Self {
+        Self { error, states }
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> &RuntimeError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn states(&self) -> &[InferenceStateSet] {
+        &self.states
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (RuntimeError, Vec<InferenceStateSet>) {
+        (self.error, self.states)
+    }
+
+    #[must_use]
+    pub fn into_error(self) -> RuntimeError {
+        self.error
+    }
+}
+
+impl fmt::Display for RuntimeSubmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "runtime submission failed: {}", self.error)
+    }
+}
+
+impl std::error::Error for RuntimeSubmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Debug)]
 pub struct CompletedExecutionBatch {
     event: ExecutionBatchEvent,
     states: Vec<InferenceStateSet>,
@@ -138,31 +182,49 @@ where
         &mut self.state_manager
     }
 
+    /// Submit a batch while preserving caller-owned logical state if model,
+    /// plan, arithmetic, or backend submission validation fails.
+    ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] when model validation, position arithmetic, or
-    /// backend submission fails.
+    /// Returns [`RuntimeSubmitError`] with the uncommitted states when the
+    /// backend never takes submission ownership.
     pub fn submit_batch(
         &mut self,
         plan: &ExecutionPlan,
         batch: &ExecutionBatch,
         mut states: Vec<InferenceStateSet>,
-    ) -> Result<RuntimeSubmission, RuntimeError> {
-        self.provider.validate_plan(plan)?;
-        if batch.len() != states.len() {
-            return Err(RuntimeError::StateCountMismatch);
+    ) -> Result<RuntimeSubmission, RuntimeSubmitError> {
+        if let Err(error) = self.provider.validate_plan(plan) {
+            return Err(RuntimeSubmitError::new(RuntimeError::Model(error), states));
         }
-        let next_positions = batch
-            .segments()
-            .iter()
-            .map(|segment| {
-                segment
-                    .state_position()
-                    .checked_add(segment.token_count())
-                    .ok_or(RuntimeError::PositionOverflow)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let backend_submission = self.backend.submit(plan, batch, &mut states)?;
+        if batch.len() != states.len() {
+            return Err(RuntimeSubmitError::new(
+                RuntimeError::StateCountMismatch,
+                states,
+            ));
+        }
+
+        let mut next_positions = Vec::with_capacity(batch.len());
+        for segment in batch.segments() {
+            let Some(position) = segment
+                .state_position()
+                .checked_add(segment.token_count())
+            else {
+                return Err(RuntimeSubmitError::new(
+                    RuntimeError::PositionOverflow,
+                    states,
+                ));
+            };
+            next_positions.push(position);
+        }
+
+        let backend_submission = match self.backend.submit(plan, batch, &mut states) {
+            Ok(submission) => submission,
+            Err(error) => {
+                return Err(RuntimeSubmitError::new(RuntimeError::Backend(error), states));
+            }
+        };
         Ok(RuntimeSubmission {
             backend_submission,
             batch: batch.clone(),
@@ -174,19 +236,28 @@ where
 
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] from batch construction or submission.
+    /// Returns [`RuntimeSubmitError`] from batch construction or submission,
+    /// preserving the supplied state.
     pub fn submit_segment(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: InferenceStateSet,
-    ) -> Result<RuntimeSubmission, RuntimeError> {
-        let batch = ExecutionBatch::new(vec![segment.clone()])?;
-        self.submit_batch(plan, &batch, vec![state])
+    ) -> Result<RuntimeSubmission, RuntimeSubmitError> {
+        let states = vec![state];
+        let batch = match ExecutionBatch::new(vec![segment.clone()]) {
+            Ok(batch) => batch,
+            Err(error) => {
+                return Err(RuntimeSubmitError::new(RuntimeError::Plan(error), states));
+            }
+        };
+        self.submit_batch(plan, &batch, states)
     }
 
     /// Poll a submitted batch. Logical state positions are committed only
     /// after the backend completion is visible and matches the submitted work.
+    /// A backend polling error is terminal: the submission retains its states
+    /// so the serving owner can recover them with `take_uncommitted_states`.
     ///
     /// # Errors
     ///
@@ -239,7 +310,9 @@ where
         batch: &ExecutionBatch,
         states: Vec<InferenceStateSet>,
     ) -> Result<CompletedExecutionBatch, RuntimeError> {
-        let submission = self.submit_batch(plan, batch, states)?;
+        let submission = self
+            .submit_batch(plan, batch, states)
+            .map_err(RuntimeSubmitError::into_error)?;
         self.wait_submission(submission)
     }
 
@@ -252,7 +325,9 @@ where
         segment: &ExecutionSegment,
         state: InferenceStateSet,
     ) -> Result<CompletedExecution, RuntimeError> {
-        let submission = self.submit_segment(plan, segment, state)?;
+        let submission = self
+            .submit_segment(plan, segment, state)
+            .map_err(RuntimeSubmitError::into_error)?;
         let completed = self.wait_submission(submission)?;
         let (batch_event, mut states) = completed.into_parts();
         let mut events = batch_event.events().iter().copied();
