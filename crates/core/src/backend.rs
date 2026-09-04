@@ -47,6 +47,21 @@ impl fmt::Display for BackendIdError {
 impl std::error::Error for BackendIdError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BackendSubmissionId(u64);
+
+impl BackendSubmissionId {
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BackendKind {
     Cpu,
     Cuda,
@@ -173,6 +188,7 @@ pub enum BackendError {
     PlanMismatch,
     InvalidPlan(PlanError),
     StateMismatch(&'static str),
+    UnknownSubmission(BackendSubmissionId),
     ExecutionFailed(String),
 }
 
@@ -183,6 +199,7 @@ impl fmt::Display for BackendError {
             Self::PlanMismatch => f.write_str("execution plan targets a different backend/device"),
             Self::InvalidPlan(error) => write!(f, "invalid execution plan: {error}"),
             Self::StateMismatch(reason) => write!(f, "state does not satisfy execution: {reason}"),
+            Self::UnknownSubmission(id) => write!(f, "backend submission {} is unknown", id.get()),
             Self::ExecutionFailed(reason) => write!(f, "execution failed: {reason}"),
         }
     }
@@ -238,14 +255,61 @@ pub trait ComputeBackend: Send {
         Ok(())
     }
 
+    /// Submit work without requiring host synchronization with its completion.
+    /// Backends may complete immediately, but callers must use [`Self::poll`]
+    /// or [`Self::wait`] before committing the logical state transition.
+    ///
     /// # Errors
     ///
     /// Returns a backend error when the plan, segment, or state cannot be
-    /// executed by this backend.
+    /// submitted by this backend.
+    fn submit(
+        &mut self,
+        plan: &ExecutionPlan,
+        segment: &ExecutionSegment,
+        state: &mut InferenceStateSet,
+    ) -> Result<BackendSubmissionId, BackendError>;
+
+    /// Poll one submitted execution. Completion is consumed exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when the submission is unknown or completion
+    /// handling fails.
+    fn poll(
+        &mut self,
+        submission: BackendSubmissionId,
+    ) -> Result<Option<ExecutionEvent>, BackendError>;
+
+    /// Wait for one submitted execution. This is a convenience path for local
+    /// and correctness-oriented callers; serving code should normally poll
+    /// completions while preparing later work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error from completion polling.
+    fn wait(&mut self, submission: BackendSubmissionId) -> Result<ExecutionEvent, BackendError> {
+        loop {
+            if let Some(event) = self.poll(submission)? {
+                return Ok(event);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Submit and wait synchronously. Kept as a convenience for small direct
+    /// callers; it is not the serving-loop contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error from submission or completion.
     fn execute(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: &mut InferenceStateSet,
-    ) -> Result<ExecutionEvent, BackendError>;
+    ) -> Result<ExecutionEvent, BackendError> {
+        let submission = self.submit(plan, segment, state)?;
+        self.wait(submission)
+    }
 }
