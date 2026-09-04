@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::execution::{ExecutionEvent, ExecutionPlan, ExecutionSegment, PlanError};
-use crate::state::{HybridStateSet, StateLocation};
+use crate::state::{InferenceStateSet, StateLocation};
 use crate::tensor::{DataType, Quantization};
 
 pub use crate::device::DeviceId;
@@ -54,8 +54,6 @@ pub enum BackendKind {
     Other,
 }
 
-/// Backend features are facts supplied by a concrete implementation, not
-/// policy preferences.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendFeatures {
     data_types: Vec<DataType>,
@@ -101,8 +99,6 @@ impl BackendFeatures {
     }
 }
 
-/// Capabilities are facts supplied by a concrete device/backend, not policy
-/// preferences. The planner can use them to reject an invalid execution plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendCapabilities {
     backend: BackendId,
@@ -194,23 +190,18 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
-/// A backend owns concrete device execution. State remains an explicit input so
-/// providers cannot silently replace recurrent state with ordinary KV state.
 pub trait ComputeBackend: Send {
     fn capabilities(&self) -> &BackendCapabilities;
 
-    /// Validate plan, phase, backend/device, and state dependencies before
-    /// dispatch. Concrete implementations should call this from `execute`.
-    ///
     /// # Errors
     ///
     /// Returns an error when the plan is not prepared for this backend or the
-    /// state bundle does not satisfy the segment.
+    /// state set does not satisfy the segment.
     fn validate_execution(
         &self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
-        state: &HybridStateSet,
+        state: &InferenceStateSet,
     ) -> Result<(), BackendError> {
         if plan.backend() != self.capabilities().backend()
             || plan.device() != self.capabilities().device()
@@ -255,6 +246,6 @@ pub trait ComputeBackend: Send {
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
-        state: &mut HybridStateSet,
+        state: &mut InferenceStateSet,
     ) -> Result<ExecutionEvent, BackendError>;
 }
