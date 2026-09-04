@@ -29,19 +29,29 @@ where
     }
 
     #[must_use]
-    pub const fn provider(&self) -> &P { &self.provider }
+    pub const fn provider(&self) -> &P {
+        &self.provider
+    }
 
     #[must_use]
-    pub const fn backend(&self) -> &B { &self.backend }
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
 
     #[must_use]
-    pub const fn backend_mut(&mut self) -> &mut B { &mut self.backend }
+    pub const fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
 
     #[must_use]
-    pub const fn state_manager(&self) -> &S { &self.state_manager }
+    pub const fn state_manager(&self) -> &S {
+        &self.state_manager
+    }
 
     #[must_use]
-    pub const fn state_manager_mut(&mut self) -> &mut S { &mut self.state_manager }
+    pub const fn state_manager_mut(&mut self) -> &mut S {
+        &mut self.state_manager
+    }
 
     /// # Errors
     ///
@@ -86,15 +96,21 @@ impl fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 impl From<ModelError> for RuntimeError {
-    fn from(error: ModelError) -> Self { Self::Model(error) }
+    fn from(error: ModelError) -> Self {
+        Self::Model(error)
+    }
 }
 
 impl From<BackendError> for RuntimeError {
-    fn from(error: BackendError) -> Self { Self::Backend(error) }
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
 }
 
 impl From<StateError> for RuntimeError {
-    fn from(error: StateError) -> Self { Self::State(error) }
+    fn from(error: StateError) -> Self {
+        Self::State(error)
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +137,9 @@ mod tests {
     }
 
     impl ModelProvider for TestProvider {
-        fn description(&self) -> &ModelDescription { &self.description }
+        fn description(&self) -> &ModelDescription {
+            &self.description
+        }
     }
 
     struct TestDispatcher;
