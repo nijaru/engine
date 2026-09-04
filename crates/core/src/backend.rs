@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-use crate::execution::{ExecutionBatch, ExecutionBatchEvent, ExecutionPlan, ExecutionSegment, PlanError};
+use crate::execution::{
+    ExecutionBatch, ExecutionBatchEvent, ExecutionPlan, ExecutionSegment, PlanError,
+};
 use crate::state::{InferenceStateSet, StateLocation};
 use crate::tensor::{DataType, Quantization};
 
@@ -229,7 +231,8 @@ pub trait ComputeBackend: Send {
         {
             return Err(BackendError::PlanMismatch);
         }
-        plan.validate_batch(batch).map_err(BackendError::InvalidPlan)?;
+        plan.validate_batch(batch)
+            .map_err(BackendError::InvalidPlan)?;
         if batch.len() != states.len() {
             return Err(BackendError::StateCountMismatch);
         }
