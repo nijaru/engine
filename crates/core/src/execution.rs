@@ -6,7 +6,9 @@ use crate::backend::BackendId;
 use crate::device::DeviceId;
 use crate::model::{ModelId, ModelRegionId};
 use crate::policy::PolicyVersion;
+use crate::qualification::{ExecutionVariant, QualificationStatus};
 use crate::request::RequestId;
+use crate::residency::ModelResidencyPlan;
 use crate::state::StateRequirement;
 use crate::weights::WeightBinding;
 
@@ -118,12 +120,15 @@ pub struct ExecutionPlan {
     stages: Vec<ExecutionStage>,
     state_requirements: Vec<StateRequirement>,
     weights: WeightBinding,
+    residency: ModelResidencyPlan,
+    variant: ExecutionVariant,
 }
 
 impl ExecutionPlan {
     /// # Errors
     ///
-    /// Returns [`PlanError::EmptyStages`] when the plan has no stages.
+    /// Returns [`PlanError::EmptyStages`] when the plan has no stages or a
+    /// binding does not match the model/device.
     pub fn new(
         model: ModelId,
         backend: BackendId,
@@ -139,6 +144,7 @@ impl ExecutionPlan {
         if weights.model() != &model || weights.device() != device {
             return Err(PlanError::WeightBindingMismatch);
         }
+        let residency = ModelResidencyPlan::single_device(model.clone(), device);
         Ok(Self {
             model,
             backend,
@@ -147,7 +153,33 @@ impl ExecutionPlan {
             stages,
             state_requirements,
             weights,
+            residency,
+            variant: ExecutionVariant::baseline(),
         })
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`PlanError::ResidencyModelMismatch`] when the residency plan
+    /// describes a different model.
+    pub fn with_residency(mut self, residency: ModelResidencyPlan) -> Result<Self, PlanError> {
+        if residency.model() != &self.model {
+            return Err(PlanError::ResidencyModelMismatch);
+        }
+        self.residency = residency;
+        Ok(self)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`PlanError::IncompatibleVariant`] for a variant that has been
+    /// explicitly qualified as incompatible.
+    pub fn with_variant(mut self, variant: ExecutionVariant) -> Result<Self, PlanError> {
+        if variant.status() == QualificationStatus::Incompatible {
+            return Err(PlanError::IncompatibleVariant);
+        }
+        self.variant = variant;
+        Ok(self)
     }
 
     /// Check that a request segment belongs to this prepared plan. A segment
@@ -209,6 +241,16 @@ impl ExecutionPlan {
     #[must_use]
     pub fn weights(&self) -> &WeightBinding {
         &self.weights
+    }
+
+    #[must_use]
+    pub const fn residency(&self) -> &ModelResidencyPlan {
+        &self.residency
+    }
+
+    #[must_use]
+    pub const fn variant(&self) -> &ExecutionVariant {
+        &self.variant
     }
 
     #[must_use]
@@ -325,6 +367,8 @@ pub enum PlanError {
     SegmentPhaseMismatch,
     SegmentStateUndeclared,
     WeightBindingMismatch,
+    ResidencyModelMismatch,
+    IncompatibleVariant,
 }
 
 impl fmt::Display for PlanError {
@@ -340,6 +384,12 @@ impl fmt::Display for PlanError {
             }
             Self::WeightBindingMismatch => {
                 f.write_str("weight binding does not match the execution model/device")
+            }
+            Self::ResidencyModelMismatch => {
+                f.write_str("model residency plan describes a different model")
+            }
+            Self::IncompatibleVariant => {
+                f.write_str("execution variant is qualified as incompatible")
             }
         }
     }
