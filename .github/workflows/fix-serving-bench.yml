@@ -1,0 +1,41 @@
+name: Fix Serving Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/fix_serving_bench.py
+      - .github/workflows/fix-serving-bench.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Fix serving benchmark
+        run: python .github/fix_serving_bench.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: NVIDIA CUDA feature clippy
+        run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
+      - name: Server CUDA feature clippy
+        run: cargo clippy -p engine-server --features cuda --all-targets -- -D warnings
+      - name: Commit changes and remove one-shot files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/fix_serving_bench.py .github/workflows/fix-serving-bench.yml
+          git add crates/nvidia/examples/qwen_serving_bench.rs
+          git commit -m "Fix Qwen serving benchmark checks"
+          git push origin HEAD:main
