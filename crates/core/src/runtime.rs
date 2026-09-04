@@ -114,7 +114,7 @@ mod tests {
         StateRequirement,
     };
     use crate::tensor::{DataType, Quantization, WeightFormat};
-    use crate::weights::{WeightBinding, WeightDescription as _};
+    use crate::weights::WeightBinding;
 
     struct TestProvider {
         description: ModelDescription,
@@ -154,7 +154,7 @@ mod tests {
             )],
             vec![requirement],
             ModelCapabilities::new(None, false),
-            crate::model::WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
+            WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
         )
         .expect("model description");
         let backend_id = BackendId::new("cuda").expect("backend ID");
