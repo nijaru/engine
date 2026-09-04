@@ -4,16 +4,15 @@ family = "qwen3.8-27b"
 [[models]]
 role = "primary-local-target"
 id = "Qwen/Qwen3.8-27B"
-revision = "snapshot 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 (HF cache, blobs keyed by sha256)"
+revision = "snapshot 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 format = "GGUF"
-quantization = "Q4_K_M (file_type 15), Unsloth dynamic UD-Q4_K_M with imatrix (chunks 1251, entries 496)"
+quantization = "Q4_K_M (file_type 15), Unsloth dynamic UD-Q4_K_M with imatrix"
 artifact = "Qwen3.8-27B-UD-Q4_K_M.gguf"
 sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
 size_bytes = 16464440224
-local_path = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf"
 vision_artifact = "mmproj-BF16.gguf (sha256 83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53)"
 runtime_reference = "llama.cpp"
-notes = "Primary first architecture/model target on the RTX 4090. Architecture in-GGUF: qwen35 arch (llama.cpp's Qwen3.8 implementation), 65 blocks (64 LM layers + 1 bundled MTP layer, nextn_predict_layers = 1), full_attention_interval = 4 => 48 Gated DeltaNet/linear-attention + 16 full-attention layers. hidden 5120, ffn 17408, 24 Q heads / 4 KV heads / head_dim 256, vocab 248320, ctx 262144, rope base 1e7 with partial rotary 0.25. DeltaNet: state_size 128, inner 6144, 16 v-groups, conv kernel 4, time_step_rank 48. Reference environment pinned 2026-09-01: Fedora 44, kernel 7.1.12, RTX 4090 24564 MiB (GPU-810dab77), driver 610.57.04, CUDA 13.1.80, i9-13900KF, 32 GiB RAM."
+notes = "Primary first architecture/model target. Architecture in-GGUF: qwen35 arch in the pinned llama.cpp reference, 65 blocks (64 LM layers + 1 bundled MTP layer, nextn_predict_layers = 1), full_attention_interval = 4 => 48 Gated DeltaNet/linear-attention + 16 full-attention layers. hidden 5120, ffn 17408, 24 Q heads / 4 KV heads / head_dim 256, vocab 248320, ctx 262144, rope base 1e7 with partial rotary 0.25. DeltaNet: state_size 128, inner 6144, 16 v-groups, conv kernel 4, time_step_rank 48. Reference hardware: RTX 4090 24 GiB, i9-13900KF, 32 GiB host RAM."
 
 [[models]]
 role = "incumbent-reference"
@@ -23,9 +22,8 @@ format = "safetensors"
 quantization = "compressed-tensors W4A16 AWQ, group size 32"
 artifact = "five safetensors shards"
 size_bytes = 21017689808
-local_path = "/home/nick/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea"
 runtime_reference = "vLLM 0.28.0"
-notes = "Q4-class incumbent comparison only; this is not the same artifact or quantization as the primary Unsloth UD-Q4_K_M GGUF. vLLM required --max-model-len 16384 --gpu-memory-utilization 0.98 --enforce-eager on the 24-GiB RTX 4090."
+notes = "Q4-class incumbent comparison only; this is not the same artifact or quantization as the primary UD-Q4_K_M GGUF. vLLM required --max-model-len 16384 --gpu-memory-utilization 0.98 --enforce-eager on the 24-GiB RTX 4090."
 
 [architecture]
 type = "dense-hybrid-causal-vl"
@@ -33,25 +31,24 @@ text_only_first = true
 notes = "Qwen3.8-27B is non-MoE but not a conventional KV-only transformer: its language stack mixes Gated DeltaNet/linear-attention and full-attention layers and includes MTP; the official model also has a vision encoder. The first Engine path may be text-only, but the core state/model interfaces must not assume KV-only execution."
 
 [semantics]
-endpoint = "OpenAI-compatible /v1 (llama-server)"
-chat_template = "GGUF-embedded Unsloth template with thinking/reasoning-effort controls (xhigh default)"
-thinking_mode = "on by default in everyday serving (--reasoning on, budget -1 unlimited; per-request reasoning_effort controls depth)"
-sampling = "bench arms: greedy seed 42, 384 output tokens; everyday serving: default temperature 1.0, top_k 20, top_p 0.95 per GGUF metadata"
-ignore_eos_for_fixed_output_length_runs = "bench-arm.sh does not set ignore_eos; runs are 384-token greedy completions"
+endpoint = "OpenAI-compatible /v1 for incumbent llama-server comparisons"
+chat_template = "GGUF-embedded Unsloth template with thinking/reasoning-effort controls"
+thinking_mode = "benchmark runs pin reasoning/thinking semantics explicitly"
+sampling = "matched benchmark arms use fixed semantics and record seed/output length"
 
 [comparison]
-primary_local_reference = "llama.cpp with the exact pinned UD-Q4_K_M GGUF (same artifact for Engine later)"
+primary_local_reference = "llama.cpp with the exact pinned UD-Q4_K_M GGUF"
 incumbents = ["vLLM", "SGLang"]
 
 [llama_cpp_reference]
-server_build = "0.3.0-dev build 10684 commit cc83d7b48 (master a298422da..cc83d7b48)"
-everyday_command = "llm-serve start -> systemd user unit, llama-server -m <UD-Q4_K_M.gguf> --alias qwen3.8:27b -ngl 99 -c 262144 -np 1 -fa on --cache-type-k q4_0 --cache-type-v q4_0 -b 2048 -ub 256 --split-mode none --cache-ram 16384 --no-cache-idle-slots --ctx-checkpoints 0 --spec-type draft-mtp --mmproj <mmproj-BF16.gguf> --no-mmproj-offload --image-min-tokens 1024 --reasoning on --reasoning-budget -1"
-bench_baseline_2026_09_01 = "see ai/research/local-baseline-llama-cpp-2026-09-01.md for pinned numbers (AR ~49.5 tok/s, MTP n=3 ~90-98 tok/s decode at 16K ctx on build 10684)"
-historical_dflash2 = "Aug-20-2026 suite in ~/qwen38-bench on desktop: DFlash2 n=5 Q4 drafter 123/110/92 tok/s chat/code/reason, AR 49.4/49.6/49.4; llama.cpp build 10548/PR 5ecbe1ac1; recommended everyday preset was DFlash2 until superseded by native MTP default"
+server_build = "0.3.0-dev build 10684 commit cc83d7b48"
+matched_artifact = "Qwen3.8-27B-UD-Q4_K_M.gguf sha256 322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
+baseline_2026_09_01 = "plain AR approximately 49.5 tok/s decode; native MTP n=3 approximately 90-98 tok/s at 16K context on the pinned reference environment"
+historical_dflash2 = "Aug-20-2026 reference suite on an earlier llama.cpp build: DFlash2 n=5 Q4 drafter 123/110/92 tok/s chat/code/reason, AR 49.4/49.6/49.4. Retained as historical evidence, not the current Engine performance claim."
 
 [vllm_reference]
 server_build = "vLLM 0.28.0"
-serve_command = "vllm serve <AWQ snapshot> --served-model-name qwen3.8:27b-awq --max-model-len 16384 --gpu-memory-utilization 0.98 --enforce-eager --port 8090"
-matched_aiperf_2026_09_01 = "AIPerf 0.12.0, synthetic chat nominal 256->128, c1, stream, seed 42, thinking off: active output 35.90 tok/s (p50 35.83), E2E 34.83, TTFT p50 130.21 ms, ITL p50 27.91 ms; 10/10 profiling requests succeeded"
+serve_configuration = "Qwen3.8-27B-AWQ-INT4, max model length 16384, gpu memory utilization 0.98, eager execution"
+matched_aiperf_2026_09_01 = "AIPerf 0.12.0, synthetic chat nominal 256->128, c1, streaming, seed 42, thinking off: active output 35.90 tok/s, E2E 34.83 tok/s, TTFT p50 130.21 ms, ITL p50 27.91 ms; 10/10 profiling requests succeeded"
 native_bench_crosscheck_2026_09_01 = "vllm bench serve: 35.45 tok/s, median TTFT 130.24 ms, median TPOT 27.31 ms, P99 ITL 29.57 ms"
 artifact_mismatch = "W4A16 compressed-tensors AWQ is a Q4-class incumbent reference, not an apples-to-apples comparison to the primary UD-Q4_K_M GGUF"
