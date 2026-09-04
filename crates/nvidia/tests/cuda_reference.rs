@@ -149,7 +149,8 @@ fn executes_reference_linear_layer_through_core_runtime() {
             &segment,
             InferenceStateSet::try_new(None, None).expect("state"),
         )
-        .expect("reference execution");
+        .expect("reference execution")
+        .into_parts();
 
     assert_eq!(event.phase(), ExecutionPhase::Decode);
     assert_eq!(event.token_count(), 1);
@@ -244,7 +245,8 @@ fn materializes_a_bounded_gguf_tensor_before_reference_execution() {
             &segment,
             InferenceStateSet::try_new(None, None).expect("state"),
         )
-        .expect("reference execution");
+        .expect("reference execution")
+        .into_parts();
 
     assert_eq!(
         runtime.backend().dispatcher().last_output(),

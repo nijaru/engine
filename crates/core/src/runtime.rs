@@ -207,10 +207,7 @@ where
 
         let mut next_positions = Vec::with_capacity(batch.len());
         for segment in batch.segments() {
-            let Some(position) = segment
-                .state_position()
-                .checked_add(segment.token_count())
-            else {
+            let Some(position) = segment.state_position().checked_add(segment.token_count()) else {
                 return Err(RuntimeSubmitError::new(
                     RuntimeError::PositionOverflow,
                     states,
@@ -222,7 +219,10 @@ where
         let backend_submission = match self.backend.submit(plan, batch, &mut states) {
             Ok(submission) => submission,
             Err(error) => {
-                return Err(RuntimeSubmitError::new(RuntimeError::Backend(error), states));
+                return Err(RuntimeSubmitError::new(
+                    RuntimeError::Backend(error),
+                    states,
+                ));
             }
         };
         Ok(RuntimeSubmission {

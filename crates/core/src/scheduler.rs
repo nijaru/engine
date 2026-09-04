@@ -381,7 +381,7 @@ impl ServingScheduler {
     pub fn complete_submission(
         &mut self,
         submission: BackendSubmissionId,
-        event: ExecutionBatchEvent,
+        event: &ExecutionBatchEvent,
         states: Vec<InferenceStateSet>,
     ) -> Result<(), SchedulerError> {
         let work = self
@@ -389,7 +389,7 @@ impl ServingScheduler {
             .get(&submission)
             .cloned()
             .ok_or(SchedulerError::UnknownSubmission(submission))?;
-        self.validate_completion(submission, &work, &event, &states)?;
+        self.validate_completion(submission, &work, event, &states)?;
 
         for ((item, completed), state) in work.iter().zip(event.events()).zip(states) {
             self.slots
@@ -588,7 +588,11 @@ impl ServingScheduler {
             if !seen.insert(item.slot()) {
                 return Err(SchedulerError::StaleWork);
             }
-            if !self.runnable.iter().any(|candidate| *candidate == item.slot()) {
+            if !self
+                .runnable
+                .iter()
+                .any(|candidate| *candidate == item.slot())
+            {
                 return Err(SchedulerError::StaleWork);
             }
             self.validate_work(*item)?;
@@ -770,12 +774,13 @@ impl ServingScheduler {
 }
 
 fn remove_id(queue: &mut VecDeque<RequestSlotId>, id: RequestSlotId) -> Result<(), SchedulerError> {
-    let index = queue
-        .iter()
-        .position(|candidate| *candidate == id)
-        .ok_or(SchedulerError::Invariant(
-            "request was absent from expected queue",
-        ))?;
+    let index =
+        queue
+            .iter()
+            .position(|candidate| *candidate == id)
+            .ok_or(SchedulerError::Invariant(
+                "request was absent from expected queue",
+            ))?;
     queue.remove(index);
     Ok(())
 }
@@ -956,11 +961,7 @@ mod tests {
         assert_eq!(scheduler.counts().in_flight(), 2);
 
         scheduler
-            .complete_submission(
-                submission,
-                batch_event(&work),
-                vec![state(), state()],
-            )
+            .complete_submission(submission, &batch_event(&work), vec![state(), state()])
             .expect("complete");
         assert_eq!(scheduler.counts().in_flight(), 0);
         assert_eq!(scheduler.counts().runnable(), 2);
@@ -982,11 +983,7 @@ mod tests {
         scheduler.cancel(first_id).expect("cancel first");
 
         scheduler
-            .complete_submission(
-                submission,
-                batch_event(&work),
-                vec![state(), state()],
-            )
+            .complete_submission(submission, &batch_event(&work), vec![state(), state()])
             .expect("complete");
         assert_eq!(scheduler.counts().terminal(), 1);
         assert_eq!(scheduler.counts().runnable(), 1);
@@ -1000,15 +997,19 @@ mod tests {
         scheduler.admit(request(2, 2), state(), 0).expect("second");
         let work = scheduler.schedule().expect("schedule");
         let states = scheduler.prepare_submission(&work).expect("prepare");
-        scheduler.fail_prepared(&work, states).expect("fail prepared");
+        scheduler
+            .fail_prepared(&work, states)
+            .expect("fail prepared");
         assert_eq!(scheduler.counts().prepared(), 0);
         assert_eq!(scheduler.counts().terminal(), 2);
-        assert!(scheduler
-            .reclaim_next()
-            .expect("reclaim")
-            .expect("terminal")
-            .state()
-            .is_some());
+        assert!(
+            scheduler
+                .reclaim_next()
+                .expect("reclaim")
+                .expect("terminal")
+                .state()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1034,7 +1035,7 @@ mod tests {
         ])
         .expect("batch event");
         assert_eq!(
-            scheduler.complete_submission(submission, wrong, vec![state()]),
+            scheduler.complete_submission(submission, &wrong, vec![state()]),
             Err(SchedulerError::CompletionMismatch)
         );
         assert_eq!(scheduler.counts().in_flight(), 1);

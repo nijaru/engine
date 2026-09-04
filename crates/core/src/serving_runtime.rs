@@ -158,7 +158,7 @@ where
                 }
                 Ok(Some(completed)) => {
                     let (event, states) = completed.into_parts();
-                    self.scheduler.complete_submission(id, event, states)?;
+                    self.scheduler.complete_submission(id, &event, states)?;
                     completed_count += 1;
                 }
                 Err(error) => match submission.take_uncommitted_states() {
@@ -328,7 +328,9 @@ mod tests {
         ) -> Result<BackendSubmissionId, BackendError> {
             self.validate_execution(plan, batch, states)?;
             if self.fail_submit {
-                return Err(BackendError::ExecutionFailed("test submit failure".to_owned()));
+                return Err(BackendError::ExecutionFailed(
+                    "test submit failure".to_owned(),
+                ));
             }
             let id = BackendSubmissionId::new(self.next_submission)
                 .ok_or_else(|| BackendError::ExecutionFailed("submission overflow".to_owned()))?;
@@ -374,7 +376,9 @@ mod tests {
         }
     }
 
-    fn fixture(fail_submit: bool) -> ServingRuntime<TestProvider, DelayedBackend, LogicalStateManager> {
+    fn fixture(
+        fail_submit: bool,
+    ) -> ServingRuntime<TestProvider, DelayedBackend, LogicalStateManager> {
         let device = DeviceId::new(0);
         let model = ModelId::new("test/model").expect("model ID");
         let backend_id = BackendId::new("test-backend").expect("backend ID");
@@ -401,10 +405,7 @@ mod tests {
                 ExecutionStage::new(ModelRegionId::new(0), ExecutionPhase::Decode),
             ],
             Vec::new(),
-            WeightBinding::empty(
-                ModelId::new("test/model").expect("model ID"),
-                device,
-            ),
+            WeightBinding::empty(ModelId::new("test/model").expect("model ID"), device),
         )
         .expect("plan");
         let policy = PolicySnapshot::new(
@@ -438,12 +439,8 @@ mod tests {
         RequestSpec::new(
             RequestId::new(id).expect("request ID"),
             ModelId::new("test/model").expect("model ID"),
-            RequestSemantics::new(
-                2,
-                SamplingParams::greedy(Some(id)),
-                ThinkingMode::Off,
-            )
-            .expect("semantics"),
+            RequestSemantics::new(2, SamplingParams::greedy(Some(id)), ThinkingMode::Off)
+                .expect("semantics"),
         )
     }
 
@@ -466,11 +463,16 @@ mod tests {
         assert_eq!(serving.submission_count(), 1);
         assert_eq!(serving.scheduler().counts().in_flight(), 2);
         for request in [first, second] {
-            let slot = serving
-                .scheduler()
-                .slot_for_request(request)
-                .expect("slot");
-            assert!(serving.scheduler().slots().get(slot).expect("request").state().is_none());
+            let slot = serving.scheduler().slot_for_request(request).expect("slot");
+            assert!(
+                serving
+                    .scheduler()
+                    .slots()
+                    .get(slot)
+                    .expect("request")
+                    .state()
+                    .is_none()
+            );
         }
 
         assert_eq!(serving.poll_completions().expect("pending poll"), 0);
@@ -507,11 +509,13 @@ mod tests {
         ));
         assert_eq!(serving.scheduler().counts().prepared(), 0);
         assert_eq!(serving.scheduler().counts().terminal(), 2);
-        assert!(serving
-            .reclaim_next()
-            .expect("reclaim")
-            .expect("terminal request")
-            .state()
-            .is_some());
+        assert!(
+            serving
+                .reclaim_next()
+                .expect("reclaim")
+                .expect("terminal request")
+                .state()
+                .is_some()
+        );
     }
 }

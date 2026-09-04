@@ -173,7 +173,10 @@ impl ActiveRequestSlot {
         if self.lifecycle != RequestLifecycle::Runnable {
             return Err(RequestSlotError::InvalidTransition);
         }
-        let state = self.state.take().ok_or(RequestSlotError::StateUnavailable)?;
+        let state = self
+            .state
+            .take()
+            .ok_or(RequestSlotError::StateUnavailable)?;
         self.lifecycle = RequestLifecycle::Submitting;
         Ok(state)
     }
