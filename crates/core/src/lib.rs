@@ -18,6 +18,7 @@ pub mod residency;
 pub mod runtime;
 pub mod scheduler;
 pub mod serving;
+pub mod serving_runtime;
 pub mod state;
 pub mod tensor;
 pub mod weights;
@@ -28,8 +29,8 @@ pub use backend::{
 };
 pub use device::DeviceId;
 pub use execution::{
-    ExecutionEvent, ExecutionMetrics, ExecutionPhase, ExecutionPlan, ExecutionSegment,
-    ExecutionStage, PlanError,
+    ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPhase,
+    ExecutionPlan, ExecutionSegment, ExecutionStage, PlanError,
 };
 pub use model::{
     FileModelProvider, FileWeightLoader, ModelCapabilities, ModelDescription, ModelError, ModelId,
@@ -51,7 +52,10 @@ pub use request::{
 pub use residency::{
     ModelResidencyPlan, ModelResourceId, ResidencyError, ResidencyLocation, ResidencyOverride,
 };
-pub use runtime::{CompletedExecution, ExecutionRuntime, RuntimeError, RuntimeSubmission};
+pub use runtime::{
+    CompletedExecution, CompletedExecutionBatch, ExecutionRuntime, RuntimeError, RuntimeSubmission,
+    RuntimeSubmitError,
+};
 pub use scheduler::{
     ScheduledWork, SchedulerConfig, SchedulerCounts, SchedulerError, ServingScheduler,
 };
@@ -59,6 +63,7 @@ pub use serving::{
     ActiveRequestSlot, RequestLifecycle, RequestProgress, RequestSlotError, RequestSlotId,
     RequestSlots,
 };
+pub use serving_runtime::{ServingIteration, ServingRuntime, ServingRuntimeError};
 pub use state::{
     ConvolutionStateShape, InferenceState, InferenceStateSet, KvState, KvStateSpec,
     LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec, StateError,
