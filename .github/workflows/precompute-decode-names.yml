@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - .github/precompute_decode_names.py
       - .github/workflows/precompute-decode-names.yml
 
 permissions:
