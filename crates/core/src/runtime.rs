@@ -7,6 +7,7 @@ use crate::execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionPlan, ExecutionSegment, PlanError,
 };
 use crate::model::{ModelError, ModelProvider};
+use crate::policy::PolicyVersion;
 use crate::state::{InferenceStateSet, StateError, StateManager};
 
 pub struct ExecutionRuntime<P, B, S> {
@@ -19,6 +20,7 @@ pub struct ExecutionRuntime<P, B, S> {
 pub struct RuntimeSubmission {
     backend_submission: BackendSubmissionId,
     batch: ExecutionBatch,
+    policy_version: PolicyVersion,
     states: Option<Vec<InferenceStateSet>>,
     next_positions: Vec<u32>,
 }
@@ -32,6 +34,11 @@ impl RuntimeSubmission {
     #[must_use]
     pub const fn batch(&self) -> &ExecutionBatch {
         &self.batch
+    }
+
+    #[must_use]
+    pub const fn policy_version(&self) -> PolicyVersion {
+        self.policy_version
     }
 
     /// Recover uncommitted logical state after a terminal submission failure.
@@ -159,6 +166,7 @@ where
         Ok(RuntimeSubmission {
             backend_submission,
             batch: batch.clone(),
+            policy_version: plan.policy_version(),
             states: Some(states),
             next_positions,
         })
@@ -191,7 +199,7 @@ where
         let Some(event) = self.backend.poll(submission.backend_submission)? else {
             return Ok(None);
         };
-        self.validate_completion(submission, &event)?;
+        Self::validate_completion(submission, &event)?;
         let states = submission
             .states
             .take()
@@ -257,7 +265,6 @@ where
     }
 
     fn validate_completion(
-        &self,
         submission: &RuntimeSubmission,
         event: &ExecutionBatchEvent,
     ) -> Result<(), RuntimeError> {
@@ -268,30 +275,12 @@ where
             if segment.request() != completed.request()
                 || segment.phase() != completed.phase()
                 || segment.token_count() != completed.token_count()
-                || completed.policy_version() != self.provider_policy_version(submission)
+                || completed.policy_version() != submission.policy_version
             {
                 return Err(RuntimeError::CompletionMismatch);
             }
         }
         Ok(())
-    }
-
-    fn provider_policy_version(&self, submission: &RuntimeSubmission) -> crate::policy::PolicyVersion {
-        let _ = submission;
-        // Every submitted segment is validated against one execution plan;
-        // backend events carry that plan's version. The runtime does not hold
-        // the plan after submission, so the first event identity check is
-        // completed by the backend and scheduler layers.
-        submission
-            .batch
-            .segments()
-            .first()
-            .map_or_else(|| unreachable!("execution batches are non-empty"), |_| {
-                // The backend contract validates plan identity before submission.
-                // A future RuntimeSubmission plan key can replace this when live
-                // policy swapping is introduced.
-                crate::policy::PolicyVersion::new(1).expect("non-zero policy version")
-            })
     }
 }
 
@@ -363,7 +352,6 @@ mod tests {
         ModelRegionKind, WeightDescription,
     };
     use crate::nvidia::{NvidiaBackend, NvidiaDispatcher};
-    use crate::policy::PolicyVersion;
     use crate::state::{
         InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
         StateRequirement,
@@ -415,11 +403,12 @@ mod tests {
         )
         .expect("model description");
         let backend_id = BackendId::new("cuda").expect("backend ID");
+        let policy = PolicyVersion::new(1).expect("policy version");
         let plan = ExecutionPlan::new(
             model.clone(),
             backend_id.clone(),
             device,
-            PolicyVersion::new(1).expect("policy version"),
+            policy,
             vec![ExecutionStage::new(
                 ModelRegionId::new(0),
                 ExecutionPhase::Decode,
@@ -459,6 +448,7 @@ mod tests {
         let submission = runtime
             .submit_segment(&plan, &segment, state)
             .expect("submission");
+        assert_eq!(submission.policy_version(), policy);
         assert_eq!(
             runtime
                 .state_manager()
