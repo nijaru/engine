@@ -51,7 +51,10 @@ fn in_flight_cancellation_waits_for_backend_completion() {
 
     let slot = slots.get_mut(id).expect("request");
     slot.make_runnable().expect("admit");
-    slot.begin_submission(submission).expect("submit");
+    let state = slot.prepare_submission().expect("prepare");
+    assert_eq!(slot.lifecycle(), RequestLifecycle::Submitting);
+    assert!(slot.state().is_none());
+    slot.confirm_submission(submission).expect("submit");
     slot.request_cancel().expect("cancel request");
     assert_eq!(slot.lifecycle(), RequestLifecycle::Cancelling(submission));
 
@@ -61,8 +64,9 @@ fn in_flight_cancellation_waits_for_backend_completion() {
     ));
 
     let slot = slots.get_mut(id).expect("request");
-    slot.complete_step(submission, ExecutionPhase::Decode, 1, empty_state())
+    slot.complete_step(submission, ExecutionPhase::Decode, 1, state)
         .expect("complete cancelled work");
     assert_eq!(slot.lifecycle(), RequestLifecycle::Cancelled);
+    assert!(slot.state().is_some());
     slots.remove(id).expect("reclaim cancelled request");
 }
