@@ -60,15 +60,29 @@ impl KvStateSpec {
     }
 
     #[must_use]
-    pub const fn layer_count(self) -> u16 { self.layer_count }
+    pub const fn layer_count(self) -> u16 {
+        self.layer_count
+    }
+
     #[must_use]
-    pub const fn kv_heads(self) -> u16 { self.kv_heads }
+    pub const fn kv_heads(self) -> u16 {
+        self.kv_heads
+    }
+
     #[must_use]
-    pub const fn head_dim(self) -> u16 { self.head_dim }
+    pub const fn head_dim(self) -> u16 {
+        self.head_dim
+    }
+
     #[must_use]
-    pub const fn block_tokens(self) -> u32 { self.block_tokens }
+    pub const fn block_tokens(self) -> u32 {
+        self.block_tokens
+    }
+
     #[must_use]
-    pub const fn dtype(self) -> DataType { self.dtype }
+    pub const fn dtype(self) -> DataType {
+        self.dtype
+    }
 
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
@@ -110,13 +124,24 @@ impl RecurrentMatrixShape {
     }
 
     #[must_use]
-    pub const fn key_heads(self) -> u16 { self.key_heads }
+    pub const fn key_heads(self) -> u16 {
+        self.key_heads
+    }
+
     #[must_use]
-    pub const fn key_head_dim(self) -> u16 { self.key_head_dim }
+    pub const fn key_head_dim(self) -> u16 {
+        self.key_head_dim
+    }
+
     #[must_use]
-    pub const fn value_heads(self) -> u16 { self.value_heads }
+    pub const fn value_heads(self) -> u16 {
+        self.value_heads
+    }
+
     #[must_use]
-    pub const fn value_head_dim(self) -> u16 { self.value_head_dim }
+    pub const fn value_head_dim(self) -> u16 {
+        self.value_head_dim
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -136,9 +161,14 @@ impl ConvolutionStateShape {
     }
 
     #[must_use]
-    pub const fn channels(self) -> u32 { self.channels }
+    pub const fn channels(self) -> u32 {
+        self.channels
+    }
+
     #[must_use]
-    pub const fn kernel(self) -> u16 { self.kernel }
+    pub const fn kernel(self) -> u16 {
+        self.kernel
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -174,15 +204,29 @@ impl RecurrentStateSpec {
     }
 
     #[must_use]
-    pub const fn layer_count(self) -> u16 { self.layer_count }
+    pub const fn layer_count(self) -> u16 {
+        self.layer_count
+    }
+
     #[must_use]
-    pub const fn matrix(self) -> RecurrentMatrixShape { self.matrix }
+    pub const fn matrix(self) -> RecurrentMatrixShape {
+        self.matrix
+    }
+
     #[must_use]
-    pub const fn convolution(self) -> ConvolutionStateShape { self.convolution }
+    pub const fn convolution(self) -> ConvolutionStateShape {
+        self.convolution
+    }
+
     #[must_use]
-    pub const fn matrix_dtype(self) -> DataType { self.matrix_dtype }
+    pub const fn matrix_dtype(self) -> DataType {
+        self.matrix_dtype
+    }
+
     #[must_use]
-    pub const fn convolution_dtype(self) -> DataType { self.convolution_dtype }
+    pub const fn convolution_dtype(self) -> DataType {
+        self.convolution_dtype
+    }
 
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
@@ -251,13 +295,24 @@ impl StateHandle {
     }
 
     #[must_use]
-    pub const fn id(&self) -> StateId { self.id }
+    pub const fn id(&self) -> StateId {
+        self.id
+    }
+
     #[must_use]
-    pub const fn requirement(&self) -> StateRequirement { self.requirement }
+    pub const fn requirement(&self) -> StateRequirement {
+        self.requirement
+    }
+
     #[must_use]
-    pub const fn location(&self) -> StateLocation { self.location }
+    pub const fn location(&self) -> StateLocation {
+        self.location
+    }
+
     #[must_use]
-    pub const fn token_position(&self) -> u32 { self.token_position }
+    pub const fn token_position(&self) -> u32 {
+        self.token_position
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -278,9 +333,14 @@ impl KvState {
     }
 
     #[must_use]
-    pub const fn handle(&self) -> &StateHandle { &self.handle }
+    pub const fn handle(&self) -> &StateHandle {
+        &self.handle
+    }
+
     #[must_use]
-    pub const fn spec(&self) -> KvStateSpec { self.spec }
+    pub const fn spec(&self) -> KvStateSpec {
+        self.spec
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -300,9 +360,14 @@ impl RecurrentState {
     }
 
     #[must_use]
-    pub const fn handle(&self) -> &StateHandle { &self.handle }
+    pub const fn handle(&self) -> &StateHandle {
+        &self.handle
+    }
+
     #[must_use]
-    pub const fn spec(&self) -> RecurrentStateSpec { self.spec }
+    pub const fn spec(&self) -> RecurrentStateSpec {
+        self.spec
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -390,6 +455,11 @@ impl InferenceStateSet {
     }
 
     /// Convenience constructor for the current Qwen hybrid path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a state error if the supplied states do not share a semantic
+    /// prefix boundary or duplicate a state requirement.
     pub fn try_new(
         kv: Option<KvState>,
         recurrent: Option<RecurrentState>,
@@ -405,7 +475,9 @@ impl InferenceStateSet {
     }
 
     #[must_use]
-    pub fn states(&self) -> &[InferenceState] { &self.states }
+    pub fn states(&self) -> &[InferenceState] {
+        &self.states
+    }
 
     #[must_use]
     pub fn kv(&self) -> Option<&KvState> {
@@ -425,7 +497,9 @@ impl InferenceStateSet {
 
     #[must_use]
     pub fn token_position(&self) -> Option<u32> {
-        self.states.first().map(|state| state.handle().token_position())
+        self.states
+            .first()
+            .map(|state| state.handle().token_position())
     }
 
     #[must_use]
@@ -537,7 +611,9 @@ impl LogicalStateManager {
     }
 
     #[must_use]
-    pub const fn device(&self) -> DeviceId { self.device }
+    pub const fn device(&self) -> DeviceId {
+        self.device
+    }
 
     #[must_use]
     pub fn capacity_bytes(&self, location: StateLocation) -> Option<u64> {
