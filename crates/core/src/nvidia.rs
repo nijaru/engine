@@ -9,6 +9,7 @@ use crate::execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionOutcome, ExecutionPlan,
     ExecutionSegment,
 };
+use crate::policy::PolicyVersion;
 use crate::state::InferenceStateSet;
 use crate::weights::WeightBinding;
 
@@ -41,13 +42,13 @@ pub trait NvidiaDispatcher: Send {
         Ok(())
     }
 
-    /// Dispatch one scheduler-selected multi-request batch.
+    /// Dispatch one scheduler-selected multi-request batch synchronously.
     ///
     /// The default implementation preserves reference/single-request
     /// dispatchers by visiting each segment in order. CUDA implementations
-    /// should override this once they have a native batch path so the backend
-    /// can choose shared launch metadata, batched kernels, and stream work
-    /// from the whole batch rather than reconstructing it segment by segment.
+    /// can override this to consume the whole batch in one backend operation.
+    /// Async-capable dispatchers should instead override [`Self::submit_batch`]
+    /// and [`Self::poll_batch`].
     ///
     /// # Errors
     ///
@@ -70,6 +71,52 @@ pub trait NvidiaDispatcher: Send {
             .map(|(segment, state)| self.dispatch(plan, segment, weights, state))
             .collect()
     }
+
+    /// Submit one scheduler batch under the backend-owned submission identity.
+    ///
+    /// The compatibility implementation executes immediately and returns its
+    /// outcomes. A genuinely asynchronous dispatcher returns `Ok(None)` after
+    /// queueing device work and later exposes outcomes from [`Self::poll_batch`].
+    /// The submission ID is stable across both calls and can key CUDA events,
+    /// pinned output slots, or other backend-local completion state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when the batch cannot be accepted.
+    fn submit_batch(
+        &mut self,
+        _submission: BackendSubmissionId,
+        plan: &ExecutionPlan,
+        batch: &ExecutionBatch,
+        weights: &WeightBinding,
+        states: &mut [InferenceStateSet],
+    ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+        self.dispatch_batch(plan, batch, weights, states).map(Some)
+    }
+
+    /// Poll outcomes for a batch previously accepted asynchronously.
+    ///
+    /// Synchronous dispatchers never reach this method. Async dispatchers
+    /// return `Ok(None)` while device work is pending and `Ok(Some(...))` once
+    /// all outcomes for the scheduler batch are ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when completion polling fails.
+    fn poll_batch(
+        &mut self,
+        _submission: BackendSubmissionId,
+    ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+        Err(BackendError::Unsupported(
+            "asynchronous NVIDIA dispatcher completion",
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingNvidiaSubmission {
+    batch: ExecutionBatch,
+    policy_version: PolicyVersion,
 }
 
 pub struct NvidiaBackend<D> {
@@ -77,6 +124,7 @@ pub struct NvidiaBackend<D> {
     dispatcher: D,
     next_submission: u64,
     completed: HashMap<BackendSubmissionId, ExecutionBatchEvent>,
+    pending: HashMap<BackendSubmissionId, PendingNvidiaSubmission>,
 }
 
 impl<D> NvidiaBackend<D> {
@@ -93,6 +141,7 @@ impl<D> NvidiaBackend<D> {
             dispatcher,
             next_submission: 1,
             completed: HashMap::new(),
+            pending: HashMap::new(),
         })
     }
 
@@ -122,6 +171,48 @@ impl<D> NvidiaBackend<D> {
     }
 }
 
+fn completion_event(
+    batch: &ExecutionBatch,
+    policy_version: PolicyVersion,
+    outcomes: Vec<ExecutionOutcome>,
+) -> Result<ExecutionBatchEvent, BackendError> {
+    if outcomes.len() != batch.len() {
+        return Err(BackendError::ExecutionFailed(format!(
+            "NVIDIA dispatcher returned {} outcomes for {} request segments",
+            outcomes.len(),
+            batch.len()
+        )));
+    }
+
+    let events = batch
+        .segments()
+        .iter()
+        .zip(outcomes)
+        .map(|(segment, outcome)| {
+            let output_token = outcome.output_token();
+            if segment.requests_sampling() != output_token.is_some() {
+                return Err(BackendError::ExecutionFailed(format!(
+                    "NVIDIA dispatcher output-token presence did not match sampling for request {}",
+                    segment.request().get()
+                )));
+            }
+            let event = ExecutionEvent::new(
+                segment.request(),
+                policy_version,
+                segment.phase(),
+                segment.token_count(),
+                outcome.metrics(),
+            )
+            .ok_or_else(|| BackendError::ExecutionFailed("segment contained no tokens".to_owned()))?;
+            Ok(match output_token {
+                Some(token) => event.with_output_token(token),
+                None => event,
+            })
+        })
+        .collect::<Result<Vec<_>, BackendError>>()?;
+    ExecutionBatchEvent::new(events).map_err(BackendError::InvalidPlan)
+}
+
 impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
     fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
@@ -138,48 +229,29 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         states: &mut [InferenceStateSet],
     ) -> Result<BackendSubmissionId, BackendError> {
         self.validate_execution(plan, batch, states)?;
-        let outcomes = self
-            .dispatcher
-            .dispatch_batch(plan, batch, plan.weights(), states)?;
-        if outcomes.len() != batch.len() {
-            return Err(BackendError::ExecutionFailed(format!(
-                "NVIDIA dispatcher returned {} outcomes for {} request segments",
-                outcomes.len(),
-                batch.len()
-            )));
-        }
-
-        let events = batch
-            .segments()
-            .iter()
-            .zip(outcomes)
-            .map(|(segment, outcome)| {
-                let output_token = outcome.output_token();
-                if segment.requests_sampling() != output_token.is_some() {
-                    return Err(BackendError::ExecutionFailed(format!(
-                        "NVIDIA dispatcher output-token presence did not match sampling for request {}",
-                        segment.request().get()
-                    )));
-                }
-                let event = ExecutionEvent::new(
-                    segment.request(),
-                    plan.policy_version(),
-                    segment.phase(),
-                    segment.token_count(),
-                    outcome.metrics(),
-                )
-                .ok_or_else(|| {
-                    BackendError::ExecutionFailed("segment contained no tokens".to_owned())
-                })?;
-                Ok(match output_token {
-                    Some(token) => event.with_output_token(token),
-                    None => event,
-                })
-            })
-            .collect::<Result<Vec<_>, BackendError>>()?;
-        let event = ExecutionBatchEvent::new(events).map_err(BackendError::InvalidPlan)?;
         let submission = self.allocate_submission()?;
-        self.completed.insert(submission, event);
+        let result = self.dispatcher.submit_batch(
+            submission,
+            plan,
+            batch,
+            plan.weights(),
+            states,
+        )?;
+        match result {
+            Some(outcomes) => {
+                let event = completion_event(batch, plan.policy_version(), outcomes)?;
+                self.completed.insert(submission, event);
+            }
+            None => {
+                self.pending.insert(
+                    submission,
+                    PendingNvidiaSubmission {
+                        batch: batch.clone(),
+                        policy_version: plan.policy_version(),
+                    },
+                );
+            }
+        }
         Ok(submission)
     }
 
@@ -187,10 +259,20 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
         &mut self,
         submission: BackendSubmissionId,
     ) -> Result<Option<ExecutionBatchEvent>, BackendError> {
-        self.completed
+        if let Some(event) = self.completed.remove(&submission) {
+            return Ok(Some(event));
+        }
+        if !self.pending.contains_key(&submission) {
+            return Err(BackendError::UnknownSubmission(submission));
+        }
+        let Some(outcomes) = self.dispatcher.poll_batch(submission)? else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending
             .remove(&submission)
-            .map(Some)
-            .ok_or(BackendError::UnknownSubmission(submission))
+            .ok_or(BackendError::UnknownSubmission(submission))?;
+        completion_event(&pending.batch, pending.policy_version, outcomes).map(Some)
     }
 }
 
@@ -264,6 +346,59 @@ mod tests {
         ) -> Result<(), BackendError> {
             self.releases += 1;
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct AsyncDispatcher {
+        submits: usize,
+        polls: usize,
+        pending: HashMap<BackendSubmissionId, usize>,
+    }
+
+    impl NvidiaDispatcher for AsyncDispatcher {
+        fn dispatch(
+            &mut self,
+            _plan: &ExecutionPlan,
+            _segment: &ExecutionSegment,
+            _weights: &WeightBinding,
+            _state: &mut InferenceStateSet,
+        ) -> Result<ExecutionOutcome, BackendError> {
+            Err(BackendError::ExecutionFailed(
+                "async dispatcher should not use synchronous dispatch".to_owned(),
+            ))
+        }
+
+        fn submit_batch(
+            &mut self,
+            submission: BackendSubmissionId,
+            _plan: &ExecutionPlan,
+            batch: &ExecutionBatch,
+            _weights: &WeightBinding,
+            states: &mut [InferenceStateSet],
+        ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+            if batch.len() != states.len() {
+                return Err(BackendError::StateCountMismatch);
+            }
+            self.submits += 1;
+            self.pending.insert(submission, batch.len());
+            Ok(None)
+        }
+
+        fn poll_batch(
+            &mut self,
+            submission: BackendSubmissionId,
+        ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+            self.polls += 1;
+            let count = self
+                .pending
+                .remove(&submission)
+                .ok_or(BackendError::UnknownSubmission(submission))?;
+            Ok(Some(
+                (0..count)
+                    .map(|_| ExecutionOutcome::new(ExecutionMetrics::new(5, 0, 0)))
+                    .collect(),
+            ))
         }
     }
 
@@ -450,5 +585,58 @@ mod tests {
         );
         assert_eq!(backend.dispatcher().batches, 1);
         assert_eq!(backend.dispatcher().segments, 0);
+    }
+
+    #[test]
+    fn backend_supports_dispatcher_owned_async_completion() {
+        let device = DeviceId::new(0);
+        let backend_id = BackendId::new("cuda").expect("backend ID");
+        let capabilities = BackendCapabilities::new(
+            backend_id.clone(),
+            device,
+            BackendKind::Cuda,
+            24 * 1024 * 1024 * 1024,
+            BackendFeatures::new(vec![DataType::F16], vec![], false, true),
+        );
+        let mut backend =
+            NvidiaBackend::new(capabilities, AsyncDispatcher::default()).expect("CUDA backend");
+        let model = ModelId::new("test-model").expect("model ID");
+        let plan = ExecutionPlan::new(
+            model.clone(),
+            backend_id,
+            device,
+            PolicyVersion::new(1).expect("policy version"),
+            vec![ExecutionStage::new(
+                ModelRegionId::new(0),
+                ExecutionPhase::Decode,
+            )],
+            Vec::new(),
+            WeightBinding::empty(model, device),
+        )
+        .expect("plan");
+        let batch = ExecutionBatch::new(vec![
+            ExecutionSegment::new(
+                RequestId::new(1).expect("request ID"),
+                ExecutionPhase::Decode,
+                1,
+                1,
+                0,
+                Vec::new(),
+            )
+            .expect("segment"),
+        ])
+        .expect("batch");
+        let mut states = vec![InferenceStateSet::new(Vec::new()).expect("state")];
+
+        let submission = backend.submit(&plan, &batch, &mut states).expect("submit");
+        assert_eq!(backend.dispatcher().submits, 1);
+        assert_eq!(backend.dispatcher().polls, 0);
+
+        let completed = backend
+            .poll(submission)
+            .expect("poll async dispatcher")
+            .expect("completion");
+        assert_eq!(completed.events()[0].metrics().elapsed_nanos(), 5);
+        assert_eq!(backend.dispatcher().polls, 1);
     }
 }
