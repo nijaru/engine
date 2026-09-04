@@ -1,5 +1,6 @@
 name: Skip Qwen Prefill Output Head
 
+# one-shot migration; removed on success
 on:
   push:
     branches: [main]
