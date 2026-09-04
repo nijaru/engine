@@ -31,59 +31,68 @@ Phase 3 proves a correct native execution path. It does not establish a competit
 
 ## Phase 4 — runtime and serving foundation
 
-Phase 4 begins with a boundary correction before scheduler work grows around Phase-3-specific assumptions.
+The pre-scheduler architecture correction is complete. Core interfaces no longer encode the Phase-3 Qwen state bundle, and the serving/runtime foundation now has stable request-slot, residency, qualification, readiness, and submission/completion contracts.
 
-### 4A — generic runtime state and resource boundaries
+The RTX 4090 remains the available local qualification machine, not a long-term architecture target.
 
-- Replace Qwen-shaped runtime state containers with generic typed `InferenceState` / `InferenceStateSet` boundaries while preserving backend-specific Qwen physical state.
-- Keep inference-state identity/lifecycle separate from model residency and weight-placement concerns.
-- Remove temporary compatibility names once current CUDA callers migrate.
-- Keep model regions and execution phases narrow; do not introduce a general compiler IR.
+### 4A — runtime boundary correction — complete
 
-### 4B — persistent request runtime
+- Generic typed `InferenceState` / `InferenceStateSet` at core runtime/backend boundaries.
+- Backend-specific physical Qwen state remains free to be specialized.
+- Model residency is distinct from per-request inference state.
+- Model regions remain distinct from execution phases; no general compiler IR was introduced.
+- Temporary core `HybridState*` compatibility aliases and NVIDIA callers were migrated.
+- Execution variants carry explicit qualified/experimental/incompatible status.
+- Runtime startup has explicit readiness states.
 
-- Define stable active-request slots and request lifecycle transitions.
-- Store persistent scheduling/model metadata once and update it incrementally.
-- Avoid rebuilding large request/batch metadata structures every iteration.
-- Make cancellation, completion, error, and reclamation ownership explicit.
+### 4B — persistent request/runtime foundation — complete
 
-### 4C — async-first execution loop
+- Stable generation-tagged active-request slots.
+- Explicit waiting/runnable/in-flight/terminal lifecycle states.
+- Persistent request progress and inference-state ownership.
+- Submission identity prevents a completion from updating the wrong request.
+- Core execution uses submit/poll completion semantics; logical state commits only after completion.
 
-- Define host/device ownership and N/N+1 overlap rules.
-- Eliminate unnecessary synchronization from the steady-state decode path.
-- Preallocate/reuse step metadata and device-side buffers where practical.
-- Add explicit readiness/warmup states rather than treating process startup as semantic readiness.
+These are contracts and data structures, not yet a complete serving scheduler.
 
-### 4D — continuous batching
+### 4C — scheduler and async serving loop — next
 
-- Admit/wait/run requests under explicit work/token budgets.
-- Form mixed prefill/decode work without hard-coding one immutable request topology.
-- Establish fairness/priority hooks without putting expensive policy search in the fast loop.
-- Benchmark throughput, TTFT, ITL, tail latency, and host overhead against incumbent configurations with matched semantics.
+- Integrate admission and `RequestSlots` into one deterministic scheduler loop.
+- Maintain ready/runnable/in-flight sets without rebuilding request metadata each iteration.
+- Schedule under explicit token/work budgets.
+- Prioritize latency-sensitive decode according to policy and fill remaining budget with chunked prefill.
+- Poll completions while preparing later work; do not introduce a mandatory per-step host/device synchronization point.
+- Make cancellation, failure, completion, and state/resource reclamation complete and testable at every lifecycle state.
+- Reuse/preallocate batch metadata and device-side step buffers where measurements justify it.
+- Replace the current synchronous NVIDIA compatibility-dispatch behavior with genuinely asynchronous CUDA submission when the serving loop can consume it.
+- Benchmark scheduler CPU overhead, TTFT, ITL, tail latency, and throughput against matched incumbents.
 
-### 4E — state paging and reuse
+### 4D — state paging and exact reuse
 
 - Add block/paged KV allocation where it improves real workloads.
 - Preserve recurrent/other required state at reusable prefix boundaries.
 - Add exact prefix reuse only when the complete model-required state can be reconstructed correctly.
 - Make allocation/reuse/transfer costs visible to scheduling.
+- Add preemption only with explicit state ownership/reclamation semantics.
 
-### 4F — minimal serving surface
+### 4E — minimal serving surface
 
 - Serve the same runtime used by direct/local inference.
 - Streaming request/response lifecycle with cancellation and backpressure.
 - OpenAI-compatible surface where useful without coupling core semantics to that protocol.
-- Tokenization/detokenization and chat-template work runs outside the device hot path and is bounded under load.
+- Tokenization/detokenization and chat-template work stays outside the device hot path and is bounded under load.
+- Readiness reflects required preparation/warmup rather than process liveness.
 
 ## Phase 5 — performance system
 
-- Execution-variant registry with explicit compatibility/qualification identity.
+- Execution-variant registry keyed by explicit compatibility and qualification identity.
 - CUDA graph/capture paths only after eager-path correctness gates exist for the same semantics.
 - Fused/vendor/custom kernel selection based on measurements.
 - Persistent and larger execution regions where they beat simpler paths.
 - Runtime profiling and empirical cost models.
 - Versioned live policy with safe application boundaries and rollback.
-- Transparent cache/preparation identity for packed weights, compiled kernels, graphs, profiles, and warmup products.
+- Transparent preparation cache for packed weights, compiled/JIT kernels, graphs, profiles, and warmup products.
+- Exact artifact identity/invalidation and safe fallback; no surprise first-request compilation stall on a path reported ready.
 
 The common path should first improve by removing host work, allocations, copies, and synchronization before relying on complex tuning.
 
@@ -96,7 +105,7 @@ The common path should first improve by removing host work, allocations, copies,
 
 ## Phase 7 — broader model and hardware coverage
 
-Prioritize architectures that force useful generalization rather than a long checklist of similar dense decoders.
+Prioritize architectures and devices that force useful generalization rather than a long checklist of similar dense decoders.
 
 - Additional dense/hybrid model families.
 - MoE/expert execution and sparse-attention architectures.
@@ -104,6 +113,8 @@ Prioritize architectures that force useful generalization rather than a long che
 - Newer NVIDIA generations and materially different CUDA capabilities.
 - Metal and AMD when the backend/runtime contracts are mature enough to test portability honestly.
 - Additional checkpoint/quantization formats based on user value.
+
+The second backend should validate the current coarse core/backend boundary. Factor shared backend internals only where real duplication appears; do not pre-build a universal backend component framework.
 
 ## Phase 8 — distributed inference
 
@@ -123,4 +134,4 @@ Research can proceed alongside implementation but does not block the roadmap unl
 
 Potential directions include joint optimization of scheduling, execution variants, state placement, speculation, and topology; broader persistent/mega-kernel execution; state compression/reuse techniques; and new hardware-aware compilation strategies.
 
-No novelty claim is required for the project to be useful. Near-term success is stronger execution across performance, latency, memory efficiency, startup, portability, correctness, observability, configuration, and usability.
+No novelty claim is required for the project to be useful. Near-term success is strong execution across performance, latency, memory efficiency, startup, portability, correctness, observability, configuration, and usability.
