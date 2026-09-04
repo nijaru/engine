@@ -39,6 +39,8 @@ jobs:
           s = s.replace("        stages,\n        state_requirements.clone(),", "        execution_stages,\n        state_requirements.clone(),", 1)
           p.write_text(s)
           PY
+      - name: Keep permanent workflows unchanged in one-shot commit
+        run: git checkout -- .github/workflows/ci.yml
       - name: Format
         run: cargo fmt --all
       - name: Test
@@ -54,6 +56,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/continue_local_qwen.py .github/workflows/continue-local-qwen.yml
-          git add crates/server .github/workflows/ci.yml Cargo.lock
+          git add crates/server Cargo.lock
           git commit -m "Add direct local Qwen serving command"
           git push origin HEAD:main
