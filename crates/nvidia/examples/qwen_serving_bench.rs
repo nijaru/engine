@@ -27,7 +27,7 @@ use engine_core::{
 };
 use engine_gguf::{Qwen35LayerKind, Qwen35ModelProvider};
 use engine_nvidia::{
-    CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
+    CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, GemvMode, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
 
@@ -57,6 +57,7 @@ fn run() -> Result<(), String> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let concurrency = parse_usize(&arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
     let output_tokens = parse_u32(&arguments, "--tokens=", DEFAULT_OUTPUT_TOKENS)?;
+    let gemv_mode = parse_gemv_mode(&arguments)?;
     if concurrency == 0 || output_tokens == 0 {
         return Err("concurrency and token count must be greater than zero".to_owned());
     }
@@ -83,8 +84,10 @@ fn run() -> Result<(), String> {
     let staged = Arc::new(stage_weights(&provider, device, &context, &stream)?);
     let stage_elapsed = stage_started.elapsed();
     let layer_kinds = qwen_layer_kinds(&provider)?;
-    let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
-        .map_err(|error| error.to_string())?;
+    let mut executor =
+        CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
+            .map_err(|error| error.to_string())?;
+    executor.set_gemv_mode(gemv_mode);
     // Pinned output slots cover every scheduler row that can be in flight at
     // once: one full scheduler batch of `concurrency` sampling rows plus a
     // safety multiple for overlapping submissions during state transitions.
@@ -279,7 +282,14 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "  caveat: the current CUDA serving dispatcher executes members of each scheduler batch sequentially through batch-1 kernels; async completion is landed, so this measures the one-stream async path before native batching"
+        "  caveat: the current CUDA serving dispatcher executes members of each scheduler batch sequentially through batch-1 kernels; async completion is landed, so this measures the one-stream async path before native batching",
+    );
+    println!(
+        "  gemv mode: {}",
+        match gemv_mode {
+            GemvMode::Scalar => "scalar (correctness oracle)",
+            GemvMode::Warp => "warp-cooperative",
+        }
     );
     Ok(())
 }
@@ -292,6 +302,17 @@ fn parse_usize(arguments: &[String], prefix: &str, default: usize) -> Result<usi
             value
                 .parse::<usize>()
                 .map_err(|_| format!("{prefix} expects an integer"))
+        })
+}
+
+fn parse_gemv_mode(arguments: &[String]) -> Result<GemvMode, String> {
+    arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--gemv="))
+        .map_or(Ok(GemvMode::Scalar), |value| match value {
+            "scalar" => Ok(GemvMode::Scalar),
+            "warp" => Ok(GemvMode::Warp),
+            other => Err(format!("--gemv expects scalar or warp, got {other}")),
         })
 }
 

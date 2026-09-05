@@ -121,6 +121,31 @@ impl QwenGemvKernel {
         }
     }
 
+    /// Run the warp-cooperative GEMV variant for one tensor. The scalar
+    /// [`Self::execute`] remains the correctness oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel's error when the family lacks a warp variant or
+    /// shape/launch validation fails.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        match self {
+            Self::Q3K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q4K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q5K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q6K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q8_0(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Iq4Nl(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Iq3S(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Iq4Xs(kernel) => kernel.execute_warp(weight, input, output),
+        }
+    }
+
     #[must_use]
     pub const fn value_type(&self) -> u32 {
         match self {

@@ -266,6 +266,22 @@ pub struct CudaQwen35Decode {
     /// first use once the KV capacity is known.
     scores: Option<CudaSlice<f32>>,
     scores_stride: usize,
+    gemv_mode: GemvMode,
+}
+
+/// Which `GEMV` kernel variant the executor launches for quantized
+/// projections.
+///
+/// `Scalar` is the parity-tested correctness oracle. `Warp` selects the
+/// warp-cooperative kernels (one warp per output row, coalesced weight/input
+/// reads) for measured A/B qualification before any automatic selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GemvMode {
+    /// One-thread-per-output-row scalar kernels (correctness oracle).
+    #[default]
+    Scalar,
+    /// Warp-cooperative row kernels (measured variant).
+    Warp,
 }
 
 impl CudaQwen35Decode {
@@ -379,6 +395,7 @@ impl CudaQwen35Decode {
             epsilon,
             scores: None,
             scores_stride: 0,
+            gemv_mode: GemvMode::Scalar,
             hidden: scratch.hidden,
             normed: scratch.normed,
             attn_incr: scratch.attn_incr,
@@ -530,12 +547,14 @@ impl CudaQwen35Decode {
                 &names.common.ffn_gate,
                 &self.normed,
                 &mut self.ffn_gate_buf,
+                self.gemv_mode,
             )?;
             gemv(
                 &self.weights,
                 &names.common.ffn_up,
                 &self.normed,
                 &mut self.ffn_up_buf,
+                self.gemv_mode,
             )?;
             self.ops
                 .silu_mul(&self.ffn_gate_buf, &self.ffn_up_buf, &mut self.ffn_act)?;
@@ -544,6 +563,7 @@ impl CudaQwen35Decode {
                 &names.common.ffn_down,
                 &self.ffn_act,
                 &mut self.ffn_incr,
+                self.gemv_mode,
             )?;
             self.ops.residual_add(&mut self.hidden, &self.ffn_incr)?;
         }
@@ -607,10 +627,33 @@ impl CudaQwen35Decode {
             "output.weight",
             &self.normed,
             &mut self.logits,
+            self.gemv_mode,
         )?;
         self.ops
             .argmax_into(&self.logits, &mut self.selected_token)?;
         Ok(())
+    }
+
+    /// Copy the current residual stream to the host. The copy is
+    /// stream-ordered and synchronized; it exists for parity debugging
+    /// against the host reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError::Driver`] when the device copy fails.
+    /// Select which `GEMV` kernel variant subsequent steps launch.
+    ///
+    /// `Scalar` is the correctness oracle; `Warp` is the measured
+    /// cooperative variant. Mode changes take effect for the next launched
+    /// step and never mutate in-flight launches.
+    #[must_use]
+    pub const fn gemv_mode(&self) -> GemvMode {
+        self.gemv_mode
+    }
+
+    /// Set the `GEMV` kernel variant used by subsequent steps.
+    pub fn set_gemv_mode(&mut self, mode: GemvMode) {
+        self.gemv_mode = mode;
     }
 
     /// Copy the current residual stream to the host. The copy is
@@ -667,24 +710,28 @@ impl CudaQwen35Decode {
             &names.attn_qkv,
             &self.normed,
             &mut self.qkv_mixed,
+            self.gemv_mode,
         )?;
         gemv(
             &self.weights,
             &names.attn_gate,
             &self.normed,
             &mut self.z_gate,
+            self.gemv_mode,
         )?;
         gemv(
             &self.weights,
             &names.ssm_beta,
             &self.normed,
             &mut self.beta_raw,
+            self.gemv_mode,
         )?;
         gemv(
             &self.weights,
             &names.ssm_alpha,
             &self.normed,
             &mut self.alpha_raw,
+            self.gemv_mode,
         )?;
         let dt_bias = f32_slice(&self.weights, &names.ssm_dt_bias)?;
         let ssm_a = f32_slice(&self.weights, &names.ssm_a)?;
@@ -746,6 +793,7 @@ impl CudaQwen35Decode {
             &names.ssm_out,
             &self.gated,
             &mut self.attn_incr,
+            self.gemv_mode,
         )?;
         self.ops.residual_add(&mut self.hidden, &self.attn_incr)?;
         Ok(())
@@ -763,7 +811,13 @@ impl CudaQwen35Decode {
         position: u32,
     ) -> Result<(), CudaDecodeError> {
         let slot = self.kv_slot[layer];
-        gemv(&self.weights, &names.q, &self.normed, &mut self.q_raw)?;
+        gemv(
+            &self.weights,
+            &names.q,
+            &self.normed,
+            &mut self.q_raw,
+            self.gemv_mode,
+        )?;
         let q_norm = f32_slice(&self.weights, &names.q_norm)?;
         self.ops.q_gate_norm(
             &self.q_raw,
@@ -773,7 +827,13 @@ impl CudaQwen35Decode {
             ATTN_HEAD_DIM,
             self.epsilon,
         )?;
-        gemv(&self.weights, &names.k, &self.normed, &mut self.k_raw)?;
+        gemv(
+            &self.weights,
+            &names.k,
+            &self.normed,
+            &mut self.k_raw,
+            self.gemv_mode,
+        )?;
         let k_norm = f32_slice(&self.weights, &names.k_norm)?;
         self.ops.strided_rms_norm(
             &self.k_raw,
@@ -783,7 +843,13 @@ impl CudaQwen35Decode {
             ATTN_HEAD_DIM,
             self.epsilon,
         )?;
-        gemv(&self.weights, &names.v, &self.normed, &mut self.v_raw)?;
+        gemv(
+            &self.weights,
+            &names.v,
+            &self.normed,
+            &mut self.v_raw,
+            self.gemv_mode,
+        )?;
         self.ops.rope_neox(
             &mut self.q_packed,
             u64::from(position),
@@ -851,6 +917,7 @@ impl CudaQwen35Decode {
             &names.output,
             &self.attn_out,
             &mut self.attn_incr,
+            self.gemv_mode,
         )?;
         self.ops.residual_add(&mut self.hidden, &self.attn_incr)?;
         Ok(())
@@ -1021,6 +1088,7 @@ fn gemv(
     name: &str,
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
+    mode: GemvMode,
 ) -> Result<(), CudaDecodeError> {
     let weight = weights
         .quantized_tensor(name)
@@ -1028,7 +1096,10 @@ fn gemv(
     let kernel = weights
         .gemv_for(weight.value_type())
         .ok_or(CudaDecodeError::MissingKernel(weight.value_type()))?;
-    kernel.execute(weight, input, output)?;
+    match mode {
+        GemvMode::Scalar => kernel.execute(weight, input, output),
+        GemvMode::Warp => kernel.execute_warp(weight, input, output),
+    }?;
     Ok(())
 }
 

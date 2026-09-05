@@ -477,6 +477,365 @@ extern "C" __global__ void q5_k_gemv(
     }
     output[output_index] = accumulator;
 }
+
+// ------------------------------------------------------------------------
+// Warp-cooperative variants: one warp per output row. Lanes split each
+// 256-element block into 8 consecutive elements (32-element blocks map one
+// element per lane), so weight bytes and input floats are read by sector-
+// coalesced transactions and every lane stays busy. Each lane accumulates
+// its partial products across all blocks; one shuffle reduction produces the
+// row result. The decode math is identical to the scalar kernels above,
+// which remain the correctness oracle.
+
+__device__ __forceinline__ float warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+extern "C" __global__ void q8_0_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 32;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 34;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const int quantized = (int)(signed char)block[2 + lane];
+        accumulator += d * (float)quantized * input[block_index * 32 + lane];
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void iq4_nl_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 32;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 18;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const int index = lane < 16 ? lane : lane - 16;
+        const int nibble = lane < 16
+            ? (int)(block[2 + index] & 0x0fu)
+            : (int)(block[2 + index] >> 4u);
+        accumulator += d * (float)values[nibble] * input[block_index * 32 + lane];
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void iq4_xs_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 136;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned short high_scales =
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8u);
+        const int group = lane >> 2;
+        const int within = (lane & 3) * 8;
+        const int low = (int)((block[4 + group / 2] >> ((group & 1) * 4)) & 0x0fu);
+        const int high = (int)((high_scales >> (group * 2)) & 0x03u);
+        const float group_scale = d * (float)((low | (high << 4)) - 32);
+        const int data_offset = 8 + group * 16;
+        for (int j = 0; j < 8; ++j) {
+            const int local = group * 32 + within + j;
+            const int element = within + j;
+            const unsigned char packed = block[data_offset + (element & 15)];
+            const int nibble = element < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4u);
+            accumulator +=
+                group_scale * (float)values[nibble] * input[block_index * 256 + local];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void q3_k_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 110;
+        const float d = decode_f16((unsigned short)block[108] | ((unsigned short)block[109] << 8u));
+        const unsigned char* high_bits = block;
+        const unsigned char* low_bits = block + 32;
+        const unsigned char* packed_scales = block + 96;
+        const int group = lane >> 1;
+        const int local = (lane & 1) * 8;
+        const int index = group < 8 ? group : group - 8;
+        const int scale_bits = group < 8
+            ? (int)((packed_scales[index] & 0x0fu)
+                | (((packed_scales[8 + index % 4] >> ((index / 4) * 2)) & 0x03u) << 4u))
+            : (int)((packed_scales[index] >> 4u)
+                | (((packed_scales[8 + index % 4] >> ((group / 4) * 2)) & 0x03u) << 4u));
+        const int group_scale = scale_bits - 32;
+        const int chunk = group / 8;
+        const int variant = (group / 2) & 3;
+        const int half = group & 1;
+        const int low_offset = chunk * 32 + half * 16;
+        const int high_offset = half * 16;
+        for (int j = 0; j < 8; ++j) {
+            const int within = local + j;
+            const int low = (int)((low_bits[low_offset + within] >> (variant * 2)) & 0x03u);
+            const int high = ((int)(high_bits[high_offset + within] >> (group / 2)) & 1) ^ 1;
+            const int quantized = low - high * 4;
+            accumulator += d * (float)group_scale * (float)quantized
+                * input[block_index * 256 + group * 16 + within];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void q6_k_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 210;
+        const unsigned char* low_bits = block;
+        const unsigned char* high_bits = block + 128;
+        const unsigned char* scales = block + 192;
+        const float d = decode_f16((unsigned short)block[208] | ((unsigned short)block[209] << 8u));
+        const int group = lane >> 2;
+        const int position_base = (lane & 3) * 8;
+        const int chunk = group / 4;
+        const int variant = group & 3;
+        const int low_offset = chunk * 64 + (variant & 1) * 32;
+        const int low_shift = variant < 2 ? 0 : 4;
+        const int high_offset = chunk * 32;
+        for (int j = 0; j < 8; ++j) {
+            const int position = position_base + j;
+            const int half = position >= 16 ? 1 : 0;
+            const int group_scale = (int)(signed char)scales[group * 2 + half];
+            const int low = (int)((low_bits[low_offset + position] >> low_shift) & 0x0fu);
+            const int high = (int)((high_bits[high_offset + position] >> (variant * 2)) & 0x03u);
+            const int quantized = (low | (high << 4)) - 32;
+            accumulator += d * (float)group_scale * (float)quantized
+                * input[block_index * 256 + group * 32 + position];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void q4_k_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 144;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
+        const int group = lane >> 2;
+        const int index_base = (lane & 3) * 8;
+        const int data_offset = 16 + (group / 2) * 32;
+        const int shift = (group & 1) * 4;
+        const float group_scale = (float)scale_value(block, group);
+        const float group_minimum = (float)minimum_value(block, group);
+        for (int j = 0; j < 8; ++j) {
+            const int index = index_base + j;
+            const int quantized = (int)((block[data_offset + index] >> shift) & 0x0fu);
+            const float value =
+                d * group_scale * (float)quantized - min * group_minimum;
+            accumulator += value * input[block_index * 256 + group * 32 + index];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void q5_k_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 176;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
+        const int group = lane >> 2;
+        const int index_base = (lane & 3) * 8;
+        const int data_offset = 48 + (group / 2) * 32;
+        const int shift = (group & 1) * 4;
+        const float group_scale = (float)scale_value(block, group);
+        const float group_minimum = (float)minimum_value(block, group);
+        for (int j = 0; j < 8; ++j) {
+            const int index = index_base + j;
+            const int low = (int)((block[data_offset + index] >> shift) & 0x0fu);
+            const int high = (int)((block[16 + index] >> group) & 1u);
+            const int quantized = low | (high << 4);
+            const float value =
+                d * group_scale * (float)quantized - min * group_minimum;
+            accumulator += value * input[block_index * 256 + group * 32 + index];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+
+extern "C" __global__ void iq3_s_gemv_warp(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    const unsigned char* grid,
+    int input_size,
+    int output_size
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 110;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned char* low_codes = block + 2;
+        const unsigned char* high_codes = block + 66;
+        const unsigned char* signs = block + 74;
+        const unsigned char* scales = block + 106;
+        const int group = lane >> 2;
+        const int sub = (lane & 3) * 2;
+        const int scale_nibble =
+            (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
+        const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
+        for (int j = 0; j < 8; ++j) {
+            const int lane_in = sub * 8 + j;
+            const int code_index = group * 8 + sub * 2 + lane_in / 4;
+            const int high_bit =
+                (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
+            const int code = (int)low_codes[code_index] | (high_bit << 8);
+            const int sign = ((signs[group * 4 + sub] >> lane_in) & 1u) == 0u ? 1 : -1;
+            const int grid_index = code * 4 + (lane_in & 3);
+            const float value = group_scale * (float)grid[grid_index] * (float)sign;
+            accumulator += value * input[block_index * 256 + group * 32 + lane_in];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 "#;
 
 #[derive(Debug)]
@@ -535,6 +894,7 @@ impl std::error::Error for CudaQuantizedKernelError {}
 struct CudaQuantizedGemv {
     stream: Arc<CudaStream>,
     kernel: CudaFunction,
+    warp_kernel: Option<CudaFunction>,
     value_type: u32,
     block_elements: usize,
     block_bytes: usize,
@@ -562,9 +922,30 @@ impl CudaQuantizedGemv {
         let kernel = module
             .load_function(function_name)
             .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        // Embedding lookups keep the scalar kernel only; GEMV families also
+        // compile their warp-cooperative variant for measured selection.
+        let warp_name: Option<&'static str> = match function_name {
+            "q8_0_gemv" => Some("q8_0_gemv_warp"),
+            "iq4_nl_gemv" => Some("iq4_nl_gemv_warp"),
+            "iq4_xs_gemv" => Some("iq4_xs_gemv_warp"),
+            "q3_k_gemv" => Some("q3_k_gemv_warp"),
+            "q6_k_gemv" => Some("q6_k_gemv_warp"),
+            "q4_k_gemv" => Some("q4_k_gemv_warp"),
+            "q5_k_gemv" => Some("q5_k_gemv_warp"),
+            "iq3_s_gemv" => Some("iq3_s_gemv_warp"),
+            _ => None,
+        };
+        let warp_kernel = warp_name
+            .map(|name| {
+                module
+                    .load_function(name)
+                    .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))
+            })
+            .transpose()?;
         Ok(Self {
             stream,
             kernel,
+            warp_kernel,
             value_type,
             block_elements,
             block_bytes,
@@ -683,6 +1064,52 @@ impl CudaQuantizedGemv {
         }
         Ok(())
     }
+
+    /// Execute the warp-cooperative variant when one was compiled for this
+    /// kernel family. One warp computes each output row: lanes split each
+    /// quantization block into consecutive element runs so both weight-byte
+    /// and input reads coalesce, and a shuffle reduction produces the row
+    /// result. The scalar kernel remains the correctness oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no warp
+    /// variant or validation/launch fails.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        const WARPS_PER_BLOCK: u32 = 4;
+        let warp_kernel = self.warp_kernel.as_ref().ok_or_else(|| {
+            CudaQuantizedKernelError::InvalidWeight(format!(
+                "{} has no warp-cooperative variant",
+                self.label
+            ))
+        })?;
+        let (input_size, output_size, _) = self.validate(weight, input, output)?;
+        let blocks = output_size.div_ceil(WARPS_PER_BLOCK);
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: same slices/validation as the scalar path; the warp kernel
+        // writes only rows [0, output_size) once each from lane 0.
+        unsafe {
+            self.stream
+                .launch_builder(warp_kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&input_size)
+                .arg(&output_size)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 /// A correctness-oriented `IQ4_NL` matrix-vector kernel.
@@ -746,6 +1173,23 @@ impl CudaIq4NlGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
+    }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
     }
 }
 
@@ -819,6 +1263,51 @@ impl CudaIq3SGemv {
             self.inner
                 .stream
                 .launch_builder(&self.inner.kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&self.grid)
+                .arg(&input_size)
+                .arg(&output_size)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Execute the warp-cooperative `IQ3_S` `GEMV` variant into a
+    /// caller-owned output. The launch is asynchronous with respect to the
+    /// host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the weight, shapes,
+    /// contexts, or launch arguments are invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        const WARPS_PER_BLOCK: u32 = 4;
+        let (input_size, output_size, _) = self.inner.validate(weight, input, output)?;
+        let warp_kernel = self.inner.warp_kernel.as_ref().ok_or_else(|| {
+            CudaQuantizedKernelError::InvalidWeight(
+                "IQ3_S has no warp-cooperative variant".to_owned(),
+            )
+        })?;
+        let blocks = output_size.div_ceil(WARPS_PER_BLOCK);
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: same slices/validation as the scalar path; the warp kernel
+        // writes only rows [0, output_size) once each from lane 0.
+        unsafe {
+            self.inner
+                .stream
+                .launch_builder(warp_kernel)
                 .arg(weight.encoded_data())
                 .arg(input)
                 .arg(output)
@@ -1183,6 +1672,23 @@ impl CudaIq4XsGemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
     }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
+    }
 }
 
 /// A correctness-oriented `Q3_K` matrix-vector kernel.
@@ -1246,6 +1752,23 @@ impl CudaQ3KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
+    }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
     }
 }
 
@@ -1311,6 +1834,23 @@ impl CudaQ8_0Gemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
     }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
+    }
 }
 
 /// A correctness-oriented `Q6_K` matrix-vector kernel.
@@ -1374,6 +1914,23 @@ impl CudaQ6KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
+    }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
     }
 }
 
@@ -1439,6 +1996,23 @@ impl CudaQ4KGemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
     }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
+    }
 }
 
 /// A correctness-oriented `Q5_K` matrix-vector kernel.
@@ -1501,5 +2075,22 @@ impl CudaQ5KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute(weight, input, output)
+    }
+
+    /// Execute the warp-cooperative `GEMV` variant into a caller-owned
+    /// output. The launch is asynchronous with respect to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family lacks a warp
+    /// variant or the weight, shapes, contexts, or launch arguments are
+    /// invalid.
+    pub fn execute_warp(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner.execute_warp(weight, input, output)
     }
 }
