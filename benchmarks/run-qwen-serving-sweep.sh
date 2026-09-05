@@ -21,8 +21,13 @@ fi
 
 tokens="${TOKENS:-32}"
 concurrencies="${CONCURRENCIES:-1 2 4 8}"
+gemv="${GEMV:-scalar}"
+if [[ "$gemv" != "scalar" && "$gemv" != "warp" ]]; then
+  echo "GEMV must be scalar or warp, got: $gemv" >&2
+  exit 2
+fi
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-out_dir="${OUT_DIR:-benchmarks/results/${stamp}-engine-qwen38-serving-sweep}"
+out_dir="${OUT_DIR:-benchmarks/results/${stamp}-engine-qwen38-serving-sweep-gemv-${gemv}}"
 mkdir -p "$out_dir/runs"
 
 benchmarks/collect-env.sh "$out_dir/env" >/dev/null
@@ -31,6 +36,7 @@ benchmarks/collect-env.sh "$out_dir/env" >/dev/null
   echo "model=$model"
   echo "tokens=$tokens"
   echo "concurrencies=$concurrencies"
+  echo "gemv=$gemv"
   echo "engine_commit=$(git rev-parse HEAD)"
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$out_dir/sweep.txt"
@@ -44,7 +50,8 @@ for concurrency in $concurrencies; do
   "$bench" \
     --model="$model" \
     --concurrency="$concurrency" \
-    --tokens="$tokens" 2>&1 | tee -a "$log"
+    --tokens="$tokens" \
+    --gemv="$gemv" 2>&1 | tee -a "$log"
 done
 
 echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$out_dir/sweep.txt"
