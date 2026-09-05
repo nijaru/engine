@@ -3287,7 +3287,7 @@ const LLAMA_GREEDY_CONTINUATION: [u32; 200] = [
     reason = "one end-to-end greedy parity gate over the full text path"
 )]
 fn decodes_greedy_tokens_matching_llama_server() {
-    use engine_nvidia::QwenLayerKind;
+    use engine_nvidia::{GemvMode, QwenLayerKind};
     use std::sync::Arc;
 
     const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
@@ -3381,6 +3381,10 @@ fn decodes_greedy_tokens_matching_llama_server() {
         EPS,
     )
     .expect("build decode executor");
+    // Pin the scalar oracle explicitly: the executor default is the qualified
+    // warp path, and this replay is the scalar reference the warp mode is
+    // measured against.
+    executor.set_gemv_mode(GemvMode::Scalar);
 
     // Prefill the raw prompt; the last step predicts the first continuation.
     let mut chosen = 0_u32;

@@ -287,8 +287,8 @@ fn run() -> Result<(), String> {
     println!(
         "  gemv mode: {}",
         match gemv_mode {
-            GemvMode::Scalar => "scalar (correctness oracle)",
-            GemvMode::Warp => "warp-cooperative",
+            GemvMode::Scalar => "scalar (correctness oracle, non-default)",
+            GemvMode::Warp => "warp-cooperative (default)",
         }
     );
     Ok(())
@@ -309,7 +309,7 @@ fn parse_gemv_mode(arguments: &[String]) -> Result<GemvMode, String> {
     arguments
         .iter()
         .find_map(|argument| argument.strip_prefix("--gemv="))
-        .map_or(Ok(GemvMode::Scalar), |value| match value {
+        .map_or(Ok(GemvMode::default()), |value| match value {
             "scalar" => Ok(GemvMode::Scalar),
             "warp" => Ok(GemvMode::Warp),
             other => Err(format!("--gemv expects scalar or warp, got {other}")),

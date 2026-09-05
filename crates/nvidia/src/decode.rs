@@ -272,15 +272,16 @@ pub struct CudaQwen35Decode {
 /// Which `GEMV` kernel variant the executor launches for quantized
 /// projections.
 ///
-/// `Scalar` is the parity-tested correctness oracle. `Warp` selects the
-/// warp-cooperative kernels (one warp per output row, coalesced weight/input
-/// reads) for measured A/B qualification before any automatic selection.
+/// `Warp` is the default: the warp-cooperative kernels (one warp per output
+/// row, coalesced weight/input reads) are hardware-qualified against the
+/// scalar oracle by per-family parity tests and a full-model greedy replay.
+/// `Scalar` remains available as the parity-tested correctness oracle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GemvMode {
     /// One-thread-per-output-row scalar kernels (correctness oracle).
-    #[default]
     Scalar,
-    /// Warp-cooperative row kernels (measured variant).
+    /// Warp-cooperative row kernels (default qualified path).
+    #[default]
     Warp,
 }
 
@@ -395,7 +396,7 @@ impl CudaQwen35Decode {
             epsilon,
             scores: None,
             scores_stride: 0,
-            gemv_mode: GemvMode::Scalar,
+            gemv_mode: GemvMode::default(),
             hidden: scratch.hidden,
             normed: scratch.normed,
             attn_incr: scratch.attn_incr,
@@ -643,9 +644,9 @@ impl CudaQwen35Decode {
     /// Returns [`CudaDecodeError::Driver`] when the device copy fails.
     /// Select which `GEMV` kernel variant subsequent steps launch.
     ///
-    /// `Scalar` is the correctness oracle; `Warp` is the measured
-    /// cooperative variant. Mode changes take effect for the next launched
-    /// step and never mutate in-flight launches.
+    /// `Warp` is the qualified default; `Scalar` is the correctness oracle.
+    /// Mode changes take effect for the next launched step and never mutate
+    /// in-flight launches.
     #[must_use]
     pub const fn gemv_mode(&self) -> GemvMode {
         self.gemv_mode
