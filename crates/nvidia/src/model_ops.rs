@@ -99,17 +99,48 @@ extern "C" __global__ void rms_norm(
     int length,
     float epsilon
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
+    // One block per vector: strided partial sums, shuffle reduction within
+    // each warp, shared reduction across warps, then a broadcast write pass.
+    // This matches the scalar reference equation exactly (only the
+    // summation order differs, within the parity tolerance).
+    __shared__ float warp_sums[32];
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int warps = (int)(blockDim.x >> 5);
+
     float sum = 0.0f;
-    for (int index = 0; index < length; ++index) {
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
         sum += input[index] * input[index];
     }
-    const float inverse_norm = rsqrtf(sum / (float)length + epsilon);
-    for (int index = 0; index < length; ++index) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        warp_sums[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            warp_sums[0] = sum;
+        }
+    }
+    __syncthreads();
+    const float inverse_norm = rsqrtf(warp_sums[0] / (float)length + epsilon);
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
         output[index] = input[index] * inverse_norm * weight[index];
     }
+}
+
+// Map a logit to a monotone unsigned key: larger floats map to larger
+// keys over the full finite range.
+__device__ __forceinline__ unsigned int logit_key(float value) {
+    const unsigned int bits = __float_as_uint(value);
+    const unsigned int sign = bits >> 31;
+    return sign ? ~bits : (bits ^ 0x80000000u);
 }
 
 extern "C" __global__ void argmax(
@@ -117,18 +148,58 @@ extern "C" __global__ void argmax(
     unsigned int* output,
     int length
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    float best_value = -3.402823466e+38f;
-    unsigned int best_index = 0;
-    for (int index = 0; index < length; ++index) {
-        if (logits[index] > best_value) {
-            best_value = logits[index];
-            best_index = (unsigned int)index;
+    // Single block of up to 1024 threads: strided positions, pairwise
+    // shuffle reduction on (key, index), cross-warp reduction through
+    // shared memory. Ties resolve to the lowest index, matching the
+    // first-occurrence scalar reference. The vocabulary (~250k floats,
+    // ~1 MB) fits L2, so one block finishes in microseconds and no
+    // grid-wide election is needed.
+    __shared__ unsigned int warp_keys[32];
+    __shared__ unsigned int warp_indices[32];
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int warps = (int)(blockDim.x >> 5);
+
+    unsigned int key = 0u;
+    unsigned int index = 0u;
+    for (int position = (int)threadIdx.x; position < length; position += (int)blockDim.x) {
+        const float candidate = logits[position];
+        const unsigned int candidate_key = logit_key(candidate);
+        // `candidate == candidate` rejects NaN exactly like the scalar
+        // reference's strict `>` comparisons.
+        if (candidate == candidate && candidate_key > key) {
+            key = candidate_key;
+            index = (unsigned int)position;
         }
     }
-    output[0] = best_index;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned int other_key = __shfl_down_sync(0xffffffffu, key, offset);
+        const unsigned int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+        if (other_key > key || (other_key == key && other_index < index)) {
+            key = other_key;
+            index = other_index;
+        }
+    }
+    if (lane == 0) {
+        warp_keys[warp] = key;
+        warp_indices[warp] = index;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        key = lane < warps ? warp_keys[lane] : 0u;
+        index = lane < warps ? warp_indices[lane] : 0u;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned int other_key = __shfl_down_sync(0xffffffffu, key, offset);
+            const unsigned int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+            if (other_key > key || (other_key == key && other_index < index)) {
+                key = other_key;
+                index = other_index;
+            }
+        }
+        if (lane == 0) {
+            output[0] = index;
+        }
+    }
 }
 
 extern "C" __global__ void silu_mul(
@@ -151,15 +222,36 @@ extern "C" __global__ void l2_norm(
     int length,
     float epsilon
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
+    // One block per vector, same reduction shape as rms_norm; the eps
+    // floor applies to the norm (not its square), matching ggml.
+    __shared__ float warp_sums[32];
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int warps = (int)(blockDim.x >> 5);
+
     float sum = 0.0f;
-    for (int index = 0; index < length; ++index) {
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
         sum += input[index] * input[index];
     }
-    const float scale = 1.0f / fmaxf(sqrtf(sum), epsilon);
-    for (int index = 0; index < length; ++index) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        warp_sums[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            warp_sums[0] = sum;
+        }
+    }
+    __syncthreads();
+    const float scale = 1.0f / fmaxf(sqrtf(warp_sums[0]), epsilon);
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
         output[index] = input[index] * scale;
     }
 }
@@ -729,7 +821,7 @@ impl CudaQwen35Ops {
         let length =
             u32::try_from(logits.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         // Safety: cudarc allocated both slices, lengths are checked, and the
-        // single-thread launch writes exactly one result element.
+        // single-block reduction writes exactly one result element.
         unsafe {
             self.stream
                 .launch_builder(&self.argmax)
@@ -738,7 +830,7 @@ impl CudaQwen35Ops {
                 .arg(&length)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -812,7 +904,8 @@ impl CudaQwen35Ops {
         }
         let length = u32::try_from(input.len()).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         // Safety: cudarc allocated all slices, lengths are validated, and the
-        // one-block launch keeps all pointers alive until the stream observes it.
+        // one-block reduction keeps all pointers alive until the stream
+        // observes it.
         unsafe {
             self.stream
                 .launch_builder(&self.rms_norm)
@@ -823,7 +916,7 @@ impl CudaQwen35Ops {
                 .arg(&epsilon)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -877,7 +970,7 @@ impl CudaQwen35Ops {
                 .arg(&epsilon)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
