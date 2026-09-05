@@ -815,20 +815,20 @@ extern "C" __global__ void iq3_s_gemv_warp(
         const unsigned char* signs = block + 74;
         const unsigned char* scales = block + 106;
         const int group = lane >> 2;
-        const int sub = (lane & 3) * 2;
+        const int sub = lane & 3;
         const int scale_nibble =
             (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
         const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
-        for (int j = 0; j < 8; ++j) {
-            const int lane_in = sub * 8 + j;
+        const unsigned char sign_bits = signs[group * 4 + sub];
+        for (int lane_in = 0; lane_in < 8; ++lane_in) {
             const int code_index = group * 8 + sub * 2 + lane_in / 4;
             const int high_bit =
                 (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
             const int code = (int)low_codes[code_index] | (high_bit << 8);
-            const int sign = ((signs[group * 4 + sub] >> lane_in) & 1u) == 0u ? 1 : -1;
+            const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
             const int grid_index = code * 4 + (lane_in & 3);
             const float value = group_scale * (float)grid[grid_index] * (float)sign;
-            accumulator += value * input[block_index * 256 + group * 32 + lane_in];
+            accumulator += value * input[block_index * 256 + group * 32 + sub * 8 + lane_in];
         }
     }
     const float total = warp_sum(accumulator);
