@@ -13,6 +13,7 @@ use engine_core::{
     WeightBinding, WeightDescription, WeightFormat, WeightTensorSpec,
 };
 use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
+use engine_nvidia::QwenGemvKernel;
 use engine_nvidia::{
     ATTN_HEAD_DIM, ATTN_Q_HEADS, AttnLayerWeights, CudaHybridState, CudaIq3SEmbedding,
     CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaQ3KGemv, CudaQ4KEmbedding, CudaQ4KGemv,
@@ -3413,6 +3414,335 @@ fn decodes_greedy_tokens_matching_llama_server() {
         "greedy parity: {}/{} tokens match llama-server",
         LLAMA_GREEDY_CONTINUATION.len(),
         LLAMA_GREEDY_CONTINUATION.len()
+    );
+}
+
+/// One warp-vs-scalar family check: stage the family fixture, run both kernel
+/// variants over the same input, and require bit-compatible outputs. Warp
+/// kernels reduce across lanes in a different order than the scalar oracle, so
+/// the tolerance mirrors the decoder-parity bound.
+fn assert_warp_matches_scalar(
+    context: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    store: &mut CudaWeightStore,
+    tensor_name: &str,
+    value_type: u32,
+    input: &[f32],
+    output_rows: usize,
+) {
+    let weight = store.quantized_tensor(tensor_name).expect("fixture weight");
+    let input_device = stream.clone_htod(input).expect("upload input");
+    let mut scalar_output = stream
+        .alloc_zeros::<f32>(output_rows)
+        .expect("allocate scalar output");
+    let mut warp_output = stream
+        .alloc_zeros::<f32>(output_rows)
+        .expect("allocate warp output");
+    let kernel = QwenGemvKernel::from_value_type(value_type, context, stream.clone())
+        .expect("compile family kernel");
+    kernel
+        .execute(weight, &input_device, &mut scalar_output)
+        .expect("execute scalar GEMV");
+    kernel
+        .execute_warp(weight, &input_device, &mut warp_output)
+        .expect("execute warp GEMV");
+    let scalar = stream
+        .clone_dtoh(&scalar_output)
+        .expect("download scalar output");
+    let warp = stream
+        .clone_dtoh(&warp_output)
+        .expect("download warp output");
+    assert_eq!(scalar.len(), warp.len());
+    for (scalar, warp) in scalar.iter().zip(warp) {
+        assert!(
+            (scalar - warp).abs() < 1.0e-3,
+            "warp GEMV diverged from the scalar oracle: {scalar} vs {warp}"
+        );
+    }
+}
+
+/// Full-model warp-mode qualification: the warp-cooperative GEMV variants must
+/// reproduce the llama-server greedy continuation that the scalar oracle
+/// path already pins. Reuses the staged full text path and the same
+/// state plan as `decodes_greedy_tokens_matching_llama_server`, with the
+/// executor switched to `GemvMode::Warp`.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end warp-mode qualification gate over the full text path"
+)]
+fn decodes_greedy_tokens_matching_llama_server_in_warp_mode() {
+    use engine_nvidia::{CudaQwen35Decode, GemvMode, QwenLayerKind};
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
+        .expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+    let mut state = engine_nvidia::CudaHybridState::from_specs(
+        stream.clone(),
+        Some(kv_spec),
+        Some(recurrent_spec),
+    )
+    .expect("physical hybrid state");
+    state.zero().expect("zero state");
+
+    let mut executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("build decode executor");
+    executor.set_gemv_mode(GemvMode::Warp);
+
+    let mut chosen = 0_u32;
+    for (position, token) in PROMPT.iter().enumerate() {
+        chosen = executor
+            .decode_step(
+                &mut state,
+                *token,
+                u32::try_from(position).expect("fits u32"),
+            )
+            .expect("prefill step");
+    }
+    assert_eq!(
+        chosen, LLAMA_GREEDY_CONTINUATION[0],
+        "warp-mode first greedy token diverged from llama-server"
+    );
+
+    for index in 1..LLAMA_GREEDY_CONTINUATION.len() {
+        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
+        chosen = executor
+            .decode_step(&mut state, LLAMA_GREEDY_CONTINUATION[index - 1], position)
+            .expect("continuation step");
+        assert_eq!(
+            chosen, LLAMA_GREEDY_CONTINUATION[index],
+            "warp-mode greedy token {} diverged from llama-server (expected {}, got {})",
+            index, LLAMA_GREEDY_CONTINUATION[index], chosen
+        );
+    }
+    eprintln!(
+        "warp-mode greedy parity: {}/{} tokens match llama-server",
+        LLAMA_GREEDY_CONTINUATION.len(),
+        LLAMA_GREEDY_CONTINUATION.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_q8_0() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("q8_0.fixture", vec![64, 3], engine_core::DataType::F32)
+        .expect("Q8_0 fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = q8_0_fixture();
+    store
+        .materialize_quantized(spec, 8, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload Q8_0 fixture");
+    let input = (0..64)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q8_0 input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(&context, &stream, &mut store, "q8_0.fixture", 8, &input, 3);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_q4_k() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("q4_k.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("Q4_K fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = q4_k_fixture();
+    store
+        .materialize_quantized(spec, 12, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload Q4_K fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q4_K input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(&context, &stream, &mut store, "q4_k.fixture", 12, &input, 2);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_q5_k() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("q5_k.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("Q5_K fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = q5_k_fixture();
+    store
+        .materialize_quantized(spec, 13, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload Q5_K fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q5_K input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(&context, &stream, &mut store, "q5_k.fixture", 13, &input, 2);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_q3_k() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("q3_k.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("Q3_K fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = q3_k_fixture();
+    store
+        .materialize_quantized(spec, 11, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload Q3_K fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q3_K input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(&context, &stream, &mut store, "q3_k.fixture", 11, &input, 2);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_q6_k() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("q6_k.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("Q6_K fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = q6_k_fixture();
+    store
+        .materialize_quantized(spec, 14, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload Q6_K fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("Q6_K input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(&context, &stream, &mut store, "q6_k.fixture", 14, &input, 2);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_iq4_nl() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("iq4_nl.fixture", vec![64, 3], engine_core::DataType::F32)
+        .expect("IQ4_NL fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = iq4_nl_fixture();
+    store
+        .materialize_quantized(spec, 20, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload IQ4_NL fixture");
+    let input = (0..64)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("IQ4_NL input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(
+        &context,
+        &stream,
+        &mut store,
+        "iq4_nl.fixture",
+        20,
+        &input,
+        3,
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_iq4_xs() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("iq4_xs.fixture", vec![512, 2], engine_core::DataType::F32)
+        .expect("IQ4_XS fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = iq4_xs_fixture();
+    store
+        .materialize_quantized(spec, 23, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload IQ4_XS fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 17).expect("IQ4_XS input index");
+            f32::from(pattern) * 0.125 - 1.0
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(
+        &context,
+        &stream,
+        &mut store,
+        "iq4_xs.fixture",
+        23,
+        &input,
+        2,
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn executes_warp_gemv_matching_the_scalar_oracle_iq3_s() {
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let spec = WeightTensorSpec::new("iq3_s.fixture", vec![512, 3], engine_core::DataType::F32)
+        .expect("IQ3_S fixture spec");
+    let mut store = CudaWeightStore::new(stream.clone());
+    let encoded = iq3_s_fixture();
+    store
+        .materialize_quantized(spec, 21, encoded.len() as u64, &mut Cursor::new(encoded))
+        .expect("upload IQ3_S fixture");
+    let input = (0..512)
+        .map(|index| {
+            let pattern = u8::try_from(index % 19).expect("IQ3_S input index");
+            f32::from(pattern) * 0.0625 - 0.5
+        })
+        .collect::<Vec<_>>();
+    assert_warp_matches_scalar(
+        &context,
+        &stream,
+        &mut store,
+        "iq3_s.fixture",
+        21,
+        &input,
+        3,
     );
 }
 

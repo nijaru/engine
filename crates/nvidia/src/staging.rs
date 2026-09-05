@@ -98,6 +98,33 @@ pub enum QwenGemvKernel {
 }
 
 impl QwenGemvKernel {
+    /// Compile the kernel for one quant family by GGUF value type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no kernel
+    /// implementation or compilation fails.
+    pub fn from_value_type(
+        value_type: u32,
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, CudaQuantizedKernelError> {
+        match value_type {
+            8 => Ok(Self::Q8_0(CudaQ8_0Gemv::from_context(context, stream)?)),
+            11 => Ok(Self::Q3K(CudaQ3KGemv::from_context(context, stream)?)),
+            12 => Ok(Self::Q4K(CudaQ4KGemv::from_context(context, stream)?)),
+            13 => Ok(Self::Q5K(CudaQ5KGemv::from_context(context, stream)?)),
+            14 => Ok(Self::Q6K(CudaQ6KGemv::from_context(context, stream)?)),
+            20 => Ok(Self::Iq4Nl(CudaIq4NlGemv::from_context(context, stream)?)),
+            21 => Ok(Self::Iq3S(CudaIq3SGemv::from_context(context, stream)?)),
+            23 => Ok(Self::Iq4Xs(CudaIq4XsGemv::from_context(context, stream)?)),
+            other => Err(CudaQuantizedKernelError::UnsupportedValueType {
+                expected: 0,
+                actual: other,
+            }),
+        }
+    }
+
     /// Run the GEMV for one tensor.
     ///
     /// # Errors
