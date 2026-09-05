@@ -11,6 +11,14 @@ if [[ ! -f "$model" ]]; then
   exit 2
 fi
 
+# GPU gate: never compete with a running workload for VRAM.
+used_mib="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1 | tr -d ' ')"
+compute_apps="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l | tr -d ' ')"
+if [[ "$used_mib" -gt 2000 ]] || [[ "$compute_apps" -ne 0 ]]; then
+  echo "GPU busy (used=${used_mib}MiB, compute_apps=${compute_apps}); stop the running workload first" >&2
+  exit 3
+fi
+
 tokens="${TOKENS:-32}"
 concurrencies="${CONCURRENCIES:-1 2 4 8}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
