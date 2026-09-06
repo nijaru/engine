@@ -247,6 +247,62 @@ extern "C" __global__ void argmax(
     }
 }
 
+extern "C" __global__ void argmax_batch(
+    const float* logits,
+    unsigned int* output,
+    int length,
+    int members
+) {
+    // One block per member row of a [members][length] batch-major buffer;
+    // the reduction body is identical to the single-row argmax kernel.
+    const int member = (int)blockIdx.x;
+    const float* member_logits = logits + (long long)member * length;
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int warps = (int)(blockDim.x >> 5);
+    __shared__ unsigned int warp_keys[32];
+    __shared__ unsigned int warp_indices[32];
+
+    unsigned int key = 0u;
+    unsigned int index = 0u;
+    for (int position = (int)threadIdx.x; position < length; position += (int)blockDim.x) {
+        const float candidate = member_logits[position];
+        const unsigned int candidate_key = logit_key(candidate);
+        if (candidate == candidate && candidate_key > key) {
+            key = candidate_key;
+            index = (unsigned int)position;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned int other_key = __shfl_down_sync(0xffffffffu, key, offset);
+        const unsigned int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+        if (other_key > key || (other_key == key && other_index < index)) {
+            key = other_key;
+            index = other_index;
+        }
+    }
+    if (lane == 0) {
+        warp_keys[warp] = key;
+        warp_indices[warp] = index;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        key = lane < warps ? warp_keys[lane] : 0u;
+        index = lane < warps ? warp_indices[lane] : 0u;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned int other_key = __shfl_down_sync(0xffffffffu, key, offset);
+            const unsigned int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+            if (other_key > key || (other_key == key && other_index < index)) {
+                key = other_key;
+                index = other_index;
+            }
+        }
+        if (lane == 0) {
+            output[member] = index;
+        }
+    }
+}
+
 extern "C" __global__ void silu_mul(
     const float* gate,
     const float* up,
@@ -892,6 +948,7 @@ extern "C" __global__ void kv_append_f16(
 pub struct CudaQwen35Ops {
     stream: Arc<CudaStream>,
     argmax: CudaFunction,
+    argmax_batch: CudaFunction,
     rms_norm: CudaFunction,
     rms_norm_batch: CudaFunction,
     silu_mul: CudaFunction,
@@ -955,6 +1012,9 @@ impl CudaQwen35Ops {
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let argmax = module
             .load_function("argmax")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let argmax_batch = module
+            .load_function("argmax_batch")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let rms_norm = module
             .load_function("rms_norm")
@@ -1025,6 +1085,7 @@ impl CudaQwen35Ops {
         Ok(Self {
             stream,
             argmax,
+            argmax_batch,
             rms_norm,
             rms_norm_batch,
             silu_mul,
@@ -1109,6 +1170,60 @@ impl CudaQwen35Ops {
                 .arg(&length)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Select the first index with the greatest finite logit value for each
+    /// member row of a batch-major `[members][length]` buffer, writing one
+    /// `u32` per member into `[members]` output.
+    ///
+    /// The launch is asynchronous with respect to the host. Ties resolve to
+    /// the lowest index and NaN logits never win, matching the single-row
+    /// kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when the context, input/output shape,
+    /// or launch is invalid.
+    pub fn argmax_into_batch(
+        &self,
+        logits: &CudaSlice<f32>,
+        selected: &mut CudaSlice<u32>,
+    ) -> Result<(), CudaModelKernelError> {
+        if self.stream.context().as_ref() != logits.context().as_ref()
+            || self.stream.context().as_ref() != selected.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if logits.is_empty() {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if selected.is_empty() || !logits.len().is_multiple_of(selected.len()) {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: logits.len(),
+                actual: selected.len(),
+            });
+        }
+        let members = selected.len();
+        let length = logits.len() / members;
+        let length = u32::try_from(length).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members = u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // Safety: cudarc allocated both slices, lengths are checked, and each
+        // block writes exactly one result element for its member.
+        unsafe {
+            self.stream
+                .launch_builder(&self.argmax_batch)
+                .arg(logits)
+                .arg(selected)
+                .arg(&length)
+                .arg(&members)
+                .launch(LaunchConfig {
+                    grid_dim: (members, 1, 1),
                     block_dim: (1024, 1, 1),
                     shared_mem_bytes: 0,
                 })
