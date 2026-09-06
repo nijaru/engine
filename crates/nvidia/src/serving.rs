@@ -9,7 +9,7 @@ use engine_core::{
     WeightBinding,
 };
 
-use crate::decode::CudaQwen35Decode;
+use crate::decode::{CudaQwen35BatchDecode, CudaQwen35Decode};
 use crate::state::{CudaHybridState, CudaStateKey, CudaStateRegistry};
 
 /// Which dispatcher-owned pinned output slot backs one scheduler row.
@@ -76,6 +76,11 @@ pub struct CudaQwen35ServingDispatcher {
     /// Their physical entries stay alive until the referencing submission
     /// completes, then they are released for real.
     deferred_releases: Vec<CudaStateKey>,
+    /// Batched decode executors keyed by member count, built lazily on the
+    /// first eligible multi-row batch of that size. Member count is fixed at
+    /// construction, and building one costs a kernel compile, so the cache
+    /// keeps each size built once.
+    batched: HashMap<usize, CudaQwen35BatchDecode>,
 }
 
 /// Run one scheduler row's model steps.
@@ -220,6 +225,7 @@ impl CudaQwen35ServingDispatcher {
             free_outputs: (0..max_pending_rows).rev().collect(),
             pending: HashMap::new(),
             deferred_releases: Vec::new(),
+            batched: HashMap::new(),
         })
     }
 
@@ -294,6 +300,200 @@ impl CudaQwen35ServingDispatcher {
             Some(token) => outcome.with_output_token(token),
             None => outcome,
         })
+    }
+
+    /// Whether every row of `batch` is a single-token greedy decode segment.
+    ///
+    /// Only multi-row batches run through the batched executor: its one
+    /// launch per (layer, op) amortizes weight reads across members, which
+    /// only pays off with more than one row. Single-row decodes stay on the
+    /// batch-1 executor - the hardware-replayed greedy oracle - and mixed
+    /// prefill/decode batches and unsampled rows fall back to the per-row
+    /// path, which handles all of those.
+    fn batch_is_batchable(batch: &ExecutionBatch, states: &[InferenceStateSet]) -> bool {
+        if batch.len() <= 1 {
+            return false;
+        }
+        batch
+            .segments()
+            .iter()
+            .zip(states.iter())
+            .all(|(segment, state)| {
+                segment.phase() == ExecutionPhase::Decode
+                    && segment.token_count() == 1
+                    && segment.requests_sampling()
+                    && segment
+                        .token_input()
+                        .and_then(engine_core::ExecutionTokenInput::decode_token)
+                        .is_some()
+                    && state.token_position().is_some()
+            })
+    }
+
+    /// Queue one fully-decode batch through the batched executor.
+    ///
+    /// Member physical states are taken out of the registry for the step
+    /// (the registry allows one mutable borrow at a time), run as one
+    /// submission's worth of batched launches, and re-inserted on every
+    /// path so no state is lost. Pinned copies stay stream-ordered behind
+    /// the step's kernels; the caller records the completion event.
+    ///
+    /// Greedy is the only supported sampling on this path, matching the
+    /// batch-1 row seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when member geometry,
+    /// construction, or launch fails; [`BackendError::Unsupported`] for
+    /// non-greedy sampling. On failure the stream is flushed and all
+    /// leased slots recycled.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one full batched submit seam; splitting it hides the registry take/reinsert contract"
+    )]
+    fn enqueue_batched_decode(
+        &mut self,
+        batch: &ExecutionBatch,
+        states: &mut [InferenceStateSet],
+    ) -> Result<QueuedRows, BackendError> {
+        let row_count = batch.len();
+        let started = Instant::now();
+        let mut leased: Vec<Option<PinnedSlotLease>> = Vec::with_capacity(row_count);
+        let mut elapsed_nanos = Vec::with_capacity(row_count);
+        let mut state_keys = Vec::with_capacity(row_count);
+
+        // Member physical states live outside the step closure so every
+        // return path - success, launch failure, even a panic-free error
+        // after the take - can re-insert them; dropping a taken state would
+        // silently lose the request's device history.
+        let mut members: Vec<CudaHybridState> = Vec::with_capacity(row_count);
+
+        let result = (|| -> Result<(), BackendError> {
+            // Reject non-greedy sampling before touching any device state.
+            for segment in batch.segments() {
+                if let Some(sampling) = segment.sampling()
+                    && sampling.temperature() != 0.0
+                {
+                    return Err(BackendError::Unsupported(
+                        "non-greedy Qwen3.8 CUDA sampling on the correctness path",
+                    ));
+                }
+            }
+
+            // Lease one pinned slot per sampling row, in batch order.
+            for segment in batch.segments() {
+                if segment.requests_sampling() {
+                    leased.push(Some(self.lease_output()?));
+                } else {
+                    leased.push(None);
+                }
+            }
+
+            // Take member physical states out of the registry in row order;
+            // the registry allows one mutable borrow at a time.
+            for state in states.iter() {
+                let key = CudaStateKey::from_state_set(state);
+                let Some(physical) = self.states.take(&key) else {
+                    return Err(BackendError::ExecutionFailed(
+                        "batched decode found no physical state for a decode row".to_owned(),
+                    ));
+                };
+                members.push(physical);
+                state_keys.push(key);
+            }
+
+            // Build (or reuse) the batched executor for this member count.
+            let executor = if let Some(executor) = self.batched.get_mut(&row_count) {
+                executor
+            } else {
+                let executor = CudaQwen35BatchDecode::new(
+                    self.stream.context(),
+                    self.stream.clone(),
+                    Arc::clone(self.executor.weights()),
+                    self.executor.layer_kinds(),
+                    self.executor.epsilon(),
+                    row_count,
+                )
+                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+                self.batched.entry(row_count).or_insert(executor)
+            };
+
+            // Assemble the step's tokens and positions.
+            let mut tokens = Vec::with_capacity(row_count);
+            let mut positions = Vec::with_capacity(row_count);
+            for segment in batch.segments() {
+                let token = segment
+                    .token_input()
+                    .and_then(engine_core::ExecutionTokenInput::decode_token)
+                    .ok_or_else(|| {
+                        BackendError::ExecutionFailed(
+                            "Qwen decode segment requires one decode token".to_owned(),
+                        )
+                    })?;
+                tokens.push(token);
+                positions.push(segment.state_position());
+            }
+
+            // One submission's worth of batched launches, then per-member
+            // pinned copies, all stream-ordered.
+            let mut member_refs: Vec<&mut CudaHybridState> = members.iter_mut().collect();
+            executor
+                .decode_step_batch_enqueue(&mut member_refs, &tokens, &positions)
+                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+            for (member, lease) in leased.iter().enumerate() {
+                let Some(lease) = lease else { continue };
+                let pinned = self.pinned_outputs.get_mut(lease.index).ok_or_else(|| {
+                    BackendError::ExecutionFailed(
+                        "pinned Qwen output slot was out of range".to_owned(),
+                    )
+                })?;
+                executor
+                    .copy_selected_into_pinned(member, pinned)
+                    .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+            }
+
+            // Advance every member state by one position; re-insertion is
+            // owned by the caller below so error paths also restore state.
+            for (physical, position) in members.iter_mut().zip(positions.iter()) {
+                let next = position.checked_add(1).ok_or_else(|| {
+                    BackendError::ExecutionFailed("decode position overflowed".to_owned())
+                })?;
+                physical
+                    .advance_to(next)
+                    .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+            }
+
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            elapsed_nanos.extend(std::iter::repeat_n(elapsed, row_count));
+            Ok(())
+        })();
+
+        // Re-insert every taken member state before reporting success or
+        // failure: the registry is the single owner of physical state, and a
+        // dropped member would lose the request's device history.
+        for (state, physical) in states.iter().zip(members) {
+            let key = CudaStateKey::from_state_set(state);
+            self.states.reinsert(key, physical);
+        }
+
+        match result {
+            Ok(()) => Ok(QueuedRows {
+                outputs: leased,
+                elapsed_nanos,
+                state_keys,
+            }),
+            Err(error) => {
+                self.stream.synchronize().map_err(|sync_error| {
+                    BackendError::ExecutionFailed(format!(
+                        "{error}; CUDA flush after batched enqueue failure also failed: {sync_error}"
+                    ))
+                })?;
+                for lease in leased.iter().flatten() {
+                    self.recycle_output(*lease);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Queue every row of one scheduler batch without blocking the host.
@@ -486,7 +686,11 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
             )));
         }
 
-        let rows = self.enqueue_batch(batch, states)?;
+        let rows = if Self::batch_is_batchable(batch, states) {
+            self.enqueue_batched_decode(batch, states)?
+        } else {
+            self.enqueue_batch(batch, states)?
+        };
 
         // One completion event for the whole submission: every kernel and
         // pinned copy enqueued above precedes it in stream order.

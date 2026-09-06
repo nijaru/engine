@@ -504,6 +504,23 @@ impl CudaStateRegistry {
     pub fn is_empty(&self) -> bool {
         self.states.is_empty()
     }
+
+    /// Remove the physical state for `key` and return it, if materialized.
+    ///
+    /// Batched execution needs several states borrowed mutably at once,
+    /// which the one-at-a-time [`Self::get_or_create`] cannot express. The
+    /// caller must [`Self::reinsert`] every removed state before returning
+    /// to normal operation so no physical state is lost.
+    pub fn take(&mut self, key: &CudaStateKey) -> Option<CudaHybridState> {
+        self.states.remove(key)
+    }
+
+    /// Put a previously [`Self::take`]-removed physical state back. Returns
+    /// the state untouched if an entry for its key somehow already exists,
+    /// keeping the registry the single owner.
+    pub fn reinsert(&mut self, key: CudaStateKey, state: CudaHybridState) {
+        self.states.entry(key).or_insert(state);
+    }
 }
 
 /// Backend-owned physical counterpart to a core [`InferenceStateSet`]. It is a

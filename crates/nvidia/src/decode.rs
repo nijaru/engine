@@ -654,6 +654,24 @@ impl CudaQwen35Decode {
         self.gemv_mode
     }
 
+    /// The staged weights this executor runs over.
+    #[must_use]
+    pub const fn weights(&self) -> &Arc<CudaQwen35Weights> {
+        &self.weights
+    }
+
+    /// The layer plan this executor was built with.
+    #[must_use]
+    pub fn layer_kinds(&self) -> &[QwenLayerKind] {
+        &self.layer_kinds
+    }
+
+    /// The `RMSNorm` epsilon this executor applies.
+    #[must_use]
+    pub const fn epsilon(&self) -> f32 {
+        self.epsilon
+    }
+
     /// Set the `GEMV` kernel variant used by subsequent steps.
     pub fn set_gemv_mode(&mut self, mode: GemvMode) {
         self.gemv_mode = mode;
@@ -1348,6 +1366,75 @@ impl CudaQwen35BatchDecode {
         tokens: &[u32],
         positions: &[u32],
     ) -> Result<Vec<u32>, CudaDecodeError> {
+        self.run_step_batch(states, tokens, positions)?;
+        let selected = self
+            .stream
+            .clone_dtoh(&self.scratch.selected)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        Ok(selected)
+    }
+
+    /// Enqueue one batched decode step without any host readback.
+    ///
+    /// All kernels are stream-ordered; the caller copies member selections
+    /// out through [`Self::copy_selected_into_pinned`], records one
+    /// completion event, and polls it. State positions are not advanced by
+    /// this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] under the same conditions as
+    /// [`Self::decode_step_batch`].
+    pub fn decode_step_batch_enqueue(
+        &mut self,
+        states: &mut [&mut CudaHybridState],
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> Result<(), CudaDecodeError> {
+        self.run_step_batch(states, tokens, positions)
+    }
+
+    /// Copy one member's greedy selection from the last batched step into a
+    /// pinned host slot, stream-ordered with the step's kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when the member index is out of range or
+    /// the copy fails to enqueue.
+    pub fn copy_selected_into_pinned(
+        &self,
+        member: usize,
+        destination: &mut PinnedHostSlice<u32>,
+    ) -> Result<(), CudaDecodeError> {
+        let slot = self
+            .scratch
+            .selected
+            .try_slice(member..=member)
+            .ok_or_else(|| {
+                CudaDecodeError::Driver("selected token slot out of range".to_owned())
+            })?;
+        self.stream
+            .memcpy_dtoh(&slot, destination)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))
+    }
+
+    /// Validation plus all batched launches for one step, shared by the
+    /// host-readback and submit-only variants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when member geometry is invalid, a
+    /// required tensor is missing, or any launch fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batched sequence per llama.cpp-verified host step; splitting it hides the step"
+    )]
+    fn run_step_batch(
+        &mut self,
+        states: &mut [&mut CudaHybridState],
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> Result<(), CudaDecodeError> {
         if states.len() != self.members || tokens.len() != self.members {
             return Err(CudaDecodeError::InvalidPlan(format!(
                 "batch step requires {} states and tokens, got {} and {}",
@@ -1371,20 +1458,30 @@ impl CudaQwen35BatchDecode {
                 return Err(CudaDecodeError::PositionOverflow { position, capacity });
             }
         }
-        // Lazy score-scratch allocation on the first batched step, once any
-        // member's KV capacity is known; all members share the executor so
-        // one stride covers every row.
+        // Lazy score-scratch allocation on the first batched step, once
+        // the member states' KV capacity is known. Attention indexing uses
+        // each member's own capacity as the scores row stride, so member
+        // capacities must agree; mixed-capacity batches would overlap rows.
         if self.scratch.scores.is_none() {
-            let stride = states
-                .iter()
-                .filter_map(|state| state.kv().map(|kv| kv.spec().block_tokens() as usize))
-                .max()
-                .unwrap_or(0);
-            if stride == 0 && states.iter().any(|state| state.kv().is_some()) {
-                return Err(CudaDecodeError::InvalidPlan(
-                    "KV state reports a zero token capacity".to_owned(),
-                ));
+            let mut stride = None;
+            for state in states.iter() {
+                let Some(kv) = state.kv() else { continue };
+                let capacity = kv.spec().block_tokens() as usize;
+                if capacity == 0 {
+                    return Err(CudaDecodeError::InvalidPlan(
+                        "KV state reports a zero token capacity".to_owned(),
+                    ));
+                }
+                if let Some(known) = stride
+                    && known != capacity
+                {
+                    return Err(CudaDecodeError::InvalidPlan(
+                        "batched attention requires uniform KV capacity across members".to_owned(),
+                    ));
+                }
+                stride = Some(capacity);
             }
+            let stride = stride.unwrap_or(0);
             let scores = alloc(&self.stream, self.members * ATTN_Q_HEADS * stride)
                 .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
             self.scratch.scores = Some(scores);
@@ -1472,11 +1569,7 @@ impl CudaQwen35BatchDecode {
         )?;
         self.ops
             .argmax_into_batch(&self.scratch.logits, &mut self.scratch.selected)?;
-        let selected = self
-            .stream
-            .clone_dtoh(&self.scratch.selected)
-            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
-        Ok(selected)
+        Ok(())
     }
 
     /// Batched recurrent (GDN) layer: projections and gates over all members,

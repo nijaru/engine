@@ -3849,6 +3849,334 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
+/// Dispatcher-level batched serving parity: a multi-request decode batch
+/// submitted through the real `NvidiaBackend` seam must select the batched
+/// executor path and reproduce the eager per-row path's greedy tokens
+/// exactly, while the same requests prefill through the per-row path.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end dispatcher batching gate staging the full model"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "row/step indices track per-request model state across parallel vectors"
+)]
+fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
+    use engine_core::{
+        BackendCapabilities, BackendFeatures, BackendKind, BackendSubmissionId, ComputeBackend,
+        DataType, ExecutionBatch, ExecutionPhase, ExecutionPlan, ExecutionStage, InferenceState,
+        LogicalStateManager, ModelProvider, NvidiaBackend, PolicyVersion, Quantization, RequestId,
+        SamplingParams, StateLocation, StateManager, StateRequirement,
+    };
+    use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
+    use std::time::Duration;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+    const ROWS: usize = 3;
+    const COMPARE_TOKENS: usize = 8;
+
+    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+        GGUF,
+        u32::try_from(PROMPT.len() + COMPARE_TOKENS + 4).expect("fits u32"),
+    )
+    .expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let device = DeviceId::new(0);
+    let description = provider.description();
+    let state_requirements = description.state_requirements().to_vec();
+    let execution_stages = [ExecutionPhase::Prefill, ExecutionPhase::Decode]
+        .into_iter()
+        .flat_map(|phase| {
+            description
+                .regions()
+                .iter()
+                .map(move |region| ExecutionStage::new(region.id(), phase))
+        })
+        .collect::<Vec<_>>();
+
+    let backend_id = BackendId::new("cuda").expect("backend ID");
+    let state_bytes: u64 = state_requirements
+        .iter()
+        .map(|requirement| requirement.byte_size().expect("state size"))
+        .sum();
+    let capabilities = BackendCapabilities::new(
+        backend_id.clone(),
+        device,
+        BackendKind::Cuda,
+        (20_u64 << 30) + state_bytes * 4,
+        BackendFeatures::new(
+            vec![DataType::F16, DataType::F32],
+            vec![Quantization::GgufQ4Km],
+            false,
+            true,
+        ),
+    );
+
+    let plan = ExecutionPlan::new(
+        description.id().clone(),
+        backend_id.clone(),
+        device,
+        PolicyVersion::new(1).expect("policy version"),
+        execution_stages,
+        state_requirements.clone(),
+        WeightBinding::empty(description.id().clone(), device),
+    )
+    .expect("plan");
+
+    let allocate_state = |manager: &mut LogicalStateManager| {
+        let states = state_requirements
+            .iter()
+            .map(|requirement| match *requirement {
+                StateRequirement::FullAttentionKv(spec) => manager
+                    .allocate_kv(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
+                StateRequirement::Recurrent(spec) => manager
+                    .allocate_recurrent(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("allocate state");
+        InferenceStateSet::new(states).expect("state set")
+    };
+
+    // Eager reference: ROWS independent requests, one segment per submit,
+    // running through the per-row seam.
+    let mut eager_manager = LogicalStateManager::new(device, state_bytes * ROWS as u64, 0);
+    let mut eager_states = (0..ROWS)
+        .map(|_| allocate_state(&mut eager_manager))
+        .collect::<Vec<_>>();
+    let eager_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("eager executor");
+    let eager_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, eager_executor, stream.clone(), 8)
+            .expect("eager dispatcher");
+    let mut eager_backend =
+        NvidiaBackend::new(capabilities.clone(), eager_dispatcher).expect("eager backend");
+
+    // Batched path: the same ROWS requests through one dispatcher, whose
+    // submit seam picks the batched executor for all-decode batches.
+    let mut batched_manager = LogicalStateManager::new(device, state_bytes * ROWS as u64, 0);
+    let mut batched_states = (0..ROWS)
+        .map(|_| allocate_state(&mut batched_manager))
+        .collect::<Vec<_>>();
+    let batched_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("batched dispatcher executor");
+    let batched_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, batched_executor, stream.clone(), 8)
+            .expect("batched dispatcher");
+    let mut batched_backend =
+        NvidiaBackend::new(capabilities, batched_dispatcher).expect("batched backend");
+
+    // Prefill each request separately (per-row path on both backends), then
+    // drive ROWS-row decode batches through submit/poll.
+    let prompt: Arc<[u32]> = Arc::from(PROMPT);
+    let greedy = SamplingParams::greedy(None);
+
+    let poll_one = |backend: &mut NvidiaBackend<CudaQwen35ServingDispatcher>,
+                    submission: BackendSubmissionId|
+     -> u32 {
+        let deadline = Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        loop {
+            match backend.poll(submission) {
+                Ok(Some(event)) => {
+                    return event
+                        .events()
+                        .first()
+                        .expect("one event")
+                        .output_token()
+                        .expect("sampled token");
+                }
+                Ok(None) => {
+                    assert!(
+                        started.elapsed() < deadline,
+                        "asynchronous submission did not complete in time"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("poll failed: {error:?}"),
+            }
+        }
+    };
+
+    let prefill_one = |backend: &mut NvidiaBackend<CudaQwen35ServingDispatcher>,
+                       request: RequestId,
+                       state: &mut InferenceStateSet|
+     -> u32 {
+        let segment = ExecutionSegment::new(
+            request,
+            ExecutionPhase::Prefill,
+            1,
+            u32::try_from(PROMPT.len()).expect("fits u32"),
+            0,
+            state_requirements.clone(),
+        )
+        .expect("segment")
+        .with_token_input(
+            engine_core::ExecutionTokenInput::prompt(
+                Arc::clone(&prompt),
+                0,
+                u32::try_from(PROMPT.len()).expect("fits u32"),
+            )
+            .expect("prompt input"),
+        )
+        .expect("token input")
+        .with_sampling(greedy);
+        let batch = ExecutionBatch::new(vec![segment]).expect("batch");
+        let submission = backend
+            .submit(&plan, &batch, std::slice::from_mut(state))
+            .expect("submit");
+        poll_one(backend, submission)
+    };
+
+    // Track the sampled token per row so decode can feed it back.
+    let mut eager_fed = Vec::with_capacity(ROWS);
+    let mut batched_fed = Vec::with_capacity(ROWS);
+    for row in 0..ROWS {
+        let request = RequestId::new(u64::try_from(row + 1).expect("fits u64")).expect("id");
+        let token = prefill_one(&mut eager_backend, request, &mut eager_states[row]);
+        assert_eq!(token, LLAMA_GREEDY_CONTINUATION[0]);
+        eager_fed.push(token);
+    }
+    for row in 0..ROWS {
+        let request = RequestId::new(u64::try_from(row + 1).expect("fits u64")).expect("id");
+        let token = prefill_one(&mut batched_backend, request, &mut batched_states[row]);
+        assert_eq!(token, LLAMA_GREEDY_CONTINUATION[0]);
+        batched_fed.push(token);
+    }
+
+    // Steady state: one ROWS-row decode batch per step through the batched
+    // submit seam. Each row keeps its own state and feeds its own previous
+    // token; positions advance one per row per step.
+    let prompt_len = u32::try_from(PROMPT.len()).expect("fits u32");
+    for step in 1..COMPARE_TOKENS {
+        let position = prompt_len + u32::try_from(step).expect("fits u32") - 1;
+        let expected = LLAMA_GREEDY_CONTINUATION[step];
+
+        // Eager reference: one segment per submit, same loop the serving
+        // runtime drives; both paths see identical inputs.
+        for row in 0..ROWS {
+            let request = RequestId::new(u64::try_from(row + 1).expect("fits u64")).expect("id");
+            let segment = ExecutionSegment::new(
+                request,
+                ExecutionPhase::Decode,
+                1,
+                1,
+                position,
+                state_requirements.clone(),
+            )
+            .expect("segment")
+            .with_token_input(engine_core::ExecutionTokenInput::decode(eager_fed[row]))
+            .expect("token input")
+            .with_sampling(greedy);
+            let batch = ExecutionBatch::new(vec![segment]).expect("batch");
+            let submission = eager_backend
+                .submit(&plan, &batch, std::slice::from_mut(&mut eager_states[row]))
+                .expect("eager submit");
+            let token = poll_one(&mut eager_backend, submission);
+            assert_eq!(token, expected, "eager row {row} diverged at token {step}");
+            eager_fed[row] = token;
+        }
+
+        // Batched: all ROWS rows in one scheduler batch.
+        let mut segments = Vec::with_capacity(ROWS);
+        for row in 0..ROWS {
+            let request = RequestId::new(u64::try_from(row + 1).expect("fits u64")).expect("id");
+            let segment = ExecutionSegment::new(
+                request,
+                ExecutionPhase::Decode,
+                1,
+                1,
+                position,
+                state_requirements.clone(),
+            )
+            .expect("segment")
+            .with_token_input(engine_core::ExecutionTokenInput::decode(batched_fed[row]))
+            .expect("token input")
+            .with_sampling(greedy);
+            segments.push(segment);
+        }
+        let batch = ExecutionBatch::new(segments).expect("batch");
+        let submission = batched_backend
+            .submit(&plan, &batch, &mut batched_states)
+            .expect("batched submit");
+        let tokens = {
+            let deadline = Duration::from_secs(120);
+            let started = std::time::Instant::now();
+            loop {
+                match batched_backend.poll(submission) {
+                    Ok(Some(event)) => {
+                        let mut tokens = Vec::with_capacity(ROWS);
+                        for row in event.events() {
+                            tokens.push(row.output_token().expect("sampled token"));
+                        }
+                        break tokens;
+                    }
+                    Ok(None) => {
+                        assert!(
+                            started.elapsed() < deadline,
+                            "batched submission did not complete in time"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("batched poll failed: {error:?}"),
+                }
+            }
+        };
+        assert_eq!(tokens.len(), ROWS, "batched outcome count mismatch");
+        for (row, &token) in tokens.iter().enumerate() {
+            assert_eq!(
+                token, expected,
+                "batched row {row} diverged from llama-server at token {step}"
+            );
+            batched_fed[row] = token;
+        }
+
+        // Commit the advanced position through the state manager, mirroring
+        // the serving runtime's completion step.
+        for manager_and_state in [
+            (&mut eager_manager, &mut eager_states),
+            (&mut batched_manager, &mut batched_states),
+        ] {
+            let (manager, states) = manager_and_state;
+            for state in states.iter_mut() {
+                let committed = manager
+                    .commit(std::mem::replace(state, placeholder_state()), position + 1)
+                    .expect("commit position");
+                *state = committed;
+            }
+        }
+    }
+}
+
 /// Batched-executor greedy parity: three members sharing the pinned prompt
 /// advance through the batched decode path in lockstep and must reproduce
 /// the llama-server continuation exactly, matching the batch-1 oracle's
