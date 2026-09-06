@@ -2,7 +2,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 
@@ -2332,6 +2333,299 @@ impl CudaQwen35Ops {
                 .arg(&rot_u32)
                 .arg(&base)
                 .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `gdn_state_update` with view-typed scratch arguments: the recurrent
+    /// matrix is the caller's state buffer; the q/k/conv/decay/beta/output
+    /// parameters may be views into batch-major scratch. Geometry checks are
+    /// identical to the slice variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_state_update_views(
+        &self,
+        matrix: &mut CudaViewMut<f32>,
+        q_normed: &CudaView<f32>,
+        k_normed: &CudaView<f32>,
+        conv_activated: &CudaView<f32>,
+        decay: &CudaView<f32>,
+        beta: &CudaView<f32>,
+        output: &mut CudaViewMut<f32>,
+        v_heads: usize,
+        k_heads: usize,
+        head_dim: usize,
+        v_offset: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        if v_heads == 0 || k_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !v_heads.is_multiple_of(k_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        let state_len = v_heads * head_dim * head_dim;
+        if matrix.len() != state_len
+            || q_normed.len() != k_heads * head_dim
+            || k_normed.len() != k_heads * head_dim
+            || decay.len() != v_heads
+            || beta.len() != v_heads
+            || output.len() != v_heads * head_dim
+            || conv_activated.len() < v_offset + v_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: state_len,
+                actual: matrix.len(),
+            });
+        }
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let k_heads_u32 =
+            u32::try_from(k_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let v_offset_u32 =
+            u32::try_from(v_offset).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = v_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total_u32 = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_u32.div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: views borrow live slices on this stream; geometry is
+        // validated exactly as in the slice variant.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_state_update)
+                .arg(&mut *matrix)
+                .arg(q_normed)
+                .arg(k_normed)
+                .arg(conv_activated)
+                .arg(decay)
+                .arg(beta)
+                .arg(&mut *output)
+                .arg(&v_heads_u32)
+                .arg(&k_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&v_offset_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `kv_append_f16` with view-typed arguments: the cache buffers are the
+    /// caller's state; keys/values may be views into batch-major scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn kv_append_f16_views(
+        &self,
+        keys: &CudaView<f32>,
+        values: &CudaView<f32>,
+        cache_keys: &mut CudaViewMut<u16>,
+        cache_values: &mut CudaViewMut<u16>,
+        token_index: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        if kv_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if keys.len() != kv_heads * head_dim || values.len() != kv_heads * head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: kv_heads * head_dim,
+                actual: keys.len().min(values.len()),
+            });
+        }
+        let per_token = kv_heads * head_dim;
+        if cache_keys.len() < (token_index + 1) * per_token
+            || cache_values.len() < (token_index + 1) * per_token
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: (token_index + 1) * per_token,
+                actual: cache_keys.len().min(cache_values.len()),
+            });
+        }
+        let token_index_u32 =
+            u32::try_from(token_index).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let kv_heads_u32 =
+            u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (kv_heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: views borrow live slices on this stream; geometry is
+        // validated exactly as in the slice variant.
+        unsafe {
+            self.stream
+                .launch_builder(&self.kv_append_f16)
+                .arg(keys)
+                .arg(values)
+                .arg(&mut *cache_keys)
+                .arg(&mut *cache_values)
+                .arg(&token_index_u32)
+                .arg(&kv_heads_u32)
+                .arg(&head_dim_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `gdn_conv_silu` with view-typed arguments: the history is the caller's
+    /// state; input/output may be views into batch-major scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn gdn_conv_silu_views(
+        &self,
+        input: &CudaView<f32>,
+        conv_weight: &CudaView<f32>,
+        history: &mut CudaViewMut<f32>,
+        output: &mut CudaViewMut<f32>,
+        channels: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        if channels == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if input.len() != channels
+            || output.len() != channels
+            || history.len() != channels * 3
+            || conv_weight.len() != channels * 4
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: channels,
+                actual: input.len().min(output.len()),
+            });
+        }
+        let channels_u32 =
+            u32::try_from(channels).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (channels_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: views borrow live slices on this stream; lengths are
+        // validated exactly as in the slice variant.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_conv_silu)
+                .arg(input)
+                .arg(conv_weight)
+                .arg(&mut *history)
+                .arg(&mut *output)
+                .arg(&channels_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `attn_score_gqa` with view-typed scratch: keys/values are the caller's
+    /// KV cache; q/gate/scores/output may be views into batch-major scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn attn_score_gqa_views(
+        &self,
+        q: &CudaView<f32>,
+        keys: &CudaView<u16>,
+        values: &CudaView<u16>,
+        gate_scratch: &CudaView<f32>,
+        scores_scratch: &mut CudaViewMut<f32>,
+        output: &mut CudaViewMut<f32>,
+        tokens: usize,
+        scores_stride: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        if !head_dim.is_multiple_of(32) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        if q.len() != q_heads * head_dim
+            || gate_scratch.len() != q_heads * 2 * head_dim
+            || output.len() != q_heads * head_dim
+            || scores_scratch.len() < q_heads * scores_stride
+            || scores_stride < tokens
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: q_heads * head_dim,
+                actual: q.len(),
+            });
+        }
+        if keys.len() < tokens * kv_heads * head_dim || values.len() < tokens * kv_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: tokens * kv_heads * head_dim,
+                actual: keys.len().min(values.len()),
+            });
+        }
+        let tokens_u32 = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let stride_u32 =
+            u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let q_heads_u32 =
+            u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let kv_heads_u32 =
+            u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (q_heads_u32.div_ceil(4), 1, 1),
+            block_dim: (4 * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: views borrow live slices on this stream; geometry is
+        // validated exactly as in the slice variant.
+        unsafe {
+            self.stream
+                .launch_builder(&self.attn_score_gqa)
+                .arg(q)
+                .arg(keys)
+                .arg(values)
+                .arg(gate_scratch)
+                .arg(&mut *scores_scratch)
+                .arg(&mut *output)
+                .arg(&tokens_u32)
+                .arg(&stride_u32)
+                .arg(&q_heads_u32)
+                .arg(&kv_heads_u32)
+                .arg(&head_dim_u32)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
