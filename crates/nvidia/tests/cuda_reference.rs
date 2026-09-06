@@ -3849,6 +3849,125 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
+/// Batched-executor greedy parity: three members sharing the pinned prompt
+/// advance through the batched decode path in lockstep and must reproduce
+/// the llama-server continuation exactly, matching the batch-1 oracle's
+/// recorded tokens at every position.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end batched parity gate over the full text path"
+)]
+fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
+    use engine_nvidia::{CudaQwen35BatchDecode, QwenLayerKind};
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+    const MEMBERS: usize = 3;
+    const COMPARE_TOKENS: usize = 16;
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
+        .expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+
+    let mut states = (0..MEMBERS)
+        .map(|_| {
+            let mut state = engine_nvidia::CudaHybridState::from_specs(
+                stream.clone(),
+                Some(kv_spec),
+                Some(recurrent_spec),
+            )
+            .expect("physical hybrid state");
+            state.zero().expect("zero state");
+            state
+        })
+        .collect::<Vec<_>>();
+
+    let mut executor = CudaQwen35BatchDecode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        &layer_kinds,
+        EPS,
+        MEMBERS,
+    )
+    .expect("build batched decode executor");
+
+    // Prefill the same prompt through every member in lockstep; each member
+    // consumes the same token at the same position, and the final prompt
+    // token produces the first sampled continuation token per member.
+    let mut chosen = vec![0_u32; MEMBERS];
+    for (position, token) in PROMPT.iter().enumerate() {
+        let position = u32::try_from(position).expect("fits u32");
+        let tokens = vec![*token; MEMBERS];
+        let positions = vec![position; MEMBERS];
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> = states.iter_mut().collect();
+        chosen = executor
+            .decode_step_batch(&mut member_refs, &tokens, &positions)
+            .expect("batched prefill step");
+    }
+    for (member, &token) in chosen.iter().enumerate() {
+        assert_eq!(
+            token, LLAMA_GREEDY_CONTINUATION[0],
+            "batched member {member} first greedy token diverged from llama-server"
+        );
+    }
+
+    // Greedy continuation in lockstep: every member feeds the recorded token
+    // and must select the next recorded token.
+    for index in 1..COMPARE_TOKENS {
+        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
+        let tokens = vec![LLAMA_GREEDY_CONTINUATION[index - 1]; MEMBERS];
+        let positions = vec![position; MEMBERS];
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> = states.iter_mut().collect();
+        chosen = executor
+            .decode_step_batch(&mut member_refs, &tokens, &positions)
+            .expect("batched continuation step");
+        for (member, &token) in chosen.iter().enumerate() {
+            assert_eq!(
+                token, LLAMA_GREEDY_CONTINUATION[index],
+                "batched member {member} greedy token {index} diverged from llama-server"
+            );
+        }
+    }
+
+    // The batched executor must not leak member state: each member's state
+    // reports the advanced prefix.
+    for state in &states {
+        assert_eq!(
+            state.token_position(),
+            u32::try_from(PROMPT.len() + COMPARE_TOKENS - 1).expect("fits u32"),
+        );
+    }
+    eprintln!(
+        "batched greedy parity: {MEMBERS} members x {COMPARE_TOKENS} tokens match llama-server"
+    );
+}
+
 /// Full staging helper shared by the serving-level tests: globals plus every
 /// language layer of the pinned artifact, through the validated provider
 /// bindings.
