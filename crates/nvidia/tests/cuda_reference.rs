@@ -3750,6 +3750,105 @@ fn executes_warp_gemv_matching_the_scalar_oracle_iq3_s() {
     );
 }
 
+/// Batched warp GEMV parity: run all eight quant families batch-major over
+/// `MEMBERS` distinct inputs and require the batched kernel to match the
+/// batch-1 warp oracle member by member. This is the qualification gate for
+/// the batched projection kernels; the batch-1 warp path stays the oracle.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::type_complexity,
+    reason = "a compact fixture table: name, value type, cols, rows, constructor"
+)]
+fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
+    const MEMBERS: usize = 3;
+
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let mut store = CudaWeightStore::new(stream.clone());
+
+    let families: &[(&str, u32, usize, usize, fn() -> Vec<u8>)] = &[
+        ("q8_0", 8, 64, 3, q8_0_fixture),
+        ("q4_k", 12, 512, 2, q4_k_fixture),
+        ("q5_k", 13, 512, 2, q5_k_fixture),
+        ("q3_k", 11, 512, 2, q3_k_fixture),
+        ("q6_k", 14, 512, 2, q6_k_fixture),
+        ("iq4_nl", 20, 64, 3, iq4_nl_fixture),
+        ("iq4_xs", 23, 512, 2, iq4_xs_fixture),
+        ("iq3_s", 21, 512, 3, iq3_s_fixture),
+    ];
+
+    for &(name, value_type, cols, rows, fixture) in families {
+        let spec = WeightTensorSpec::new(
+            format!("{name}.batch.fixture"),
+            vec![cols as u64, rows as u64],
+            engine_core::DataType::F32,
+        )
+        .expect("fixture spec");
+        let encoded = fixture();
+        store
+            .materialize_quantized(
+                spec.clone(),
+                value_type,
+                encoded.len() as u64,
+                &mut Cursor::new(encoded),
+            )
+            .expect("upload fixture");
+        let weight = store
+            .quantized_tensor(&format!("{name}.batch.fixture"))
+            .expect("fixture weight");
+
+        // Distinct inputs per member, batch-major [members][cols].
+        let inputs = (0..MEMBERS)
+            .map(|member| {
+                (0..cols)
+                    .map(|index| {
+                        let pattern = u8::try_from((index + member * 7) % 17).expect("input index");
+                        f32::from(pattern) * 0.125 - 1.0
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let batched_input = inputs.concat();
+        let input_device = stream.clone_htod(&batched_input).expect("upload input");
+        let mut batched_output = stream
+            .alloc_zeros::<f32>(MEMBERS * rows)
+            .expect("allocate output");
+        let kernel = QwenGemvKernel::from_value_type(value_type, &context, stream.clone())
+            .expect("compile family kernel");
+        kernel
+            .execute_warp_batch(weight, &input_device, &mut batched_output, MEMBERS)
+            .expect("execute batched warp GEMV");
+        let batched = stream
+            .clone_dtoh(&batched_output)
+            .expect("download batched output");
+
+        // Oracle: batch-1 warp kernel per member.
+        for member in 0..MEMBERS {
+            let member_input = stream
+                .clone_htod(&inputs[member])
+                .expect("upload member input");
+            let mut member_output = stream
+                .alloc_zeros::<f32>(rows)
+                .expect("allocate member output");
+            kernel
+                .execute_warp(weight, &member_input, &mut member_output)
+                .expect("execute batch-1 warp GEMV");
+            let oracle = stream
+                .clone_dtoh(&member_output)
+                .expect("download member output");
+            let actual = &batched[member * rows..(member + 1) * rows];
+            assert_eq!(actual.len(), oracle.len());
+            for (actual, oracle) in actual.iter().zip(oracle) {
+                assert!(
+                    (actual - oracle).abs() < 1.0e-3,
+                    "{name} batched member {member} diverged from the batch-1 oracle: {actual} vs {oracle}"
+                );
+            }
+        }
+    }
+}
+
 /// Full staging helper shared by the serving-level tests: globals plus every
 /// language layer of the pinned artifact, through the validated provider
 /// bindings.

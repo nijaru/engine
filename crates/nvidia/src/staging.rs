@@ -173,6 +173,33 @@ impl QwenGemvKernel {
         }
     }
 
+    /// Run the batched warp-cooperative GEMV variant over `members`
+    /// batch-major input/output rows. The batch-1 warp path remains the
+    /// correctness oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel's error when the family lacks a batched variant or
+    /// shape/launch validation fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        match self {
+            Self::Q3K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Q4K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Q5K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Q6K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Q8_0(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Iq4Nl(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Iq3S(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Iq4Xs(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+        }
+    }
+
     #[must_use]
     pub const fn value_type(&self) -> u32 {
         match self {

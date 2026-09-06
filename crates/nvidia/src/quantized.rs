@@ -522,6 +522,45 @@ extern "C" __global__ void q8_0_gemv_warp(
         output[row] = total;
     }
 }
+// Batched variant of q8_0_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void q8_0_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
+
+    const int blocks_per_output = input_size / 32;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 34;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const int quantized = (int)(signed char)block[2 + lane];
+        accumulator += d * (float)quantized * input[block_index * 32 + lane];
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 
 extern "C" __global__ void iq4_nl_gemv_warp(
     const unsigned char* weights,
@@ -558,6 +597,52 @@ extern "C" __global__ void iq4_nl_gemv_warp(
         output[row] = total;
     }
 }
+// Batched variant of iq4_nl_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void iq4_nl_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
+
+    const int blocks_per_output = input_size / 32;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 18;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const int index = lane < 16 ? lane : lane - 16;
+        const int nibble = lane < 16
+            ? (int)(block[2 + index] & 0x0fu)
+            : (int)(block[2 + index] >> 4u);
+        accumulator += d * (float)values[nibble] * input[block_index * 32 + lane];
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 
 extern "C" __global__ void iq4_xs_gemv_warp(
     const unsigned char* weights,
@@ -572,6 +657,63 @@ extern "C" __global__ void iq4_xs_gemv_warp(
     if (row >= output_size) {
         return;
     }
+
+    const int blocks_per_output = input_size / 256;
+    const signed char values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 136;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned short high_scales =
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8u);
+        const int group = lane >> 2;
+        const int within = (lane & 3) * 8;
+        const int low = (int)((block[4 + group / 2] >> ((group & 1) * 4)) & 0x0fu);
+        const int high = (int)((high_scales >> (group * 2)) & 0x03u);
+        const float group_scale = d * (float)((low | (high << 4)) - 32);
+        const int data_offset = 8 + group * 16;
+        for (int j = 0; j < 8; ++j) {
+            const int local = group * 32 + within + j;
+            const int element = within + j;
+            const unsigned char packed = block[data_offset + (element & 15)];
+            const int nibble = element < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4u);
+            accumulator +=
+                group_scale * (float)values[nibble] * input[block_index * 256 + local];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+// Batched variant of iq4_xs_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void iq4_xs_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
 
     const int blocks_per_output = input_size / 256;
     const signed char values[16] = {
@@ -657,6 +799,68 @@ extern "C" __global__ void q3_k_gemv_warp(
         output[row] = total;
     }
 }
+// Batched variant of q3_k_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void q3_k_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 110;
+        const float d = decode_f16((unsigned short)block[108] | ((unsigned short)block[109] << 8u));
+        const unsigned char* high_bits = block;
+        const unsigned char* low_bits = block + 32;
+        const unsigned char* packed_scales = block + 96;
+        const int group = lane >> 1;
+        const int local = (lane & 1) * 8;
+        const int index = group < 8 ? group : group - 8;
+        const int scale_bits = group < 8
+            ? (int)((packed_scales[index] & 0x0fu)
+                | (((packed_scales[8 + index % 4] >> ((index / 4) * 2)) & 0x03u) << 4u))
+            : (int)((packed_scales[index] >> 4u)
+                | (((packed_scales[8 + index % 4] >> ((group / 4) * 2)) & 0x03u) << 4u));
+        const int group_scale = scale_bits - 32;
+        const int chunk = group / 8;
+        const int variant = (group / 2) & 3;
+        const int half = group & 1;
+        const int low_offset = chunk * 32 + half * 16;
+        const int high_offset = half * 16;
+        for (int j = 0; j < 8; ++j) {
+            const int within = local + j;
+            const int low = (int)((low_bits[low_offset + within] >> (variant * 2)) & 0x03u);
+            const int high = ((int)(high_bits[high_offset + within] >> (group / 2)) & 1) ^ 1;
+            const int quantized = low - high * 4;
+            accumulator += d * (float)group_scale * (float)quantized
+                * input[block_index * 256 + group * 16 + within];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 
 extern "C" __global__ void q6_k_gemv_warp(
     const unsigned char* weights,
@@ -671,6 +875,63 @@ extern "C" __global__ void q6_k_gemv_warp(
     if (row >= output_size) {
         return;
     }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 210;
+        const unsigned char* low_bits = block;
+        const unsigned char* high_bits = block + 128;
+        const unsigned char* scales = block + 192;
+        const float d = decode_f16((unsigned short)block[208] | ((unsigned short)block[209] << 8u));
+        const int group = lane >> 2;
+        const int position_base = (lane & 3) * 8;
+        const int chunk = group / 4;
+        const int variant = group & 3;
+        const int low_offset = chunk * 64 + (variant & 1) * 32;
+        const int low_shift = variant < 2 ? 0 : 4;
+        const int high_offset = chunk * 32;
+        for (int j = 0; j < 8; ++j) {
+            const int position = position_base + j;
+            const int half = position >= 16 ? 1 : 0;
+            const int group_scale = (int)(signed char)scales[group * 2 + half];
+            const int low = (int)((low_bits[low_offset + position] >> low_shift) & 0x0fu);
+            const int high = (int)((high_bits[high_offset + position] >> (variant * 2)) & 0x03u);
+            const int quantized = (low | (high << 4)) - 32;
+            accumulator += d * (float)group_scale * (float)quantized
+                * input[block_index * 256 + group * 32 + position];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+// Batched variant of q6_k_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void q6_k_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
 
     const int blocks_per_output = input_size / 256;
     float accumulator = 0.0f;
@@ -745,6 +1006,57 @@ extern "C" __global__ void q4_k_gemv_warp(
         output[row] = total;
     }
 }
+// Batched variant of q4_k_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void q4_k_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 144;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
+        const int group = lane >> 2;
+        const int index_base = (lane & 3) * 8;
+        const int data_offset = 16 + (group / 2) * 32;
+        const int shift = (group & 1) * 4;
+        const float group_scale = (float)scale_value(block, group);
+        const float group_minimum = (float)minimum_value(block, group);
+        for (int j = 0; j < 8; ++j) {
+            const int index = index_base + j;
+            const int quantized = (int)((block[data_offset + index] >> shift) & 0x0fu);
+            const float value =
+                d * group_scale * (float)quantized - min * group_minimum;
+            accumulator += value * input[block_index * 256 + group * 32 + index];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 
 extern "C" __global__ void q5_k_gemv_warp(
     const unsigned char* weights,
@@ -759,6 +1071,59 @@ extern "C" __global__ void q5_k_gemv_warp(
     if (row >= output_size) {
         return;
     }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 176;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
+        const int group = lane >> 2;
+        const int index_base = (lane & 3) * 8;
+        const int data_offset = 48 + (group / 2) * 32;
+        const int shift = (group & 1) * 4;
+        const float group_scale = (float)scale_value(block, group);
+        const float group_minimum = (float)minimum_value(block, group);
+        for (int j = 0; j < 8; ++j) {
+            const int index = index_base + j;
+            const int low = (int)((block[data_offset + index] >> shift) & 0x0fu);
+            const int high = (int)((block[16 + index] >> group) & 1u);
+            const int quantized = low | (high << 4);
+            const float value =
+                d * group_scale * (float)quantized - min * group_minimum;
+            accumulator += value * input[block_index * 256 + group * 32 + index];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+// Batched variant of q5_k_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void q5_k_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
 
     const int blocks_per_output = input_size / 256;
     float accumulator = 0.0f;
@@ -803,6 +1168,64 @@ extern "C" __global__ void iq3_s_gemv_warp(
     if (row >= output_size) {
         return;
     }
+
+    const int blocks_per_output = input_size / 256;
+    float accumulator = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
+        const unsigned char* block =
+            weights + (row * blocks_per_output + block_index) * 110;
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned char* low_codes = block + 2;
+        const unsigned char* high_codes = block + 66;
+        const unsigned char* signs = block + 74;
+        const unsigned char* scales = block + 106;
+        const int group = lane >> 2;
+        const int sub = lane & 3;
+        const int scale_nibble =
+            (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
+        const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
+        const unsigned char sign_bits = signs[group * 4 + sub];
+        for (int lane_in = 0; lane_in < 8; ++lane_in) {
+            const int code_index = group * 8 + sub * 2 + lane_in / 4;
+            const int high_bit =
+                (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
+            const int code = (int)low_codes[code_index] | (high_bit << 8);
+            const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
+            const int grid_index = code * 4 + (lane_in & 3);
+            const float value = group_scale * (float)grid[grid_index] * (float)sign;
+            accumulator += value * input[block_index * 256 + group * 32 + sub * 8 + lane_in];
+        }
+    }
+    const float total = warp_sum(accumulator);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
+// Batched variant of iq3_s_gemv_warp: one warp per (row, member) over
+// batch-major [members][K] input and [members][N] output. Consecutive
+// warps cover the same weight row across members, so each weight byte is
+// fetched once per block and reused for every member it serves.
+extern "C" __global__ void iq3_s_gemv_warp_batch(
+    const unsigned char* weights,
+    const float* input,
+    float* output,
+    const unsigned char* grid,
+    int input_size,
+    int output_size,
+    int members
+) {
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row = warp_id / members;
+    const int member = warp_id - row * members;
+    const int lane = (int)(threadIdx.x & 31u);
+    if (row >= output_size) {
+        return;
+    }
+    // Batch-major [members][input_size] / [members][output_size] layouts:
+    // offset to this member's slice so the decode body is unchanged.
+    input += (long long)member * input_size;
+    output += (long long)member * output_size;
 
     const int blocks_per_output = input_size / 256;
     float accumulator = 0.0f;
@@ -895,6 +1318,7 @@ struct CudaQuantizedGemv {
     stream: Arc<CudaStream>,
     kernel: CudaFunction,
     warp_kernel: Option<CudaFunction>,
+    batch_kernel: Option<CudaFunction>,
     value_type: u32,
     block_elements: usize,
     block_bytes: usize,
@@ -923,7 +1347,8 @@ impl CudaQuantizedGemv {
             .load_function(function_name)
             .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
         // Embedding lookups keep the scalar kernel only; GEMV families also
-        // compile their warp-cooperative variant for measured selection.
+        // compile their warp-cooperative and batched variants for measured
+        // selection.
         let warp_name: Option<&'static str> = match function_name {
             "q8_0_gemv" => Some("q8_0_gemv_warp"),
             "iq4_nl_gemv" => Some("iq4_nl_gemv_warp"),
@@ -935,7 +1360,25 @@ impl CudaQuantizedGemv {
             "iq3_s_gemv" => Some("iq3_s_gemv_warp"),
             _ => None,
         };
+        let batch_name: Option<&'static str> = match function_name {
+            "q8_0_gemv" => Some("q8_0_gemv_warp_batch"),
+            "iq4_nl_gemv" => Some("iq4_nl_gemv_warp_batch"),
+            "iq4_xs_gemv" => Some("iq4_xs_gemv_warp_batch"),
+            "q3_k_gemv" => Some("q3_k_gemv_warp_batch"),
+            "q6_k_gemv" => Some("q6_k_gemv_warp_batch"),
+            "q4_k_gemv" => Some("q4_k_gemv_warp_batch"),
+            "q5_k_gemv" => Some("q5_k_gemv_warp_batch"),
+            "iq3_s_gemv" => Some("iq3_s_gemv_warp_batch"),
+            _ => None,
+        };
         let warp_kernel = warp_name
+            .map(|name| {
+                module
+                    .load_function(name)
+                    .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))
+            })
+            .transpose()?;
+        let batch_kernel = batch_name
             .map(|name| {
                 module
                     .load_function(name)
@@ -946,11 +1389,117 @@ impl CudaQuantizedGemv {
             stream,
             kernel,
             warp_kernel,
+            batch_kernel,
             value_type,
             block_elements,
             block_bytes,
             label,
         })
+    }
+
+    /// Validate the quantized weight geometry shared by every variant:
+    /// rank-2, block-aligned input extent, exact encoded length.
+    fn validate_geometry(
+        &self,
+        weight: &CudaQuantizedWeight,
+    ) -> Result<(usize, usize), CudaQuantizedKernelError> {
+        if weight.value_type() != self.value_type {
+            return Err(CudaQuantizedKernelError::UnsupportedValueType {
+                expected: self.value_type,
+                actual: weight.value_type(),
+            });
+        }
+        let dimensions = weight.spec().dimensions();
+        if dimensions.len() != 2 {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "expected rank-2 tensor, got rank {}",
+                dimensions.len()
+            )));
+        }
+        let input_size =
+            usize::try_from(dimensions[0]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let output_size =
+            usize::try_from(dimensions[1]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        if input_size == 0 || output_size == 0 || !input_size.is_multiple_of(self.block_elements) {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "{} shape is {input_size}x{output_size}; input size must be a positive multiple of {}",
+                self.label, self.block_elements
+            )));
+        }
+        let blocks = input_size
+            .checked_div(self.block_elements)
+            .and_then(|value| value.checked_mul(output_size))
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        let expected_bytes = blocks
+            .checked_mul(self.block_bytes)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        if weight.encoded_bytes() != expected_bytes {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "encoded length is {}, expected {expected_bytes}",
+                weight.encoded_bytes()
+            )));
+        }
+        if blocks > (i32::MAX as usize) / self.block_bytes {
+            return Err(CudaQuantizedKernelError::ShapeOverflow);
+        }
+        if input_size > i32::MAX as usize || output_size > i32::MAX as usize {
+            return Err(CudaQuantizedKernelError::ShapeOverflow);
+        }
+        Ok((input_size, output_size))
+    }
+
+    /// Validate a batch-major launch over `members` concurrent inputs and
+    /// outputs: each member contributes one `[input_size]` input row and one
+    /// `[output_size]` output row.
+    fn validate_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(u32, u32, u32, LaunchConfig), CudaQuantizedKernelError> {
+        if self.stream.context().as_ref() != weight.encoded_data().context().as_ref()
+            || self.stream.context().as_ref() != input.context().as_ref()
+            || self.stream.context().as_ref() != output.context().as_ref()
+        {
+            return Err(CudaQuantizedKernelError::ContextMismatch);
+        }
+        let (input_size, output_size) = self.validate_geometry(weight)?;
+        let expected_input = input_size
+            .checked_mul(members)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        let expected_output = output_size
+            .checked_mul(members)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        if input.len() != expected_input {
+            return Err(CudaQuantizedKernelError::InputLength {
+                expected: expected_input,
+                actual: input.len(),
+            });
+        }
+        if output.len() != expected_output {
+            return Err(CudaQuantizedKernelError::OutputLength {
+                expected: expected_output,
+                actual: output.len(),
+            });
+        }
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let total_warps = output_size
+            .checked_mul(members)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        let total_warps =
+            u32::try_from(total_warps).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let input_size =
+            u32::try_from(input_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let output_size =
+            u32::try_from(output_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_warps.div_ceil(4), 1, 1),
+            block_dim: (4 * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        Ok((input_size, output_size, members_u32, config))
     }
 
     fn validate(
@@ -1110,6 +1659,52 @@ impl CudaQuantizedGemv {
         }
         Ok(())
     }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// concurrent inputs/outputs laid out batch-major. The batch-1 warp path
+    /// remains the correctness oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    fn execute_warp_batch_inner(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        let batch_kernel = self.batch_kernel.as_ref().ok_or_else(|| {
+            CudaQuantizedKernelError::InvalidWeight(format!(
+                "{} has no batched warp variant",
+                self.label
+            ))
+        })?;
+        if members == 0 {
+            return Err(CudaQuantizedKernelError::InputLength {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let (input_size, output_size, members, config) =
+            self.validate_batch(weight, input, output, members)?;
+        // Safety: same slices/validation as the warp path; the batch kernel
+        // writes only [member][row] outputs once each from lane 0.
+        unsafe {
+            self.stream
+                .launch_builder(batch_kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&input_size)
+                .arg(&output_size)
+                .arg(&members)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 /// A correctness-oriented `IQ4_NL` matrix-vector kernel.
@@ -1190,6 +1785,24 @@ impl CudaIq4NlGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
+    }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
     }
 }
 
@@ -1314,6 +1927,50 @@ impl CudaIq3SGemv {
                 .arg(&self.grid)
                 .arg(&input_size)
                 .arg(&output_size)
+                .launch(config)
+                .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Execute the batched warp-cooperative `IQ3_S` variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        let batch_kernel = self.inner.batch_kernel.as_ref().ok_or_else(|| {
+            CudaQuantizedKernelError::InvalidWeight("IQ3_S has no batched warp variant".to_owned())
+        })?;
+        if members == 0 {
+            return Err(CudaQuantizedKernelError::InputLength {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let (input_size, output_size, members_u32, config) =
+            self.inner.validate_batch(weight, input, output, members)?;
+        // Safety: same slices/validation as the warp path; the batch kernel
+        // writes only [member][row] outputs once each from lane 0.
+        unsafe {
+            self.inner
+                .stream
+                .launch_builder(batch_kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&self.grid)
+                .arg(&input_size)
+                .arg(&output_size)
+                .arg(&members_u32)
                 .launch(config)
                 .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
         }
@@ -1689,6 +2346,24 @@ impl CudaIq4XsGemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
     }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
+    }
 }
 
 /// A correctness-oriented `Q3_K` matrix-vector kernel.
@@ -1769,6 +2444,24 @@ impl CudaQ3KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
+    }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
     }
 }
 
@@ -1851,6 +2544,24 @@ impl CudaQ8_0Gemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
     }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
+    }
 }
 
 /// A correctness-oriented `Q6_K` matrix-vector kernel.
@@ -1931,6 +2642,24 @@ impl CudaQ6KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
+    }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
     }
 }
 
@@ -2013,6 +2742,24 @@ impl CudaQ4KGemv {
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
     }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
+    }
 }
 
 /// A correctness-oriented `Q5_K` matrix-vector kernel.
@@ -2092,5 +2839,23 @@ impl CudaQ5KGemv {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaQuantizedKernelError> {
         self.inner.execute_warp(weight, input, output)
+    }
+
+    /// Execute the batched warp-cooperative variant over `members`
+    /// batch-major input/output rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaQuantizedKernelError`] when the family has no batched
+    /// variant or validation/launch fails.
+    pub fn execute_warp_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        self.inner
+            .execute_warp_batch_inner(weight, input, output, members)
     }
 }
