@@ -323,12 +323,15 @@ extern "C" __global__ void attn_score_gqa(
     int kv_heads,
     int head_dim
 ) {
-    // One thread per q head; serial over cached tokens. Reads the F16 KV
-    // cache laid out [token][kv_head][head_dim] and computes the
-    // block-mapped GQA decode: scores, softmax, weighted V sum, then the
-    // sigmoid gate. scores_scratch is a [q_heads][scores_stride] buffer;
-    // only the first `tokens` entries per head are used.
-    const int q_head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    // One warp per q head. Lanes split head_dim (a multiple of 32 by launch
+    // validation), so F16 KV reads coalesce and the dot/softmax reductions
+    // are shuffles. scores_scratch keeps the [q_heads][scores_stride]
+    // layout: lane 0 writes each token's score, then the warp re-reads
+    // them for the weighted V accumulation after the final max is known.
+    // The sigmoid gate matches the scalar reference's semantics.
+    const int warps_per_block = (int)(blockDim.x >> 5);
+    const int q_head = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int lane = (int)(threadIdx.x & 31u);
     if (q_head >= q_heads) {
         return;
     }
@@ -337,45 +340,61 @@ extern "C" __global__ void attn_score_gqa(
     const float scale = rsqrtf((float)head_dim);
 
     float* scores = scores_scratch + q_head * scores_stride;
+    const float* q_vec = q + q_head * head_dim;
+    const int dims_per_lane = head_dim >> 5;
+    const int dim_base = lane * dims_per_lane;
+    // Per-lane output accumulators over this lane's contiguous dims;
+    // head_dim <= 512 keeps this bounded.
+    float out_acc[16];
+    for (int d = 0; d < dims_per_lane && d < 16; ++d) {
+        out_acc[d] = 0.0f;
+    }
+
+    // Pass one: per-token scores (dot + shuffle reduce), running max, and
+    // a running total rescaled exactly when the max moves so the division
+    // by total matches the reference softmax numerics.
+    float max_score = -3.402823466e+38f;
+    float total = 0.0f;
     for (int token = 0; token < tokens; ++token) {
         const unsigned short* key =
             keys + ((long long)token * kv_heads + kv_head) * head_dim;
-        const float* q_vec = q + q_head * head_dim;
         float dot = 0.0f;
-        for (int dim = 0; dim < head_dim; ++dim) {
-            dot += q_vec[dim] * f16_bits_to_f32(key[dim]);
+        for (int d = 0; d < dims_per_lane && d < 16; ++d) {
+            dot += q_vec[dim_base + d] * f16_bits_to_f32(key[dim_base + d]);
         }
-        scores[token] = dot * scale;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        const float scaled = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        if (lane == 0) {
+            scores[token] = scaled;
+        }
+        const float prev_max = max_score;
+        max_score = fmaxf(max_score, scaled);
+        const float factor = scaled > prev_max ? expf(prev_max - max_score) : 1.0f;
+        total = total * factor + expf(scaled - max_score);
     }
-    float max_score = -3.402823466e+38f;
-    for (int token = 0; token < tokens; ++token) {
-        max_score = fmaxf(max_score, scores[token]);
-    }
-    float total = 0.0f;
-    for (int token = 0; token < tokens; ++token) {
-        scores[token] = expf(scores[token] - max_score);
-        total += scores[token];
-    }
-    const float inv_total = 1.0f / total;
 
-    float* out = output + q_head * head_dim;
-    for (int dim = 0; dim < head_dim; ++dim) {
-        out[dim] = 0.0f;
-    }
+    // Pass two: normalized weights (computed per lane from the shared
+    // scores) accumulate the weighted V sum into the lane's dims.
+    const float inv_total = 1.0f / total;
     for (int token = 0; token < tokens; ++token) {
-        const float weight = scores[token] * inv_total;
+        const float weight = expf(scores[token] - max_score) * inv_total;
         const unsigned short* value =
             values + ((long long)token * kv_heads + kv_head) * head_dim;
-        for (int dim = 0; dim < head_dim; ++dim) {
-            out[dim] += weight * f16_bits_to_f32(value[dim]);
+        for (int d = 0; d < dims_per_lane && d < 16; ++d) {
+            out_acc[d] += weight * f16_bits_to_f32(value[dim_base + d]);
         }
     }
 
-    // Sigmoid gate from the second half of each 2*head_dim q-head slice.
+    // Sigmoid gate from the second half of each 2*head_dim q-head slice,
+    // then write this lane's contiguous dims.
     const float* gate = gate_scratch + q_head * 2 * head_dim + head_dim;
-    for (int dim = 0; dim < head_dim; ++dim) {
+    float* out = output + q_head * head_dim;
+    for (int d = 0; d < dims_per_lane && d < 16; ++d) {
+        const int dim = dim_base + d;
         const float sigmoid = 1.0f / (1.0f + expf(-gate[dim]));
-        out[dim] *= sigmoid;
+        out[dim] = out_acc[d] * sigmoid;
     }
 }
 
@@ -1256,6 +1275,10 @@ impl CudaQwen35Ops {
         if !q_heads.is_multiple_of(kv_heads) {
             return Err(CudaModelKernelError::ShapeOverflow);
         }
+        // The warp-cooperative head split assumes whole 32-dim lane runs.
+        if !head_dim.is_multiple_of(32) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
         if q.len() != q_heads * head_dim
             || gate_scratch.len() != q_heads * 2 * head_dim
             || output.len() != q_heads * head_dim
@@ -1284,8 +1307,8 @@ impl CudaQwen35Ops {
         let head_dim_u32 =
             u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let config = LaunchConfig {
-            grid_dim: (q_heads_u32.div_ceil(32), 1, 1),
-            block_dim: (32, 1, 1),
+            grid_dim: (q_heads_u32.div_ceil(4), 1, 1),
+            block_dim: (4 * 32, 1, 1),
             shared_mem_bytes: 0,
         };
         // Safety: cudarc allocated all slices, geometry is validated, and
