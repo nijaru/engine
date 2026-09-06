@@ -1363,6 +1363,32 @@ impl CudaQwen35BatchDecode {
                 positions.len()
             )));
         }
+        // Validate every member's position against its own state's KV
+        // capacity before any launch, mirroring the batch-1 executor's guard.
+        for (state, &position) in states.iter().zip(positions) {
+            let capacity = state.kv().map_or(u32::MAX, |kv| kv.spec().block_tokens());
+            if position >= capacity {
+                return Err(CudaDecodeError::PositionOverflow { position, capacity });
+            }
+        }
+        // Lazy score-scratch allocation on the first batched step, once any
+        // member's KV capacity is known; all members share the executor so
+        // one stride covers every row.
+        if self.scratch.scores.is_none() {
+            let stride = states
+                .iter()
+                .filter_map(|state| state.kv().map(|kv| kv.spec().block_tokens() as usize))
+                .max()
+                .unwrap_or(0);
+            if stride == 0 && states.iter().any(|state| state.kv().is_some()) {
+                return Err(CudaDecodeError::InvalidPlan(
+                    "KV state reports a zero token capacity".to_owned(),
+                ));
+            }
+            let scores = alloc(&self.stream, self.members * ATTN_Q_HEADS * stride)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+            self.scratch.scores = Some(scores);
+        }
         self.upload_tokens(tokens, positions)?;
 
         let embedding_weight = self
