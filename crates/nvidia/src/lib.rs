@@ -45,7 +45,9 @@ pub use staging::{
 };
 
 #[cfg(feature = "cuda")]
-pub use decode::{CudaDecodeError, CudaQwen35Decode, GemvMode, QwenLayerKind};
+pub use decode::{
+    CudaDecodeError, CudaQwen35BatchDecode, CudaQwen35Decode, GemvMode, QwenLayerKind,
+};
 
 #[cfg(feature = "cuda")]
 pub use state::{

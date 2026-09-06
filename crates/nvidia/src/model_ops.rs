@@ -2140,6 +2140,54 @@ impl CudaQwen35Ops {
         Ok(())
     }
 
+    /// `l2_norm_heads` over a view: per-head in-place normalization of a
+    /// `[heads][head_dim]` buffer that may be a member row of batch scratch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when lengths or epsilon are invalid.
+    pub fn l2_norm_heads_views(
+        &self,
+        values: &mut CudaViewMut<f32>,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        if heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if values.len() != heads * head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: heads * head_dim,
+                actual: values.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (heads_u32.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: the view borrows a live slice on this stream and its
+        // length is validated against the head geometry.
+        unsafe {
+            self.stream
+                .launch_builder(&self.l2_norm_heads)
+                .arg(&mut *values)
+                .arg(&heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Per-head gated norm over `members` batch-major rows, sharing the
     /// per-layer raw `ssm_norm` weight.
     ///
@@ -2469,7 +2517,7 @@ impl CudaQwen35Ops {
     )]
     pub fn gdn_state_update_views(
         &self,
-        matrix: &mut CudaViewMut<f32>,
+        matrix: &mut CudaSlice<f32>,
         q_normed: &CudaView<f32>,
         k_normed: &CudaView<f32>,
         conv_activated: &CudaView<f32>,
@@ -2555,8 +2603,8 @@ impl CudaQwen35Ops {
         &self,
         keys: &CudaView<f32>,
         values: &CudaView<f32>,
-        cache_keys: &mut CudaViewMut<u16>,
-        cache_values: &mut CudaViewMut<u16>,
+        cache_keys: &mut CudaSlice<u16>,
+        cache_values: &mut CudaSlice<u16>,
         token_index: usize,
         kv_heads: usize,
         head_dim: usize,
@@ -2618,8 +2666,8 @@ impl CudaQwen35Ops {
     pub fn gdn_conv_silu_views(
         &self,
         input: &CudaView<f32>,
-        conv_weight: &CudaView<f32>,
-        history: &mut CudaViewMut<f32>,
+        conv_weight: &CudaSlice<f32>,
+        history: &mut CudaSlice<f32>,
         output: &mut CudaViewMut<f32>,
         channels: usize,
     ) -> Result<(), CudaModelKernelError> {
@@ -2673,8 +2721,8 @@ impl CudaQwen35Ops {
     pub fn attn_score_gqa_views(
         &self,
         q: &CudaView<f32>,
-        keys: &CudaView<u16>,
-        values: &CudaView<u16>,
+        keys: &CudaSlice<u16>,
+        values: &CudaSlice<u16>,
         gate_scratch: &CudaView<f32>,
         scores_scratch: &mut CudaViewMut<f32>,
         output: &mut CudaViewMut<f32>,

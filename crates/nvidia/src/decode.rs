@@ -17,7 +17,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, PinnedHostSlice};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaSlice, CudaStream, CudaView, CudaViewMut, PinnedHostSlice,
+};
 use engine_core::DataType;
 
 use crate::cuda::CudaF32Weight;
@@ -1104,6 +1106,25 @@ fn gemv(
     Ok(())
 }
 
+/// Run one quantized projection for `members` batch-major rows in a single
+/// batched warp launch.
+fn gemv_batch(
+    weights: &CudaQwen35Weights,
+    name: &str,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    members: usize,
+) -> Result<(), CudaDecodeError> {
+    let weight = weights
+        .quantized_tensor(name)
+        .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+    let kernel = weights
+        .gemv_for(weight.value_type())
+        .ok_or(CudaDecodeError::MissingKernel(weight.value_type()))?;
+    kernel.execute_warp_batch(weight, input, output, members)?;
+    Ok(())
+}
+
 fn copy_range(
     stream: &Arc<CudaStream>,
     source: &CudaSlice<f32>,
@@ -1116,4 +1137,671 @@ fn copy_range(
     stream
         .memcpy_dtod(&view, destination)
         .map_err(|error| CudaDecodeError::Driver(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Batched decode executor: one launch per (layer, op) over all scheduler-batch
+// members, batch-major scratch. State families stay per member — each member
+// owns its own CudaHybridState, and the per-member state kernels receive
+// view-sliced member rows of the batch scratch. The batch-1 executor above
+// remains the correctness oracle; this path is opt-in until qualified.
+
+/// Batch-major scratch for `members` concurrent decode rows.
+struct BatchScratch {
+    tokens: CudaSlice<u32>,
+    positions: CudaSlice<i64>,
+    hidden: CudaSlice<f32>,
+    normed: CudaSlice<f32>,
+    attn_incr: CudaSlice<f32>,
+    ffn_incr: CudaSlice<f32>,
+    qkv_mixed: CudaSlice<f32>,
+    z_gate: CudaSlice<f32>,
+    beta_raw: CudaSlice<f32>,
+    alpha_raw: CudaSlice<f32>,
+    decay: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    conv_out: CudaSlice<f32>,
+    gdn_q: CudaSlice<f32>,
+    gdn_k: CudaSlice<f32>,
+    state_out: CudaSlice<f32>,
+    gated: CudaSlice<f32>,
+    q_raw: CudaSlice<f32>,
+    q_packed: CudaSlice<f32>,
+    k_raw: CudaSlice<f32>,
+    k_normed: CudaSlice<f32>,
+    v_raw: CudaSlice<f32>,
+    attn_out: CudaSlice<f32>,
+    ffn_gate_buf: CudaSlice<f32>,
+    ffn_up_buf: CudaSlice<f32>,
+    ffn_act: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+    selected: CudaSlice<u32>,
+    /// Per-member attention scores, `[m][q_heads][stride]`.
+    scores: Option<CudaSlice<f32>>,
+}
+
+/// Multi-member Qwen3.8 decode executor over shared staged weights.
+///
+/// `decode_step_batch` advances every member's model state by one token and
+/// returns each member's greedy selection in one submission's worth of
+/// launches: projections, norms, gates, rope, embedding, and argmax run as
+/// single batched kernels; the per-member GDN/attention state kernels run
+/// with view-sliced member rows of the batch scratch.
+pub struct CudaQwen35BatchDecode {
+    stream: Arc<CudaStream>,
+    ops: Arc<CudaQwen35Ops>,
+    embedding: CudaQ4KEmbedding,
+    weights: Arc<CudaQwen35Weights>,
+    tensor_names: Arc<[LayerTensorNames]>,
+    kv_slot: Vec<u32>,
+    recurrent_slot: Vec<u32>,
+    epsilon: f32,
+    members: usize,
+    scratch: BatchScratch,
+}
+
+impl CudaQwen35BatchDecode {
+    /// Build the batched executor over staged weights for `members` rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] under the same conditions as the batch-1
+    /// executor's constructor, plus when `members` is zero or scratch
+    /// allocation fails.
+    pub fn new(
+        context: &Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+        weights: Arc<CudaQwen35Weights>,
+        layer_kinds: &[QwenLayerKind],
+        epsilon: f32,
+        members: usize,
+    ) -> Result<Self, CudaDecodeError> {
+        if members == 0 {
+            return Err(CudaDecodeError::InvalidPlan(
+                "the batched executor requires at least one member".to_owned(),
+            ));
+        }
+        let vocab = weights
+            .quantized_tensor("output.weight")
+            .map(|weight| weight.spec().dimensions()[1])
+            .ok_or_else(|| CudaDecodeError::MissingTensor("output.weight".to_owned()))
+            .and_then(|dim| {
+                usize::try_from(dim)
+                    .map_err(|_| CudaDecodeError::InvalidPlan("vocabulary does not fit".to_owned()))
+            })?;
+
+        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
+            .iter()
+            .enumerate()
+            .map(|(layer, kind)| LayerTensorNames::new(layer, *kind))
+            .collect::<Vec<_>>()
+            .into();
+        let mut kv_slot = Vec::with_capacity(layer_kinds.len());
+        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
+        let mut kv_count = 0_u32;
+        let mut recurrent_count = 0_u32;
+        for kind in layer_kinds {
+            match kind {
+                QwenLayerKind::Recurrent => {
+                    recurrent_slot.push(recurrent_count);
+                    recurrent_count += 1;
+                    kv_slot.push(kv_count);
+                }
+                QwenLayerKind::FullAttention => {
+                    kv_slot.push(kv_count);
+                    kv_count += 1;
+                    recurrent_slot.push(recurrent_count);
+                }
+            }
+        }
+
+        let ops = Arc::new(CudaQwen35Ops::from_context(context, stream.clone())?);
+        let embedding = CudaQ4KEmbedding::from_context(context, stream.clone())?;
+        let m = members;
+        let alloc = |length: usize| -> Result<CudaSlice<f32>, CudaDecodeError> {
+            alloc(&stream, length * m)
+        };
+        let scratch = BatchScratch {
+            tokens: stream
+                .alloc_zeros::<u32>(m)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            positions: stream
+                .alloc_zeros::<i64>(m)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            hidden: alloc(N_EMBD)?,
+            normed: alloc(N_EMBD)?,
+            attn_incr: alloc(N_EMBD)?,
+            ffn_incr: alloc(N_EMBD)?,
+            qkv_mixed: alloc(GDN_QKV_DIM)?,
+            z_gate: alloc(GDN_INNER)?,
+            beta_raw: alloc(GDN_V_HEADS)?,
+            alpha_raw: alloc(GDN_V_HEADS)?,
+            decay: alloc(GDN_V_HEADS)?,
+            beta: alloc(GDN_V_HEADS)?,
+            conv_out: alloc(GDN_QKV_DIM)?,
+            gdn_q: alloc(GDN_K_HEADS * GDN_HEAD_DIM)?,
+            gdn_k: alloc(GDN_K_HEADS * GDN_HEAD_DIM)?,
+            state_out: alloc(GDN_INNER)?,
+            gated: alloc(GDN_INNER)?,
+            q_raw: alloc(ATTN_Q_HEADS * 2 * ATTN_HEAD_DIM)?,
+            q_packed: alloc(ATTN_Q_HEADS * ATTN_HEAD_DIM)?,
+            k_raw: alloc(ATTN_KV_HEADS * ATTN_HEAD_DIM)?,
+            k_normed: alloc(ATTN_KV_HEADS * ATTN_HEAD_DIM)?,
+            v_raw: alloc(ATTN_KV_HEADS * ATTN_HEAD_DIM)?,
+            attn_out: alloc(ATTN_Q_HEADS * ATTN_HEAD_DIM)?,
+            ffn_gate_buf: alloc(N_FF)?,
+            ffn_up_buf: alloc(N_FF)?,
+            ffn_act: alloc(N_FF)?,
+            logits: alloc(vocab)?,
+            selected: stream
+                .alloc_zeros::<u32>(m)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            scores: None,
+        };
+
+        Ok(Self {
+            stream,
+            ops,
+            embedding,
+            weights,
+            tensor_names,
+            kv_slot,
+            recurrent_slot,
+            epsilon,
+            members,
+            scratch,
+        })
+    }
+
+    /// Number of batch rows this executor was built for.
+    #[must_use]
+    pub const fn members(&self) -> usize {
+        self.members
+    }
+
+    /// Upload `[members]` tokens and positions into the batch buffers.
+    fn upload_tokens(&mut self, tokens: &[u32], positions: &[u32]) -> Result<(), CudaDecodeError> {
+        self.stream
+            .memcpy_htod(tokens, &mut self.scratch.tokens)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        let positions: Vec<i64> = positions.iter().map(|&p| i64::from(p)).collect();
+        self.stream
+            .memcpy_htod(&positions, &mut self.scratch.positions)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        Ok(())
+    }
+
+    /// One batched decode step: advance every member's state by its token at
+    /// its position and return each member's greedy selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError`] when state/geometry is invalid or any
+    /// batched launch fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batched sequence per llama.cpp-verified host step; splitting it hides the step"
+    )]
+    pub fn decode_step_batch(
+        &mut self,
+        states: &mut [&mut CudaHybridState],
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> Result<Vec<u32>, CudaDecodeError> {
+        if states.len() != self.members || tokens.len() != self.members {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "batch step requires {} states and tokens, got {} and {}",
+                self.members,
+                states.len(),
+                tokens.len()
+            )));
+        }
+        if positions.len() != self.members {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "batch step requires {} positions, got {}",
+                self.members,
+                positions.len()
+            )));
+        }
+        self.upload_tokens(tokens, positions)?;
+
+        let embedding_weight = self
+            .weights
+            .quantized_tensor("token_embd.weight")
+            .ok_or_else(|| CudaDecodeError::MissingTensor("token_embd.weight".to_owned()))?;
+        self.embedding.execute_batch(
+            embedding_weight,
+            &self.scratch.tokens,
+            &mut self.scratch.hidden,
+        )?;
+
+        let tensor_names = Arc::clone(&self.tensor_names);
+        for (layer, names) in tensor_names.iter().enumerate() {
+            self.ops.rms_norm_batch(
+                &self.scratch.hidden,
+                f32_slice(&self.weights, &names.common.attn_norm)?,
+                &mut self.scratch.normed,
+                N_EMBD,
+                self.epsilon,
+            )?;
+            match &names.attention {
+                AttentionLayerTensorNames::Recurrent(attention) => {
+                    self.recurrent_layer_batch(states, layer, attention)?;
+                }
+                AttentionLayerTensorNames::FullAttention(attention) => {
+                    self.full_attention_layer_batch(states, layer, attention, positions)?;
+                }
+            }
+            self.ops.rms_norm_batch(
+                &self.scratch.hidden,
+                f32_slice(&self.weights, &names.common.post_attention_norm)?,
+                &mut self.scratch.normed,
+                N_EMBD,
+                self.epsilon,
+            )?;
+            gemv_batch(
+                &self.weights,
+                &names.common.ffn_gate,
+                &self.scratch.normed,
+                &mut self.scratch.ffn_gate_buf,
+                self.members,
+            )?;
+            gemv_batch(
+                &self.weights,
+                &names.common.ffn_up,
+                &self.scratch.normed,
+                &mut self.scratch.ffn_up_buf,
+                self.members,
+            )?;
+            self.ops.silu_mul(
+                &self.scratch.ffn_gate_buf,
+                &self.scratch.ffn_up_buf,
+                &mut self.scratch.ffn_act,
+            )?;
+            gemv_batch(
+                &self.weights,
+                &names.common.ffn_down,
+                &self.scratch.ffn_act,
+                &mut self.scratch.ffn_incr,
+                self.members,
+            )?;
+            self.ops
+                .residual_add(&mut self.scratch.hidden, &self.scratch.ffn_incr)?;
+        }
+
+        // Output head over all members, then one batched argmax.
+        self.ops.rms_norm_batch(
+            &self.scratch.hidden,
+            f32_slice(&self.weights, "output_norm.weight")?,
+            &mut self.scratch.normed,
+            N_EMBD,
+            self.epsilon,
+        )?;
+        gemv_batch(
+            &self.weights,
+            "output.weight",
+            &self.scratch.normed,
+            &mut self.scratch.logits,
+            self.members,
+        )?;
+        self.ops
+            .argmax_into_batch(&self.scratch.logits, &mut self.scratch.selected)?;
+        let selected = self
+            .stream
+            .clone_dtoh(&self.scratch.selected)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+        Ok(selected)
+    }
+
+    /// Batched recurrent (GDN) layer: projections and gates over all members,
+    /// then per-member convolution/state kernels on view-sliced rows.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batched sequence per llama.cpp-verified host step; splitting it hides the step"
+    )]
+    fn recurrent_layer_batch(
+        &mut self,
+        states: &mut [&mut CudaHybridState],
+        layer: usize,
+        names: &RecurrentLayerTensorNames,
+    ) -> Result<(), CudaDecodeError> {
+        let m = self.members;
+        gemv_batch(
+            &self.weights,
+            &names.attn_qkv,
+            &self.scratch.normed,
+            &mut self.scratch.qkv_mixed,
+            m,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.attn_gate,
+            &self.scratch.normed,
+            &mut self.scratch.z_gate,
+            m,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.ssm_beta,
+            &self.scratch.normed,
+            &mut self.scratch.beta_raw,
+            m,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.ssm_alpha,
+            &self.scratch.normed,
+            &mut self.scratch.alpha_raw,
+            m,
+        )?;
+        let dt_bias = f32_slice(&self.weights, &names.ssm_dt_bias)?;
+        let ssm_a = f32_slice(&self.weights, &names.ssm_a)?;
+        let conv_weight = f32_slice(&self.weights, &names.ssm_conv1d)?;
+        let ssm_norm = f32_slice(&self.weights, &names.ssm_norm)?;
+
+        self.ops.gdn_scalar_gate_batch(
+            &self.scratch.alpha_raw,
+            &self.scratch.beta_raw,
+            dt_bias,
+            ssm_a,
+            &mut self.scratch.decay,
+            &mut self.scratch.beta,
+            GDN_V_HEADS,
+        )?;
+
+        // Per member: conv history + recurrent matrix live in the member's
+        // state; scratch rows are sliced views of the batch buffers.
+        for member in 0..m {
+            let slot = self.recurrent_slot[layer];
+            let state = states
+                .get_mut(member)
+                .ok_or_else(|| CudaDecodeError::InvalidPlan("missing member state".to_owned()))?;
+            let recurrent = state.recurrent_mut().ok_or(missing_recurrent())?;
+            let (matrix_buffer, conv_buffer) = recurrent.layer_mut(slot).ok_or_else(|| {
+                CudaDecodeError::InvalidPlan(format!("recurrent state lacks slot {slot}"))
+            })?;
+            // Validate the matrix buffer eagerly; the state-update loop below
+            // re-borrows it for the actual update.
+            let matrix = matrix_buffer.as_f32_mut().ok_or_else(|| {
+                CudaDecodeError::InvalidPlan("recurrent matrix must be F32".to_owned())
+            })?;
+            let _ = matrix.len();
+            let history = conv_buffer.as_f32_mut().ok_or_else(|| {
+                CudaDecodeError::InvalidPlan("recurrent convolution history must be F32".to_owned())
+            })?;
+
+            let qkv = member_row(&self.scratch.qkv_mixed, member, GDN_QKV_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("qkv row out of range".to_owned()))?;
+            let mut conv_out = member_row_mut(&mut self.scratch.conv_out, member, GDN_QKV_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("conv_out row out of range".to_owned()))?;
+            self.ops
+                .gdn_conv_silu_views(&qkv, conv_weight, history, &mut conv_out, GDN_QKV_DIM)?;
+        }
+
+        // Q/k normalization in place on each member's conv_out row: q is the
+        // [0, K_OFFSET) channel range and k is [K_OFFSET, V_OFFSET) of the
+        // member's row, so normalize per member via views (the same math as
+        // the batch-1 l2_norm_heads).
+        for member in 0..m {
+            let start = member * GDN_QKV_DIM;
+            let mut conv_q = self
+                .scratch
+                .conv_out
+                .try_slice_mut(start..start + GDN_K_OFFSET)
+                .ok_or_else(|| CudaDecodeError::Driver("conv q slice out of range".to_owned()))?;
+            self.ops
+                .l2_norm_heads_views(&mut conv_q, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
+            let mut conv_k = self
+                .scratch
+                .conv_out
+                .try_slice_mut(start + GDN_K_OFFSET..start + GDN_V_OFFSET)
+                .ok_or_else(|| CudaDecodeError::Driver("conv k slice out of range".to_owned()))?;
+            self.ops
+                .l2_norm_heads_views(&mut conv_k, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
+        }
+
+        // Per-member state update with member views of decay/beta/conv_out.
+        for member in 0..m {
+            let slot = self.recurrent_slot[layer];
+            let state = states
+                .get_mut(member)
+                .ok_or_else(|| CudaDecodeError::InvalidPlan("missing member state".to_owned()))?;
+            let recurrent = state.recurrent_mut().ok_or(missing_recurrent())?;
+            let (matrix_buffer, _conv_buffer) = recurrent.layer_mut(slot).ok_or_else(|| {
+                CudaDecodeError::InvalidPlan(format!("recurrent state lacks slot {slot}"))
+            })?;
+            let matrix = matrix_buffer.as_f32_mut().ok_or_else(|| {
+                CudaDecodeError::InvalidPlan("recurrent matrix must be F32".to_owned())
+            })?;
+
+            let q_normed = member_row(&self.scratch.gdn_q, member, GDN_K_HEADS * GDN_HEAD_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("gdn_q row out of range".to_owned()))?;
+            let k_normed = member_row(&self.scratch.gdn_k, member, GDN_K_HEADS * GDN_HEAD_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("gdn_k row out of range".to_owned()))?;
+            let conv_activated = member_row(&self.scratch.conv_out, member, GDN_QKV_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("conv_out row out of range".to_owned()))?;
+            let decay = member_row(&self.scratch.decay, member, GDN_V_HEADS)
+                .ok_or_else(|| CudaDecodeError::Driver("decay row out of range".to_owned()))?;
+            let beta = member_row(&self.scratch.beta, member, GDN_V_HEADS)
+                .ok_or_else(|| CudaDecodeError::Driver("beta row out of range".to_owned()))?;
+            let mut state_out = member_row_mut(&mut self.scratch.state_out, member, GDN_INNER)
+                .ok_or_else(|| CudaDecodeError::Driver("state_out row out of range".to_owned()))?;
+            self.ops.gdn_state_update_views(
+                matrix,
+                &q_normed,
+                &k_normed,
+                &conv_activated,
+                &decay,
+                &beta,
+                &mut state_out,
+                GDN_V_HEADS,
+                GDN_K_HEADS,
+                GDN_HEAD_DIM,
+                GDN_V_OFFSET,
+            )?;
+        }
+
+        self.ops.gdn_gated_norm_batch(
+            &self.scratch.state_out,
+            &self.scratch.z_gate,
+            ssm_norm,
+            &mut self.scratch.gated,
+            GDN_V_HEADS,
+            GDN_HEAD_DIM,
+            self.epsilon,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.ssm_out,
+            &self.scratch.gated,
+            &mut self.scratch.attn_incr,
+            m,
+        )?;
+        self.ops
+            .residual_add(&mut self.scratch.hidden, &self.scratch.attn_incr)?;
+        Ok(())
+    }
+
+    /// Batched full-attention layer: projections/norms/rope over all members,
+    /// then per-member KV append and attention against each member's cache.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batched sequence per llama.cpp-verified host step; splitting it hides the step"
+    )]
+    fn full_attention_layer_batch(
+        &mut self,
+        states: &mut [&mut CudaHybridState],
+        layer: usize,
+        names: &FullAttentionLayerTensorNames,
+        positions: &[u32],
+    ) -> Result<(), CudaDecodeError> {
+        let m = self.members;
+        gemv_batch(
+            &self.weights,
+            &names.q,
+            &self.scratch.normed,
+            &mut self.scratch.q_raw,
+            m,
+        )?;
+        let q_norm = f32_slice(&self.weights, &names.q_norm)?;
+        self.ops.q_gate_norm_batch(
+            &self.scratch.q_raw,
+            q_norm,
+            &mut self.scratch.q_packed,
+            ATTN_Q_HEADS,
+            ATTN_HEAD_DIM,
+            self.epsilon,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.k,
+            &self.scratch.normed,
+            &mut self.scratch.k_raw,
+            m,
+        )?;
+        let k_norm = f32_slice(&self.weights, &names.k_norm)?;
+        self.ops.strided_rms_norm_batch(
+            &self.scratch.k_raw,
+            k_norm,
+            &mut self.scratch.k_normed,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+            self.epsilon,
+        )?;
+        gemv_batch(
+            &self.weights,
+            &names.v,
+            &self.scratch.normed,
+            &mut self.scratch.v_raw,
+            m,
+        )?;
+        self.ops.rope_neox_batch(
+            &mut self.scratch.q_packed,
+            &self.scratch.positions,
+            ATTN_Q_HEADS,
+            ATTN_HEAD_DIM,
+            ATTN_ROT_DIMS,
+            ATTN_ROPE_BASE,
+        )?;
+        self.ops.rope_neox_batch(
+            &mut self.scratch.k_normed,
+            &self.scratch.positions,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+            ATTN_ROT_DIMS,
+            ATTN_ROPE_BASE,
+        )?;
+
+        // Per member: append to this member's KV cache, then score attention
+        // against it, using member views of the batch scratch.
+        for (member, &position_u32) in positions.iter().enumerate().take(m) {
+            let slot = self.kv_slot[layer];
+            let position = usize::try_from(position_u32)
+                .map_err(|_| CudaDecodeError::Driver("position overflowed".to_owned()))?;
+            let state = states
+                .get_mut(member)
+                .ok_or_else(|| CudaDecodeError::InvalidPlan("missing member state".to_owned()))?;
+            // Read the capacity before borrowing the cache mutably.
+            let capacity = state
+                .kv()
+                .map_or(usize::MAX, |kv| kv.spec().block_tokens() as usize);
+            let stride = capacity;
+            let tokens = position + 1;
+            let kv = state.kv_mut().ok_or(missing_kv())?;
+            let (keys_buffer, values_buffer) = kv.layer_mut(slot).ok_or_else(|| {
+                CudaDecodeError::InvalidPlan(format!("KV state lacks slot {slot}"))
+            })?;
+            let cache_keys = keys_buffer
+                .as_f16_mut()
+                .ok_or_else(|| CudaDecodeError::InvalidPlan("KV cache must be F16".to_owned()))?;
+            let cache_values = values_buffer
+                .as_f16_mut()
+                .ok_or_else(|| CudaDecodeError::InvalidPlan("KV cache must be F16".to_owned()))?;
+            let k_member = member_row(
+                &self.scratch.k_normed,
+                member,
+                ATTN_KV_HEADS * ATTN_HEAD_DIM,
+            )
+            .ok_or_else(|| CudaDecodeError::Driver("k_normed row out of range".to_owned()))?;
+            let v_member =
+                member_row(&self.scratch.v_raw, member, ATTN_KV_HEADS * ATTN_HEAD_DIM)
+                    .ok_or_else(|| CudaDecodeError::Driver("v_raw row out of range".to_owned()))?;
+            self.ops.kv_append_f16_views(
+                &k_member,
+                &v_member,
+                cache_keys,
+                cache_values,
+                position,
+                ATTN_KV_HEADS,
+                ATTN_HEAD_DIM,
+            )?;
+
+            let q_member = member_row(&self.scratch.q_packed, member, ATTN_Q_HEADS * ATTN_HEAD_DIM)
+                .ok_or_else(|| CudaDecodeError::Driver("q_packed row out of range".to_owned()))?;
+            let gate_member = member_row(
+                &self.scratch.q_raw,
+                member,
+                ATTN_Q_HEADS * 2 * ATTN_HEAD_DIM,
+            )
+            .ok_or_else(|| CudaDecodeError::Driver("q_raw row out of range".to_owned()))?;
+            let scores =
+                self.scratch.scores.as_mut().ok_or_else(|| {
+                    CudaDecodeError::InvalidPlan("score scratch is unset".to_owned())
+                })?;
+            let mut scores_member = member_row_mut(scores, member, ATTN_Q_HEADS * stride)
+                .ok_or_else(|| CudaDecodeError::Driver("scores row out of range".to_owned()))?;
+            let mut out_member = member_row_mut(
+                &mut self.scratch.attn_out,
+                member,
+                ATTN_Q_HEADS * ATTN_HEAD_DIM,
+            )
+            .ok_or_else(|| CudaDecodeError::Driver("attn_out row out of range".to_owned()))?;
+            self.ops.attn_score_gqa_views(
+                &q_member,
+                cache_keys,
+                cache_values,
+                &gate_member,
+                &mut scores_member,
+                &mut out_member,
+                tokens,
+                stride,
+                ATTN_Q_HEADS,
+                ATTN_KV_HEADS,
+                ATTN_HEAD_DIM,
+            )?;
+        }
+
+        gemv_batch(
+            &self.weights,
+            &names.output,
+            &self.scratch.attn_out,
+            &mut self.scratch.attn_incr,
+            m,
+        )?;
+        self.ops
+            .residual_add(&mut self.scratch.hidden, &self.scratch.attn_incr)?;
+        Ok(())
+    }
+}
+
+/// Borrow one member's `[row_length]` row of a batch-major slice as a view.
+fn member_row(
+    slice: &CudaSlice<f32>,
+    member: usize,
+    row_length: usize,
+) -> Option<CudaView<'_, f32>> {
+    let start = member.checked_mul(row_length)?;
+    let end = start.checked_add(row_length)?;
+    slice.try_slice(start..end)
+}
+
+/// Mutably borrow one member's `[row_length]` row of a batch-major slice.
+fn member_row_mut(
+    slice: &mut CudaSlice<f32>,
+    member: usize,
+    row_length: usize,
+) -> Option<CudaViewMut<'_, f32>> {
+    let start = member.checked_mul(row_length)?;
+    let end = start.checked_add(row_length)?;
+    slice.try_slice_mut(start..end)
 }
