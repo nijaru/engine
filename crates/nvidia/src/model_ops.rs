@@ -143,6 +143,50 @@ __device__ __forceinline__ unsigned int logit_key(float value) {
     return sign ? ~bits : (bits ^ 0x80000000u);
 }
 
+extern "C" __global__ void rms_norm_batch(
+    const float* input,
+    const float* weight,
+    float* output,
+    int length,
+    float epsilon
+) {
+    // Batch-major [members][length]: block x indexes the member vector; the
+    // reduction body is identical to the single-vector rms_norm kernel.
+    const int member = (int)blockIdx.x;
+    const float* member_input = input + (long long)member * length;
+    float* member_output = output + (long long)member * length;
+    __shared__ float warp_sums[32];
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int warps = (int)(blockDim.x >> 5);
+
+    float sum = 0.0f;
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
+        sum += member_input[index] * member_input[index];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        warp_sums[warp] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            warp_sums[0] = sum;
+        }
+    }
+    __syncthreads();
+    const float inverse_norm = rsqrtf(warp_sums[0] / (float)length + epsilon);
+    for (int index = (int)threadIdx.x; index < length; index += (int)blockDim.x) {
+        member_output[index] = member_input[index] * inverse_norm * weight[index];
+    }
+}
+
 extern "C" __global__ void argmax(
     const float* logits,
     unsigned int* output,
@@ -672,6 +716,7 @@ pub struct CudaQwen35Ops {
     stream: Arc<CudaStream>,
     argmax: CudaFunction,
     rms_norm: CudaFunction,
+    rms_norm_batch: CudaFunction,
     silu_mul: CudaFunction,
     l2_norm: CudaFunction,
     gdn_scalar_gate: CudaFunction,
@@ -727,6 +772,9 @@ impl CudaQwen35Ops {
         let rms_norm = module
             .load_function("rms_norm")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let rms_norm_batch = module
+            .load_function("rms_norm_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let silu_mul = module
             .load_function("silu_mul")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -773,6 +821,7 @@ impl CudaQwen35Ops {
             stream,
             argmax,
             rms_norm,
+            rms_norm_batch,
             silu_mul,
             l2_norm,
             gdn_scalar_gate,
@@ -935,6 +984,70 @@ impl CudaQwen35Ops {
                 .arg(&epsilon)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Apply `RMSNorm` to `members` batch-major `[members][length]` vectors
+    /// sharing one weight vector. One block per member vector; the
+    /// per-element equation matches the single-vector kernel exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, epsilon, or
+    /// launch arguments are invalid.
+    pub fn rms_norm_batch(
+        &self,
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        length: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        self.check_contexts(input, weight, output)?;
+        if input.is_empty() || length == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !input.len().is_multiple_of(length) {
+            return Err(CudaModelKernelError::InputLength {
+                expected: input.len(),
+                actual: length,
+            });
+        }
+        if weight.len() != length {
+            return Err(CudaModelKernelError::WeightLength {
+                expected: length,
+                actual: weight.len(),
+            });
+        }
+        if output.len() != input.len() {
+            return Err(CudaModelKernelError::OutputLength {
+                expected: input.len(),
+                actual: output.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let members = input.len() / length;
+        let length = u32::try_from(length).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members = u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // Safety: cudarc allocated all slices, lengths are validated, and the
+        // grid covers exactly one block per member vector.
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_norm_batch)
+                .arg(input)
+                .arg(weight)
+                .arg(output)
+                .arg(&length)
+                .arg(&epsilon)
+                .launch(LaunchConfig {
+                    grid_dim: (members, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
