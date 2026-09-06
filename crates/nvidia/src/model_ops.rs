@@ -642,6 +642,182 @@ extern "C" __global__ void q_gate_norm(
     }
 }
 
+
+// ------------------------------------------------------------------------
+// Batched elementwise variants: one launch over [members][...] batch-major
+// scratch. Shared per-layer weights (dt_bias, A_log, norms, rope base) stay
+// un-offset; member-owned rows are offset by member. Decode math is
+// identical to the single-vector kernels above, which remain the oracle.
+
+extern "C" __global__ void gdn_scalar_gate_batch(
+    const float* alpha,
+    const float* beta_raw,
+    const float* dt_bias,
+    const float* a,
+    float* decay,
+    float* beta,
+    int heads,
+    int members
+) {
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= members * heads) {
+        return;
+    }
+    const int member = index / heads;
+    const int head = index - member * heads;
+    const long long offset = (long long)member * heads + head;
+    const float softplus_arg = alpha[offset] + dt_bias[head];
+    const float softplus_value = softplus_arg > 20.0f
+        ? softplus_arg
+        : logf(1.0f + expf(softplus_arg));
+    decay[offset] = expf(a[head] * softplus_value);
+    beta[offset] = 1.0f / (1.0f + expf(-beta_raw[offset]));
+}
+
+extern "C" __global__ void l2_norm_heads_batch(
+    float* values,
+    int heads,
+    int head_dim,
+    float epsilon,
+    int members
+) {
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= members * heads) {
+        return;
+    }
+    const int member = head / heads;
+    const int within = head - member * heads;
+    float* head_values = values + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_values[index] * head_values[index];
+    }
+    const float scale = 1.0f / fmaxf(sqrtf(sum), epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_values[index] *= scale;
+    }
+    (void)member;
+    (void)within;
+}
+
+extern "C" __global__ void gdn_gated_norm_batch(
+    const float* input,
+    const float* z_gate,
+    const float* ssm_norm,
+    float* output,
+    int v_heads,
+    int head_dim,
+    float epsilon,
+    int members
+) {
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= members * v_heads) {
+        return;
+    }
+    const float* head_input = input + (long long)head * head_dim;
+    const float* head_gate = z_gate + (long long)head * head_dim;
+    float* head_output = output + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        const float z = head_gate[index];
+        const float silu = z / (1.0f + expf(-z));
+        head_output[index] = head_input[index] * inverse * ssm_norm[index] * silu;
+    }
+}
+
+extern "C" __global__ void q_gate_norm_batch(
+    const float* q_gate,
+    const float* q_norm_weight,
+    float* q_normed,
+    int q_heads,
+    int head_dim,
+    float epsilon,
+    int members
+) {
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= members * q_heads) {
+        return;
+    }
+    const int member = head / q_heads;
+    const int within = head - member * q_heads;
+    const float* head_input =
+        q_gate + (long long)member * q_heads * 2 * head_dim + (long long)within * 2 * head_dim;
+    float* head_output =
+        q_normed + (long long)member * q_heads * head_dim + (long long)within * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_output[index] = head_input[index] * inverse * q_norm_weight[index];
+    }
+}
+
+extern "C" __global__ void strided_rms_norm_batch(
+    const float* input,
+    const float* weight,
+    float* output,
+    int heads,
+    int head_dim,
+    float epsilon,
+    int members
+) {
+    const int head = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (head >= members * heads) {
+        return;
+    }
+    const float* head_input = input + (long long)head * head_dim;
+    float* head_output = output + (long long)head * head_dim;
+    float sum = 0.0f;
+    for (int index = 0; index < head_dim; ++index) {
+        sum += head_input[index] * head_input[index];
+    }
+    const float inverse = rsqrtf(sum / (float)head_dim + epsilon);
+    for (int index = 0; index < head_dim; ++index) {
+        head_output[index] = head_input[index] * inverse * weight[index];
+    }
+}
+
+extern "C" __global__ void rope_neox_batch(
+    float* values,
+    const long long* positions,
+    int head_count,
+    int head_dim,
+    int rot_dim_pairs,
+    float base,
+    int members
+) {
+    // One thread per (member, head, pair). Each member rotates at its own
+    // position; the NEOX half-split math is identical to the scalar-position
+    // kernel.
+    const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int pairs_per_member = head_count * rot_dim_pairs;
+    if (index >= members * pairs_per_member) {
+        return;
+    }
+    const int member = index / pairs_per_member;
+    const int pair_index = index - member * pairs_per_member;
+    const int head = pair_index / rot_dim_pairs;
+    const int pair = pair_index - head * rot_dim_pairs;
+    const float pos = (float)positions[member];
+    const int half = rot_dim_pairs;
+    const float theta =
+        pos * powf(base, -(2.0f * (float)pair) / (2.0f * (float)half));
+    const float sin_theta = sinf(theta);
+    const float cos_theta = cosf(theta);
+    float* member_values = values + (long long)member * head_count * head_dim;
+    const int offset = head * head_dim + pair;
+    const float x0 = member_values[offset];
+    const float x1 = member_values[offset + half];
+    member_values[offset] = x0 * cos_theta - x1 * sin_theta;
+    member_values[offset + half] = x0 * sin_theta + x1 * cos_theta;
+}
+
 __device__ __forceinline__ unsigned short f32_to_f16_bits(float value) {
     // Round-to-nearest-even conversion matching __float2half.
     const unsigned int bits = __float_as_int(value);
@@ -731,6 +907,12 @@ pub struct CudaQwen35Ops {
     gdn_gated_norm: CudaFunction,
     q_gate_norm: CudaFunction,
     kv_append_f16: CudaFunction,
+    gdn_scalar_gate_batch: CudaFunction,
+    l2_norm_heads_batch: CudaFunction,
+    gdn_gated_norm_batch: CudaFunction,
+    q_gate_norm_batch: CudaFunction,
+    strided_rms_norm_batch: CudaFunction,
+    rope_neox_batch: CudaFunction,
 }
 
 impl CudaQwen35Ops {
@@ -754,6 +936,10 @@ impl CudaQwen35Ops {
     /// # Errors
     ///
     /// Returns [`CudaModelKernelError`] when NVRTC or module loading fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one load function per compiled kernel keeps load failures addressable"
+    )]
     pub fn from_context(
         context: &Arc<CudaContext>,
         stream: Arc<CudaStream>,
@@ -817,6 +1003,24 @@ impl CudaQwen35Ops {
         let kv_append_f16 = module
             .load_function("kv_append_f16")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_scalar_gate_batch = module
+            .load_function("gdn_scalar_gate_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let l2_norm_heads_batch = module
+            .load_function("l2_norm_heads_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_gated_norm_batch = module
+            .load_function("gdn_gated_norm_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let q_gate_norm_batch = module
+            .load_function("q_gate_norm_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let strided_rms_norm_batch = module
+            .load_function("strided_rms_norm_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let rope_neox_batch = module
+            .load_function("rope_neox_batch")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         Ok(Self {
             stream,
             argmax,
@@ -836,6 +1040,12 @@ impl CudaQwen35Ops {
             gdn_gated_norm,
             q_gate_norm,
             kv_append_f16,
+            gdn_scalar_gate_batch,
+            l2_norm_heads_batch,
+            gdn_gated_norm_batch,
+            q_gate_norm_batch,
+            strided_rms_norm_batch,
+            rope_neox_batch,
         })
     }
 
@@ -1665,6 +1875,463 @@ impl CudaQwen35Ops {
                 .arg(&heads_u32)
                 .arg(&head_dim_u32)
                 .arg(&epsilon)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Compute per-head GDN scalar gates for `members` batch-major member
+    /// rows `[members][heads]`, sharing the per-layer `dt_bias` and `A_log`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_scalar_gate_batch(
+        &self,
+        alpha: &CudaSlice<f32>,
+        beta_raw: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        decay: &mut CudaSlice<f32>,
+        beta: &mut CudaSlice<f32>,
+        heads: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != alpha.context().as_ref()
+            || context.as_ref() != beta_raw.context().as_ref()
+            || context.as_ref() != dt_bias.context().as_ref()
+            || context.as_ref() != a.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if heads == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let members = alpha.len() / heads;
+        if members == 0
+            || !alpha.len().is_multiple_of(heads)
+            || beta_raw.len() != alpha.len()
+            || decay.len() != alpha.len()
+            || beta.len() != alpha.len()
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: alpha.len(),
+                actual: beta_raw.len().min(decay.len()).min(beta.len()),
+            });
+        }
+        let dt_bias_len = dt_bias.len().max(a.len());
+        if dt_bias_len != heads || dt_bias.len() != heads || a.len() != heads {
+            return Err(CudaModelKernelError::InputLength {
+                expected: heads,
+                actual: dt_bias.len().min(a.len()),
+            });
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_scalar_gate_batch)
+                .arg(alpha)
+                .arg(beta_raw)
+                .arg(dt_bias)
+                .arg(a)
+                .arg(&mut *decay)
+                .arg(&mut *beta)
+                .arg(&heads_u32)
+                .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// In-place per-head `l2` normalization over `members` batch-major
+    /// `[members][heads][head_dim]` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn l2_norm_heads_batch(
+        &self,
+        values: &mut CudaSlice<f32>,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != values.context().as_ref() {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let members = values.len() / (heads * head_dim);
+        if members == 0 || !values.len().is_multiple_of(heads * head_dim) {
+            return Err(CudaModelKernelError::InputLength {
+                expected: heads * head_dim,
+                actual: values.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated the slice, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.l2_norm_heads_batch)
+                .arg(&mut *values)
+                .arg(&heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head gated norm over `members` batch-major rows, sharing the
+    /// per-layer raw `ssm_norm` weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_gated_norm_batch(
+        &self,
+        input: &CudaSlice<f32>,
+        z_gate: &CudaSlice<f32>,
+        ssm_norm: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        v_heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != z_gate.context().as_ref()
+            || context.as_ref() != ssm_norm.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if v_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let members = input.len() / (v_heads * head_dim);
+        if members == 0
+            || !input.len().is_multiple_of(v_heads * head_dim)
+            || z_gate.len() != input.len()
+            || output.len() != input.len()
+            || ssm_norm.len() != head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: input.len(),
+                actual: z_gate.len().min(output.len()),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(v_heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_gated_norm_batch)
+                .arg(input)
+                .arg(z_gate)
+                .arg(ssm_norm)
+                .arg(&mut *output)
+                .arg(&v_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head `RMSNorm` over the first half of each `[q | gate]` slice for
+    /// `members` batch-major rows, sharing the per-layer `q_norm` weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn q_gate_norm_batch(
+        &self,
+        q_gate: &CudaSlice<f32>,
+        q_norm_weight: &CudaSlice<f32>,
+        q_normed: &mut CudaSlice<f32>,
+        q_heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != q_gate.context().as_ref()
+            || context.as_ref() != q_norm_weight.context().as_ref()
+            || context.as_ref() != q_normed.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if q_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let per_member = q_heads * 2 * head_dim;
+        let members = q_gate.len() / per_member;
+        if members == 0 || !q_gate.len().is_multiple_of(per_member) {
+            return Err(CudaModelKernelError::InputLength {
+                expected: per_member,
+                actual: q_gate.len(),
+            });
+        }
+        let expected_out = members * q_heads * head_dim;
+        if q_normed.len() != expected_out || q_norm_weight.len() != head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: expected_out,
+                actual: q_normed.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let q_heads_u32 =
+            u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(q_heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.q_gate_norm_batch)
+                .arg(q_gate)
+                .arg(q_norm_weight)
+                .arg(&mut *q_normed)
+                .arg(&q_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Per-head `RMSNorm` over `members` batch-major `[members][heads][head_dim]`
+    /// inputs, sharing one weight vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn strided_rms_norm_batch(
+        &self,
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != input.context().as_ref()
+            || context.as_ref() != weight.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let members = input.len() / (heads * head_dim);
+        if members == 0
+            || !input.len().is_multiple_of(heads * head_dim)
+            || output.len() != input.len()
+            || weight.len() != head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: input.len(),
+                actual: output.len(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let heads_u32 = u32::try_from(heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.strided_rms_norm_batch)
+                .arg(input)
+                .arg(weight)
+                .arg(&mut *output)
+                .arg(&heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&epsilon)
+                .arg(&members_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// NEOX rope over `members` batch-major head stacks, each member rotating
+    /// at its own position from `[members]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, or launch
+    /// arguments are invalid.
+    pub fn rope_neox_batch(
+        &self,
+        values: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i64>,
+        head_count: usize,
+        head_dim: usize,
+        rot_dim_pairs: usize,
+        base: f32,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != values.context().as_ref()
+            || context.as_ref() != positions.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if head_count == 0 || head_dim == 0 || rot_dim_pairs == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if rot_dim_pairs * 2 > head_dim {
+            return Err(CudaModelKernelError::InputLength {
+                expected: head_dim,
+                actual: rot_dim_pairs * 2,
+            });
+        }
+        let per_member = head_count * head_dim;
+        let members = values.len() / per_member;
+        if members == 0 || !values.len().is_multiple_of(per_member) {
+            return Err(CudaModelKernelError::InputLength {
+                expected: per_member,
+                actual: values.len(),
+            });
+        }
+        if positions.len() != members {
+            return Err(CudaModelKernelError::InputLength {
+                expected: members,
+                actual: positions.len(),
+            });
+        }
+        if !base.is_finite() || base <= 0.0 {
+            return Err(CudaModelKernelError::InvalidEpsilon);
+        }
+        let head_count_u32 =
+            u32::try_from(head_count).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let rot_u32 =
+            u32::try_from(rot_dim_pairs).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = members
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(rot_dim_pairs))
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_neox_batch)
+                .arg(&mut *values)
+                .arg(positions)
+                .arg(&head_count_u32)
+                .arg(&head_dim_u32)
+                .arg(&rot_u32)
+                .arg(&base)
+                .arg(&members_u32)
                 .launch(config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
