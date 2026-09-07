@@ -4302,11 +4302,11 @@ fn finds_first_diverging_batched_step_against_batch1() {
         oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
     }
 
-    // Token comparison: the decision-level parity that serving actually
-    // consumes. Hiddens are reported for diagnosis but a divergence that
-    // never flips a token is a read anomaly, not a numerics bug.
+    // Token comparison over the decode phase only: prefill steps produce no
+    // oracle choice, so the comparison starts at the prompt boundary.
+    let prefill = PROMPT.len() - 1;
     let mut token_divergence: Option<(usize, u32, u32)> = None;
-    for step in 0..batched_tokens.len().min(oracle_tokens.len()) {
+    for step in prefill..batched_tokens.len().min(oracle_tokens.len()) {
         if batched_tokens[step] != oracle_tokens[step] && token_divergence.is_none() {
             token_divergence = Some((step, oracle_tokens[step], batched_tokens[step]));
         }
