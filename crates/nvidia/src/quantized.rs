@@ -582,10 +582,10 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 32;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -593,16 +593,22 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
         const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const int quantized = (int)(signed char)block[2 + lane];
         const float value = d * (float)quantized;
-        for (int m = 0; m < members; ++m) {
-            acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < members) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+            }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -666,10 +672,10 @@ extern "C" __global__ void iq4_nl_gemv_warp_batch(
         -127, -104, -83, -65, -49, -35, -22, -10,
         1, 13, 25, 38, 53, 69, 89, 113
     };
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 32;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -680,16 +686,22 @@ extern "C" __global__ void iq4_nl_gemv_warp_batch(
             ? (int)(block[2 + index] & 0x0fu)
             : (int)(block[2 + index] >> 4u);
         const float value = d * (float)values[nibble];
-        for (int m = 0; m < members; ++m) {
-            acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < members) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+            }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -764,10 +776,10 @@ extern "C" __global__ void iq4_xs_gemv_warp_batch(
         -127, -104, -83, -65, -49, -35, -22, -10,
         1, 13, 25, 38, 53, 69, 89, 113
     };
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -787,17 +799,23 @@ extern "C" __global__ void iq4_xs_gemv_warp_batch(
             const unsigned char packed = block[data_offset + (element & 15)];
             const int nibble = element < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4u);
             const float value = group_scale * (float)values[nibble];
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + local];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + local];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -873,10 +891,10 @@ extern "C" __global__ void q3_k_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -905,17 +923,23 @@ extern "C" __global__ void q3_k_gemv_warp_batch(
             const int high = ((int)(high_bits[high_offset + within] >> (group / 2)) & 1) ^ 1;
             const int quantized = low - high * 4;
             const float value = d * (float)group_scale * (float)quantized;
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 16 + within];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 16 + within];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -986,10 +1010,10 @@ extern "C" __global__ void q6_k_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -1013,17 +1037,23 @@ extern "C" __global__ void q6_k_gemv_warp_batch(
             const int high = (int)((high_bits[high_offset + position] >> (variant * 2)) & 0x03u);
             const int quantized = (low | (high << 4)) - 32;
             const float value = d * (float)group_scale * (float)quantized;
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + position];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + position];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -1088,10 +1118,10 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -1109,17 +1139,23 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
             const int quantized = (int)((block[data_offset + index] >> shift) & 0x0fu);
             const float value =
                 d * group_scale * (float)quantized - min * group_minimum;
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -1186,10 +1222,10 @@ extern "C" __global__ void q5_k_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -1209,17 +1245,23 @@ extern "C" __global__ void q5_k_gemv_warp_batch(
             const int quantized = low | (high << 4);
             const float value =
                 d * group_scale * (float)quantized - min * group_minimum;
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
@@ -1292,10 +1334,10 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
     if (row >= output_size) {
         return;
     }
-    float acc[8];
-    for (int m = 0; m < members; ++m) {
-        acc[m] = 0.0f;
-    }
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop spills it to local
+    // memory and serializes the member input loads.
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
@@ -1319,17 +1361,23 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
             const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
             const int grid_index = code * 4 + (lane_in & 3);
             const float value = group_scale * (float)grid[grid_index] * (float)sign;
-            for (int m = 0; m < members; ++m) {
-                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + sub * 8 + lane_in];
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < members) {
+                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + sub * 8 + lane_in];
+                }
             }
         }
     }
-    for (int m = 0; m < members; ++m) {
-        // Every lane participates in the shuffle reduction; lane 0 holds
-        // the full sum and writes it.
-        const float total = warp_sum(acc[m]);
-        if (lane == 0) {
-            output[(long long)m * output_size + row] = total;
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0) {
+                output[(long long)m * output_size + row] = total;
+            }
         }
     }
 }
