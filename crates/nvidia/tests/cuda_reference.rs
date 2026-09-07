@@ -3954,7 +3954,7 @@ fn finds_first_diverging_batched_step_against_batch1() {
                 .iter()
                 .zip(observed.iter())
                 .enumerate()
-                .filter(|(_, (a, b))| (a - b).abs() > 1.0e-4)
+                .filter(|(_, (a, b))| (**a - **b).abs() > 1.0e-4)
                 .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
                 .collect();
             if !diffs.is_empty() {
