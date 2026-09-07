@@ -573,31 +573,34 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; the decoded quantized
+    // byte is reused against every member's input, so the weight matrix
+    // is fetched once per launch instead of once per member.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 32;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 34;
         const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const int quantized = (int)(signed char)block[2 + lane];
-        accumulator += d * (float)quantized * input[block_index * 32 + lane];
+        const float value = d * (float)quantized;
+        for (int m = 0; m < members; ++m) {
+            acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+        }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -648,25 +651,23 @@ extern "C" __global__ void iq4_nl_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; the decoded nibble is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
-    const int blocks_per_output = input_size / 32;
     const signed char values[16] = {
         -127, -104, -83, -65, -49, -35, -22, -10,
         1, 13, 25, 38, 53, 69, 89, 113
     };
-    float accumulator = 0.0f;
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
+    const int blocks_per_output = input_size / 32;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 18;
@@ -675,11 +676,15 @@ extern "C" __global__ void iq4_nl_gemv_warp_batch(
         const int nibble = lane < 16
             ? (int)(block[2 + index] & 0x0fu)
             : (int)(block[2 + index] >> 4u);
-        accumulator += d * (float)values[nibble] * input[block_index * 32 + lane];
+        const float value = d * (float)values[nibble];
+        for (int m = 0; m < members; ++m) {
+            acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
+        }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -741,25 +746,23 @@ extern "C" __global__ void iq4_xs_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded nibble is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
-    const int blocks_per_output = input_size / 256;
     const signed char values[16] = {
         -127, -104, -83, -65, -49, -35, -22, -10,
         1, 13, 25, 38, 53, 69, 89, 113
     };
-    float accumulator = 0.0f;
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
+    const int blocks_per_output = input_size / 256;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 136;
@@ -777,13 +780,16 @@ extern "C" __global__ void iq4_xs_gemv_warp_batch(
             const int element = within + j;
             const unsigned char packed = block[data_offset + (element & 15)];
             const int nibble = element < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4u);
-            accumulator +=
-                group_scale * (float)values[nibble] * input[block_index * 256 + local];
+            const float value = group_scale * (float)values[nibble];
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + local];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -850,21 +856,19 @@ extern "C" __global__ void q3_k_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded element is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 256;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 110;
@@ -891,13 +895,16 @@ extern "C" __global__ void q3_k_gemv_warp_batch(
             const int low = (int)((low_bits[low_offset + within] >> (variant * 2)) & 0x03u);
             const int high = ((int)(high_bits[high_offset + within] >> (group / 2)) & 1) ^ 1;
             const int quantized = low - high * 4;
-            accumulator += d * (float)group_scale * (float)quantized
-                * input[block_index * 256 + group * 16 + within];
+            const float value = d * (float)group_scale * (float)quantized;
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 16 + within];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -959,21 +966,19 @@ extern "C" __global__ void q6_k_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded element is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 256;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 210;
@@ -995,13 +1000,16 @@ extern "C" __global__ void q6_k_gemv_warp_batch(
             const int low = (int)((low_bits[low_offset + position] >> low_shift) & 0x0fu);
             const int high = (int)((high_bits[high_offset + position] >> (variant * 2)) & 0x03u);
             const int quantized = (low | (high << 4)) - 32;
-            accumulator += d * (float)group_scale * (float)quantized
-                * input[block_index * 256 + group * 32 + position];
+            const float value = d * (float)group_scale * (float)quantized;
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + position];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -1057,21 +1065,19 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded element is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 256;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 144;
@@ -1088,12 +1094,15 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
             const int quantized = (int)((block[data_offset + index] >> shift) & 0x0fu);
             const float value =
                 d * group_scale * (float)quantized - min * group_minimum;
-            accumulator += value * input[block_index * 256 + group * 32 + index];
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -1151,21 +1160,19 @@ extern "C" __global__ void q5_k_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded element is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 256;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 176;
@@ -1184,12 +1191,15 @@ extern "C" __global__ void q5_k_gemv_warp_batch(
             const int quantized = low | (high << 4);
             const float value =
                 d * group_scale * (float)quantized - min * group_minimum;
-            accumulator += value * input[block_index * 256 + group * 32 + index];
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + index];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
 
@@ -1253,21 +1263,19 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
     int output_size,
     int members
 ) {
+    // Weights-read-once: one warp per weight row; each decoded element is
+    // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int warp_id = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
-    const int row = warp_id / members;
-    const int member = warp_id - row * members;
+    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
     if (row >= output_size) {
         return;
     }
-    // Batch-major [members][input_size] / [members][output_size] layouts:
-    // offset to this member's slice so the decode body is unchanged.
-    input += (long long)member * input_size;
-    output += (long long)member * output_size;
-
+    float acc[8];
+    for (int m = 0; m < members; ++m) {
+        acc[m] = 0.0f;
+    }
     const int blocks_per_output = input_size / 256;
-    float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 110;
@@ -1290,14 +1298,18 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
             const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
             const int grid_index = code * 4 + (lane_in & 3);
             const float value = group_scale * (float)grid[grid_index] * (float)sign;
-            accumulator += value * input[block_index * 256 + group * 32 + sub * 8 + lane_in];
+            for (int m = 0; m < members; ++m) {
+                acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + sub * 8 + lane_in];
+            }
         }
     }
-    const float total = warp_sum(accumulator);
     if (lane == 0) {
-        output[row] = total;
+        for (int m = 0; m < members; ++m) {
+            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+        }
     }
 }
+
 "#;
 
 #[derive(Debug)]
@@ -1525,11 +1537,10 @@ impl CudaQuantizedGemv {
         }
         let members_u32 =
             u32::try_from(members).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        let total_warps = output_size
-            .checked_mul(members)
-            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        // One warp per weight row (not per (row, member)): the kernel
+        // decodes each weight element once and accumulates all members.
         let total_warps =
-            u32::try_from(total_warps).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+            u32::try_from(output_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
         let input_size =
             u32::try_from(input_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
         let output_size =
@@ -1726,6 +1737,12 @@ impl CudaQuantizedGemv {
                 expected: 1,
                 actual: 0,
             });
+        }
+        if members > 8 {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "{} weights-read-once batch variant supports at most 8 members",
+                self.label
+            )));
         }
         let (input_size, output_size, members, config) =
             self.validate_batch(weight, input, output, members)?;
