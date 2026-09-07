@@ -282,7 +282,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "  caveat: the current CUDA serving dispatcher executes members of each scheduler batch sequentially through batch-1 kernels; async completion is landed, so this measures the one-stream async path before native batching",
+        "  caveat: multi-row decode batches run through the batched executor (one launch per layer/op); mixed batches and single rows stay per-row, so concurrency-1 measures the unchanged batch-1 path",
     );
     println!(
         "  gemv mode: {}",
