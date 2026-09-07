@@ -3849,23 +3849,21 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
-/// Batched-vs-batch-1 hidden-state parity per step: the batch-1 oracle runs
-/// the exact replay pattern (prefill_step for intermediate prompt tokens,
-/// decode_step from the boundary, feeding the recorded llama-server
-/// continuation), while the batched executor runs the same tokens/positions
-/// through batched steps at every position. Hidden streams are compared
-/// after every step to find the first divergence.
+/// Bisect the first diverging layer of one batched step: batch-1 and the
+/// batched executor run the same token at position 0 over growing layer
+/// prefixes of the layer plan, comparing residual streams. The smallest
+/// prefix that diverges names the guilty layer; prefixes below it isolate
+/// that layer's batched kernels from all cross-layer accumulation.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
-fn finds_first_diverging_batched_step_against_batch1() {
+fn bisects_first_diverging_layer_in_batched_step() {
     use engine_nvidia::{CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
     use std::sync::Arc;
 
     const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
     const EPS: f32 = 1.0e-6;
-    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
-    const MEMBERS: usize = 1;
-    const STEPS: usize = 12;
+    const TOKEN: u32 = 760;
+    const TOLERANCE: f32 = 1.0e-4;
 
     let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
@@ -3879,6 +3877,12 @@ fn finds_first_diverging_batched_step_against_batch1() {
                 Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
+        .collect::<Vec<_>>();
+    let attention_layers = layer_kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == QwenLayerKind::FullAttention)
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
 
     let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
@@ -3903,95 +3907,91 @@ fn finds_first_diverging_batched_step_against_batch1() {
         state
     };
 
-    // Oracle: replay pattern. Intermediate prompt tokens run prefill_step;
-    // the final prompt token and every continuation token run decode_step,
-    // feeding the recorded llama-server continuation.
-    let mut oracle = CudaQwen35Decode::new(
-        &context,
-        stream.clone(),
-        Arc::clone(&staged),
-        layer_kinds.clone(),
-        EPS,
-    )
-    .expect("batch-1 executor");
-    let mut oracle_state = fresh_state();
-    let mut oracle_hidden: Vec<Vec<f32>> = Vec::with_capacity(STEPS);
-
-    let last_prompt = u32::try_from(PROMPT.len() - 1).expect("fits u32");
-    for (offset, &token) in PROMPT[..PROMPT.len() - 1].iter().enumerate() {
-        let position = u32::try_from(offset).expect("fits u32");
+    // One comparison over the first `layers` layers of the plan: both
+    // executors run the same single step, then their residual streams are
+    // compared element-wise. The oracle runs first, matching the failing
+    // full-model tap's ordering.
+    let compare_prefix = |layers: usize| -> (f32, Option<(usize, f32, f32)>) {
+        let kinds = layer_kinds[..layers].to_vec();
+        let mut oracle = CudaQwen35Decode::new(
+            &context,
+            stream.clone(),
+            Arc::clone(&staged),
+            kinds.clone(),
+            EPS,
+        )
+        .expect("batch-1 prefix executor");
+        let mut oracle_state = fresh_state();
         oracle
-            .prefill_step(&mut oracle_state, token, position)
-            .expect("oracle prefill");
-        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
-    }
-    let boundary = oracle
-        .decode_step(&mut oracle_state, PROMPT[PROMPT.len() - 1], last_prompt)
-        .expect("oracle boundary decode");
-    assert_eq!(
-        boundary, LLAMA_GREEDY_CONTINUATION[0],
-        "oracle boundary token diverged from llama-server"
-    );
-    oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
-    for index in 1..STEPS - PROMPT.len() + 1 {
-        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
-        oracle
-            .decode_step(
-                &mut oracle_state,
-                LLAMA_GREEDY_CONTINUATION[index - 1],
-                position,
-            )
-            .expect("oracle continuation");
-        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
-    }
+            .decode_step(&mut oracle_state, TOKEN, 0)
+            .expect("oracle prefix step");
+        let reference = oracle.copy_hidden().expect("oracle hidden");
 
-    // Batched: same tokens/positions through batched steps at every
-    // position (the executor's prefill-through-decode path).
-    let mut batched = CudaQwen35BatchDecode::new(
-        &context,
-        stream.clone(),
-        Arc::clone(&staged),
-        &layer_kinds,
-        EPS,
-        MEMBERS,
-    )
-    .expect("batched executor");
-    let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
-
-    let mut tokens: Vec<u32> = PROMPT.to_vec();
-    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
-    for index in 1..STEPS - PROMPT.len() + 1 {
-        tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
-        positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
-    }
-
-    for (step, (&token, &position)) in tokens.iter().zip(positions.iter()).enumerate() {
-        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
-            batched_states.iter_mut().collect();
+        let mut batched = CudaQwen35BatchDecode::new(
+            &context,
+            stream.clone(),
+            Arc::clone(&staged),
+            &kinds,
+            EPS,
+            1,
+        )
+        .expect("batched prefix executor");
+        let mut batched_state = fresh_state();
         batched
-            .decode_step_batch_enqueue(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
-            .expect("batched step");
-        for member in 0..MEMBERS {
-            let observed = batched.copy_hidden_member(member).expect("batched hidden");
-            let reference = &oracle_hidden[step];
-            let diffs: Vec<(usize, f32, f32, f32)> = reference
-                .iter()
-                .zip(observed.iter())
-                .enumerate()
-                .filter(|(_, (a, b))| (**a - **b).abs() > 1.0e-4)
-                .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
-                .collect();
-            if !diffs.is_empty() {
-                eprintln!(
-                    "step {step} member {member} (token {token}, position {position}): {} of {} elements differ; first 8: {:?}",
-                    diffs.len(),
-                    reference.len(),
-                    &diffs[..diffs.len().min(8)]
-                );
-                panic!("first hidden-state divergence at step {step}");
+            .decode_step_batch(&mut [&mut batched_state], &[TOKEN], &[0])
+            .expect("batched prefix step");
+        let observed = batched.copy_hidden_member(0).expect("batched hidden");
+
+        let mut max_diff = 0.0_f32;
+        let mut worst = None;
+        for (index, (a, b)) in reference.iter().zip(observed.iter()).enumerate() {
+            let diff = (a - b).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                worst = Some((index, *a, *b));
             }
         }
+        (max_diff, worst)
+    };
+
+    // Binary search the smallest diverging prefix in 1..=64, then confirm
+    // its neighbors so a flaky boundary cannot mislead.
+    let diverges = |layers: usize| compare_prefix(layers).0 > TOLERANCE;
+    assert!(
+        !diverges(1),
+        "layer 0 alone diverges; the bug is in the first layer's batched path"
+    );
+    assert!(
+        diverges(64),
+        "no prefix diverges; the full-model tap's divergence was an ordering artifact"
+    );
+    let (mut low, mut high) = (1_usize, 64_usize);
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        if diverges(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
     }
+    let guilty = high;
+    let (diff, worst) = compare_prefix(guilty);
+    let (index, reference_value, observed_value) = worst.unwrap_or((0, 0.0, 0.0));
+    let kind = if layer_kinds[guilty - 1] == QwenLayerKind::Recurrent {
+        "recurrent"
+    } else {
+        "full-attention"
+    };
+    eprintln!(
+        "first diverging prefix: {guilty} layers (layer {} is {kind}); max diff {diff} at hidden[{index}]: oracle {reference_value} vs batched {observed_value}",
+        guilty - 1
+    );
+    eprintln!("attention layers: {attention_layers:?}");
+    assert!(
+        compare_prefix(guilty - 1).0 <= TOLERANCE,
+        "the layer below the guilty prefix unexpectedly diverges too"
+    );
+    panic!("batched layer {guilty} ({kind}) diverges from the batch-1 oracle at step 0");
 }
 
 /// Dispatcher-level batched serving parity: a multi-request decode batch
