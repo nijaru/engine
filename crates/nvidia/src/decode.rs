@@ -327,29 +327,7 @@ fn validate_model_plan(
     let output_weight = weights
         .quantized_tensor("output.weight")
         .ok_or_else(|| CudaDecodeError::MissingTensor("output.weight".to_owned()))?;
-    let dimensions = output_weight.spec().dimensions();
-    if dimensions.len() != 2 {
-        return Err(CudaDecodeError::InvalidPlan(
-            "output.weight must be a rank-2 tensor".to_owned(),
-        ));
-    }
-    let input_width = usize::try_from(dimensions[0]).map_err(|_| {
-        CudaDecodeError::InvalidPlan("output input width does not fit the host".to_owned())
-    })?;
-    if input_width != N_EMBD {
-        return Err(CudaDecodeError::InvalidPlan(format!(
-            "output.weight input width is {input_width}, expected {N_EMBD}"
-        )));
-    }
-    let vocab = usize::try_from(dimensions[1]).map_err(|_| {
-        CudaDecodeError::InvalidPlan("output vocabulary does not fit the host".to_owned())
-    })?;
-
-    if vocab == 0 || vocab > i32::MAX as usize {
-        return Err(CudaDecodeError::InvalidPlan(
-            "vocabulary must fit a positive kernel dimension".to_owned(),
-        ));
-    }
+    let vocab = validate_output_dimensions(output_weight.spec().dimensions())?;
     let embedding = weights
         .quantized_tensor("token_embd.weight")
         .expect("validated presence");
@@ -1175,17 +1153,15 @@ fn validate_staged(
     name: &str,
 ) -> Result<(), CudaDecodeError> {
     let dimensions = if is_f32_staged(name) {
-        Some({
-            let weight = weights
-                .f32_tensor(name)
-                .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
-            if context.as_ref() != weight.data().context().as_ref() {
-                return Err(CudaDecodeError::InvalidPlan(format!(
-                    "{name} belongs to another CUDA context"
-                )));
-            }
-            weight.spec().dimensions()
-        })
+        let weight = weights
+            .f32_tensor(name)
+            .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+        if context.as_ref() != weight.data().context().as_ref() {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "{name} belongs to another CUDA context"
+            )));
+        }
+        weight.spec().dimensions()
     } else {
         let weight = weights
             .quantized_tensor(name)
@@ -1198,9 +1174,8 @@ fn validate_staged(
         if weights.gemv_for(weight.value_type()).is_none() {
             return Err(CudaDecodeError::MissingKernel(weight.value_type()));
         }
-        Some(weight.spec().dimensions())
-    }
-    .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+        weight.spec().dimensions()
+    };
     let leaf = name
         .strip_prefix("blk.")
         .and_then(|name| name.split_once('.').map(|(_, leaf)| leaf))
@@ -1228,6 +1203,32 @@ fn validate_staged(
         }
     };
     validate_dimensions(name, dimensions, shape)
+}
+
+fn validate_output_dimensions(dimensions: &[u64]) -> Result<usize, CudaDecodeError> {
+    if dimensions.len() != 2 {
+        return Err(CudaDecodeError::InvalidPlan(
+            "output.weight must be a rank-2 tensor".to_owned(),
+        ));
+    }
+    let input_width = usize::try_from(dimensions[0]).map_err(|_| {
+        CudaDecodeError::InvalidPlan("output input width does not fit the host".to_owned())
+    })?;
+    if input_width != N_EMBD {
+        return Err(CudaDecodeError::InvalidPlan(format!(
+            "output.weight input width is {input_width}, expected {N_EMBD}"
+        )));
+    }
+    let vocab = usize::try_from(dimensions[1]).map_err(|_| {
+        CudaDecodeError::InvalidPlan("output vocabulary does not fit the host".to_owned())
+    })?;
+
+    if vocab == 0 || vocab > i32::MAX as usize {
+        return Err(CudaDecodeError::InvalidPlan(
+            "vocabulary must fit a positive kernel dimension".to_owned(),
+        ));
+    }
+    Ok(vocab)
 }
 
 fn validate_dimensions(
@@ -2182,6 +2183,21 @@ mod preparation_tests {
         assert!(attention_scratch_elements(2, [4, 16]).is_err());
         assert!(attention_scratch_elements(2, [0, 0]).is_err());
         assert!(attention_scratch_elements(2, [usize::MAX, usize::MAX]).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_output_rank_before_indexing_dimensions() {
+        for shape in [
+            vec![],
+            vec![N_EMBD as u64],
+            vec![N_EMBD as u64, 8, 1],
+            vec![N_EMBD as u64, 0],
+            vec![N_EMBD as u64, u64::MAX],
+            vec![1, 8],
+        ] {
+            assert!(validate_output_dimensions(&shape).is_err());
+        }
+        assert_eq!(validate_output_dimensions(&[N_EMBD as u64, 8]).unwrap(), 8);
     }
 
     #[test]

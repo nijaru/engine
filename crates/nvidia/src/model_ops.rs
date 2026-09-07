@@ -3127,3 +3127,7 @@ impl CudaQwen35Ops {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "model_ops_tests.rs"]
+mod tests;
