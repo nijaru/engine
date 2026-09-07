@@ -3262,6 +3262,214 @@ fn bisects_four_layer_batched_divergence_by_prefix() {
     }
 }
 
+/// View-wrapper parity for the batched attention state kernels:
+/// `kv_append_f16_views` and `attn_score_gqa_views` must produce
+/// byte-identical cache contents and outputs to their batch-1 slice twins
+/// when given member rows of batch-major scratch and per-member caches.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "two wrapper parity gates over shared fixture geometry"
+)]
+fn executes_attention_view_wrappers_matching_slice_twins() {
+    const Q_HEADS: usize = 6;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 32;
+    const TOKENS: usize = 3;
+    const MEMBERS: usize = 3;
+
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut state = 987_654_321_u32;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "0.125-step fixtures are exact in F16 and F32"
+    )]
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_390_422);
+        (((state >> 8) & 63) as f32) * 0.125 - 4.0
+    };
+    let row = |len: usize| (0..len).map(|_| next()).collect::<Vec<_>>();
+
+    // Batch-major scratch: q [m][q_heads*head_dim], gate [m][q_heads*2*head_dim],
+    // k [m][kv_heads*head_dim], v likewise; per-member caches [tokens*kv*dim].
+    let q_flat: Vec<f32> = (0..MEMBERS * Q_HEADS * HEAD_DIM).map(|_| next()).collect();
+    let gate_flat: Vec<f32> = (0..MEMBERS * Q_HEADS * 2 * HEAD_DIM)
+        .map(|_| next())
+        .collect();
+    let k_flat: Vec<f32> = (0..MEMBERS * KV_HEADS * HEAD_DIM).map(|_| next()).collect();
+    let v_flat: Vec<f32> = (0..MEMBERS * KV_HEADS * HEAD_DIM).map(|_| next()).collect();
+
+    let q_device = stream.clone_htod(&q_flat).expect("q");
+    let gate_device = stream.clone_htod(&gate_flat).expect("gate");
+    let k_device = stream.clone_htod(&k_flat).expect("k");
+    let v_device = stream.clone_htod(&v_flat).expect("v");
+
+    let per_token = KV_HEADS * HEAD_DIM;
+    let cache_len = TOKENS * per_token;
+
+    // Oracle: slice twins per member over independent caches, fed from
+    // fresh uploads of that member's rows (batch-1 semantics: dedicated
+    // scratch slices, not views).
+    let mut oracle_out = Vec::new();
+    for member in 0..MEMBERS {
+        let q_base = member * Q_HEADS * HEAD_DIM;
+        let q_member = stream
+            .clone_htod(&q_flat[q_base..q_base + Q_HEADS * HEAD_DIM])
+            .expect("q member upload");
+        let gate_base = member * Q_HEADS * 2 * HEAD_DIM;
+        let gate_member = stream
+            .clone_htod(&gate_flat[gate_base..gate_base + Q_HEADS * 2 * HEAD_DIM])
+            .expect("gate member upload");
+        let kv_base = member * KV_HEADS * HEAD_DIM;
+        let k_member = stream
+            .clone_htod(&k_flat[kv_base..kv_base + KV_HEADS * HEAD_DIM])
+            .expect("k member upload");
+        let v_member = stream
+            .clone_htod(&v_flat[kv_base..kv_base + KV_HEADS * HEAD_DIM])
+            .expect("v member upload");
+
+        let mut cache_keys = stream.alloc_zeros::<u16>(cache_len).expect("keys cache");
+        let mut cache_values = stream.alloc_zeros::<u16>(cache_len).expect("values cache");
+        // Append the member's k/v at token_index = member (distinct slots
+        // per member so the caches differ across members).
+        ops.kv_append_f16(
+            &k_member,
+            &v_member,
+            &mut cache_keys,
+            &mut cache_values,
+            member,
+            KV_HEADS,
+            HEAD_DIM,
+        )
+        .expect("oracle kv append");
+        let mut scores = stream
+            .alloc_zeros::<f32>(Q_HEADS * TOKENS)
+            .expect("oracle scores");
+        let mut output = stream
+            .alloc_zeros::<f32>(Q_HEADS * HEAD_DIM)
+            .expect("oracle output");
+        ops.attn_score_gqa(
+            &q_member,
+            &cache_keys,
+            &cache_values,
+            &gate_member,
+            &mut scores,
+            &mut output,
+            member + 1,
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+        )
+        .expect("oracle attention");
+        oracle_out.extend(stream.clone_dtoh(&output).expect("read"));
+        // Keep the oracle cache bytes for the wrapper comparison below.
+        if member == 0 {
+            let keys_host = stream.clone_dtoh(&cache_keys).expect("read keys");
+            let values_host = stream.clone_dtoh(&cache_values).expect("read values");
+            // Expected slot content for member 0 at token_index 0.
+            let expected_keys: Vec<u16> = k_flat[..KV_HEADS * HEAD_DIM]
+                .iter()
+                .map(|&value| fixture_f16_bits(value))
+                .collect();
+            let expected_values: Vec<u16> = v_flat[..KV_HEADS * HEAD_DIM]
+                .iter()
+                .map(|&value| fixture_f16_bits(value))
+                .collect();
+            for (index, (a, b)) in keys_host.iter().zip(expected_keys.iter()).enumerate() {
+                if index < per_token {
+                    assert_eq!(a, b, "oracle cache key at {index} mismatch");
+                }
+            }
+            for (index, (a, b)) in values_host.iter().zip(expected_values.iter()).enumerate() {
+                if index < per_token {
+                    assert_eq!(a, b, "oracle cache value at {index} mismatch");
+                }
+            }
+        }
+    }
+
+    // Batched: view wrappers over the same batch-major scratch rows and the
+    // same independent per-member caches.
+    let mut batched_out = Vec::new();
+    for member in 0..MEMBERS {
+        let base = member * Q_HEADS * HEAD_DIM;
+        let q_view = q_device
+            .try_slice(base..base + Q_HEADS * HEAD_DIM)
+            .expect("q view");
+        let gate_base = member * Q_HEADS * 2 * HEAD_DIM;
+        let gate_view = gate_device
+            .try_slice(gate_base..gate_base + Q_HEADS * 2 * HEAD_DIM)
+            .expect("gate view");
+        let kv_base = member * KV_HEADS * HEAD_DIM;
+        let k_view = k_device
+            .try_slice(kv_base..kv_base + KV_HEADS * HEAD_DIM)
+            .expect("k view");
+        let v_view = v_device
+            .try_slice(kv_base..kv_base + KV_HEADS * HEAD_DIM)
+            .expect("v view");
+
+        let mut cache_keys = stream.alloc_zeros::<u16>(cache_len).expect("keys cache");
+        let mut cache_values = stream.alloc_zeros::<u16>(cache_len).expect("values cache");
+        ops.kv_append_f16_views(
+            &k_view,
+            &v_view,
+            &mut cache_keys,
+            &mut cache_values,
+            member,
+            KV_HEADS,
+            HEAD_DIM,
+        )
+        .expect("wrapper kv append");
+        // Batch-major scratch mirrors the executor's layout: scores
+        // [m][q_heads*stride] and output [m][q_heads*head_dim], with the
+        // wrapper receiving member-row views.
+        let mut scores_batch = stream
+            .alloc_zeros::<f32>(MEMBERS * Q_HEADS * TOKENS)
+            .expect("wrapper scores batch");
+        let mut output_batch = stream
+            .alloc_zeros::<f32>(MEMBERS * Q_HEADS * HEAD_DIM)
+            .expect("wrapper output batch");
+        let scores_base = member * Q_HEADS * TOKENS;
+        let mut scores_view = scores_batch
+            .try_slice_mut(scores_base..scores_base + Q_HEADS * TOKENS)
+            .expect("scores view");
+        let output_base = member * Q_HEADS * HEAD_DIM;
+        let mut output_view = output_batch
+            .try_slice_mut(output_base..output_base + Q_HEADS * HEAD_DIM)
+            .expect("output view");
+        ops.attn_score_gqa_views(
+            &q_view,
+            &cache_keys,
+            &cache_values,
+            &gate_view,
+            &mut scores_view,
+            &mut output_view,
+            member + 1,
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+        )
+        .expect("wrapper attention");
+        batched_out.extend(stream.clone_dtoh(&output_view).expect("read"));
+    }
+
+    let max_diff = oracle_out
+        .iter()
+        .zip(batched_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_diff <= 1.0e-6,
+        "attention view wrappers diverged from slice twins: {max_diff}"
+    );
+}
+
 /// Greedy continuation llama-server produced for the raw prompt
 /// "The capital of France is" (tokens [760, 6511, 314, 9338, 369],
 /// temperature 0, no chat template), captured from the pinned artifact via
