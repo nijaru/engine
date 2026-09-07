@@ -597,9 +597,12 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
             acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -681,9 +684,12 @@ extern "C" __global__ void iq4_nl_gemv_warp_batch(
             acc[m] += value * input[(long long)m * input_size + block_index * 32 + lane];
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -786,9 +792,12 @@ extern "C" __global__ void iq4_xs_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -901,9 +910,12 @@ extern "C" __global__ void q3_k_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -1006,9 +1018,12 @@ extern "C" __global__ void q6_k_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -1099,9 +1114,12 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -1196,9 +1214,12 @@ extern "C" __global__ void q5_k_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
@@ -1303,9 +1324,12 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
             }
         }
     }
-    if (lane == 0) {
-        for (int m = 0; m < members; ++m) {
-            output[(long long)m * output_size + row] = warp_sum(acc[m]);
+    for (int m = 0; m < members; ++m) {
+        // Every lane participates in the shuffle reduction; lane 0 holds
+        // the full sum and writes it.
+        const float total = warp_sum(acc[m]);
+        if (lane == 0) {
+            output[(long long)m * output_size + row] = total;
         }
     }
 }
