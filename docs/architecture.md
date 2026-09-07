@@ -38,7 +38,7 @@ The scheduler will gather work from these slots and update only what changes. Ca
 
 The core backend contract is submission/completion based. Submitting a segment does not imply host synchronization with device completion, and logical inference-state position is committed only after completion becomes visible.
 
-This lets a serving loop prepare step N+1 while device work for step N is in flight when dependencies permit it. The current NVIDIA compatibility dispatcher may still complete synchronously internally; that is an implementation limitation, not the core runtime contract.
+This lets a serving loop prepare step N+1 while device work for step N is in flight when dependencies permit it. The NVIDIA serving dispatcher enqueues kernels and pinned output copies, then polls completion events. Its eager path remains an explicit correctness oracle.
 
 ### Typed inference state
 
@@ -98,7 +98,7 @@ The first native path is Qwen3.8-27B. Compatibility providers may later use exte
 
 ## Hardware boundary
 
-The RTX 4090 is the available initial qualification and development machine. It is useful for free local correctness and performance work, but the architecture is not optimized around that device or its 24-GiB memory limit.
+The RTX 4090 is the available initial qualification and development machine. It is the first testable target within the RTX 3090-and-up class; the architecture does not depend on that device or its 24-GiB memory limit.
 
 Future NVIDIA generations, AMD, Metal, and other devices should pressure-test the same semantic contracts while using target-specific execution mechanisms.
 
