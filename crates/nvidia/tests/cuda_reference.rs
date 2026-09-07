@@ -3070,38 +3070,40 @@ fn decodes_four_layers_against_the_host_reference() {
     }
 }
 
-/// Four-layer batched parity against the host reference: the same staged
-/// four-layer prefix, tokens, and state geometry as the batch-1 four-layer
-/// test, but through the batched executor with three lockstep members. The
-/// host reference is ground truth, so this isolates the batched attention
-/// path with real weights and no llama-server dependency.
+/// Bisect the batched divergence by real-weight prefix: plans [R], [R,R],
+/// [R,R,R], and [R,R,R,A] over the pinned artifact (attention tensors exist
+/// only at plan index 3, matching the real layer layout), each run through
+/// both the batch-1 oracle and the batched executor with the same tokens.
+/// The first prefix whose residual streams diverge names the guilty layer
+/// kind; earlier prefixes stay exact.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 #[allow(
     clippy::too_many_lines,
-    reason = "one end-to-end four-layer parity gate staging the real prefix"
+    reason = "one staging pass plus four prefix comparisons"
 )]
-fn decodes_four_layers_in_batch_mode_against_the_host_reference() {
+fn bisects_four_layer_batched_divergence_by_prefix() {
     use engine_core::{
         ConvolutionStateShape, DataType, KvStateSpec, RecurrentMatrixShape, RecurrentStateSpec,
     };
-    use engine_nvidia::host_full_attn_ar_step;
     use engine_nvidia::{
-        CudaQwen35BatchDecode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource,
+        CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind,
+        StagedTensorSource,
     };
     use std::sync::Arc;
 
     const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
     const EPS: f32 = 1.0e-6;
-    const TOKENS: [usize; 4] = [12_675, 1017, 760, 6511];
+    const TOKENS: [u32; 4] = [12_675, 1017, 760, 6511];
     const LAYERS: usize = 4;
     const MEMBERS: usize = 3;
+    const TOLERANCE: f32 = 1.0e-4;
 
     let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
 
-    // Stage globals plus layers 0..LAYERS only, same as the batch-1 test.
+    // Stage globals plus layers 0..LAYERS only (same set for every prefix).
     let mut names: Vec<String> = vec![
         "token_embd.weight".to_owned(),
         "output_norm.weight".to_owned(),
@@ -3148,130 +3150,114 @@ fn decodes_four_layers_in_batch_mode_against_the_host_reference() {
             .expect("stage the four-layer prefix"),
     );
 
-    let layer_kinds = [QwenLayerKind::Recurrent; 3]
-        .into_iter()
-        .chain([QwenLayerKind::FullAttention])
-        .collect::<Vec<_>>();
-    let kv_spec = KvStateSpec::new(1, 4, 256, 8, DataType::F16).expect("KV spec");
-    let recurrent_spec = RecurrentStateSpec::new(
-        3,
-        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
-        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
-        DataType::F32,
-        DataType::F32,
-    )
-    .expect("recurrent spec");
-    let mut states = (0..MEMBERS)
-        .map(|_| {
-            let mut state = engine_nvidia::CudaHybridState::from_specs(
-                stream.clone(),
-                Some(kv_spec),
-                Some(recurrent_spec),
+    let compare_prefix = |kinds: &[QwenLayerKind]| -> Option<(usize, f32)> {
+        let recurrent_count = kinds
+            .iter()
+            .filter(|kind| **kind == QwenLayerKind::Recurrent)
+            .count();
+        let kv_count = kinds.len() - recurrent_count;
+        let kv_spec = (kv_count > 0).then(|| {
+            KvStateSpec::new(
+                u16::try_from(kv_count).expect("kv layers fit"),
+                4,
+                256,
+                8,
+                DataType::F16,
             )
-            .expect("physical hybrid state");
+            .expect("KV spec")
+        });
+        let recurrent_spec = (recurrent_count > 0).then(|| {
+            RecurrentStateSpec::new(
+                u16::try_from(recurrent_count).expect("recurrent layers fit"),
+                RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+                ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+                DataType::F32,
+                DataType::F32,
+            )
+            .expect("recurrent spec")
+        });
+        let fresh_state = || {
+            let mut state =
+                engine_nvidia::CudaHybridState::from_specs(stream.clone(), kv_spec, recurrent_spec)
+                    .expect("physical hybrid state");
             state.zero().expect("zero state");
             state
-        })
-        .collect::<Vec<_>>();
+        };
 
-    let mut executor = CudaQwen35BatchDecode::new(
-        &context,
-        stream.clone(),
-        Arc::clone(&staged),
-        &layer_kinds,
-        EPS,
-        MEMBERS,
-    )
-    .expect("build batched executor");
-
-    // Host reference chain, same as the batch-1 four-layer test: the
-    // host-hidden values are computed for the single stream, then the
-    // batched members must each match.
-    let embeds: Vec<Vec<f32>> = TOKENS
-        .iter()
-        .map(|token| pinned_embedding_row(&provider, *token))
-        .collect();
-    let mut host_hidden = embeds.clone();
-    let mut host_kv_keys = Vec::new();
-    let mut host_kv_values = Vec::new();
-    for layer in 0..LAYERS {
-        let attn_norm_w = pinned_tensor_f32(&provider, &format!("blk.{layer}.attn_norm.weight"));
-        let post_norm_w = pinned_tensor_f32(
-            &provider,
-            &format!("blk.{layer}.post_attention_norm.weight"),
-        );
-        let ffn_w = load_ffn_layer(&provider, layer);
-        if layer < 3 {
-            let gdn_w = load_gdn_layer(&provider, layer);
-            let mut gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
-            let mut gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
-            for x in &mut host_hidden {
-                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
-                let attn_out =
-                    host_gdn_ar_step(&gdn_w, &normalized, &mut gdn_matrix, &mut gdn_conv, EPS);
-                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
-                    *x_elem += out_elem;
-                }
-                let post = host_rms_norm(x, &post_norm_w, EPS);
-                let ffn_out = host_ffn_step(&ffn_w, &post);
-                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
-                    *x_elem += out_elem;
-                }
-            }
-        } else {
-            let attn_w = load_attn_layer(&provider, layer);
-            let mut keys: Vec<f32> = Vec::new();
-            let mut values: Vec<f32> = Vec::new();
-            for (position, x) in host_hidden.iter_mut().enumerate() {
-                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
-                let attn_out = host_full_attn_ar_step(
-                    &attn_w,
-                    &normalized,
-                    &mut keys,
-                    &mut values,
-                    position,
-                    EPS,
-                );
-                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
-                    *x_elem += out_elem;
-                }
-                let post = host_rms_norm(x, &post_norm_w, EPS);
-                let ffn_out = host_ffn_step(&ffn_w, &post);
-                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
-                    *x_elem += out_elem;
-                }
-            }
-            host_kv_keys = keys;
-            host_kv_values = values;
+        // Batch-1 oracle over the prefix plan.
+        let mut oracle = CudaQwen35Decode::new(
+            &context,
+            stream.clone(),
+            Arc::clone(&staged),
+            kinds.to_vec(),
+            EPS,
+        )
+        .expect("batch-1 prefix executor");
+        let mut oracle_state = fresh_state();
+        let mut oracle_hidden = Vec::new();
+        for (position, &token) in TOKENS.iter().enumerate() {
+            let position = u32::try_from(position).expect("position fits u32");
+            oracle
+                .decode_step(&mut oracle_state, token, position)
+                .expect("oracle step");
+            oracle_state
+                .advance_to(position + 1)
+                .expect("oracle advance");
+            oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
         }
-    }
 
-    // Batched device replay: every member consumes the same token at the
-    // same position; each member's residual must match the host stream.
-    for (position, token) in TOKENS.iter().enumerate() {
-        let position = u32::try_from(position).expect("position fits u32");
-        let token = u32::try_from(*token).expect("token fits u32");
-        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> = states.iter_mut().collect();
-        executor
-            .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
-            .expect("batched step");
-        for state in states.iter_mut() {
-            state.advance_to(position + 1).expect("batched advance");
-        }
-        let host_x = &host_hidden[position as usize];
-        for member in 0..MEMBERS {
-            let device_hidden = executor
-                .copy_hidden_member(member)
-                .expect("device hidden after step");
-            let max_abs = device_hidden
+        // Batched executor over the same prefix plan, members in lockstep.
+        let mut batched = CudaQwen35BatchDecode::new(
+            &context,
+            stream.clone(),
+            Arc::clone(&staged),
+            kinds,
+            EPS,
+            MEMBERS,
+        )
+        .expect("batched prefix executor");
+        let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
+        for (position, &token) in TOKENS.iter().enumerate() {
+            let position = u32::try_from(position).expect("position fits u32");
+            let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
+                batched_states.iter_mut().collect();
+            batched
+                .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
+                .expect("batched step");
+            for state in &mut batched_states {
+                state.advance_to(position + 1).expect("batched advance");
+            }
+            let observed = batched.copy_hidden_member(0).expect("batched hidden");
+            let max_diff = oracle_hidden[position as usize]
                 .iter()
-                .zip(host_x)
+                .zip(observed.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f32, f32::max);
-            assert!(
-                max_abs < 5.0e-3,
-                "batched member {member} residual diverged at position {position}: max abs {max_abs}"
-            );
+            if max_diff > TOLERANCE {
+                return Some((position as usize, max_diff));
+            }
+        }
+        None
+    };
+
+    let plans: [(&str, Vec<QwenLayerKind>); 4] = [
+        ("[R]", vec![QwenLayerKind::Recurrent]),
+        ("[R,R]", vec![QwenLayerKind::Recurrent; 2]),
+        ("[R,R,R]", vec![QwenLayerKind::Recurrent; 3]),
+        (
+            "[R,R,R,A]",
+            [QwenLayerKind::Recurrent; 3]
+                .into_iter()
+                .chain([QwenLayerKind::FullAttention])
+                .collect(),
+        ),
+    ];
+    for (name, kinds) in &plans {
+        match compare_prefix(kinds) {
+            None => eprintln!("prefix {name}: exact"),
+            Some((position, diff)) => {
+                panic!("prefix {name} diverges at position {position}: max diff {diff}")
+            }
         }
     }
 }
@@ -4348,6 +4334,10 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
 /// rather than the executor.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one oracle phase plus one batched phase over the shared schedule"
+)]
 fn finds_first_diverging_batched_step_against_batch1() {
     use engine_nvidia::{CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
     use std::sync::Arc;
@@ -4397,8 +4387,8 @@ fn finds_first_diverging_batched_step_against_batch1() {
     // Shared token/position schedule: the prompt, then the recorded
     // llama-server continuation.
     let mut tokens: Vec<u32> = PROMPT.to_vec();
-    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
-    for index in 1..STEPS - PROMPT.len() + 1 {
+    let mut positions: Vec<u32> = (0..u32::try_from(PROMPT.len()).expect("fits u32")).collect();
+    for index in 1..=STEPS - PROMPT.len() {
         tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
         positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
     }
@@ -4424,7 +4414,7 @@ fn finds_first_diverging_batched_step_against_batch1() {
         let chosen = batched
             .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
             .expect("batched step");
-        for state in batched_states.iter_mut() {
+        for state in &mut batched_states {
             state.advance_to(position + 1).expect("batched advance");
         }
         batched_tokens.push(chosen[0]);
@@ -4492,7 +4482,7 @@ fn finds_first_diverging_batched_step_against_batch1() {
         .expect("oracle advance");
     oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
     oracle_tokens.push(boundary);
-    for index in 1..STEPS - PROMPT.len() + 1 {
+    for index in 1..=STEPS - PROMPT.len() {
         let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
         let choice = oracle
             .decode_step(
@@ -4953,7 +4943,7 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
         chosen = executor
             .decode_step_batch(&mut member_refs, &tokens, &positions)
             .expect("batched prefill step");
-        for state in states.iter_mut() {
+        for state in &mut states {
             state.advance_to(position + 1).expect("advance prefill");
         }
     }
@@ -4974,7 +4964,7 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
         chosen = executor
             .decode_step_batch(&mut member_refs, &tokens, &positions)
             .expect("batched continuation step");
-        for state in states.iter_mut() {
+        for state in &mut states {
             state
                 .advance_to(position + 1)
                 .expect("advance continuation");
