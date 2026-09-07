@@ -3849,11 +3849,12 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
-/// Bisect the first diverging layer of one batched step: batch-1 and the
-/// batched executor run the same token at position 0 over growing layer
-/// prefixes of the layer plan, comparing residual streams. The smallest
-/// prefix that diverges names the guilty layer; prefixes below it isolate
-/// that layer's batched kernels from all cross-layer accumulation.
+/// Bisect the first diverging layer kind of one batched step: single-layer
+/// plans (one recurrent layer, one attention layer) run the same token at
+/// position 0 through the batch-1 oracle and the batched executor over
+/// state specs sized for exactly that one layer, comparing residual
+/// streams. Divergence isolates the layer kind; parity isolates the bug to
+/// cross-layer accumulation (ordering/scheduling) instead of kernels.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn bisects_first_diverging_layer_in_batched_step() {
@@ -3870,49 +3871,53 @@ fn bisects_first_diverging_layer_in_batched_step() {
     let stream = context.default_stream();
     let staged = stage_full_text_path(&provider, &context, &stream);
 
-    let layer_kinds = (0..64_u32)
-        .map(
-            |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+    let compare_layer = |layer: usize| -> (f32, Option<(usize, f32, f32)>) {
+        let kind = match provider
+            .layer_kind(u32::try_from(layer).expect("layer index fits u32"))
+            .expect("layer kind")
+        {
+            Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+            Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+        };
+        let kinds = vec![kind];
+
+        // State sized for exactly this one layer.
+        let kv_spec = engine_core::KvStateSpec::new(
+            if kind == QwenLayerKind::FullAttention {
+                1
+            } else {
+                0
             },
+            4,
+            256,
+            512,
+            engine_core::DataType::F16,
         )
-        .collect::<Vec<_>>();
-    let attention_layers = layer_kinds
-        .iter()
-        .enumerate()
-        .filter(|(_, kind)| **kind == QwenLayerKind::FullAttention)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-
-    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
         .expect("KV spec");
-    let recurrent_spec = RecurrentStateSpec::new(
-        48,
-        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
-        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
-        engine_core::DataType::F32,
-        engine_core::DataType::F32,
-    )
-    .expect("recurrent spec");
-
-    let fresh_state = || {
-        let mut state = engine_nvidia::CudaHybridState::from_specs(
-            stream.clone(),
-            Some(kv_spec),
-            Some(recurrent_spec),
+        let recurrent_spec = RecurrentStateSpec::new(
+            if kind == QwenLayerKind::Recurrent {
+                1
+            } else {
+                0
+            },
+            RecurrentMatrixShape::new(1, 128, 128).expect("matrix shape"),
+            ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+            engine_core::DataType::F32,
+            engine_core::DataType::F32,
         )
-        .expect("physical hybrid state");
-        state.zero().expect("zero state");
-        state
-    };
+        .expect("recurrent spec");
+        let fresh_state = || {
+            let mut state = engine_nvidia::CudaHybridState::from_specs(
+                stream.clone(),
+                Some(kv_spec),
+                Some(recurrent_spec),
+            )
+            .expect("physical hybrid state");
+            state.zero().expect("zero state");
+            state
+        };
 
-    // One comparison over the first `layers` layers of the plan: both
-    // executors run the same single step, then their residual streams are
-    // compared element-wise. The oracle runs first, matching the failing
-    // full-model tap's ordering.
-    let compare_prefix = |layers: usize| -> (f32, Option<(usize, f32, f32)>) {
-        let kinds = layer_kinds[..layers].to_vec();
+        // Oracle over the single-layer plan.
         let mut oracle = CudaQwen35Decode::new(
             &context,
             stream.clone(),
@@ -3920,13 +3925,14 @@ fn bisects_first_diverging_layer_in_batched_step() {
             kinds.clone(),
             EPS,
         )
-        .expect("batch-1 prefix executor");
+        .expect("batch-1 single-layer executor");
         let mut oracle_state = fresh_state();
         oracle
             .decode_step(&mut oracle_state, TOKEN, 0)
-            .expect("oracle prefix step");
+            .expect("oracle single-layer step");
         let reference = oracle.copy_hidden().expect("oracle hidden");
 
+        // Batched over the same single-layer plan.
         let mut batched = CudaQwen35BatchDecode::new(
             &context,
             stream.clone(),
@@ -3935,11 +3941,11 @@ fn bisects_first_diverging_layer_in_batched_step() {
             EPS,
             1,
         )
-        .expect("batched prefix executor");
+        .expect("batched single-layer executor");
         let mut batched_state = fresh_state();
         batched
             .decode_step_batch(&mut [&mut batched_state], &[TOKEN], &[0])
-            .expect("batched prefix step");
+            .expect("batched single-layer step");
         let observed = batched.copy_hidden_member(0).expect("batched hidden");
 
         let mut max_diff = 0.0_f32;
@@ -3954,44 +3960,16 @@ fn bisects_first_diverging_layer_in_batched_step() {
         (max_diff, worst)
     };
 
-    // Binary search the smallest diverging prefix in 1..=64, then confirm
-    // its neighbors so a flaky boundary cannot mislead.
-    let diverges = |layers: usize| compare_prefix(layers).0 > TOLERANCE;
-    assert!(
-        !diverges(1),
-        "layer 0 alone diverges; the bug is in the first layer's batched path"
-    );
-    assert!(
-        diverges(64),
-        "no prefix diverges; the full-model tap's divergence was an ordering artifact"
-    );
-    let (mut low, mut high) = (1_usize, 64_usize);
-    while low + 1 < high {
-        let mid = (low + high) / 2;
-        if diverges(mid) {
-            high = mid;
-        } else {
-            low = mid;
-        }
+    // Compare the first recurrent layer (0) and the first attention layer
+    // (3, per the 3:1 hybrid pattern).
+    for layer in [0, 3] {
+        let (diff, worst) = compare_layer(layer);
+        eprintln!("layer {layer}: max diff {diff}, worst {worst:?}");
+        assert!(
+            diff <= TOLERANCE,
+            "batched single-layer {layer} diverges from the oracle: {diff}"
+        );
     }
-    let guilty = high;
-    let (diff, worst) = compare_prefix(guilty);
-    let (index, reference_value, observed_value) = worst.unwrap_or((0, 0.0, 0.0));
-    let kind = if layer_kinds[guilty - 1] == QwenLayerKind::Recurrent {
-        "recurrent"
-    } else {
-        "full-attention"
-    };
-    eprintln!(
-        "first diverging prefix: {guilty} layers (layer {} is {kind}); max diff {diff} at hidden[{index}]: oracle {reference_value} vs batched {observed_value}",
-        guilty - 1
-    );
-    eprintln!("attention layers: {attention_layers:?}");
-    assert!(
-        compare_prefix(guilty - 1).0 <= TOLERANCE,
-        "the layer below the guilty prefix unexpectedly diverges too"
-    );
-    panic!("batched layer {guilty} ({kind}) diverges from the batch-1 oracle at step 0");
 }
 
 /// Dispatcher-level batched serving parity: a multi-request decode batch
