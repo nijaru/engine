@@ -231,49 +231,13 @@ impl CudaQuantizedGemv {
         &self,
         weight: &CudaQuantizedWeight,
     ) -> Result<(usize, usize), CudaQuantizedKernelError> {
-        if weight.value_type() != self.value_type {
-            return Err(CudaQuantizedKernelError::UnsupportedValueType {
-                expected: self.value_type,
-                actual: weight.value_type(),
-            });
-        }
-        let dimensions = weight.spec().dimensions();
-        if dimensions.len() != 2 {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "expected rank-2 tensor, got rank {}",
-                dimensions.len()
-            )));
-        }
-        let input_size =
-            usize::try_from(dimensions[0]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        let output_size =
-            usize::try_from(dimensions[1]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        if input_size == 0 || output_size == 0 || !input_size.is_multiple_of(self.block_elements) {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "{} shape is {input_size}x{output_size}; input size must be a positive multiple of {}",
-                self.label, self.block_elements
-            )));
-        }
-        let blocks = input_size
-            .checked_div(self.block_elements)
-            .and_then(|value| value.checked_mul(output_size))
-            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
-        let expected_bytes = blocks
-            .checked_mul(self.block_bytes)
-            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
-        if weight.encoded_bytes() != expected_bytes {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "encoded length is {}, expected {expected_bytes}",
-                weight.encoded_bytes()
-            )));
-        }
-        if blocks > (i32::MAX as usize) / self.block_bytes {
-            return Err(CudaQuantizedKernelError::ShapeOverflow);
-        }
-        if input_size > i32::MAX as usize || output_size > i32::MAX as usize {
-            return Err(CudaQuantizedKernelError::ShapeOverflow);
-        }
-        Ok((input_size, output_size))
+        validate_quantized_geometry(
+            weight,
+            self.value_type,
+            self.block_elements,
+            self.block_bytes,
+            self.label,
+        )
     }
 
     /// Validate a batch-major launch over `members` concurrent inputs and
@@ -341,48 +305,7 @@ impl CudaQuantizedGemv {
         {
             return Err(CudaQuantizedKernelError::ContextMismatch);
         }
-        if weight.value_type() != self.value_type {
-            return Err(CudaQuantizedKernelError::UnsupportedValueType {
-                expected: self.value_type,
-                actual: weight.value_type(),
-            });
-        }
-        let dimensions = weight.spec().dimensions();
-        if dimensions.len() != 2 {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "expected rank-2 tensor, got rank {}",
-                dimensions.len()
-            )));
-        }
-        let input_size =
-            usize::try_from(dimensions[0]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        let output_size =
-            usize::try_from(dimensions[1]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        if input_size == 0 || output_size == 0 || !input_size.is_multiple_of(self.block_elements) {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "{} shape is {input_size}x{output_size}; input size must be a positive multiple of {}",
-                self.label, self.block_elements
-            )));
-        }
-        let blocks = input_size
-            .checked_div(self.block_elements)
-            .and_then(|value| value.checked_mul(output_size))
-            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
-        let expected_bytes = blocks
-            .checked_mul(self.block_bytes)
-            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
-        if weight.encoded_bytes() != expected_bytes {
-            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
-                "encoded length is {}, expected {expected_bytes}",
-                weight.encoded_bytes()
-            )));
-        }
-        if blocks > (i32::MAX as usize) / self.block_bytes {
-            return Err(CudaQuantizedKernelError::ShapeOverflow);
-        }
-        if input_size > i32::MAX as usize || output_size > i32::MAX as usize {
-            return Err(CudaQuantizedKernelError::ShapeOverflow);
-        }
+        let (input_size, output_size) = self.validate_geometry(weight)?;
         if input.len() != input_size {
             return Err(CudaQuantizedKernelError::InputLength {
                 expected: input_size,
@@ -1804,3 +1727,58 @@ impl CudaQ5KGemv {
             .execute_warp_batch_inner(weight, input, output, members)
     }
 }
+
+fn validate_quantized_geometry(
+    weight: &CudaQuantizedWeight,
+    value_type: u32,
+    block_elements: usize,
+    block_bytes: usize,
+    label: &str,
+) -> Result<(usize, usize), CudaQuantizedKernelError> {
+    if weight.value_type() != value_type {
+        return Err(CudaQuantizedKernelError::UnsupportedValueType {
+            expected: value_type,
+            actual: weight.value_type(),
+        });
+    }
+    let dimensions = weight.spec().dimensions();
+    if dimensions.len() != 2 {
+        return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+            "expected rank-2 tensor, got rank {}",
+            dimensions.len()
+        )));
+    }
+    let input_size =
+        usize::try_from(dimensions[0]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+    let output_size =
+        usize::try_from(dimensions[1]).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+    if input_size == 0 || output_size == 0 || !input_size.is_multiple_of(block_elements) {
+        return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+            "{label} shape is {input_size}x{output_size}; input size must be a positive multiple of {block_elements}"
+        )));
+    }
+    let blocks = input_size
+        .checked_div(block_elements)
+        .and_then(|value| value.checked_mul(output_size))
+        .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+    let expected_bytes = blocks
+        .checked_mul(block_bytes)
+        .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+    if weight.encoded_bytes() != expected_bytes {
+        return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+            "encoded length is {}, expected {expected_bytes}",
+            weight.encoded_bytes()
+        )));
+    }
+    if blocks > (i32::MAX as usize) / block_bytes {
+        return Err(CudaQuantizedKernelError::ShapeOverflow);
+    }
+    if input_size > i32::MAX as usize || output_size > i32::MAX as usize {
+        return Err(CudaQuantizedKernelError::ShapeOverflow);
+    }
+    Ok((input_size, output_size))
+}
+
+#[path = "q4_q8_1.rs"]
+mod q4_q8_1;
+pub use q4_q8_1::CudaQ4KQ8_1Gemv;
