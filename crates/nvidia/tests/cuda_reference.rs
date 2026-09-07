@@ -3950,17 +3950,23 @@ fn finds_first_diverging_batched_step_against_batch1() {
 
         for member in 0..MEMBERS {
             let observed = batched.copy_hidden_member(member).expect("batched hidden");
-            let max_diff = reference
+            let diffs: Vec<(usize, f32, f32, f32)> = reference
                 .iter()
                 .zip(observed.iter())
-                .map(|(a, b)| (a - b).abs())
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(0.0);
-            if max_diff > 1.0e-4 {
+                .enumerate()
+                .filter(|(_, (a, b))| (a - b).abs() > 1.0e-4)
+                .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
+                .collect();
+            if !diffs.is_empty() {
+                eprintln!(
+                    "step {step} member {member}: {} of {} elements differ; first 8: {:?}",
+                    diffs.len(),
+                    reference.len(),
+                    &diffs[..diffs.len().min(8)]
+                );
                 if first_divergence.is_none() {
-                    first_divergence = Some((step, max_diff));
+                    first_divergence = Some((step, diffs.iter().map(|d| d.3).sum::<f32>()));
                 }
-                break;
             }
         }
         if first_divergence.is_some() {
