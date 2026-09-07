@@ -1820,12 +1820,14 @@ impl CudaQwen35BatchDecode {
             &mut self.scratch.v_raw,
             m,
         )?;
+        // `rope_neox_batch` takes rotation *pairs*: half the rotating dim
+        // count, like the batch-1 host seam computing pairs from rot_dims.
         self.ops.rope_neox_batch(
             &mut self.scratch.q_packed,
             &self.scratch.positions,
             ATTN_Q_HEADS,
             ATTN_HEAD_DIM,
-            ATTN_ROT_DIMS,
+            ATTN_ROT_DIMS / 2,
             ATTN_ROPE_BASE,
         )?;
         self.ops.rope_neox_batch(
@@ -1833,7 +1835,7 @@ impl CudaQwen35BatchDecode {
             &self.scratch.positions,
             ATTN_KV_HEADS,
             ATTN_HEAD_DIM,
-            ATTN_ROT_DIMS,
+            ATTN_ROT_DIMS / 2,
             ATTN_ROPE_BASE,
         )?;
 

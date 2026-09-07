@@ -3857,6 +3857,10 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
 /// batch calls exercise exactly the inference the executor relies on.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "five kernel parity gates share one deterministic generator and upload helpers"
+)]
 fn executes_batched_elementwise_matching_batch1_kernels() {
     use engine_nvidia::CudaQwen35Ops;
 
@@ -3870,10 +3874,15 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
 
     // Deterministic pseudo-random inputs: index-mixed bits avoid exact-zero
     // or uniform rows that could hide indexing errors.
-    let mut seed = 0x12345678_u32;
+    let mut seed = 0x1234_5678_u32;
     let mut next = || {
         seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_390_422);
-        ((seed >> 8) & 0xffff) as f32 / 32_768.0 - 1.0
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "16 generator bits always convert exactly"
+        )]
+        let sample = ((seed >> 8) & 0xffff) as f32;
+        sample / 32_768.0 - 1.0
     };
     let mut row = |len: usize| (0..len).map(|_| next()).collect::<Vec<_>>();
 
@@ -4073,6 +4082,7 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
         const Q_HEADS: usize = 32;
         const HEAD_DIM: usize = 128;
         const ROT_DIMS: usize = 64;
+        const ROT_PAIRS: usize = ROT_DIMS / 2;
         let row_len = Q_HEADS * HEAD_DIM;
         let members: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
         let flat: Vec<f32> = members.iter().flatten().copied().collect();
@@ -4092,13 +4102,15 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
             .expect("oracle");
             oracle.extend(stream.clone_dtoh(&values).expect("read"));
         }
+        // The batch host seam takes rotation pairs, matching the executor's
+        // ATTN_ROT_DIMS / 2 convention; the scalar oracle takes full dims.
         let mut batched = upload(&flat);
         ops.rope_neox_batch(
             &mut batched,
             &stream.clone_htod(&positions).expect("positions upload"),
             Q_HEADS,
             HEAD_DIM,
-            ROT_DIMS,
+            ROT_PAIRS,
             10_000.0,
         )
         .expect("batched");
