@@ -4135,13 +4135,11 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
     }
 }
 
-/// Batched-vs-batch-1 hidden-state parity per step at three members: the
-/// batch-1 oracle runs the replay pattern (prefill_step for intermediate
-/// prompt tokens, decode_step from the boundary, feeding the recorded
-/// llama-server continuation) while the batched executor runs the same
-/// tokens/positions through batched steps at every position - the exact
-/// flow of the executor replay test. Hidden streams are compared after
-/// every step to find the first diverging step and element.
+/// Batched-vs-batch-1 hidden-state parity, with the batched phase running
+/// FIRST on a fresh executor (no prior oracle work on the stream). The
+/// batched phase also asserts its own boundary greedy token, so a hidden
+/// read that disagrees with a correct boundary argmax isolates the read
+/// rather than the executor.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn finds_first_diverging_batched_step_against_batch1() {
@@ -4190,9 +4188,51 @@ fn finds_first_diverging_batched_step_against_batch1() {
         state
     };
 
-    // Oracle: replay pattern. Intermediate prompt tokens run prefill_step;
-    // the final prompt token and every continuation token run decode_step,
-    // feeding the recorded llama-server continuation.
+    // Shared token/position schedule: the prompt, then the recorded
+    // llama-server continuation.
+    let mut tokens: Vec<u32> = PROMPT.to_vec();
+    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
+    for index in 1..STEPS - PROMPT.len() + 1 {
+        tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
+        positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
+    }
+
+    // Batched phase FIRST on a fresh executor: the exact flow of the
+    // executor replay test, capturing per-step hidden and asserting the
+    // boundary token matches llama-server.
+    let mut batched = CudaQwen35BatchDecode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        &layer_kinds,
+        EPS,
+        MEMBERS,
+    )
+    .expect("batched executor");
+    let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
+    let mut batched_hidden: Vec<Vec<f32>> = Vec::with_capacity(STEPS);
+    for (step, (&token, &position)) in tokens.iter().zip(positions.iter()).enumerate() {
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
+            batched_states.iter_mut().collect();
+        let chosen = batched
+            .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
+            .expect("batched step");
+        for state in batched_states.iter_mut() {
+            state.advance_to(position + 1).expect("batched advance");
+        }
+        if step == PROMPT.len() - 1 {
+            for (member, &token) in chosen.iter().enumerate() {
+                assert_eq!(
+                    token, LLAMA_GREEDY_CONTINUATION[0],
+                    "batched member {member} boundary token diverged from llama-server"
+                );
+            }
+        }
+        batched_hidden.push(batched.copy_hidden_member(0).expect("batched hidden"));
+    }
+
+    // Oracle phase second: replay pattern (prefill_step for intermediate
+    // prompt tokens, decode_step from the boundary).
     let mut oracle = CudaQwen35Decode::new(
         &context,
         stream.clone(),
@@ -4241,54 +4281,26 @@ fn finds_first_diverging_batched_step_against_batch1() {
         oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
     }
 
-    // Batched: same tokens/positions through batched steps at every
-    // position, advancing each member state like the serving dispatcher.
-    let mut batched = CudaQwen35BatchDecode::new(
-        &context,
-        stream.clone(),
-        Arc::clone(&staged),
-        &layer_kinds,
-        EPS,
-        MEMBERS,
-    )
-    .expect("batched executor");
-    let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
-
-    let mut tokens: Vec<u32> = PROMPT.to_vec();
-    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
-    for index in 1..STEPS - PROMPT.len() + 1 {
-        tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
-        positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
-    }
-
-    for (step, (&token, &position)) in tokens.iter().zip(positions.iter()).enumerate() {
-        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
-            batched_states.iter_mut().collect();
-        batched
-            .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
-            .expect("batched step");
-        for state in batched_states.iter_mut() {
-            state.advance_to(position + 1).expect("batched advance");
-        }
-        for member in 0..MEMBERS {
-            let observed = batched.copy_hidden_member(member).expect("batched hidden");
-            let reference = &oracle_hidden[step];
-            let diffs: Vec<(usize, f32, f32, f32)> = reference
-                .iter()
-                .zip(observed.iter())
-                .enumerate()
-                .filter(|(_, (a, b))| (**a - **b).abs() > 1.0e-4)
-                .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
-                .collect();
-            if !diffs.is_empty() {
-                eprintln!(
-                    "step {step} member {member} (token {token}, position {position}): {} of {} elements differ; first 8: {:?}",
-                    diffs.len(),
-                    reference.len(),
-                    &diffs[..diffs.len().min(8)]
-                );
-                panic!("first hidden-state divergence at step {step}");
-            }
+    // Compare per-step hidden streams.
+    for (step, (reference, observed)) in oracle_hidden.iter().zip(batched_hidden.iter()).enumerate()
+    {
+        let diffs: Vec<(usize, f32, f32, f32)> = reference
+            .iter()
+            .zip(observed.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| (**a - **b).abs() > 1.0e-4)
+            .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
+            .collect();
+        if !diffs.is_empty() {
+            eprintln!(
+                "step {step} (token {}, position {}): {} of {} elements differ; first 8: {:?}",
+                tokens[step],
+                positions[step],
+                diffs.len(),
+                reference.len(),
+                &diffs[..diffs.len().min(8)]
+            );
+            panic!("first hidden-state divergence at step {step}");
         }
     }
 }
