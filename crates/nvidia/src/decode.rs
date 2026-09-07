@@ -24,7 +24,7 @@ use engine_core::DataType;
 
 use crate::cuda::CudaF32Weight;
 use crate::model_ops::{CudaModelKernelError, CudaQwen35Ops};
-use crate::quantized::{CudaQ4KEmbedding, CudaQuantizedKernelError};
+use crate::quantized::{CudaQ4KEmbedding, CudaQuantizedKernelError, MAX_BATCH_MEMBERS};
 use crate::staging::CudaQwen35Weights;
 use crate::state::{CudaHybridState, CudaStateError};
 
@@ -231,7 +231,7 @@ impl LayerTensorNames {
 pub struct CudaQwen35Decode {
     stream: Arc<CudaStream>,
     ops: Arc<CudaQwen35Ops>,
-    embedding: CudaQ4KEmbedding,
+    embedding: Arc<CudaQ4KEmbedding>,
     weights: Arc<CudaQwen35Weights>,
     layer_kinds: Vec<QwenLayerKind>,
     tensor_names: Arc<[LayerTensorNames]>,
@@ -287,6 +287,119 @@ pub enum GemvMode {
     Warp,
 }
 
+struct ValidatedModelPlan {
+    tensor_names: Arc<[LayerTensorNames]>,
+    kv_slot: Vec<u32>,
+    recurrent_slot: Vec<u32>,
+    vocab: usize,
+}
+
+fn validate_model_plan(
+    context: &Arc<CudaContext>,
+    weights: &CudaQwen35Weights,
+    layer_kinds: &[QwenLayerKind],
+    epsilon: f32,
+) -> Result<ValidatedModelPlan, CudaDecodeError> {
+    if layer_kinds.is_empty() || layer_kinds.len() > u16::MAX as usize {
+        return Err(CudaDecodeError::InvalidPlan(
+            "the layer plan must contain 1..=65535 layers".to_owned(),
+        ));
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(CudaDecodeError::InvalidPlan(
+            "epsilon must be positive and finite".to_owned(),
+        ));
+    }
+    for (layer, kind) in layer_kinds.iter().enumerate() {
+        let prefix = format!("blk.{layer}.");
+        let tensors = match kind {
+            QwenLayerKind::Recurrent => RECURRENT_LAYER_TENSORS,
+            QwenLayerKind::FullAttention => FULL_ATTENTION_LAYER_TENSORS,
+        };
+        for tensor in tensors {
+            validate_staged(context, weights, &format!("{prefix}{tensor}"))?;
+        }
+    }
+    validate_staged(context, weights, "token_embd.weight")?;
+    validate_staged(context, weights, "output.weight")?;
+    validate_staged(context, weights, "output_norm.weight")?;
+
+    let output_weight = weights
+        .quantized_tensor("output.weight")
+        .ok_or_else(|| CudaDecodeError::MissingTensor("output.weight".to_owned()))?;
+    let dimensions = output_weight.spec().dimensions();
+    if dimensions.len() != 2 {
+        return Err(CudaDecodeError::InvalidPlan(
+            "output.weight must be a rank-2 tensor".to_owned(),
+        ));
+    }
+    let input_width = usize::try_from(dimensions[0]).map_err(|_| {
+        CudaDecodeError::InvalidPlan("output input width does not fit the host".to_owned())
+    })?;
+    if input_width != N_EMBD {
+        return Err(CudaDecodeError::InvalidPlan(format!(
+            "output.weight input width is {input_width}, expected {N_EMBD}"
+        )));
+    }
+    let vocab = usize::try_from(dimensions[1]).map_err(|_| {
+        CudaDecodeError::InvalidPlan("output vocabulary does not fit the host".to_owned())
+    })?;
+
+    if vocab == 0 || vocab > i32::MAX as usize {
+        return Err(CudaDecodeError::InvalidPlan(
+            "vocabulary must fit a positive kernel dimension".to_owned(),
+        ));
+    }
+    let embedding = weights
+        .quantized_tensor("token_embd.weight")
+        .expect("validated presence");
+    validate_dimensions(
+        "token_embd.weight",
+        embedding.spec().dimensions(),
+        &[N_EMBD, vocab],
+    )?;
+    if embedding.value_type() != 12 {
+        return Err(CudaDecodeError::InvalidPlan(
+            "token embedding requires Q4_K encoding".to_owned(),
+        ));
+    }
+
+    let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(layer, kind)| LayerTensorNames::new(layer, kind))
+        .collect::<Vec<_>>()
+        .into();
+    let mut kv_slot = Vec::with_capacity(layer_kinds.len());
+    let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
+    let mut kv_count = 0_u32;
+    let mut recurrent_count = 0_u32;
+    // Both slot tables are indexed by absolute layer index; a layer of
+    // one family records the next unused slot of its own family only.
+    for kind in layer_kinds {
+        match kind {
+            QwenLayerKind::Recurrent => {
+                recurrent_slot.push(recurrent_count);
+                recurrent_count += 1;
+                kv_slot.push(kv_count);
+            }
+            QwenLayerKind::FullAttention => {
+                kv_slot.push(kv_count);
+                kv_count += 1;
+                recurrent_slot.push(recurrent_count);
+            }
+        }
+    }
+
+    Ok(ValidatedModelPlan {
+        tensor_names,
+        kv_slot,
+        recurrent_slot,
+        vocab,
+    })
+}
+
 impl CudaQwen35Decode {
     /// Build the executor over staged weights and a layer plan.
     ///
@@ -306,81 +419,15 @@ impl CudaQwen35Decode {
         layer_kinds: Vec<QwenLayerKind>,
         epsilon: f32,
     ) -> Result<Self, CudaDecodeError> {
-        if layer_kinds.is_empty() {
-            return Err(CudaDecodeError::InvalidPlan(
-                "the layer plan must not be empty".to_owned(),
-            ));
-        }
-        if !epsilon.is_finite() || epsilon <= 0.0 {
-            return Err(CudaDecodeError::InvalidPlan(
-                "epsilon must be positive and finite".to_owned(),
-            ));
-        }
-        for (layer, kind) in layer_kinds.iter().enumerate() {
-            let prefix = format!("blk.{layer}.");
-            let tensors = match kind {
-                QwenLayerKind::Recurrent => RECURRENT_LAYER_TENSORS,
-                QwenLayerKind::FullAttention => FULL_ATTENTION_LAYER_TENSORS,
-            };
-            for tensor in tensors {
-                validate_staged(&weights, &format!("{prefix}{tensor}"))?;
-            }
-        }
-        validate_staged(&weights, "token_embd.weight")?;
-        validate_staged(&weights, "output.weight")?;
-        validate_staged(&weights, "output_norm.weight")?;
-
-        let output_weight = weights
-            .quantized_tensor("output.weight")
-            .ok_or_else(|| CudaDecodeError::MissingTensor("output.weight".to_owned()))?;
-        let dimensions = output_weight.spec().dimensions();
-        if dimensions.len() != 2 {
-            return Err(CudaDecodeError::InvalidPlan(
-                "output.weight must be a rank-2 tensor".to_owned(),
-            ));
-        }
-        let input_width = usize::try_from(dimensions[0]).map_err(|_| {
-            CudaDecodeError::InvalidPlan("output input width does not fit the host".to_owned())
-        })?;
-        if input_width != N_EMBD {
-            return Err(CudaDecodeError::InvalidPlan(format!(
-                "output.weight input width is {input_width}, expected {N_EMBD}"
-            )));
-        }
-        let vocab = usize::try_from(dimensions[1]).map_err(|_| {
-            CudaDecodeError::InvalidPlan("output vocabulary does not fit the host".to_owned())
-        })?;
-
-        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(layer, kind)| LayerTensorNames::new(layer, kind))
-            .collect::<Vec<_>>()
-            .into();
-        let mut kv_slot = Vec::with_capacity(layer_kinds.len());
-        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
-        let mut kv_count = 0_u32;
-        let mut recurrent_count = 0_u32;
-        // Both slot tables are indexed by absolute layer index; a layer of
-        // one family records the next unused slot of its own family only.
-        for kind in &layer_kinds {
-            match kind {
-                QwenLayerKind::Recurrent => {
-                    recurrent_slot.push(recurrent_count);
-                    recurrent_count += 1;
-                    kv_slot.push(kv_count);
-                }
-                QwenLayerKind::FullAttention => {
-                    kv_slot.push(kv_count);
-                    kv_count += 1;
-                    recurrent_slot.push(recurrent_count);
-                }
-            }
-        }
+        let ValidatedModelPlan {
+            tensor_names,
+            kv_slot,
+            recurrent_slot,
+            vocab,
+        } = validate_model_plan(context, &weights, &layer_kinds, epsilon)?;
 
         let ops = Arc::new(CudaQwen35Ops::from_context(context, stream.clone())?);
-        let embedding = CudaQ4KEmbedding::from_context(context, stream.clone())?;
+        let embedding = Arc::new(CudaQ4KEmbedding::from_context(context, stream.clone())?);
         let scratch = alloc_scratch(&stream, vocab)?;
         let selected_token = stream
             .alloc_zeros::<u32>(1)
@@ -501,12 +548,13 @@ impl CudaQwen35Decode {
         token: u32,
         position: u32,
     ) -> Result<(), CudaDecodeError> {
-        self.validate_state(state)?;
+        validate_state(self.stream.context(), &self.layer_kinds, state)?;
+        validate_token(token, self.logits.len())?;
         let capacity = state.kv().map_or(u32::MAX, |kv| kv.spec().block_tokens());
         if position >= capacity {
             return Err(CudaDecodeError::PositionOverflow { position, capacity });
         }
-        if state.kv().is_some() && self.scores.is_none() {
+        if state.kv().is_some() && self.scores_stride < capacity as usize {
             let stride = capacity as usize;
             self.scores = Some(
                 self.stream
@@ -652,6 +700,10 @@ impl CudaQwen35Decode {
     #[must_use]
     pub const fn gemv_mode(&self) -> GemvMode {
         self.gemv_mode
+    }
+
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// The staged weights this executor runs over.
@@ -943,52 +995,88 @@ impl CudaQwen35Decode {
         self.ops.residual_add(&mut self.hidden, &self.attn_incr)?;
         Ok(())
     }
+}
 
-    fn validate_state(&self, state: &CudaHybridState) -> Result<(), CudaDecodeError> {
-        let full_count = self
-            .layer_kinds
-            .iter()
-            .filter(|kind| **kind == QwenLayerKind::FullAttention)
-            .count();
-        let recurrent_count = self.layer_kinds.len() - full_count;
-        if full_count > 0 {
-            let kv = state.kv().ok_or(missing_kv())?;
-            let spec = kv.spec();
-            if usize::from(spec.layer_count()) != full_count
-                || usize::from(spec.kv_heads()) != ATTN_KV_HEADS
-                || usize::from(spec.head_dim()) != ATTN_HEAD_DIM
-                || spec.dtype() != DataType::F16
-            {
-                return Err(CudaDecodeError::InvalidPlan(format!(
-                    "KV state must hold {full_count} layers with {ATTN_KV_HEADS} heads, head dim {ATTN_HEAD_DIM}, F16"
-                )));
-            }
+fn validate_state(
+    context: &Arc<CudaContext>,
+    layer_kinds: &[QwenLayerKind],
+    state: &CudaHybridState,
+) -> Result<(), CudaDecodeError> {
+    let full_count = layer_kinds
+        .iter()
+        .filter(|kind| **kind == QwenLayerKind::FullAttention)
+        .count();
+    let recurrent_count = layer_kinds.len() - full_count;
+    if full_count > 0 {
+        let kv = state.kv().ok_or(missing_kv())?;
+        let spec = kv.spec();
+        if usize::from(spec.layer_count()) != full_count
+            || usize::from(spec.kv_heads()) != ATTN_KV_HEADS
+            || usize::from(spec.head_dim()) != ATTN_HEAD_DIM
+            || spec.dtype() != DataType::F16
+        {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "KV state must hold {full_count} layers with {ATTN_KV_HEADS} heads, head dim {ATTN_HEAD_DIM}, F16"
+            )));
         }
-        if recurrent_count > 0 {
-            let recurrent = state.recurrent().ok_or(missing_recurrent())?;
-            let spec = recurrent.spec();
-            let matrix = spec.matrix();
-            let convolution = spec.convolution();
-            // The state matrix is one [k_dim][v_dim] F32 block per v head
-            // (`gdn_state_update` indexes [v_head][k][v]); the convolution
-            // buffer holds d_conv - 1 history elements per channel
-            // (`gdn_conv_silu` validates channels * 3).
-            if usize::from(spec.layer_count()) != recurrent_count
-                || usize::from(matrix.matrix_count()) != GDN_V_HEADS
-                || usize::from(matrix.rows()) != GDN_HEAD_DIM
-                || usize::from(matrix.columns()) != GDN_HEAD_DIM
-                || u64::from(convolution.channels()) != GDN_QKV_DIM as u64
-                || usize::from(convolution.history_tokens()) != GDN_D_CONV - 1
-                || spec.matrix_dtype() != DataType::F32
-                || spec.convolution_dtype() != DataType::F32
-            {
-                return Err(CudaDecodeError::InvalidPlan(format!(
-                    "recurrent state must hold {recurrent_count} layers with per-v-head [128x128] F32 matrices and {GDN_QKV_DIM}x3 F32 convolution history"
-                )));
-            }
-        }
-        Ok(())
     }
+    if recurrent_count > 0 {
+        let recurrent = state.recurrent().ok_or(missing_recurrent())?;
+        let spec = recurrent.spec();
+        let matrix = spec.matrix();
+        let convolution = spec.convolution();
+        // The state matrix is one [k_dim][v_dim] F32 block per v head
+        // (`gdn_state_update` indexes [v_head][k][v]); the convolution
+        // buffer holds d_conv - 1 history elements per channel
+        // (`gdn_conv_silu` validates channels * 3).
+        if usize::from(spec.layer_count()) != recurrent_count
+            || usize::from(matrix.matrix_count()) != GDN_V_HEADS
+            || usize::from(matrix.rows()) != GDN_HEAD_DIM
+            || usize::from(matrix.columns()) != GDN_HEAD_DIM
+            || u64::from(convolution.channels()) != GDN_QKV_DIM as u64
+            || usize::from(convolution.history_tokens()) != GDN_D_CONV - 1
+            || spec.matrix_dtype() != DataType::F32
+            || spec.convolution_dtype() != DataType::F32
+        {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "recurrent state must hold {recurrent_count} layers with per-v-head [128x128] F32 matrices and {GDN_QKV_DIM}x3 F32 convolution history"
+            )));
+        }
+    }
+    for layer in 0..u32::try_from(full_count).expect("validated layer count") {
+        let kv = state.kv().ok_or(missing_kv())?;
+        for buffer in [kv.layer_keys(layer), kv.layer_values(layer)] {
+            validate_buffer_context(context, buffer)?;
+        }
+    }
+    for layer in 0..u32::try_from(recurrent_count).expect("validated layer count") {
+        let recurrent = state.recurrent().ok_or(missing_recurrent())?;
+        for buffer in [
+            recurrent.layer_matrix(layer),
+            recurrent.layer_convolution(layer),
+        ] {
+            validate_buffer_context(context, buffer)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_buffer_context(
+    context: &Arc<CudaContext>,
+    buffer: Option<&crate::state::CudaStateBuffer>,
+) -> Result<(), CudaDecodeError> {
+    let buffer = buffer
+        .ok_or_else(|| CudaDecodeError::InvalidPlan("state lacks a layer buffer".to_owned()))?;
+    let actual = match buffer {
+        crate::state::CudaStateBuffer::F16(buffer) => buffer.context(),
+        crate::state::CudaStateBuffer::F32(buffer) => buffer.context(),
+    };
+    if context.as_ref() != actual.as_ref() {
+        return Err(CudaDecodeError::InvalidPlan(
+            "state belongs to another CUDA context".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// The state matrix and history access for one recurrent layer slot.
@@ -1081,17 +1169,78 @@ fn is_f32_staged(name: &str) -> bool {
         || name.ends_with("ssm_conv1d.weight")
 }
 
-fn validate_staged(weights: &CudaQwen35Weights, name: &str) -> Result<(), CudaDecodeError> {
-    let present = if is_f32_staged(name) {
-        weights.f32_tensor(name).is_some()
+fn validate_staged(
+    context: &Arc<CudaContext>,
+    weights: &CudaQwen35Weights,
+    name: &str,
+) -> Result<(), CudaDecodeError> {
+    let dimensions = if is_f32_staged(name) {
+        Some({
+            let weight = weights
+                .f32_tensor(name)
+                .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+            if context.as_ref() != weight.data().context().as_ref() {
+                return Err(CudaDecodeError::InvalidPlan(format!(
+                    "{name} belongs to another CUDA context"
+                )));
+            }
+            weight.spec().dimensions()
+        })
     } else {
-        weights.quantized_tensor(name).is_some()
-    };
-    if present {
-        Ok(())
-    } else {
-        Err(CudaDecodeError::MissingTensor(name.to_owned()))
+        let weight = weights
+            .quantized_tensor(name)
+            .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+        if context.as_ref() != weight.encoded_data().context().as_ref() {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "{name} belongs to another CUDA context"
+            )));
+        }
+        if weights.gemv_for(weight.value_type()).is_none() {
+            return Err(CudaDecodeError::MissingKernel(weight.value_type()));
+        }
+        Some(weight.spec().dimensions())
     }
+    .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))?;
+    let leaf = name
+        .strip_prefix("blk.")
+        .and_then(|name| name.split_once('.').map(|(_, leaf)| leaf))
+        .unwrap_or(name);
+    let shape: &[usize] = match leaf {
+        "attn_norm.weight" | "post_attention_norm.weight" | "output_norm.weight" => &[N_EMBD],
+        "ffn_gate.weight" | "ffn_up.weight" => &[N_EMBD, N_FF],
+        "ffn_down.weight" => &[N_FF, N_EMBD],
+        "attn_gate.weight" => &[N_EMBD, GDN_INNER],
+        "attn_qkv.weight" => &[N_EMBD, GDN_QKV_DIM],
+        "ssm_alpha.weight" | "ssm_beta.weight" => &[N_EMBD, GDN_V_HEADS],
+        "ssm_a" | "ssm_dt.bias" => &[GDN_V_HEADS],
+        "ssm_conv1d.weight" => &[GDN_D_CONV, GDN_QKV_DIM],
+        "ssm_norm.weight" => &[GDN_HEAD_DIM],
+        "ssm_out.weight" => &[GDN_INNER, N_EMBD],
+        "attn_q.weight" => &[N_EMBD, ATTN_Q_HEADS * 2 * ATTN_HEAD_DIM],
+        "attn_k.weight" | "attn_v.weight" => &[N_EMBD, ATTN_KV_HEADS * ATTN_HEAD_DIM],
+        "attn_q_norm.weight" | "attn_k_norm.weight" => &[ATTN_HEAD_DIM],
+        "attn_output.weight" => &[ATTN_Q_HEADS * ATTN_HEAD_DIM, N_EMBD],
+        "token_embd.weight" | "output.weight" => return Ok(()),
+        _ => {
+            return Err(CudaDecodeError::InvalidPlan(format!(
+                "unknown model tensor {name}"
+            )));
+        }
+    };
+    validate_dimensions(name, dimensions, shape)
+}
+
+fn validate_dimensions(
+    name: &str,
+    actual: &[u64],
+    expected: &[usize],
+) -> Result<(), CudaDecodeError> {
+    if actual.len() != expected.len() || actual.iter().zip(expected).any(|(&a, &e)| a != e as u64) {
+        return Err(CudaDecodeError::InvalidPlan(format!(
+            "{name} dimensions are {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn f32_slice<'a>(
@@ -1208,13 +1357,14 @@ struct BatchScratch {
 pub struct CudaQwen35BatchDecode {
     stream: Arc<CudaStream>,
     ops: Arc<CudaQwen35Ops>,
-    embedding: CudaQ4KEmbedding,
+    embedding: Arc<CudaQ4KEmbedding>,
     weights: Arc<CudaQwen35Weights>,
     tensor_names: Arc<[LayerTensorNames]>,
     kv_slot: Vec<u32>,
     recurrent_slot: Vec<u32>,
     epsilon: f32,
     members: usize,
+    layer_kinds: Vec<QwenLayerKind>,
     scratch: BatchScratch,
 }
 
@@ -1234,47 +1384,56 @@ impl CudaQwen35BatchDecode {
         epsilon: f32,
         members: usize,
     ) -> Result<Self, CudaDecodeError> {
-        if members == 0 {
-            return Err(CudaDecodeError::InvalidPlan(
-                "the batched executor requires at least one member".to_owned(),
-            ));
-        }
-        let vocab = weights
-            .quantized_tensor("output.weight")
-            .map(|weight| weight.spec().dimensions()[1])
-            .ok_or_else(|| CudaDecodeError::MissingTensor("output.weight".to_owned()))
-            .and_then(|dim| {
-                usize::try_from(dim)
-                    .map_err(|_| CudaDecodeError::InvalidPlan("vocabulary does not fit".to_owned()))
-            })?;
-
-        let tensor_names: Arc<[LayerTensorNames]> = layer_kinds
-            .iter()
-            .enumerate()
-            .map(|(layer, kind)| LayerTensorNames::new(layer, *kind))
-            .collect::<Vec<_>>()
-            .into();
-        let mut kv_slot = Vec::with_capacity(layer_kinds.len());
-        let mut recurrent_slot = Vec::with_capacity(layer_kinds.len());
-        let mut kv_count = 0_u32;
-        let mut recurrent_count = 0_u32;
-        for kind in layer_kinds {
-            match kind {
-                QwenLayerKind::Recurrent => {
-                    recurrent_slot.push(recurrent_count);
-                    recurrent_count += 1;
-                    kv_slot.push(kv_count);
-                }
-                QwenLayerKind::FullAttention => {
-                    kv_slot.push(kv_count);
-                    kv_count += 1;
-                    recurrent_slot.push(recurrent_count);
-                }
-            }
-        }
-
+        validate_batch_members(members)?;
+        let plan = validate_model_plan(context, &weights, layer_kinds, epsilon)?;
         let ops = Arc::new(CudaQwen35Ops::from_context(context, stream.clone())?);
-        let embedding = CudaQ4KEmbedding::from_context(context, stream.clone())?;
+        let embedding = Arc::new(CudaQ4KEmbedding::from_context(context, stream.clone())?);
+        Self::prepare(stream, weights, epsilon, members, plan, ops, embedding)
+    }
+
+    /// Prepare a lane on the single executor's stream, reusing its validated
+    /// model bindings and compiled kernels. No NVRTC compilation occurs here.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported member count or allocation failure.
+    pub fn from_decode(single: &CudaQwen35Decode, members: usize) -> Result<Self, CudaDecodeError> {
+        validate_batch_members(members)?;
+        let plan = ValidatedModelPlan {
+            tensor_names: Arc::clone(&single.tensor_names),
+            kv_slot: single.kv_slot.clone(),
+            recurrent_slot: single.recurrent_slot.clone(),
+            vocab: single.logits.len(),
+        };
+        Self::prepare(
+            Arc::clone(single.stream()),
+            Arc::clone(&single.weights),
+            single.epsilon,
+            members,
+            plan,
+            Arc::clone(&single.ops),
+            Arc::clone(&single.embedding),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private preparation receives shared model resources and lane geometry"
+    )]
+    fn prepare(
+        stream: Arc<CudaStream>,
+        weights: Arc<CudaQwen35Weights>,
+        epsilon: f32,
+        members: usize,
+        plan: ValidatedModelPlan,
+        ops: Arc<CudaQwen35Ops>,
+        embedding: Arc<CudaQ4KEmbedding>,
+    ) -> Result<Self, CudaDecodeError> {
+        let ValidatedModelPlan {
+            tensor_names,
+            kv_slot,
+            recurrent_slot,
+            vocab,
+        } = plan;
         let m = members;
         let alloc = |length: usize| -> Result<CudaSlice<f32>, CudaDecodeError> {
             alloc(&stream, length * m)
@@ -1322,11 +1481,21 @@ impl CudaQwen35BatchDecode {
             ops,
             embedding,
             weights,
-            tensor_names,
+            tensor_names: Arc::clone(&tensor_names),
             kv_slot,
             recurrent_slot,
             epsilon,
             members,
+            layer_kinds: tensor_names
+                .iter()
+                .map(|names| {
+                    if matches!(names.attention, AttentionLayerTensorNames::Recurrent(_)) {
+                        QwenLayerKind::Recurrent
+                    } else {
+                        QwenLayerKind::FullAttention
+                    }
+                })
+                .collect(),
             scratch,
         })
     }
@@ -1468,38 +1637,30 @@ impl CudaQwen35BatchDecode {
         // Validate every member's position against its own state's KV
         // capacity before any launch, mirroring the batch-1 executor's guard.
         for (state, &position) in states.iter().zip(positions) {
+            validate_state(self.stream.context(), &self.layer_kinds, state)?;
             let capacity = state.kv().map_or(u32::MAX, |kv| kv.spec().block_tokens());
             if position >= capacity {
                 return Err(CudaDecodeError::PositionOverflow { position, capacity });
             }
         }
-        // Lazy score-scratch allocation on the first batched step, once
-        // the member states' KV capacity is known. Attention indexing uses
-        // each member's own capacity as the scores row stride, so member
-        // capacities must agree; mixed-capacity batches would overlap rows.
-        if self.scratch.scores.is_none() {
-            let mut stride = None;
-            for state in states.iter() {
-                let Some(kv) = state.kv() else { continue };
-                let capacity = kv.spec().block_tokens() as usize;
-                if capacity == 0 {
-                    return Err(CudaDecodeError::InvalidPlan(
-                        "KV state reports a zero token capacity".to_owned(),
-                    ));
-                }
-                if let Some(known) = stride
-                    && known != capacity
-                {
-                    return Err(CudaDecodeError::InvalidPlan(
-                        "batched attention requires uniform KV capacity across members".to_owned(),
-                    ));
-                }
-                stride = Some(capacity);
-            }
-            let stride = stride.unwrap_or(0);
-            let scores = alloc(&self.stream, self.members * ATTN_Q_HEADS * stride)
-                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
-            self.scratch.scores = Some(scores);
+        // Validate current member capacities on every step, including reuse of
+        // a previously allocated lane. Growth precedes state writes.
+        let required = attention_scratch_elements(
+            self.members,
+            states
+                .iter()
+                .filter_map(|state| state.kv().map(|kv| kv.spec().block_tokens() as usize)),
+        )?;
+        if self
+            .scratch
+            .scores
+            .as_ref()
+            .is_none_or(|scores| scores.len() < required)
+        {
+            self.scratch.scores = Some(alloc(&self.stream, required)?);
+        }
+        for &token in tokens {
+            validate_token(token, self.scratch.logits.len() / self.members)?;
         }
         self.upload_tokens(tokens, positions)?;
 
@@ -1951,4 +2112,90 @@ fn member_row_mut(
     let start = member.checked_mul(row_length)?;
     let end = start.checked_add(row_length)?;
     slice.try_slice_mut(start..end)
+}
+
+fn validate_batch_members(members: usize) -> Result<(), CudaDecodeError> {
+    if !(1..=MAX_BATCH_MEMBERS).contains(&members) {
+        return Err(CudaDecodeError::InvalidPlan(format!(
+            "batched execution requires 1..={MAX_BATCH_MEMBERS} members, got {members}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_token(token: u32, vocab: usize) -> Result<(), CudaDecodeError> {
+    if token as usize >= vocab {
+        return Err(CudaDecodeError::InvalidPlan(format!(
+            "token {token} is outside vocabulary {vocab}"
+        )));
+    }
+    Ok(())
+}
+
+fn attention_scratch_elements(
+    members: usize,
+    capacities: impl IntoIterator<Item = usize>,
+) -> Result<usize, CudaDecodeError> {
+    let mut stride = None;
+    for capacity in capacities {
+        if capacity == 0 || stride.is_some_and(|known| known != capacity) {
+            return Err(CudaDecodeError::InvalidPlan(
+                "batched attention requires positive uniform KV capacity".to_owned(),
+            ));
+        }
+        stride = Some(capacity);
+    }
+    members
+        .checked_mul(ATTN_Q_HEADS)
+        .and_then(|heads| heads.checked_mul(stride.unwrap_or(0)))
+        .ok_or_else(|| CudaDecodeError::InvalidPlan("attention scratch size overflow".to_owned()))
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_kernel_supported_member_counts() {
+        for members in [1, 2, 8] {
+            assert!(validate_batch_members(members).is_ok());
+        }
+        for members in [0, 9, usize::MAX] {
+            assert!(validate_batch_members(members).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_current_attention_capacity_on_lane_reuse() {
+        assert_eq!(
+            attention_scratch_elements(2, [4, 4]).unwrap(),
+            8 * ATTN_Q_HEADS
+        );
+        assert_eq!(
+            attention_scratch_elements(2, [16, 16]).unwrap(),
+            32 * ATTN_Q_HEADS
+        );
+        assert_eq!(
+            attention_scratch_elements(2, [4, 4]).unwrap(),
+            8 * ATTN_Q_HEADS
+        );
+        assert!(attention_scratch_elements(2, [4, 16]).is_err());
+        assert!(attention_scratch_elements(2, [0, 0]).is_err());
+        assert!(attention_scratch_elements(2, [usize::MAX, usize::MAX]).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_bindings_and_tokens() {
+        assert!(
+            validate_dimensions("projection", &[N_EMBD as u64, N_FF as u64], &[N_EMBD, N_FF])
+                .is_ok()
+        );
+        assert!(validate_dimensions("projection", &[N_EMBD as u64], &[N_EMBD, N_FF]).is_err());
+        assert!(
+            validate_dimensions("projection", &[N_FF as u64, N_EMBD as u64], &[N_EMBD, N_FF])
+                .is_err()
+        );
+        assert!(validate_token(7, 8).is_ok());
+        assert!(validate_token(8, 8).is_err());
+    }
 }

@@ -85,7 +85,8 @@ pub struct StagedTensorSource<'a> {
 
 /// The per-value-type GEMV kernel entry compiled once during staging.
 ///
-/// Each variant owns its NVRTC module; the dispatcher picks by value type.
+/// Each variant owns context-local functions loaded from shared compiled PTX;
+/// the dispatcher picks by value type.
 pub enum QwenGemvKernel {
     Q3K(CudaQ3KGemv),
     Q4K(CudaQ4KGemv),
@@ -281,24 +282,11 @@ impl CudaQwen35Weights {
         }
         let mut gemv = Vec::new();
         for value_type in seen_types {
-            gemv.push(match value_type {
-                8 => QwenGemvKernel::Q8_0(CudaQ8_0Gemv::from_context(context, stream.clone())?),
-                11 => QwenGemvKernel::Q3K(CudaQ3KGemv::from_context(context, stream.clone())?),
-                12 => QwenGemvKernel::Q4K(CudaQ4KGemv::from_context(context, stream.clone())?),
-                13 => QwenGemvKernel::Q5K(CudaQ5KGemv::from_context(context, stream.clone())?),
-                14 => QwenGemvKernel::Q6K(CudaQ6KGemv::from_context(context, stream.clone())?),
-                20 => QwenGemvKernel::Iq4Nl(CudaIq4NlGemv::from_context(context, stream.clone())?),
-                21 => QwenGemvKernel::Iq3S(CudaIq3SGemv::from_context(context, stream.clone())?),
-                23 => QwenGemvKernel::Iq4Xs(CudaIq4XsGemv::from_context(context, stream.clone())?),
-                other => {
-                    return Err(CudaWeightStagingError::Kernel(
-                        CudaQuantizedKernelError::UnsupportedValueType {
-                            expected: 0,
-                            actual: other,
-                        },
-                    ));
-                }
-            });
+            gemv.push(QwenGemvKernel::from_value_type(
+                value_type,
+                context,
+                stream.clone(),
+            )?);
         }
         Ok(Self { store, gemv })
     }

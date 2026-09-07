@@ -78,7 +78,7 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
         }
         const int leading = shift; // position of the MSB, 0-based
         const unsigned int normalized = (fraction << (10 - leading)) & 0x3ffu;
-        const int new_exponent = -14 - leading + 127;
+        const int new_exponent = -24 + leading + 127;
         const unsigned int result = (sign << 31) | ((unsigned int)new_exponent << 23) | (normalized << 13);
         return __int_as_float(result);
     }
