@@ -2633,9 +2633,15 @@ impl CudaQwen35Ops {
             u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let head_dim_u32 =
             u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // Same coverage as the slice variant: one thread per (kv head, dim)
+        // element of the appended token, 256 per block.
+        let total = kv_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total_u32 = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let config = LaunchConfig {
-            grid_dim: (kv_heads_u32.div_ceil(64), 1, 1),
-            block_dim: (64, 1, 1),
+            grid_dim: (total_u32.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         // Safety: views borrow live slices on this stream; geometry is

@@ -3282,7 +3282,7 @@ fn bisects_four_layer_batched_divergence_by_prefix() {
 }
 
 /// View-wrapper parity for the batched attention state kernels at the
-/// REAL model geometry: 24 q heads over 4 kv heads, head_dim 256 (eight
+/// REAL model geometry: 24 q heads over 4 kv heads, `head_dim` 256 (eight
 /// dims per lane in the warp kernel), capacity-8 caches (stride greater
 /// than the token count, matching the executor's capacity stride).
 /// `kv_append_f16_views` and `attn_score_gqa_views` must produce
