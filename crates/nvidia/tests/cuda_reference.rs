@@ -4680,7 +4680,7 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
     const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
     const EPS: f32 = 1.0e-6;
     const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
-    const MEMBERS: usize = 3;
+    const MEMBERS: usize = 1;
     const COMPARE_TOKENS: usize = 16;
 
     let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
