@@ -44,9 +44,8 @@ struct QueuedRows {
 
 /// One-stream asynchronous Qwen3.8 CUDA serving dispatcher.
 ///
-/// The scheduler submits a whole multi-request batch. Rows still execute
-/// sequentially through the batch-1 executor on the single serving stream,
-/// but the host is no longer blocked on the result: rows that request
+/// Compatible decode rows execute together through prepared batch lanes;
+/// other rows use the single-row executor on the same stream. Rows that request
 /// sampling copy their greedy selection into dispatcher-owned pinned host
 /// slots, one completion event is recorded per submission, and outcomes are
 /// published later through [`NvidiaDispatcher::poll_batch`] once the event
@@ -57,13 +56,13 @@ struct QueuedRows {
 /// the stream has finished that work.
 ///
 /// Error contract, matching the `NvidiaDispatcher` seam:
-/// - a `submit_batch` error means no asynchronous ownership was retained: the
-///   stream is flushed so partial launches cannot touch request state or
-///   scratch after the error returns, and every leased slot is recycled;
+/// - ordinary enqueue errors flush partial work before recycling leases;
+///   a failed flush poisons the dispatcher and blocks physical release until
+///   teardown, preserving ownership while completion is uncertain;
 /// - `poll_batch` returns `Ok(None)` while the completion event is pending.
-///   A device fault observed through the event is terminal: the pending
-///   record (event, leases, retained state keys) is dropped before the error
-///   is returned, ending this dispatcher's access to those resources.
+///   A device fault poisons the dispatcher. Pending records are retired after
+///   a successful drain or quarantined until teardown if the drain fails.
+///   Quarantined state cannot be reported as successfully released.
 pub struct CudaQwen35ServingDispatcher {
     executor: CudaQwen35Decode,
     states: CudaStateRegistry,
@@ -71,15 +70,13 @@ pub struct CudaQwen35ServingDispatcher {
     /// Reusable pinned one-`u32` output slots.
     pinned_outputs: Vec<PinnedHostSlice<u32>>,
     free_outputs: Vec<usize>,
-    pending: HashMap<BackendSubmissionId, PendingSubmission>,
+    submissions: crate::submissions::Submissions<PendingSubmission>,
     /// State keys released while still referenced by pending submissions.
     /// Their physical entries stay alive until the referencing submission
     /// completes, then they are released for real.
     deferred_releases: Vec<CudaStateKey>,
-    /// Batched decode executors keyed by member count, built lazily on the
-    /// first eligible multi-row batch of that size. Member count is fixed at
-    /// construction, and building one costs a kernel compile, so the cache
-    /// keeps each size built once.
+    /// Supported execution lanes are prepared before accepting submissions.
+    /// Compiled kernels and validated model bindings are shared by all lanes.
     batched: HashMap<usize, CudaQwen35BatchDecode>,
 }
 
@@ -202,6 +199,12 @@ impl CudaQwen35ServingDispatcher {
         stream: Arc<CudaStream>,
         max_pending_rows: usize,
     ) -> Result<Self, BackendError> {
+        if context.as_ref() != stream.context().as_ref() || !Arc::ptr_eq(&stream, executor.stream())
+        {
+            return Err(BackendError::ExecutionFailed(
+                "dispatcher and executor must share one CUDA stream/context".to_owned(),
+            ));
+        }
         if max_pending_rows == 0 {
             return Err(BackendError::ExecutionFailed(
                 "the serving dispatcher requires at least one pinned output slot".to_owned(),
@@ -217,15 +220,21 @@ impl CudaQwen35ServingDispatcher {
                 .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
             pinned_outputs.push(slot);
         }
+        let mut batched = HashMap::new();
+        for members in 2..=max_pending_rows.min(crate::quantized::MAX_BATCH_MEMBERS) {
+            let batch = CudaQwen35BatchDecode::from_decode(&executor, members)
+                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+            batched.insert(members, batch);
+        }
         Ok(Self {
             executor,
             states: CudaStateRegistry::new(stream.clone()),
             stream,
             pinned_outputs,
             free_outputs: (0..max_pending_rows).rev().collect(),
-            pending: HashMap::new(),
+            submissions: crate::submissions::Submissions::default(),
             deferred_releases: Vec::new(),
-            batched: HashMap::new(),
+            batched,
         })
     }
 
@@ -236,7 +245,35 @@ impl CudaQwen35ServingDispatcher {
 
     #[must_use]
     pub fn pending_submissions(&self) -> usize {
-        self.pending.len()
+        self.submissions.pending.len()
+    }
+
+    fn check_health(&self) -> Result<(), BackendError> {
+        match self.submissions.fault() {
+            Some(fault) => Err(BackendError::ExecutionFailed(format!(
+                "CUDA dispatcher is unusable after a device failure: {fault}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// A driver fault ends normal polling, but not necessarily device access.
+    /// Drain before retiring leases; quarantine them if completion is uncertain.
+    fn fail_device(&mut self, error: BackendError) -> BackendError {
+        let flush = self.stream.synchronize();
+        let retired = self.submissions.fail(error.to_string(), flush.is_ok());
+        if let Err(flush_error) = flush {
+            return BackendError::ExecutionFailed(format!(
+                "{error}; CUDA drain failed: {flush_error}; resources quarantined until teardown"
+            ));
+        }
+        for record in retired {
+            for lease in record.outputs.into_iter().flatten() {
+                self.recycle_output(lease);
+            }
+        }
+        self.drain_deferred_releases();
+        error
     }
 
     fn lease_output(&mut self) -> Result<PinnedSlotLease, BackendError> {
@@ -280,7 +317,7 @@ impl CudaQwen35ServingDispatcher {
             states: registry,
             ..
         } = self;
-        let (output_token, elapsed_nanos) = run_row(
+        let result = run_row(
             executor,
             registry,
             segment,
@@ -291,10 +328,11 @@ impl CudaQwen35ServingDispatcher {
                     .map(Some)
                     .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
             },
-        )?;
-        self.stream
-            .synchronize()
-            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+        );
+        if let Err(error) = self.stream.synchronize() {
+            return Err(self.fail_device(BackendError::ExecutionFailed(error.to_string())));
+        }
+        let (output_token, elapsed_nanos) = result?;
         let outcome = ExecutionOutcome::new(ExecutionMetrics::new(elapsed_nanos, 0, 0));
         Ok(match output_token {
             Some(token) => outcome.with_output_token(token),
@@ -311,7 +349,7 @@ impl CudaQwen35ServingDispatcher {
     /// prefill/decode batches and unsampled rows fall back to the per-row
     /// path, which handles all of those.
     fn batch_is_batchable(batch: &ExecutionBatch, states: &[InferenceStateSet]) -> bool {
-        if batch.len() <= 1 {
+        if batch.len() <= 1 || batch.len() > crate::quantized::MAX_BATCH_MEMBERS {
             return false;
         }
         batch
@@ -402,21 +440,9 @@ impl CudaQwen35ServingDispatcher {
                 state_keys.push(key);
             }
 
-            // Build (or reuse) the batched executor for this member count.
-            let executor = if let Some(executor) = self.batched.get_mut(&row_count) {
-                executor
-            } else {
-                let executor = CudaQwen35BatchDecode::new(
-                    self.stream.context(),
-                    self.stream.clone(),
-                    Arc::clone(self.executor.weights()),
-                    self.executor.layer_kinds(),
-                    self.executor.epsilon(),
-                    row_count,
-                )
-                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
-                self.batched.entry(row_count).or_insert(executor)
-            };
+            let executor = self.batched.get_mut(&row_count).ok_or_else(|| {
+                BackendError::ExecutionFailed("batch shape was not prepared".to_owned())
+            })?;
 
             // Assemble the step's tokens and positions.
             let mut tokens = Vec::with_capacity(row_count);
@@ -483,11 +509,11 @@ impl CudaQwen35ServingDispatcher {
                 state_keys,
             }),
             Err(error) => {
-                self.stream.synchronize().map_err(|sync_error| {
-                    BackendError::ExecutionFailed(format!(
+                if let Err(sync_error) = self.stream.synchronize() {
+                    return Err(self.fail_device(BackendError::ExecutionFailed(format!(
                         "{error}; CUDA flush after batched enqueue failure also failed: {sync_error}"
-                    ))
-                })?;
+                    ))));
+                }
                 for lease in leased.iter().flatten() {
                     self.recycle_output(*lease);
                 }
@@ -575,11 +601,11 @@ impl CudaQwen35ServingDispatcher {
         })();
 
         if let Err(error) = enqueue_result {
-            self.stream.synchronize().map_err(|sync_error| {
-                BackendError::ExecutionFailed(format!(
+            if let Err(sync_error) = self.stream.synchronize() {
+                return Err(self.fail_device(BackendError::ExecutionFailed(format!(
                     "{error}; CUDA flush after enqueue failure also failed: {sync_error}"
-                ))
-            })?;
+                ))));
+            }
             for lease in leased {
                 self.recycle_output(lease);
             }
@@ -616,6 +642,7 @@ impl CudaQwen35ServingDispatcher {
         let deferred = std::mem::take(&mut self.deferred_releases);
         for key in deferred {
             let still_referenced = self
+                .submissions
                 .pending
                 .values()
                 .any(|pending| pending.state_keys.contains(&key));
@@ -636,6 +663,7 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         _weights: &WeightBinding,
         state: &mut InferenceStateSet,
     ) -> Result<ExecutionOutcome, BackendError> {
+        self.check_health()?;
         self.dispatch_segment_eager(segment, state)
     }
 
@@ -646,6 +674,7 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         _weights: &WeightBinding,
         states: &mut [InferenceStateSet],
     ) -> Result<Vec<ExecutionOutcome>, BackendError> {
+        self.check_health()?;
         if batch.len() != states.len() {
             return Err(BackendError::StateCountMismatch);
         }
@@ -662,9 +691,9 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         match (outcomes, sync) {
             (Ok(values), Ok(())) => Ok(values),
             (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(sync_error)) => Err(sync_error),
-            (Err(error), Err(sync_error)) => Err(BackendError::ExecutionFailed(format!(
-                "{error}; CUDA completion synchronization also failed: {sync_error}"
+            (Ok(_), Err(sync_error)) => Err(self.fail_device(sync_error)),
+            (Err(error), Err(sync_error)) => Err(self.fail_device(BackendError::ExecutionFailed(
+                format!("{error}; CUDA completion synchronization also failed: {sync_error}"),
             ))),
         }
     }
@@ -677,10 +706,11 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         _weights: &WeightBinding,
         states: &mut [InferenceStateSet],
     ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+        self.check_health()?;
         if batch.len() != states.len() {
             return Err(BackendError::StateCountMismatch);
         }
-        if self.pending.contains_key(&submission) {
+        if self.submissions.pending.contains_key(&submission) {
             return Err(BackendError::ExecutionFailed(format!(
                 "duplicate asynchronous submission {submission:?}"
             )));
@@ -704,15 +734,17 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
                         "event recording failed: {error}; CUDA flush also failed: {sync_error}"
                     ))
                 });
+                if let Err(error) = flush {
+                    return Err(self.fail_device(error));
+                }
                 for lease in rows.outputs.iter().filter_map(|lease| *lease) {
                     self.recycle_output(lease);
                 }
-                flush?;
                 return Err(BackendError::ExecutionFailed(error.to_string()));
             }
         };
 
-        self.pending.insert(
+        self.submissions.pending.insert(
             submission,
             PendingSubmission {
                 completion,
@@ -728,14 +760,17 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         &mut self,
         submission: BackendSubmissionId,
     ) -> Result<Option<Vec<ExecutionOutcome>>, BackendError> {
+        self.check_health()?;
         let ready = {
-            let Some(pending) = self.pending.get(&submission) else {
+            let Some(pending) = self.submissions.pending.get(&submission) else {
                 return Err(BackendError::UnknownSubmission(submission));
             };
-            Self::completion_is_ready(&pending.completion)?
+            Self::completion_is_ready(&pending.completion)
         };
-        if !ready {
-            return Ok(None);
+        match ready {
+            Ok(false) => return Ok(None),
+            Err(error) => return Err(self.fail_device(error)),
+            Ok(true) => {}
         }
 
         // The completion event covers every kernel and pinned copy of this
@@ -744,24 +779,34 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
         // are recycled before outcome construction so a read failure cannot
         // strand pool slots.
         let pending = self
+            .submissions
             .pending
             .remove(&submission)
             .expect("presence was checked above");
-        for lease in pending.outputs.iter().filter_map(|lease| *lease) {
-            self.recycle_output(lease);
-        }
-
-        let mut outcomes = Vec::with_capacity(pending.outputs.len());
-        for (row_elapsed, lease) in pending.elapsed_nanos.iter().zip(pending.outputs.iter()) {
-            let outcome = ExecutionOutcome::new(ExecutionMetrics::new(*row_elapsed, 0, 0));
-            let outcome = match lease {
-                Some(lease) => {
-                    let token = self.read_pinned_output(*lease)?;
-                    outcome.with_output_token(token)
+        let result = pending
+            .elapsed_nanos
+            .iter()
+            .zip(&pending.outputs)
+            .map(|(elapsed, lease)| {
+                let outcome = ExecutionOutcome::new(ExecutionMetrics::new(*elapsed, 0, 0));
+                match lease {
+                    Some(lease) => self
+                        .read_pinned_output(*lease)
+                        .map(|token| outcome.with_output_token(token)),
+                    None => Ok(outcome),
                 }
-                None => outcome,
-            };
-            outcomes.push(outcome);
+            })
+            .collect::<Result<Vec<_>, BackendError>>();
+        // Retain the removed record too if a pinned read exposes a driver fault.
+        let outcomes = match result {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                self.submissions.quarantine(pending);
+                return Err(self.fail_device(error));
+            }
+        };
+        for lease in pending.outputs.iter().flatten() {
+            self.recycle_output(*lease);
         }
         drop(pending);
         self.drain_deferred_releases();
@@ -770,10 +815,16 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
     }
 
     fn release_inference_state(&mut self, state: &InferenceStateSet) -> Result<(), BackendError> {
+        if !self.submissions.release_is_safe() {
+            return Err(BackendError::ExecutionFailed(
+                "CUDA resource release awaits teardown of the faulted dispatcher".to_owned(),
+            ));
+        }
         // Physical release while queued device work still accesses this
         // state is deferred to the referencing submission's completion.
         let key = CudaStateKey::from_state_set(state);
         let referenced = self
+            .submissions
             .pending
             .values()
             .any(|pending| pending.state_keys.contains(&key));

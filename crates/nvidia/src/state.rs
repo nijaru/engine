@@ -1020,12 +1020,14 @@ mod tests {
         let kv = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("logical KV state");
-        let zero = InferenceStateSet::try_new(Some(kv), None).expect("state set");
+        let mut zero = InferenceStateSet::try_new(Some(kv), None).expect("state set");
         assert!(validate_fresh_materialization(&zero).is_ok());
 
-        let advanced = manager.commit(zero, 3).expect("advance logical prefix");
+        manager
+            .commit(&mut zero, 3)
+            .expect("advance logical prefix");
         assert!(matches!(
-            validate_fresh_materialization(&advanced),
+            validate_fresh_materialization(&zero),
             Err(CudaStateError::UnmaterializedPrefix { position: 3 })
         ));
     }

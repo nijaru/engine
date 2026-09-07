@@ -26,6 +26,9 @@ mod staging;
 #[cfg(feature = "cuda")]
 mod state;
 
+#[cfg(any(feature = "cuda", test))]
+mod submissions;
+
 mod qwen_reference;
 
 #[cfg(feature = "cuda")]
