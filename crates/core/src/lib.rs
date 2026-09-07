@@ -62,8 +62,8 @@ pub use scheduler::{
     ScheduledWork, SchedulerConfig, SchedulerCounts, SchedulerError, ServingScheduler,
 };
 pub use serving::{
-    ActiveRequestSlot, RequestLifecycle, RequestProgress, RequestSlotError, RequestSlotId,
-    RequestSlots,
+    ActiveRequestSlot, AdmissionError, RequestLifecycle, RequestProgress, RequestSlotError,
+    RequestSlotId, RequestSlots,
 };
 pub use serving_runtime::{GeneratedToken, ServingIteration, ServingRuntime, ServingRuntimeError};
 pub use state::{
