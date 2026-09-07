@@ -3070,6 +3070,212 @@ fn decodes_four_layers_against_the_host_reference() {
     }
 }
 
+/// Four-layer batched parity against the host reference: the same staged
+/// four-layer prefix, tokens, and state geometry as the batch-1 four-layer
+/// test, but through the batched executor with three lockstep members. The
+/// host reference is ground truth, so this isolates the batched attention
+/// path with real weights and no llama-server dependency.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end four-layer parity gate staging the real prefix"
+)]
+fn decodes_four_layers_in_batch_mode_against_the_host_reference() {
+    use engine_core::{
+        ConvolutionStateShape, DataType, KvStateSpec, RecurrentMatrixShape, RecurrentStateSpec,
+    };
+    use engine_nvidia::host_full_attn_ar_step;
+    use engine_nvidia::{
+        CudaQwen35BatchDecode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource,
+    };
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const TOKENS: [usize; 4] = [12_675, 1017, 760, 6511];
+    const LAYERS: usize = 4;
+    const MEMBERS: usize = 3;
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+
+    // Stage globals plus layers 0..LAYERS only, same as the batch-1 test.
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    let device = DeviceId::new(0);
+    for layer in 0..LAYERS {
+        let binding = provider
+            .layer_weight_binding(device, u32::try_from(layer).expect("layer fits u32"))
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+    let staged = Arc::new(
+        CudaQwen35Weights::stage(&context, &stream, 4_u64 << 30, tensors)
+            .expect("stage the four-layer prefix"),
+    );
+
+    let layer_kinds = [QwenLayerKind::Recurrent; 3]
+        .into_iter()
+        .chain([QwenLayerKind::FullAttention])
+        .collect::<Vec<_>>();
+    let kv_spec = KvStateSpec::new(1, 4, 256, 8, DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        3,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        DataType::F32,
+        DataType::F32,
+    )
+    .expect("recurrent spec");
+    let mut states = (0..MEMBERS)
+        .map(|_| {
+            let mut state = engine_nvidia::CudaHybridState::from_specs(
+                stream.clone(),
+                Some(kv_spec),
+                Some(recurrent_spec),
+            )
+            .expect("physical hybrid state");
+            state.zero().expect("zero state");
+            state
+        })
+        .collect::<Vec<_>>();
+
+    let mut executor = CudaQwen35BatchDecode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        &layer_kinds,
+        EPS,
+        MEMBERS,
+    )
+    .expect("build batched executor");
+
+    // Host reference chain, same as the batch-1 four-layer test: the
+    // host-hidden values are computed for the single stream, then the
+    // batched members must each match.
+    let embeds: Vec<Vec<f32>> = TOKENS
+        .iter()
+        .map(|token| pinned_embedding_row(&provider, *token))
+        .collect();
+    let mut host_hidden = embeds.clone();
+    let mut host_kv_keys = Vec::new();
+    let mut host_kv_values = Vec::new();
+    for layer in 0..LAYERS {
+        let attn_norm_w = pinned_tensor_f32(&provider, &format!("blk.{layer}.attn_norm.weight"));
+        let post_norm_w = pinned_tensor_f32(
+            &provider,
+            &format!("blk.{layer}.post_attention_norm.weight"),
+        );
+        let ffn_w = load_ffn_layer(&provider, layer);
+        if layer < 3 {
+            let gdn_w = load_gdn_layer(&provider, layer);
+            let mut gdn_matrix = vec![0.0_f32; GDN_V_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM];
+            let mut gdn_conv = vec![0.0_f32; GDN_QKV_DIM * (GDN_D_CONV - 1)];
+            for x in &mut host_hidden {
+                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
+                let attn_out =
+                    host_gdn_ar_step(&gdn_w, &normalized, &mut gdn_matrix, &mut gdn_conv, EPS);
+                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, EPS);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+            }
+        } else {
+            let attn_w = load_attn_layer(&provider, layer);
+            let mut keys: Vec<f32> = Vec::new();
+            let mut values: Vec<f32> = Vec::new();
+            for (position, x) in host_hidden.iter_mut().enumerate() {
+                let normalized = host_rms_norm(x, &attn_norm_w, EPS);
+                let attn_out = host_full_attn_ar_step(
+                    &attn_w,
+                    &normalized,
+                    &mut keys,
+                    &mut values,
+                    position,
+                    EPS,
+                );
+                for (x_elem, out_elem) in x.iter_mut().zip(&attn_out) {
+                    *x_elem += out_elem;
+                }
+                let post = host_rms_norm(x, &post_norm_w, EPS);
+                let ffn_out = host_ffn_step(&ffn_w, &post);
+                for (x_elem, out_elem) in x.iter_mut().zip(&ffn_out) {
+                    *x_elem += out_elem;
+                }
+            }
+            host_kv_keys = keys;
+            host_kv_values = values;
+        }
+    }
+
+    // Batched device replay: every member consumes the same token at the
+    // same position; each member's residual must match the host stream.
+    for (position, token) in TOKENS.iter().enumerate() {
+        let position = u32::try_from(position).expect("position fits u32");
+        let token = u32::try_from(*token).expect("token fits u32");
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> = states.iter_mut().collect();
+        executor
+            .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
+            .expect("batched step");
+        for state in states.iter_mut() {
+            state.advance_to(position + 1).expect("batched advance");
+        }
+        let host_x = &host_hidden[position as usize];
+        for member in 0..MEMBERS {
+            let device_hidden = executor
+                .copy_hidden_member(member)
+                .expect("device hidden after step");
+            let max_abs = device_hidden
+                .iter()
+                .zip(host_x)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs < 5.0e-3,
+                "batched member {member} residual diverged at position {position}: max abs {max_abs}"
+            );
+        }
+    }
+}
+
 /// Greedy continuation llama-server produced for the raw prompt
 /// "The capital of France is" (tokens [760, 6511, 314, 9338, 369],
 /// temperature 0, no chat template), captured from the pinned artifact via
