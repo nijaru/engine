@@ -3889,7 +3889,7 @@ fn bisects_first_diverging_layer_in_batched_step() {
         let recurrent_spec = (kind == QwenLayerKind::Recurrent).then(|| {
             RecurrentStateSpec::new(
                 1,
-                RecurrentMatrixShape::new(1, 128, 128).expect("matrix shape"),
+                RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
                 ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
                 engine_core::DataType::F32,
                 engine_core::DataType::F32,
