@@ -3881,38 +3881,25 @@ fn bisects_first_diverging_layer_in_batched_step() {
         };
         let kinds = vec![kind];
 
-        // State sized for exactly this one layer.
-        let kv_spec = engine_core::KvStateSpec::new(
-            if kind == QwenLayerKind::FullAttention {
-                1
-            } else {
-                0
-            },
-            4,
-            256,
-            512,
-            engine_core::DataType::F16,
-        )
-        .expect("KV spec");
-        let recurrent_spec = RecurrentStateSpec::new(
-            if kind == QwenLayerKind::Recurrent {
-                1
-            } else {
-                0
-            },
-            RecurrentMatrixShape::new(1, 128, 128).expect("matrix shape"),
-            ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
-            engine_core::DataType::F32,
-            engine_core::DataType::F32,
-        )
-        .expect("recurrent spec");
-        let fresh_state = || {
-            let mut state = engine_nvidia::CudaHybridState::from_specs(
-                stream.clone(),
-                Some(kv_spec),
-                Some(recurrent_spec),
+        // State sized for exactly this one layer: the absent family is None.
+        let kv_spec = (kind == QwenLayerKind::FullAttention).then(|| {
+            engine_core::KvStateSpec::new(1, 4, 256, 512, engine_core::DataType::F16)
+                .expect("KV spec")
+        });
+        let recurrent_spec = (kind == QwenLayerKind::Recurrent).then(|| {
+            RecurrentStateSpec::new(
+                1,
+                RecurrentMatrixShape::new(1, 128, 128).expect("matrix shape"),
+                ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+                engine_core::DataType::F32,
+                engine_core::DataType::F32,
             )
-            .expect("physical hybrid state");
+            .expect("recurrent spec")
+        });
+        let fresh_state = || {
+            let mut state =
+                engine_nvidia::CudaHybridState::from_specs(stream.clone(), kv_spec, recurrent_spec)
+                    .expect("physical hybrid state");
             state.zero().expect("zero state");
             state
         };
