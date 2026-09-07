@@ -7,6 +7,11 @@
 //! model-specific Qwen3.8 execution is attempted.
 
 #[cfg(feature = "cuda")]
+mod activation;
+#[cfg(feature = "cuda")]
+pub use activation::CudaQ8_1Quantizer;
+
+#[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cuda")]
 mod decode;
