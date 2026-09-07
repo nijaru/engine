@@ -4135,6 +4135,164 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
     }
 }
 
+/// Batched-vs-batch-1 hidden-state parity per step at three members: the
+/// batch-1 oracle runs the replay pattern (prefill_step for intermediate
+/// prompt tokens, decode_step from the boundary, feeding the recorded
+/// llama-server continuation) while the batched executor runs the same
+/// tokens/positions through batched steps at every position - the exact
+/// flow of the executor replay test. Hidden streams are compared after
+/// every step to find the first diverging step and element.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn finds_first_diverging_batched_step_against_batch1() {
+    use engine_nvidia::{CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+    const MEMBERS: usize = 3;
+    const STEPS: usize = 12;
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
+        .expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+
+    let fresh_state = || {
+        let mut state = engine_nvidia::CudaHybridState::from_specs(
+            stream.clone(),
+            Some(kv_spec),
+            Some(recurrent_spec),
+        )
+        .expect("physical hybrid state");
+        state.zero().expect("zero state");
+        state
+    };
+
+    // Oracle: replay pattern. Intermediate prompt tokens run prefill_step;
+    // the final prompt token and every continuation token run decode_step,
+    // feeding the recorded llama-server continuation.
+    let mut oracle = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("batch-1 executor");
+    let mut oracle_state = fresh_state();
+    let mut oracle_hidden: Vec<Vec<f32>> = Vec::with_capacity(STEPS);
+
+    let last_prompt = u32::try_from(PROMPT.len() - 1).expect("fits u32");
+    for (offset, &token) in PROMPT[..PROMPT.len() - 1].iter().enumerate() {
+        let position = u32::try_from(offset).expect("fits u32");
+        oracle
+            .prefill_step(&mut oracle_state, token, position)
+            .expect("oracle prefill");
+        oracle_state
+            .advance_to(position + 1)
+            .expect("oracle advance");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    }
+    let boundary = oracle
+        .decode_step(&mut oracle_state, PROMPT[PROMPT.len() - 1], last_prompt)
+        .expect("oracle boundary decode");
+    assert_eq!(
+        boundary, LLAMA_GREEDY_CONTINUATION[0],
+        "oracle boundary token diverged from llama-server"
+    );
+    oracle_state
+        .advance_to(last_prompt + 1)
+        .expect("oracle advance");
+    oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    for index in 1..STEPS - PROMPT.len() + 1 {
+        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
+        oracle
+            .decode_step(
+                &mut oracle_state,
+                LLAMA_GREEDY_CONTINUATION[index - 1],
+                position,
+            )
+            .expect("oracle continuation");
+        oracle_state
+            .advance_to(position + 1)
+            .expect("oracle advance");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    }
+
+    // Batched: same tokens/positions through batched steps at every
+    // position, advancing each member state like the serving dispatcher.
+    let mut batched = CudaQwen35BatchDecode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        &layer_kinds,
+        EPS,
+        MEMBERS,
+    )
+    .expect("batched executor");
+    let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
+
+    let mut tokens: Vec<u32> = PROMPT.to_vec();
+    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
+    for index in 1..STEPS - PROMPT.len() + 1 {
+        tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
+        positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
+    }
+
+    for (step, (&token, &position)) in tokens.iter().zip(positions.iter()).enumerate() {
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
+            batched_states.iter_mut().collect();
+        batched
+            .decode_step_batch(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
+            .expect("batched step");
+        for state in batched_states.iter_mut() {
+            state.advance_to(position + 1).expect("batched advance");
+        }
+        for member in 0..MEMBERS {
+            let observed = batched.copy_hidden_member(member).expect("batched hidden");
+            let reference = &oracle_hidden[step];
+            let diffs: Vec<(usize, f32, f32, f32)> = reference
+                .iter()
+                .zip(observed.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| (**a - **b).abs() > 1.0e-4)
+                .map(|(index, (a, b))| (index, *a, *b, (a - b).abs()))
+                .collect();
+            if !diffs.is_empty() {
+                eprintln!(
+                    "step {step} member {member} (token {token}, position {position}): {} of {} elements differ; first 8: {:?}",
+                    diffs.len(),
+                    reference.len(),
+                    &diffs[..diffs.len().min(8)]
+                );
+                panic!("first hidden-state divergence at step {step}");
+            }
+        }
+    }
+}
+
 /// Dispatcher-level batched serving parity: a multi-request decode batch
 /// submitted through the real `NvidiaBackend` seam must select the batched
 /// executor path and reproduce the eager per-row path's greedy tokens
