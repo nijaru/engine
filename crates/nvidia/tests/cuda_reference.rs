@@ -3849,112 +3849,263 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
-/// Bisect the first diverging layer kind of one batched step: single-layer
-/// plans (one recurrent layer, one attention layer) run the same token at
-/// position 0 through the batch-1 oracle and the batched executor over
-/// state specs sized for exactly that one layer, comparing residual
-/// streams. Divergence isolates the layer kind; parity isolates the bug to
-/// cross-layer accumulation (ordering/scheduling) instead of kernels.
+/// Direct parity of the untested batched elementwise kernels against their
+/// batch-1 counterparts: `q_gate_norm_batch`, `strided_rms_norm_batch`,
+/// `gdn_gated_norm_batch`, `gdn_scalar_gate_batch`, and `rope_neox_batch`
+/// (with per-member positions) over deterministic pseudo-random
+/// batch-major inputs. Members are derived from buffer geometry, so the
+/// batch calls exercise exactly the inference the executor relies on.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
-fn bisects_first_diverging_layer_in_batched_step() {
-    use engine_nvidia::{CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
-    use std::sync::Arc;
+fn executes_batched_elementwise_matching_batch1_kernels() {
+    use engine_nvidia::CudaQwen35Ops;
 
-    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
-    const EPS: f32 = 1.0e-6;
-    const TOKEN: u32 = 760;
-    const TOLERANCE: f32 = 1.0e-4;
+    const MEMBERS: usize = 3;
+    const EPSILON: f32 = 1.0e-6;
+    const TOLERANCE: f32 = 1.0e-5;
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
-    let staged = stage_full_text_path(&provider, &context, &stream);
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("ops");
 
-    let compare_layer = |layer: usize| -> (f32, Option<(usize, f32, f32)>) {
-        let kind = match provider
-            .layer_kind(u32::try_from(layer).expect("layer index fits u32"))
-            .expect("layer kind")
-        {
-            Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-            Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
-        };
-        let kinds = vec![kind];
-
-        // State sized for exactly this one layer: the absent family is None.
-        let kv_spec = (kind == QwenLayerKind::FullAttention).then(|| {
-            engine_core::KvStateSpec::new(1, 4, 256, 512, engine_core::DataType::F16)
-                .expect("KV spec")
-        });
-        let recurrent_spec = (kind == QwenLayerKind::Recurrent).then(|| {
-            RecurrentStateSpec::new(
-                1,
-                RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
-                ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
-                engine_core::DataType::F32,
-                engine_core::DataType::F32,
-            )
-            .expect("recurrent spec")
-        });
-        let fresh_state = || {
-            let mut state =
-                engine_nvidia::CudaHybridState::from_specs(stream.clone(), kv_spec, recurrent_spec)
-                    .expect("physical hybrid state");
-            state.zero().expect("zero state");
-            state
-        };
-
-        // Oracle over the single-layer plan.
-        let mut oracle = CudaQwen35Decode::new(
-            &context,
-            stream.clone(),
-            Arc::clone(&staged),
-            kinds.clone(),
-            EPS,
-        )
-        .expect("batch-1 single-layer executor");
-        let mut oracle_state = fresh_state();
-        oracle
-            .decode_step(&mut oracle_state, TOKEN, 0)
-            .expect("oracle single-layer step");
-        let reference = oracle.copy_hidden().expect("oracle hidden");
-
-        // Batched over the same single-layer plan.
-        let mut batched = CudaQwen35BatchDecode::new(
-            &context,
-            stream.clone(),
-            Arc::clone(&staged),
-            &kinds,
-            EPS,
-            1,
-        )
-        .expect("batched single-layer executor");
-        let mut batched_state = fresh_state();
-        batched
-            .decode_step_batch(&mut [&mut batched_state], &[TOKEN], &[0])
-            .expect("batched single-layer step");
-        let observed = batched.copy_hidden_member(0).expect("batched hidden");
-
-        let mut max_diff = 0.0_f32;
-        let mut worst = None;
-        for (index, (a, b)) in reference.iter().zip(observed.iter()).enumerate() {
-            let diff = (a - b).abs();
-            if diff > max_diff {
-                max_diff = diff;
-                worst = Some((index, *a, *b));
-            }
-        }
-        (max_diff, worst)
+    // Deterministic pseudo-random inputs: index-mixed bits avoid exact-zero
+    // or uniform rows that could hide indexing errors.
+    let mut seed = 0x12345678_u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_390_422);
+        ((seed >> 8) & 0xffff) as f32 / 32_768.0 - 1.0
     };
+    let mut row = |len: usize| (0..len).map(|_| next()).collect::<Vec<_>>();
 
-    // Compare the first recurrent layer (0) and the first attention layer
-    // (3, per the 3:1 hybrid pattern).
-    for layer in [0, 3] {
-        let (diff, worst) = compare_layer(layer);
-        eprintln!("layer {layer}: max diff {diff}, worst {worst:?}");
+    let compare = |name: &str, expected: &[f32], observed: &[f32]| {
+        let max_diff = expected
+            .iter()
+            .zip(observed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
         assert!(
-            diff <= TOLERANCE,
-            "batched single-layer {layer} diverges from the oracle: {diff}"
+            max_diff <= TOLERANCE,
+            "{name} diverged: max diff {max_diff}"
+        );
+    };
+    let upload = |values: &[f32]| stream.clone_htod(values).expect("upload");
+
+    // q_gate_norm: [q | gate] strided input, packed output.
+    {
+        const Q_HEADS: usize = 32;
+        const HEAD_DIM: usize = 128;
+        let row_len = Q_HEADS * 2 * HEAD_DIM;
+        let members: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
+        let flat: Vec<f32> = members.iter().flatten().copied().collect();
+        let weight = upload(&row(HEAD_DIM));
+
+        let mut oracle = Vec::new();
+        for member in &members {
+            let mut out = stream.alloc_zeros::<f32>(Q_HEADS * HEAD_DIM).expect("out");
+            ops.q_gate_norm(
+                &upload(member),
+                &weight,
+                &mut out,
+                Q_HEADS,
+                HEAD_DIM,
+                EPSILON,
+            )
+            .expect("oracle");
+            oracle.extend(stream.clone_dtoh(&out).expect("read"));
+        }
+        let mut batched = stream
+            .alloc_zeros::<f32>(MEMBERS * Q_HEADS * HEAD_DIM)
+            .expect("batched out");
+        ops.q_gate_norm_batch(
+            &upload(&flat),
+            &weight,
+            &mut batched,
+            Q_HEADS,
+            HEAD_DIM,
+            EPSILON,
+        )
+        .expect("batched");
+        compare(
+            "q_gate_norm_batch",
+            &oracle,
+            &stream.clone_dtoh(&batched).expect("read"),
+        );
+    }
+
+    // strided_rms_norm: [heads][head_dim] per member.
+    {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 128;
+        let row_len = HEADS * HEAD_DIM;
+        let members: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
+        let flat: Vec<f32> = members.iter().flatten().copied().collect();
+        let weight = upload(&row(HEAD_DIM));
+
+        let mut oracle = Vec::new();
+        for member in &members {
+            let mut out = stream.alloc_zeros::<f32>(row_len).expect("out");
+            ops.strided_rms_norm(&upload(member), &weight, &mut out, HEADS, HEAD_DIM, EPSILON)
+                .expect("oracle");
+            oracle.extend(stream.clone_dtoh(&out).expect("read"));
+        }
+        let mut batched = stream
+            .alloc_zeros::<f32>(MEMBERS * row_len)
+            .expect("batched out");
+        ops.strided_rms_norm_batch(
+            &upload(&flat),
+            &weight,
+            &mut batched,
+            HEADS,
+            HEAD_DIM,
+            EPSILON,
+        )
+        .expect("batched");
+        compare(
+            "strided_rms_norm_batch",
+            &oracle,
+            &stream.clone_dtoh(&batched).expect("read"),
+        );
+    }
+
+    // gdn_gated_norm: state_out + z_gate rows, shared ssm_norm.
+    {
+        const V_HEADS: usize = 48;
+        const HEAD_DIM: usize = 128;
+        let row_len = V_HEADS * HEAD_DIM;
+        let state_rows: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
+        let gate_rows: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
+        let state_flat: Vec<f32> = state_rows.iter().flatten().copied().collect();
+        let gate_flat: Vec<f32> = gate_rows.iter().flatten().copied().collect();
+        let norm = upload(&row(HEAD_DIM));
+
+        let mut oracle = Vec::new();
+        for (state, gate) in state_rows.iter().zip(gate_rows.iter()) {
+            let mut out = stream.alloc_zeros::<f32>(row_len).expect("out");
+            ops.gdn_gated_norm(
+                &upload(state),
+                &upload(gate),
+                &norm,
+                &mut out,
+                V_HEADS,
+                HEAD_DIM,
+                EPSILON,
+            )
+            .expect("oracle");
+            oracle.extend(stream.clone_dtoh(&out).expect("read"));
+        }
+        let mut batched = stream
+            .alloc_zeros::<f32>(MEMBERS * row_len)
+            .expect("batched out");
+        ops.gdn_gated_norm_batch(
+            &upload(&state_flat),
+            &upload(&gate_flat),
+            &norm,
+            &mut batched,
+            V_HEADS,
+            HEAD_DIM,
+            EPSILON,
+        )
+        .expect("batched");
+        compare(
+            "gdn_gated_norm_batch",
+            &oracle,
+            &stream.clone_dtoh(&batched).expect("read"),
+        );
+    }
+
+    // gdn_scalar_gate: per-head scalars, shared dt_bias/a.
+    {
+        const V_HEADS: usize = 48;
+        let alpha_rows: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(V_HEADS)).collect();
+        let beta_rows: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(V_HEADS)).collect();
+        let alpha_flat: Vec<f32> = alpha_rows.iter().flatten().copied().collect();
+        let beta_flat: Vec<f32> = beta_rows.iter().flatten().copied().collect();
+        let dt_bias = upload(&row(V_HEADS));
+        let a = upload(&row(V_HEADS));
+
+        let mut oracle_decay = Vec::new();
+        let mut oracle_beta = Vec::new();
+        for (alpha, beta_raw) in alpha_rows.iter().zip(beta_rows.iter()) {
+            let mut decay = stream.alloc_zeros::<f32>(V_HEADS).expect("decay");
+            let mut beta = stream.alloc_zeros::<f32>(V_HEADS).expect("beta");
+            ops.gdn_scalar_gate(
+                &upload(alpha),
+                &upload(beta_raw),
+                &dt_bias,
+                &a,
+                &mut decay,
+                &mut beta,
+            )
+            .expect("oracle");
+            oracle_decay.extend(stream.clone_dtoh(&decay).expect("read"));
+            oracle_beta.extend(stream.clone_dtoh(&beta).expect("read"));
+        }
+        let mut decay = stream
+            .alloc_zeros::<f32>(MEMBERS * V_HEADS)
+            .expect("batched decay");
+        let mut beta = stream
+            .alloc_zeros::<f32>(MEMBERS * V_HEADS)
+            .expect("batched beta");
+        ops.gdn_scalar_gate_batch(
+            &upload(&alpha_flat),
+            &upload(&beta_flat),
+            &dt_bias,
+            &a,
+            &mut decay,
+            &mut beta,
+            V_HEADS,
+        )
+        .expect("batched");
+        compare(
+            "gdn_scalar_gate_batch decay",
+            &oracle_decay,
+            &stream.clone_dtoh(&decay).expect("read"),
+        );
+        compare(
+            "gdn_scalar_gate_batch beta",
+            &oracle_beta,
+            &stream.clone_dtoh(&beta).expect("read"),
+        );
+    }
+
+    // rope_neox: per-member positions must rotate only that member's heads.
+    {
+        const Q_HEADS: usize = 32;
+        const HEAD_DIM: usize = 128;
+        const ROT_DIMS: usize = 64;
+        let row_len = Q_HEADS * HEAD_DIM;
+        let members: Vec<Vec<f32>> = (0..MEMBERS).map(|_| row(row_len)).collect();
+        let flat: Vec<f32> = members.iter().flatten().copied().collect();
+        let positions: [i64; MEMBERS] = [0, 5, 37];
+
+        let mut oracle = Vec::new();
+        for (member, &position) in members.iter().zip(positions.iter()) {
+            let mut values = upload(member);
+            ops.rope_neox(
+                &mut values,
+                u64::try_from(position).expect("position"),
+                Q_HEADS,
+                HEAD_DIM,
+                ROT_DIMS,
+                10_000.0,
+            )
+            .expect("oracle");
+            oracle.extend(stream.clone_dtoh(&values).expect("read"));
+        }
+        let mut batched = upload(&flat);
+        ops.rope_neox_batch(
+            &mut batched,
+            &stream.clone_htod(&positions).expect("positions upload"),
+            Q_HEADS,
+            HEAD_DIM,
+            ROT_DIMS,
+            10_000.0,
+        )
+        .expect("batched");
+        compare(
+            "rope_neox_batch",
+            &oracle,
+            &stream.clone_dtoh(&batched).expect("read"),
         );
     }
 }
