@@ -3228,12 +3228,31 @@ fn bisects_four_layer_batched_divergence_by_prefix() {
                 state.advance_to(position + 1).expect("batched advance");
             }
             let observed = batched.copy_hidden_member(0).expect("batched hidden");
-            let max_diff = oracle_hidden[position as usize]
+            let reference = &oracle_hidden[position as usize];
+            let diffs: Vec<(usize, f32, f32)> = reference
                 .iter()
                 .zip(observed.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f32, f32::max);
-            if max_diff > TOLERANCE {
+                .enumerate()
+                .filter(|(_, (a, b))| (**a - **b).abs() > TOLERANCE)
+                .map(|(index, (a, b))| (index, *a, *b))
+                .collect();
+            if !diffs.is_empty() {
+                let max_diff = diffs
+                    .iter()
+                    .map(|(_, a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                eprintln!(
+                    "position {position}: {}/{} differ, max {max_diff}; first 10 (index, oracle, batched): {:?}",
+                    diffs.len(),
+                    reference.len(),
+                    &diffs[..diffs.len().min(10)]
+                );
+                let stride_gaps: Vec<usize> = diffs
+                    .windows(2)
+                    .take(20)
+                    .map(|pair| pair[1].0 - pair[0].0)
+                    .collect();
+                eprintln!("index gaps between first divergents: {stride_gaps:?}");
                 return Some((position as usize, max_diff));
             }
         }
