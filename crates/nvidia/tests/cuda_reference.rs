@@ -4102,11 +4102,24 @@ fn executes_batched_elementwise_matching_batch1_kernels() {
             10_000.0,
         )
         .expect("batched");
-        compare(
-            "rope_neox_batch",
-            &oracle,
-            &stream.clone_dtoh(&batched).expect("read"),
-        );
+        let batched_host = stream.clone_dtoh(&batched).expect("read");
+        let mut printed = 0;
+        for (index, (a, b)) in oracle.iter().zip(batched_host.iter()).enumerate() {
+            if (a - b).abs() > 1.0e-5 && printed < 10 {
+                eprintln!(
+                    "rope diff at flat index {index} (member {}, within-row {}: {}): oracle {a} vs batched {b}",
+                    index / row_len,
+                    index % row_len,
+                    if (index % row_len) < ROT_DIMS {
+                        "rot dims"
+                    } else {
+                        "pass-through"
+                    }
+                );
+                printed += 1;
+            }
+        }
+        compare("rope_neox_batch", &oracle, &batched_host);
     }
 }
 
