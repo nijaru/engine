@@ -4228,7 +4228,23 @@ fn finds_first_diverging_batched_step_against_batch1() {
                 );
             }
         }
-        batched_hidden.push(batched.copy_hidden_member(0).expect("batched hidden"));
+        let member_hiddens: Vec<Vec<f32>> = (0..MEMBERS)
+            .map(|member| batched.copy_hidden_member(member).expect("batched hidden"))
+            .collect();
+        for member in 1..MEMBERS {
+            let max_diff = member_hiddens[0]
+                .iter()
+                .zip(member_hiddens[member].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            if max_diff > 1.0e-4 {
+                eprintln!(
+                    "step {step}: batched member {member} differs from member 0 by {max_diff}"
+                );
+                panic!("batched members diverge from each other at step {step}");
+            }
+        }
+        batched_hidden.push(member_hiddens[0].clone());
     }
 
     // Oracle phase second: replay pattern (prefill_step for intermediate
