@@ -4057,7 +4057,10 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
         poll_one(backend, submission)
     };
 
-    // Track the sampled token per row so decode can feed it back.
+    // Prefill every request, committing the advanced prefix position
+    // through the state manager so the following decode submits see the
+    // prompt boundary, exactly like the serving runtime's completion step.
+    let prompt_len = u32::try_from(PROMPT.len()).expect("fits u32");
     let mut eager_fed = Vec::with_capacity(ROWS);
     let mut batched_fed = Vec::with_capacity(ROWS);
     for row in 0..ROWS {
@@ -4066,17 +4069,28 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
         assert_eq!(token, LLAMA_GREEDY_CONTINUATION[0]);
         eager_fed.push(token);
     }
+    for state in &mut eager_states {
+        let committed = eager_manager
+            .commit(std::mem::replace(state, placeholder_state()), prompt_len)
+            .expect("commit eager prefill position");
+        *state = committed;
+    }
     for row in 0..ROWS {
         let request = RequestId::new(u64::try_from(row + 1).expect("fits u64")).expect("id");
         let token = prefill_one(&mut batched_backend, request, &mut batched_states[row]);
         assert_eq!(token, LLAMA_GREEDY_CONTINUATION[0]);
         batched_fed.push(token);
     }
+    for state in &mut batched_states {
+        let committed = batched_manager
+            .commit(std::mem::replace(state, placeholder_state()), prompt_len)
+            .expect("commit batched prefill position");
+        *state = committed;
+    }
 
     // Steady state: one ROWS-row decode batch per step through the batched
     // submit seam. Each row keeps its own state and feeds its own previous
     // token; positions advance one per row per step.
-    let prompt_len = u32::try_from(PROMPT.len()).expect("fits u32");
     for step in 1..COMPARE_TOKENS {
         let position = prompt_len + u32::try_from(step).expect("fits u32") - 1;
         let expected = LLAMA_GREEDY_CONTINUATION[step];

@@ -1657,26 +1657,37 @@ impl CudaQwen35BatchDecode {
                 .gdn_conv_silu_views(&qkv, conv_weight, history, &mut conv_out, GDN_QKV_DIM)?;
         }
 
-        // Q/k normalization in place on each member's conv_out row: q is the
-        // [0, K_OFFSET) channel range and k is [K_OFFSET, V_OFFSET) of the
-        // member's row, so normalize per member via views (the same math as
-        // the batch-1 l2_norm_heads).
+        // Q/k normalization, mirroring the batch-1 flow exactly: copy each
+        // member's conv_out q section [0, K_OFFSET) into gdn_q and k
+        // section [K_OFFSET, V_OFFSET) into gdn_k, then l2-normalize those
+        // buffers. conv_out itself stays untouched because the state update
+        // consumes its full row (silu-activated v channels included).
         for member in 0..m {
-            let start = member * GDN_QKV_DIM;
-            let mut conv_q = self
+            let row = member * GDN_QKV_DIM;
+            let conv_q = self
                 .scratch
                 .conv_out
-                .try_slice_mut(start..start + GDN_K_OFFSET)
+                .try_slice(row..row + GDN_K_OFFSET)
                 .ok_or_else(|| CudaDecodeError::Driver("conv q slice out of range".to_owned()))?;
-            self.ops
-                .l2_norm_heads_views(&mut conv_q, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
-            let mut conv_k = self
+            let mut gdn_q = member_row_mut(&mut self.scratch.gdn_q, member, GDN_K_OFFSET)
+                .ok_or_else(|| CudaDecodeError::Driver("gdn_q row out of range".to_owned()))?;
+            self.stream
+                .memcpy_dtod(&conv_q, &mut gdn_q)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
+            let conv_k = self
                 .scratch
                 .conv_out
-                .try_slice_mut(start + GDN_K_OFFSET..start + GDN_V_OFFSET)
+                .try_slice(row + GDN_K_OFFSET..row + GDN_V_OFFSET)
                 .ok_or_else(|| CudaDecodeError::Driver("conv k slice out of range".to_owned()))?;
+            let mut gdn_k = member_row_mut(&mut self.scratch.gdn_k, member, GDN_K_OFFSET)
+                .ok_or_else(|| CudaDecodeError::Driver("gdn_k row out of range".to_owned()))?;
+            self.stream
+                .memcpy_dtod(&conv_k, &mut gdn_k)
+                .map_err(|error| CudaDecodeError::Driver(error.to_string()))?;
             self.ops
-                .l2_norm_heads_views(&mut conv_k, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
+                .l2_norm_heads_views(&mut gdn_q, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
+            self.ops
+                .l2_norm_heads_views(&mut gdn_k, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
         }
 
         // Per-member state update with member views of decay/beta/conv_out.
