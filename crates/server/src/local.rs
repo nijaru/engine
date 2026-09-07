@@ -176,9 +176,12 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let output_tokens = generate(&mut serving, request_id, tokenizer.eos_token_id())?;
-    let text = tokenizer
-        .decode(&output_tokens)
+    let bytes = tokenizer
+        .decode_bytes(&output_tokens)
         .map_err(|error| error.to_string())?;
+    // A token budget can end in the middle of a UTF-8 code point. Preserve
+    // complete output and display a replacement character for truncated bytes.
+    let text = String::from_utf8_lossy(&bytes);
     println!("{text}");
     Ok(())
 }
