@@ -1418,6 +1418,21 @@ impl CudaQwen35BatchDecode {
             .map_err(|error| CudaDecodeError::Driver(error.to_string()))
     }
 
+    /// Copy one member's residual stream to the host. The copy is
+    /// stream-ordered and synchronized; it exists for parity debugging
+    /// against the batch-1 reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError::Driver`] when the device copy fails.
+    pub fn copy_hidden_member(&self, member: usize) -> Result<Vec<f32>, CudaDecodeError> {
+        let row = member_row(&self.scratch.hidden, member, N_EMBD)
+            .ok_or_else(|| CudaDecodeError::Driver("hidden row out of range".to_owned()))?;
+        self.stream
+            .clone_dtoh(&row)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))
+    }
+
     /// Validation plus all batched launches for one step, shared by the
     /// host-readback and submit-only variants.
     ///

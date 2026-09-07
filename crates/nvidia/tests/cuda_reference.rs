@@ -3849,6 +3849,130 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
+/// Batched-vs-batch-1 hidden-state parity per step: find the first step
+/// where the batched executor's residual stream diverges from the batch-1
+/// oracle, driving the same tokens through both executors at prefill and
+/// decode positions.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn finds_first_diverging_batched_step_against_batch1() {
+    use engine_nvidia::{CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+    const MEMBERS: usize = 3;
+    const STEPS: usize = 12;
+
+    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
+                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = engine_core::KvStateSpec::new(16, 4, 256, 512, engine_core::DataType::F16)
+        .expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        engine_core::DataType::F32,
+        engine_core::DataType::F32,
+    )
+    .expect("recurrent spec");
+
+    let fresh_state = || {
+        let mut state = engine_nvidia::CudaHybridState::from_specs(
+            stream.clone(),
+            Some(kv_spec),
+            Some(recurrent_spec),
+        )
+        .expect("physical hybrid state");
+        state.zero().expect("zero state");
+        state
+    };
+
+    let mut oracle = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("batch-1 executor");
+    let mut oracle_state = fresh_state();
+
+    let mut batched = CudaQwen35BatchDecode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        &layer_kinds,
+        EPS,
+        MEMBERS,
+    )
+    .expect("batched executor");
+    let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
+
+    // Drive the prompt, then the oracle's own greedy choices, through both
+    // executors at matching positions, comparing residual streams per step.
+    let mut token = PROMPT[0];
+    let mut first_divergence: Option<(usize, f32)> = None;
+    for step in 0..STEPS {
+        let position = u32::try_from(step).expect("fits u32");
+        if step > 0 {
+            token = if step <= PROMPT.len() {
+                PROMPT[step - 1]
+            } else {
+                token
+            };
+        }
+
+        // Batch-1 step (full pass; hidden survives the output head).
+        let choice = oracle
+            .decode_step(&mut oracle_state, token, position)
+            .expect("oracle step");
+        let reference = oracle.copy_hidden().expect("oracle hidden");
+
+        let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
+            batched_states.iter_mut().collect();
+        batched
+            .decode_step_batch_enqueue(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
+            .expect("batched step");
+
+        for member in 0..MEMBERS {
+            let observed = batched.copy_hidden_member(member).expect("batched hidden");
+            let max_diff = reference
+                .iter()
+                .zip(observed.iter())
+                .map(|(a, b)| (a - b).abs())
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            if max_diff > 1.0e-4 {
+                if first_divergence.is_none() {
+                    first_divergence = Some((step, max_diff));
+                }
+                break;
+            }
+        }
+        if first_divergence.is_some() {
+            break;
+        }
+        token = choice;
+    }
+    if let Some((step, diff)) = first_divergence {
+        panic!("first hidden-state divergence at step {step}: max diff {diff}");
+    }
+}
+
 /// Dispatcher-level batched serving parity: a multi-request decode batch
 /// submitted through the real `NvidiaBackend` seam must select the batched
 /// executor path and reproduce the eager per-row path's greedy tokens
