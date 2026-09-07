@@ -44,6 +44,7 @@ incumbents = ["vLLM", "SGLang"]
 server_build = "0.3.0-dev build 10684 commit cc83d7b48"
 matched_artifact = "Qwen3.8-27B-UD-Q4_K_M.gguf sha256 322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
 baseline_2026_09_01 = "plain AR approximately 49.5 tok/s decode; native MTP n=3 approximately 90-98 tok/s at 16K context on the pinned reference environment"
+serving_sweep_2026_09_07 = "llama-server 0.3.0-dev b81c99b47, same artifact, same 5-token prompt / 32 output tokens / greedy / concurrent admission as the engine sweep (benchmarks/incumbent-serving-bench.py): c1 45.03 tok/s (TTFT 84 ms, ITL 20.2 ms), c2 70.58, c4 114.89, c8 164.44 (TTFT 472 ms, ITL 34.7 ms) with -np 8 slot configuration; first c8 run at default n_slots=4 measured 112.98 tok/s and is slot-capped, not comparable"
 historical_dflash2 = "Aug-20-2026 reference suite on an earlier llama.cpp build: DFlash2 n=5 Q4 drafter 123/110/92 tok/s chat/code/reason, AR 49.4/49.6/49.4. Retained as historical evidence, not the current Engine performance claim."
 
 [vllm_reference]
