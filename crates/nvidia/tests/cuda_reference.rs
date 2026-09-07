@@ -3849,10 +3849,11 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
-/// Batched-vs-batch-1 hidden-state parity per step: find the first step
-/// where the batched executor's residual stream diverges from the batch-1
-/// oracle, driving the same tokens through both executors at prefill and
-/// decode positions.
+/// Batched-vs-batch-1 hidden-state parity per step: run the batch-1 oracle
+/// to completion first (recording its greedy choices and residual streams),
+/// then replay the same tokens through the batched executor, comparing
+/// residual streams per step. Separating the runs removes interleaved-launch
+/// ordering from the comparison.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn finds_first_diverging_batched_step_against_batch1() {
@@ -3911,6 +3912,29 @@ fn finds_first_diverging_batched_step_against_batch1() {
     .expect("batch-1 executor");
     let mut oracle_state = fresh_state();
 
+    // Phase one: the oracle consumes the prompt, then its own greedy
+    // choices. Record the fed tokens, the per-step hidden, and sanity-check
+    // the recorded continuation against llama-server.
+    let mut fed: Vec<u32> = PROMPT.to_vec();
+    let mut oracle_hidden: Vec<Vec<f32>> = Vec::with_capacity(STEPS);
+    for step in 0..STEPS {
+        let token = fed[step];
+        let position = u32::try_from(step).expect("fits u32");
+        let choice = oracle
+            .decode_step(&mut oracle_state, token, position)
+            .expect("oracle step");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+        if fed.len() == PROMPT.len() {
+            assert_eq!(
+                choice, LLAMA_GREEDY_CONTINUATION[0],
+                "oracle continuation diverged at the prompt boundary"
+            );
+        }
+        fed.push(choice);
+    }
+
+    // Phase two: replay the identical tokens/positions through the batched
+    // executor and compare residual streams step by step.
     let mut batched = CudaQwen35BatchDecode::new(
         &context,
         stream.clone(),
@@ -3922,34 +3946,16 @@ fn finds_first_diverging_batched_step_against_batch1() {
     .expect("batched executor");
     let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
 
-    // Drive the prompt, then the oracle's own greedy choices, through both
-    // executors at matching positions, comparing residual streams per step.
-    let mut token = PROMPT[0];
-    let mut first_divergence: Option<(usize, f32)> = None;
-    for step in 0..STEPS {
+    for (step, &token) in fed.iter().enumerate().take(STEPS) {
         let position = u32::try_from(step).expect("fits u32");
-        if step > 0 {
-            token = if step <= PROMPT.len() {
-                PROMPT[step - 1]
-            } else {
-                token
-            };
-        }
-
-        // Batch-1 step (full pass; hidden survives the output head).
-        let choice = oracle
-            .decode_step(&mut oracle_state, token, position)
-            .expect("oracle step");
-        let reference = oracle.copy_hidden().expect("oracle hidden");
-
         let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
             batched_states.iter_mut().collect();
         batched
             .decode_step_batch_enqueue(&mut member_refs, &[token; MEMBERS], &[position; MEMBERS])
             .expect("batched step");
-
         for member in 0..MEMBERS {
             let observed = batched.copy_hidden_member(member).expect("batched hidden");
+            let reference = &oracle_hidden[step];
             let diffs: Vec<(usize, f32, f32, f32)> = reference
                 .iter()
                 .zip(observed.iter())
@@ -3964,18 +3970,9 @@ fn finds_first_diverging_batched_step_against_batch1() {
                     reference.len(),
                     &diffs[..diffs.len().min(8)]
                 );
-                if first_divergence.is_none() {
-                    first_divergence = Some((step, diffs.iter().map(|d| d.3).sum::<f32>()));
-                }
+                panic!("first hidden-state divergence at step {step}");
             }
         }
-        if first_divergence.is_some() {
-            break;
-        }
-        token = choice;
-    }
-    if let Some((step, diff)) = first_divergence {
-        panic!("first hidden-state divergence at step {step}: max diff {diff}");
     }
 }
 
