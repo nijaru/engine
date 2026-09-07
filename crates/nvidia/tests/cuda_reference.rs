@@ -3849,11 +3849,12 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
     }
 }
 
-/// Batched-vs-batch-1 hidden-state parity per step: run the batch-1 oracle
-/// to completion first (recording its greedy choices and residual streams),
-/// then replay the same tokens through the batched executor, comparing
-/// residual streams per step. Separating the runs removes interleaved-launch
-/// ordering from the comparison.
+/// Batched-vs-batch-1 hidden-state parity per step: the batch-1 oracle runs
+/// the exact replay pattern (prefill_step for intermediate prompt tokens,
+/// decode_step from the boundary, feeding the recorded llama-server
+/// continuation), while the batched executor runs the same tokens/positions
+/// through batched steps at every position. Hidden streams are compared
+/// after every step to find the first divergence.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn finds_first_diverging_batched_step_against_batch1() {
@@ -3902,6 +3903,9 @@ fn finds_first_diverging_batched_step_against_batch1() {
         state
     };
 
+    // Oracle: replay pattern. Intermediate prompt tokens run prefill_step;
+    // the final prompt token and every continuation token run decode_step,
+    // feeding the recorded llama-server continuation.
     let mut oracle = CudaQwen35Decode::new(
         &context,
         stream.clone(),
@@ -3911,30 +3915,38 @@ fn finds_first_diverging_batched_step_against_batch1() {
     )
     .expect("batch-1 executor");
     let mut oracle_state = fresh_state();
-
-    // Phase one: the oracle consumes the prompt, then its own greedy
-    // choices. Record the fed tokens, the per-step hidden, and sanity-check
-    // the recorded continuation against llama-server.
-    let mut fed: Vec<u32> = PROMPT.to_vec();
     let mut oracle_hidden: Vec<Vec<f32>> = Vec::with_capacity(STEPS);
-    for step in 0..STEPS {
-        let token = fed[step];
-        let position = u32::try_from(step).expect("fits u32");
-        let choice = oracle
-            .decode_step(&mut oracle_state, token, position)
-            .expect("oracle step");
+
+    let last_prompt = u32::try_from(PROMPT.len() - 1).expect("fits u32");
+    for (offset, &token) in PROMPT[..PROMPT.len() - 1].iter().enumerate() {
+        let position = u32::try_from(offset).expect("fits u32");
+        oracle
+            .prefill_step(&mut oracle_state, token, position)
+            .expect("oracle prefill");
         oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
-        if fed.len() == PROMPT.len() {
-            assert_eq!(
-                choice, LLAMA_GREEDY_CONTINUATION[0],
-                "oracle continuation diverged at the prompt boundary"
-            );
-        }
-        fed.push(choice);
+    }
+    let boundary = oracle
+        .decode_step(&mut oracle_state, PROMPT[PROMPT.len() - 1], last_prompt)
+        .expect("oracle boundary decode");
+    assert_eq!(
+        boundary, LLAMA_GREEDY_CONTINUATION[0],
+        "oracle boundary token diverged from llama-server"
+    );
+    oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    for index in 1..STEPS - PROMPT.len() + 1 {
+        let position = u32::try_from(PROMPT.len() + index - 1).expect("fits u32");
+        oracle
+            .decode_step(
+                &mut oracle_state,
+                LLAMA_GREEDY_CONTINUATION[index - 1],
+                position,
+            )
+            .expect("oracle continuation");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
     }
 
-    // Phase two: replay the identical tokens/positions through the batched
-    // executor and compare residual streams step by step.
+    // Batched: same tokens/positions through batched steps at every
+    // position (the executor's prefill-through-decode path).
     let mut batched = CudaQwen35BatchDecode::new(
         &context,
         stream.clone(),
@@ -3946,8 +3958,14 @@ fn finds_first_diverging_batched_step_against_batch1() {
     .expect("batched executor");
     let mut batched_states = (0..MEMBERS).map(|_| fresh_state()).collect::<Vec<_>>();
 
-    for (step, &token) in fed.iter().enumerate().take(STEPS) {
-        let position = u32::try_from(step).expect("fits u32");
+    let mut tokens: Vec<u32> = PROMPT.to_vec();
+    let mut positions: Vec<u32> = (0..PROMPT.len() as u32).collect();
+    for index in 1..STEPS - PROMPT.len() + 1 {
+        tokens.push(LLAMA_GREEDY_CONTINUATION[index - 1]);
+        positions.push(u32::try_from(PROMPT.len() + index - 1).expect("fits u32"));
+    }
+
+    for (step, (&token, &position)) in tokens.iter().zip(positions.iter()).enumerate() {
         let mut member_refs: Vec<&mut engine_nvidia::CudaHybridState> =
             batched_states.iter_mut().collect();
         batched
@@ -3965,7 +3983,7 @@ fn finds_first_diverging_batched_step_against_batch1() {
                 .collect();
             if !diffs.is_empty() {
                 eprintln!(
-                    "step {step} member {member}: {} of {} elements differ; first 8: {:?}",
+                    "step {step} member {member} (token {token}, position {position}): {} of {} elements differ; first 8: {:?}",
                     diffs.len(),
                     reference.len(),
                     &diffs[..diffs.len().min(8)]
