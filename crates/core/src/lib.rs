@@ -43,7 +43,8 @@ pub use policy::{
     PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
 };
 pub use qualification::{
-    ExecutionVariant, ExecutionVariantId, ExecutionVariantIdError, QualificationStatus,
+    ExecutionVariant, ExecutionVariantId, ExecutionVariantIdError, QualificationError,
+    QualificationEvidence, QualificationScope, QualificationStatus,
 };
 pub use readiness::{ReadinessError, ReadinessState, RuntimeReadiness};
 pub use request::{
@@ -138,7 +139,8 @@ mod tests {
 
         assert!(plan.requires_kv_state());
         assert!(plan.requires_recurrent_state());
-        assert!(plan.variant().eligible_for_automatic_selection());
+        assert_eq!(plan.variant().status(), QualificationStatus::Experimental);
+        assert!(plan.variant().evidence().is_none());
         assert_eq!(
             plan.residency().default_location(),
             ResidencyLocation::Device(DeviceId::new(0))
