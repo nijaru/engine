@@ -54,8 +54,8 @@ pub use residency::{
     ModelResidencyPlan, ModelResourceId, ResidencyError, ResidencyLocation, ResidencyOverride,
 };
 pub use runtime::{
-    CompletedExecution, CompletedExecutionBatch, ExecutionRuntime, RuntimeError, RuntimeSubmission,
-    RuntimeSubmitError,
+    CompletedExecution, CompletedExecutionBatch, ExecutionRuntime, RuntimeError, RuntimeStateError,
+    RuntimeSubmission,
 };
 pub use scheduler::{
     ScheduledWork, SchedulerConfig, SchedulerCounts, SchedulerError, ServingScheduler,
@@ -342,7 +342,8 @@ mod tests {
         ));
 
         let state_set = InferenceStateSet::try_new(Some(state), None).expect("state set");
-        let committed = manager.commit(state_set, 4).expect("commit");
+        let mut committed = state_set;
+        manager.commit(&mut committed, 4).expect("commit");
         assert_eq!(committed.token_position(), Some(4));
         manager
             .release(committed.kv().expect("KV state").handle().clone())

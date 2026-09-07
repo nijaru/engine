@@ -56,7 +56,7 @@ fn only_the_final_prefill_chunk_requests_an_output_token() {
     assert_eq!(first[0].phase(), ExecutionPhase::Prefill);
     assert_eq!(first[0].token_count(), 3);
     assert!(!first[0].requests_output());
-    let first_states = scheduler
+    let mut first_states = scheduler
         .prepare_submission(&first)
         .expect("prepare first chunk");
     let first_submission = BackendSubmissionId::new(1).expect("submission ID");
@@ -64,7 +64,11 @@ fn only_the_final_prefill_chunk_requests_an_output_token() {
         .confirm_submission(first.clone(), first_submission)
         .expect("confirm first chunk");
     scheduler
-        .complete_submission(first_submission, &completion(first[0], None), first_states)
+        .complete_submission(
+            first_submission,
+            &completion(first[0], None),
+            &mut first_states,
+        )
         .expect("complete first chunk");
 
     let second = scheduler.schedule().expect("second schedule");
@@ -73,7 +77,7 @@ fn only_the_final_prefill_chunk_requests_an_output_token() {
     assert_eq!(second[0].token_count(), 2);
     assert_eq!(second[0].state_position(), 3);
     assert!(second[0].requests_output());
-    let second_states = scheduler
+    let mut second_states = scheduler
         .prepare_submission(&second)
         .expect("prepare final chunk");
     let second_submission = BackendSubmissionId::new(2).expect("submission ID");
@@ -84,7 +88,7 @@ fn only_the_final_prefill_chunk_requests_an_output_token() {
         .complete_submission(
             second_submission,
             &completion(second[0], Some(7)),
-            second_states,
+            &mut second_states,
         )
         .expect("complete final chunk");
 

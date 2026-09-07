@@ -12,7 +12,7 @@ use crate::model::ModelProvider;
 use crate::request::{RequestId, RequestSpec};
 use crate::runtime::{ExecutionRuntime, RuntimeError, RuntimeSubmission};
 use crate::scheduler::{ScheduledWork, SchedulerError, ServingScheduler};
-use crate::serving::ActiveRequestSlot;
+use crate::serving::{ActiveRequestSlot, AdmissionError};
 use crate::state::{InferenceStateSet, StateManager};
 
 pub struct ServingRuntime<P, B, S> {
@@ -102,14 +102,30 @@ where
         request: RequestSpec,
         state: InferenceStateSet,
         prompt_tokens: Arc<[u32]>,
-    ) -> Result<crate::serving::RequestSlotId, ServingRuntimeError> {
-        if prompt_tokens.is_empty() {
-            return Err(ServingRuntimeError::InvalidPrompt);
+    ) -> Result<crate::serving::RequestSlotId, AdmissionError<ServingRuntimeError>> {
+        if let Err(error) = self.runtime.state_manager().validate(&state) {
+            return Err(AdmissionError::new(
+                ServingRuntimeError::Runtime(RuntimeError::State(error)),
+                state,
+            ));
         }
-        let prompt_len =
-            u32::try_from(prompt_tokens.len()).map_err(|_| ServingRuntimeError::InvalidPrompt)?;
+        if prompt_tokens.is_empty() {
+            return Err(AdmissionError::new(
+                ServingRuntimeError::InvalidPrompt,
+                state,
+            ));
+        }
+        let Ok(prompt_len) = u32::try_from(prompt_tokens.len()) else {
+            return Err(AdmissionError::new(
+                ServingRuntimeError::InvalidPrompt,
+                state,
+            ));
+        };
         let request_id = request.id();
-        let slot = self.scheduler.admit(request, state, prompt_len)?;
+        let slot = self
+            .scheduler
+            .admit(request, state, prompt_len)
+            .map_err(|error| error.map_error(ServingRuntimeError::from))?;
         self.prompt_tokens.insert(request_id, prompt_tokens);
         Ok(slot)
     }
@@ -131,17 +147,26 @@ where
     /// # Errors
     ///
     /// Returns a scheduler error when terminal bookkeeping is inconsistent.
+    /// Release errors retain the terminal slot and its state for retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the terminal slot disappears without a scheduler mutation.
     pub fn reclaim_next(&mut self) -> Result<Option<ActiveRequestSlot>, ServingRuntimeError> {
-        let Some(mut reclaimed) = self.scheduler.reclaim_next()? else {
+        let Some(state) = self.scheduler.terminal_state()? else {
             return Ok(None);
         };
+        self.runtime
+            .release_state_set(state)
+            .map_err(ServingRuntimeError::Runtime)?;
+        let mut reclaimed = self
+            .scheduler
+            .reclaim_next()?
+            .expect("terminal slot retained during release");
         let request = reclaimed.request().id();
-        let state = reclaimed
+        reclaimed
             .take_terminal_state()
             .map_err(SchedulerError::from)?;
-        self.runtime
-            .release_state_set(&state)
-            .map_err(ServingRuntimeError::Runtime)?;
         self.prompt_tokens.remove(&request);
         self.next_tokens.remove(&request);
         Ok(Some(reclaimed))
@@ -201,8 +226,12 @@ where
                     self.submissions.insert(id, submission);
                 }
                 Ok(Some(completed)) => {
-                    let (event, states) = completed.into_parts();
-                    self.scheduler.complete_submission(id, &event, states)?;
+                    let (event, mut states) = completed.into_parts();
+                    if let Err(error) = self.scheduler.complete_submission(id, &event, &mut states)
+                    {
+                        self.scheduler.fail_submission(id, states)?;
+                        return Err(ServingRuntimeError::Scheduler(error));
+                    }
                     for completed in event.events() {
                         let request = completed.request();
                         let lifecycle = self
@@ -447,370 +476,4 @@ impl From<SchedulerError> for ServingRuntimeError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::{
-        BackendCapabilities, BackendError, BackendFeatures, BackendId, BackendKind,
-    };
-    use crate::device::DeviceId;
-    use crate::execution::{
-        ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionPhase, ExecutionStage,
-    };
-    use crate::model::{
-        ModelCapabilities, ModelDescription, ModelId, ModelRegion, ModelRegionId, ModelRegionKind,
-        WeightDescription,
-    };
-    use crate::policy::{PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference};
-    use crate::request::{RequestSemantics, SamplingParams, ThinkingMode};
-    use crate::scheduler::SchedulerConfig;
-    use crate::state::LogicalStateManager;
-    use crate::tensor::{Quantization, WeightFormat};
-    use crate::weights::WeightBinding;
-
-    struct TestProvider {
-        description: ModelDescription,
-    }
-
-    impl ModelProvider for TestProvider {
-        fn description(&self) -> &ModelDescription {
-            &self.description
-        }
-    }
-
-    struct DelayedBackend {
-        capabilities: BackendCapabilities,
-        next_submission: u64,
-        pending: HashMap<BackendSubmissionId, (u8, ExecutionBatchEvent)>,
-        submitted_inputs: Vec<Vec<ExecutionTokenInput>>,
-        fail_submit: bool,
-    }
-
-    impl DelayedBackend {
-        fn new(capabilities: BackendCapabilities, fail_submit: bool) -> Self {
-            Self {
-                capabilities,
-                next_submission: 1,
-                pending: HashMap::new(),
-                submitted_inputs: Vec::new(),
-                fail_submit,
-            }
-        }
-    }
-
-    impl ComputeBackend for DelayedBackend {
-        fn capabilities(&self) -> &BackendCapabilities {
-            &self.capabilities
-        }
-
-        fn submit(
-            &mut self,
-            plan: &ExecutionPlan,
-            batch: &ExecutionBatch,
-            states: &mut [InferenceStateSet],
-        ) -> Result<BackendSubmissionId, BackendError> {
-            self.validate_execution(plan, batch, states)?;
-            if self.fail_submit {
-                return Err(BackendError::ExecutionFailed(
-                    "test submit failure".to_owned(),
-                ));
-            }
-            let inputs = batch
-                .segments()
-                .iter()
-                .map(|segment| {
-                    segment.token_input().cloned().ok_or_else(|| {
-                        BackendError::ExecutionFailed(
-                            "test serving segment lacked token input".to_owned(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.submitted_inputs.push(inputs);
-            let id = BackendSubmissionId::new(self.next_submission)
-                .ok_or_else(|| BackendError::ExecutionFailed("submission overflow".to_owned()))?;
-            self.next_submission = self
-                .next_submission
-                .checked_add(1)
-                .ok_or_else(|| BackendError::ExecutionFailed("submission overflow".to_owned()))?;
-            let events = batch
-                .segments()
-                .iter()
-                .map(|segment| {
-                    let event = ExecutionEvent::new(
-                        segment.request(),
-                        plan.policy_version(),
-                        segment.phase(),
-                        segment.token_count(),
-                        ExecutionMetrics::new(10, 0, 0),
-                    )
-                    .expect("non-zero segment");
-                    if segment.requests_sampling() {
-                        event.with_output_token(7)
-                    } else {
-                        event
-                    }
-                })
-                .collect();
-            let event = ExecutionBatchEvent::new(events).expect("batch event");
-            self.pending.insert(id, (1, event));
-            Ok(id)
-        }
-
-        fn poll(
-            &mut self,
-            submission: BackendSubmissionId,
-        ) -> Result<Option<ExecutionBatchEvent>, BackendError> {
-            let Some((remaining, _)) = self.pending.get_mut(&submission) else {
-                return Err(BackendError::UnknownSubmission(submission));
-            };
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Ok(None);
-            }
-            let (_, event) = self
-                .pending
-                .remove(&submission)
-                .ok_or(BackendError::UnknownSubmission(submission))?;
-            Ok(Some(event))
-        }
-    }
-
-    fn fixture(
-        fail_submit: bool,
-    ) -> ServingRuntime<TestProvider, DelayedBackend, LogicalStateManager> {
-        let device = DeviceId::new(0);
-        let model = ModelId::new("test/model").expect("model ID");
-        let backend_id = BackendId::new("test-backend").expect("backend ID");
-        let version = PolicyVersion::new(1).expect("policy version");
-        let description = ModelDescription::new(
-            model.clone(),
-            "test",
-            vec![ModelRegion::new(
-                ModelRegionId::new(0),
-                ModelRegionKind::FullAttention,
-            )],
-            Vec::new(),
-            ModelCapabilities::new(None, false),
-            WeightDescription::new(WeightFormat::Gguf, Quantization::None),
-        )
-        .expect("description");
-        let plan = ExecutionPlan::new(
-            model,
-            backend_id.clone(),
-            device,
-            version,
-            vec![
-                ExecutionStage::new(ModelRegionId::new(0), ExecutionPhase::Prefill),
-                ExecutionStage::new(ModelRegionId::new(0), ExecutionPhase::Decode),
-            ],
-            Vec::new(),
-            WeightBinding::empty(ModelId::new("test/model").expect("model ID"), device),
-        )
-        .expect("plan");
-        let policy = PolicySnapshot::new(
-            version,
-            2,
-            4,
-            StateTierPreference::Automatic,
-            SpeculationPolicy::Disabled,
-        )
-        .expect("policy");
-        let scheduler = ServingScheduler::new(
-            policy,
-            SchedulerConfig::new(2, 2, 3).expect("scheduler config"),
-        );
-        let capabilities = BackendCapabilities::new(
-            backend_id,
-            device,
-            BackendKind::Cpu,
-            1024,
-            BackendFeatures::new(Vec::new(), Vec::new(), false, true),
-        );
-        let runtime = ExecutionRuntime::new(
-            TestProvider { description },
-            DelayedBackend::new(capabilities, fail_submit),
-            LogicalStateManager::new(device, 1024, 0),
-        );
-        ServingRuntime::new(scheduler, runtime, plan).expect("serving runtime")
-    }
-
-    fn request(id: u64) -> RequestSpec {
-        RequestSpec::new(
-            RequestId::new(id).expect("request ID"),
-            ModelId::new("test/model").expect("model ID"),
-            RequestSemantics::new(2, SamplingParams::greedy(Some(id)), ThinkingMode::Off)
-                .expect("semantics"),
-        )
-    }
-
-    fn state() -> InferenceStateSet {
-        InferenceStateSet::new(Vec::new()).expect("state")
-    }
-
-    fn prompt(tokens: &[u32]) -> Arc<[u32]> {
-        Arc::from(tokens)
-    }
-
-    #[test]
-    fn one_runtime_submission_owns_multiple_slots_until_completion() {
-        let mut serving = fixture(false);
-        let first = RequestId::new(1).expect("request ID");
-        let second = RequestId::new(2).expect("request ID");
-        serving
-            .admit(request(1), state(), prompt(&[11]))
-            .expect("first");
-        serving
-            .admit(request(2), state(), prompt(&[12]))
-            .expect("second");
-
-        let submission = serving
-            .submit_ready_batch()
-            .expect("submit")
-            .expect("submission");
-        assert_eq!(serving.submission_count(), 1);
-        assert_eq!(serving.scheduler().counts().in_flight(), 2);
-        for request in [first, second] {
-            let slot = serving.scheduler().slot_for_request(request).expect("slot");
-            assert!(
-                serving
-                    .scheduler()
-                    .slots()
-                    .get(slot)
-                    .expect("request")
-                    .state()
-                    .is_none()
-            );
-        }
-
-        assert_eq!(serving.poll_completions().expect("pending poll"), 0);
-        assert_eq!(serving.submission_count(), 1);
-        assert_eq!(serving.poll_completions().expect("completion poll"), 1);
-        assert_eq!(serving.submission_count(), 0);
-        assert_eq!(serving.scheduler().counts().runnable(), 2);
-        assert_eq!(serving.scheduler().counts().in_flight(), 0);
-        assert!(submission.get() > 0);
-    }
-
-    #[test]
-    fn sampled_prefill_token_becomes_the_next_decode_input() {
-        let mut serving = fixture(false);
-        serving
-            .admit(request(1), state(), prompt(&[11, 12]))
-            .expect("request");
-
-        serving.submit_ready_batch().expect("prefill submit");
-        assert_eq!(
-            serving.runtime().backend().submitted_inputs[0][0].prompt_slice(),
-            Some(&[11, 12][..])
-        );
-        assert_eq!(serving.poll_completions().expect("pending poll"), 0);
-        assert_eq!(serving.poll_completions().expect("prefill completion"), 1);
-        assert_eq!(serving.generated_token_count(), 1);
-        assert_eq!(
-            serving.pop_generated_token(),
-            Some(GeneratedToken::new(
-                RequestId::new(1).expect("request ID"),
-                7
-            ))
-        );
-        assert_eq!(serving.generated_token_count(), 0);
-
-        serving.submit_ready_batch().expect("decode submit");
-        assert_eq!(
-            serving.runtime().backend().submitted_inputs[1][0].decode_token(),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn cancelling_one_request_does_not_cancel_peer_in_same_submission() {
-        let mut serving = fixture(false);
-        let first = RequestId::new(1).expect("request ID");
-        serving
-            .admit(request(1), state(), prompt(&[11]))
-            .expect("first");
-        serving
-            .admit(request(2), state(), prompt(&[12]))
-            .expect("second");
-        serving.submit_ready_batch().expect("submit");
-        serving.cancel(first).expect("cancel");
-        serving.poll_completions().expect("pending poll");
-        serving.poll_completions().expect("completion poll");
-        assert_eq!(serving.scheduler().counts().terminal(), 1);
-        assert_eq!(serving.scheduler().counts().runnable(), 1);
-        assert_eq!(serving.generated_token_count(), 1);
-        assert_eq!(
-            serving.pop_generated_token(),
-            Some(GeneratedToken::new(
-                RequestId::new(2).expect("request ID"),
-                7
-            ))
-        );
-        assert_eq!(serving.generated_token_count(), 0);
-    }
-
-    #[test]
-    fn terminal_reclaim_releases_logical_state_capacity() {
-        let mut serving = fixture(false);
-        let device = DeviceId::new(0);
-        let spec = crate::state::KvStateSpec::new(1, 1, 2, 4, crate::tensor::DataType::F16)
-            .expect("KV spec");
-        let kv = serving
-            .runtime_mut()
-            .state_manager_mut()
-            .allocate_kv(spec, crate::state::StateLocation::Device(device))
-            .expect("KV allocation");
-        let state = InferenceStateSet::try_new(Some(kv), None).expect("state set");
-        assert!(
-            serving
-                .runtime()
-                .state_manager()
-                .used_bytes(crate::state::StateLocation::Device(device))
-                .is_some_and(|bytes| bytes > 0)
-        );
-
-        let request_id = RequestId::new(1).expect("request ID");
-        serving
-            .admit(request(1), state, prompt(&[11]))
-            .expect("admit");
-        serving.cancel(request_id).expect("cancel");
-        let reclaimed = serving
-            .reclaim_next()
-            .expect("reclaim")
-            .expect("terminal request");
-
-        assert!(reclaimed.state().is_none());
-        assert_eq!(
-            serving
-                .runtime()
-                .state_manager()
-                .used_bytes(crate::state::StateLocation::Device(device)),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn failed_backend_submit_restores_states_before_terminalizing() {
-        let mut serving = fixture(true);
-        serving
-            .admit(request(1), state(), prompt(&[11]))
-            .expect("first");
-        serving
-            .admit(request(2), state(), prompt(&[12]))
-            .expect("second");
-        assert!(matches!(
-            serving.submit_ready_batch(),
-            Err(ServingRuntimeError::Runtime(RuntimeError::Backend(_)))
-        ));
-        assert_eq!(serving.scheduler().counts().prepared(), 0);
-        assert_eq!(serving.scheduler().counts().terminal(), 2);
-        assert!(
-            serving
-                .reclaim_next()
-                .expect("reclaim")
-                .expect("terminal request")
-                .state()
-                .is_none()
-        );
-    }
-}
+mod tests;

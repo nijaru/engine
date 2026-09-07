@@ -287,6 +287,9 @@ pub trait ComputeBackend: Send {
     /// # Errors
     ///
     /// Returns a backend error when physical state cannot be released safely.
+    /// Successful release must be idempotent across retries. When device
+    /// ownership is uncertain, return an error and retain physical resources;
+    /// the runtime then retains the terminal request and logical allocations.
     fn release_inference_state(&mut self, _state: &InferenceStateSet) -> Result<(), BackendError> {
         Ok(())
     }

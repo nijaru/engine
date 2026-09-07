@@ -8,7 +8,8 @@ use crate::execution::{ExecutionBatchEvent, ExecutionPhase};
 use crate::policy::PolicySnapshot;
 use crate::request::{RequestId, RequestSpec};
 use crate::serving::{
-    ActiveRequestSlot, RequestLifecycle, RequestSlotError, RequestSlotId, RequestSlots,
+    ActiveRequestSlot, AdmissionError, RequestLifecycle, RequestSlotError, RequestSlotId,
+    RequestSlots,
 };
 use crate::state::InferenceStateSet;
 
@@ -208,26 +209,38 @@ impl ServingScheduler {
     ///
     /// Returns [`SchedulerError::Backpressure`] when resident capacity is
     /// exhausted, or a slot error when the request cannot be inserted.
+    /// Rejected admission returns ownership of the supplied state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if newly inserted slot bookkeeping violates its internal invariant.
     pub fn admit(
         &mut self,
         request: RequestSpec,
         state: InferenceStateSet,
         prompt_tokens: u32,
-    ) -> Result<RequestSlotId, SchedulerError> {
+    ) -> Result<RequestSlotId, AdmissionError<SchedulerError>> {
         if self.requests.contains_key(&request.id()) {
-            return Err(SchedulerError::DuplicateRequest(request.id()));
+            return Err(AdmissionError::new(
+                SchedulerError::DuplicateRequest(request.id()),
+                state,
+            ));
         }
         if self.slots.len() >= self.config.max_resident_requests() {
-            return Err(SchedulerError::Backpressure);
+            return Err(AdmissionError::new(SchedulerError::Backpressure, state));
         }
 
         let request_id = request.id();
-        let id = self.slots.insert(request, state, prompt_tokens)?;
+        let id = self
+            .slots
+            .insert(request, state, prompt_tokens)
+            .map_err(|error| error.map_error(SchedulerError::from))?;
         if self.active_count() < self.config.max_active_requests() {
             self.slots
                 .get_mut(id)
-                .ok_or(SchedulerError::Invariant("new request slot disappeared"))?
-                .make_runnable()?;
+                .expect("new request slot exists")
+                .make_runnable()
+                .expect("new request starts waiting with state");
             self.runnable.push_back(id);
         } else {
             self.waiting.push_back(id);
@@ -388,16 +401,16 @@ impl ServingScheduler {
         &mut self,
         submission: BackendSubmissionId,
         event: &ExecutionBatchEvent,
-        states: Vec<InferenceStateSet>,
+        states: &mut Vec<InferenceStateSet>,
     ) -> Result<(), SchedulerError> {
         let work = self
             .in_flight
             .get(&submission)
             .cloned()
             .ok_or(SchedulerError::UnknownSubmission(submission))?;
-        self.validate_completion(submission, &work, event, &states)?;
+        self.validate_completion(submission, &work, event, states)?;
 
-        for ((item, completed), state) in work.iter().zip(event.events()).zip(states) {
+        for ((item, completed), state) in work.iter().zip(event.events()).zip(states.drain(..)) {
             self.slots
                 .get_mut(item.slot())
                 .ok_or(SchedulerError::Invariant("in-flight slot disappeared"))?
@@ -567,6 +580,23 @@ impl ServingScheduler {
         Ok(())
     }
 
+    /// Borrow the next terminal state while retaining its slot until release succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error if terminal bookkeeping is inconsistent.
+    pub fn terminal_state(&self) -> Result<Option<&InferenceStateSet>, SchedulerError> {
+        self.terminal
+            .front()
+            .map(|&id| {
+                self.slots
+                    .get(id)
+                    .and_then(ActiveRequestSlot::state)
+                    .ok_or(SchedulerError::Invariant("terminal slot has no state"))
+            })
+            .transpose()
+    }
+
     /// Reclaim one terminal slot. Terminal slots remain resident until this is
     /// called so state/resource destruction can be handled explicitly.
     ///
@@ -701,6 +731,17 @@ impl ServingScheduler {
                     if actual == submission
             ) {
                 return Err(SchedulerError::SubmissionMismatch);
+            }
+            if matches!(lifecycle, RequestLifecycle::InFlight(_)) {
+                let mut progress = self
+                    .slots
+                    .get(item.slot())
+                    .expect("validated slot")
+                    .progress();
+                progress.record(completed.phase(), completed.token_count())?;
+                if completed.output_token().is_some() {
+                    progress.record_generated()?;
+                }
             }
         }
         Ok(())
@@ -935,7 +976,9 @@ mod tests {
         assert_eq!(scheduler.counts().runnable(), 1);
         assert_eq!(scheduler.counts().waiting(), 1);
         assert_eq!(
-            scheduler.admit(request(3, 2), state(), 0),
+            scheduler
+                .admit(request(3, 2), state(), 0)
+                .map_err(|error| error.into_parts().0),
             Err(SchedulerError::Backpressure)
         );
 
@@ -989,7 +1032,7 @@ mod tests {
         assert_eq!(scheduler.counts().in_flight(), 2);
 
         scheduler
-            .complete_submission(submission, &batch_event(&work), vec![state(), state()])
+            .complete_submission(submission, &batch_event(&work), &mut vec![state(), state()])
             .expect("complete");
         assert_eq!(scheduler.counts().in_flight(), 0);
         assert_eq!(scheduler.counts().runnable(), 2);
@@ -1011,7 +1054,7 @@ mod tests {
         scheduler.cancel(first_id).expect("cancel first");
 
         scheduler
-            .complete_submission(submission, &batch_event(&work), vec![state(), state()])
+            .complete_submission(submission, &batch_event(&work), &mut vec![state(), state()])
             .expect("complete");
         assert_eq!(scheduler.counts().terminal(), 1);
         assert_eq!(scheduler.counts().runnable(), 1);
@@ -1058,7 +1101,7 @@ mod tests {
             .confirm_submission(prefill.clone(), submission)
             .expect("confirm");
         scheduler
-            .complete_submission(submission, &batch_event(&prefill), vec![state()])
+            .complete_submission(submission, &batch_event(&prefill), &mut vec![state()])
             .expect("complete prefill");
 
         let slot_id = scheduler.slot_for_request(request_id).expect("slot");
@@ -1097,7 +1140,7 @@ mod tests {
         ])
         .expect("batch event");
         assert_eq!(
-            scheduler.complete_submission(submission, &wrong, vec![state()]),
+            scheduler.complete_submission(submission, &wrong, &mut vec![state()]),
             Err(SchedulerError::CompletionMismatch)
         );
         assert_eq!(scheduler.counts().in_flight(), 1);

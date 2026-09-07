@@ -38,6 +38,8 @@ pub trait NvidiaDispatcher: Send {
     /// # Errors
     ///
     /// Returns a backend error when the dispatcher cannot release the state.
+    /// Release must be idempotent after success: logical release can fail and
+    /// cause a later retry. An error must retain resources still needed by work.
     fn release_inference_state(&mut self, _state: &InferenceStateSet) -> Result<(), BackendError> {
         Ok(())
     }
@@ -87,7 +89,9 @@ pub trait NvidiaDispatcher: Send {
     /// Returns a backend error when the batch cannot be accepted. Returning an
     /// error means the dispatcher did not retain asynchronous ownership: no
     /// queued work may still access the supplied request state or transient
-    /// submission resources after this method returns.
+    /// submission resources after this method returns, unless a device fault
+    /// forced explicit quarantine. Quarantined ownership must prevent physical
+    /// release and report an error through `release_inference_state`.
     fn submit_batch(
         &mut self,
         _submission: BackendSubmissionId,
@@ -108,9 +112,11 @@ pub trait NvidiaDispatcher: Send {
     /// # Errors
     ///
     /// Returns a backend error for terminal completion failure. An error is a
-    /// terminal result for this submission: before returning it, the dispatcher
-    /// must have relinquished all asynchronous access to request state and
-    /// submission-local resources so the runtime may safely reclaim them.
+    /// terminal result for this submission, which the runtime will not poll
+    /// again. The dispatcher must either end asynchronous access or retain
+    /// uncertain device-owned resources in an explicit quarantine. While
+    /// ownership is uncertain, `release_inference_state` must return an error
+    /// so the runtime retains the logical owner for retry or teardown.
     fn poll_batch(
         &mut self,
         _submission: BackendSubmissionId,

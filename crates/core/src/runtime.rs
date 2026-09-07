@@ -53,12 +53,12 @@ impl RuntimeSubmission {
 }
 
 #[derive(Debug)]
-pub struct RuntimeSubmitError {
+pub struct RuntimeStateError {
     error: RuntimeError,
     states: Vec<InferenceStateSet>,
 }
 
-impl RuntimeSubmitError {
+impl RuntimeStateError {
     fn new(error: RuntimeError, states: Vec<InferenceStateSet>) -> Self {
         Self { error, states }
     }
@@ -77,20 +77,15 @@ impl RuntimeSubmitError {
     pub fn into_parts(self) -> (RuntimeError, Vec<InferenceStateSet>) {
         (self.error, self.states)
     }
-
-    #[must_use]
-    pub fn into_error(self) -> RuntimeError {
-        self.error
-    }
 }
 
-impl fmt::Display for RuntimeSubmitError {
+impl fmt::Display for RuntimeStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "runtime submission failed: {}", self.error)
+        write!(f, "runtime execution failed: {}", self.error)
     }
 }
 
-impl std::error::Error for RuntimeSubmitError {
+impl std::error::Error for RuntimeStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
@@ -197,9 +192,7 @@ where
         self.backend
             .release_inference_state(state)
             .map_err(RuntimeError::Backend)?;
-        for value in state.states() {
-            self.state_manager.release(value.handle().clone())?;
-        }
+        self.state_manager.release_set(state)?;
         Ok(())
     }
 
@@ -208,28 +201,34 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeSubmitError`] with the uncommitted states when the
+    /// Returns [`RuntimeStateError`] with the uncommitted states when the
     /// backend never takes submission ownership.
     pub fn submit_batch(
         &mut self,
         plan: &ExecutionPlan,
         batch: &ExecutionBatch,
         mut states: Vec<InferenceStateSet>,
-    ) -> Result<RuntimeSubmission, RuntimeSubmitError> {
+    ) -> Result<RuntimeSubmission, RuntimeStateError> {
         if let Err(error) = self.provider.validate_plan(plan) {
-            return Err(RuntimeSubmitError::new(RuntimeError::Model(error), states));
+            return Err(RuntimeStateError::new(RuntimeError::Model(error), states));
         }
         if batch.len() != states.len() {
-            return Err(RuntimeSubmitError::new(
+            return Err(RuntimeStateError::new(
                 RuntimeError::StateCountMismatch,
                 states,
             ));
         }
 
+        for state in &states {
+            if let Err(error) = self.state_manager.validate(state) {
+                return Err(RuntimeStateError::new(RuntimeError::State(error), states));
+            }
+        }
+
         let mut next_positions = Vec::with_capacity(batch.len());
         for segment in batch.segments() {
             let Some(position) = segment.state_position().checked_add(segment.token_count()) else {
-                return Err(RuntimeSubmitError::new(
+                return Err(RuntimeStateError::new(
                     RuntimeError::PositionOverflow,
                     states,
                 ));
@@ -240,10 +239,7 @@ where
         let backend_submission = match self.backend.submit(plan, batch, &mut states) {
             Ok(submission) => submission,
             Err(error) => {
-                return Err(RuntimeSubmitError::new(
-                    RuntimeError::Backend(error),
-                    states,
-                ));
+                return Err(RuntimeStateError::new(RuntimeError::Backend(error), states));
             }
         };
         Ok(RuntimeSubmission {
@@ -257,19 +253,19 @@ where
 
     /// # Errors
     ///
-    /// Returns [`RuntimeSubmitError`] from batch construction or submission,
+    /// Returns [`RuntimeStateError`] from batch construction or submission,
     /// preserving the supplied state.
     pub fn submit_segment(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: InferenceStateSet,
-    ) -> Result<RuntimeSubmission, RuntimeSubmitError> {
+    ) -> Result<RuntimeSubmission, RuntimeStateError> {
         let states = vec![state];
         let batch = match ExecutionBatch::new(vec![segment.clone()]) {
             Ok(batch) => batch,
             Err(error) => {
-                return Err(RuntimeSubmitError::new(RuntimeError::Plan(error), states));
+                return Err(RuntimeStateError::new(RuntimeError::Plan(error), states));
             }
         };
         self.submit_batch(plan, &batch, states)
@@ -294,13 +290,14 @@ where
         Self::validate_completion(submission, &event)?;
         let states = submission
             .states
+            .as_mut()
+            .ok_or(RuntimeError::SubmissionConsumed)?;
+        self.state_manager
+            .commit_batch(states, &submission.next_positions)?;
+        let committed = submission
+            .states
             .take()
             .ok_or(RuntimeError::SubmissionConsumed)?;
-        let committed = states
-            .into_iter()
-            .zip(submission.next_positions.iter().copied())
-            .map(|(state, position)| self.state_manager.commit(state, position))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(CompletedExecutionBatch {
             event,
             states: committed,
@@ -313,50 +310,69 @@ where
     pub fn wait_submission(
         &mut self,
         mut submission: RuntimeSubmission,
-    ) -> Result<CompletedExecutionBatch, RuntimeError> {
+    ) -> Result<CompletedExecutionBatch, RuntimeStateError> {
         loop {
-            if let Some(completed) = self.poll_submission(&mut submission)? {
-                return Ok(completed);
+            match self.poll_submission(&mut submission) {
+                Ok(Some(completed)) => return Ok(completed),
+                Ok(None) => std::thread::yield_now(),
+                Err(error) => {
+                    return Err(RuntimeStateError::new(
+                        error,
+                        submission.states.take().unwrap_or_default(),
+                    ));
+                }
             }
-            std::thread::yield_now();
         }
     }
 
+    /// Execute a batch while retaining allocation ownership on every failure.
+    ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] from submission, completion, or state commit.
+    /// Returns the runtime error and states for terminal cleanup.
     pub fn execute_batch(
         &mut self,
         plan: &ExecutionPlan,
         batch: &ExecutionBatch,
         states: Vec<InferenceStateSet>,
-    ) -> Result<CompletedExecutionBatch, RuntimeError> {
-        let submission = self
-            .submit_batch(plan, batch, states)
-            .map_err(RuntimeSubmitError::into_error)?;
+    ) -> Result<CompletedExecutionBatch, RuntimeStateError> {
+        let submission = self.submit_batch(plan, batch, states)?;
         self.wait_submission(submission)
     }
 
+    /// Execute one segment while retaining allocation ownership on failure.
+    ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError`] from submission, completion, or state commit.
+    /// Returns the runtime error and states for terminal cleanup.
     pub fn execute_segment(
         &mut self,
         plan: &ExecutionPlan,
         segment: &ExecutionSegment,
         state: InferenceStateSet,
-    ) -> Result<CompletedExecution, RuntimeError> {
-        let submission = self
-            .submit_segment(plan, segment, state)
-            .map_err(RuntimeSubmitError::into_error)?;
+    ) -> Result<CompletedExecution, RuntimeStateError> {
+        let submission = self.submit_segment(plan, segment, state)?;
         let completed = self.wait_submission(submission)?;
         let (batch_event, mut states) = completed.into_parts();
         let mut events = batch_event.events().iter().copied();
-        let event = events.next().ok_or(RuntimeError::CompletionMismatch)?;
+        let Some(event) = events.next() else {
+            return Err(RuntimeStateError::new(
+                RuntimeError::CompletionMismatch,
+                states,
+            ));
+        };
         if events.next().is_some() || states.len() != 1 {
-            return Err(RuntimeError::CompletionMismatch);
+            return Err(RuntimeStateError::new(
+                RuntimeError::CompletionMismatch,
+                states,
+            ));
         }
-        let state = states.pop().ok_or(RuntimeError::CompletionMismatch)?;
+        let Some(state) = states.pop() else {
+            return Err(RuntimeStateError::new(
+                RuntimeError::CompletionMismatch,
+                states,
+            ));
+        };
         Ok(CompletedExecution { event, state })
     }
 
@@ -372,6 +388,7 @@ where
                 || segment.phase() != completed.phase()
                 || segment.token_count() != completed.token_count()
                 || completed.policy_version() != submission.policy_version
+                || completed.output_token().is_some() != segment.requests_sampling()
             {
                 return Err(RuntimeError::CompletionMismatch);
             }

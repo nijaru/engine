@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::device::DeviceId;
 use crate::tensor::DataType;
@@ -312,7 +315,7 @@ impl StateHandle {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct KvState {
     handle: StateHandle,
     spec: KvStateSpec,
@@ -340,7 +343,7 @@ impl KvState {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct RecurrentState {
     handle: StateHandle,
     spec: RecurrentStateSpec,
@@ -367,7 +370,7 @@ impl RecurrentState {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub enum InferenceState {
     Kv(KvState),
     Recurrent(RecurrentState),
@@ -387,20 +390,10 @@ impl InferenceState {
         self.handle().requirement()
     }
 
-    fn with_position(&self, token_position: u32) -> Result<Self, StateError> {
-        let handle = StateHandle::new(
-            self.handle().id(),
-            self.handle().requirement(),
-            self.handle().location(),
-            token_position,
-        );
+    fn set_position(&mut self, token_position: u32) {
         match self {
-            Self::Kv(state) => KvState::new(handle, state.spec())
-                .map(Self::Kv)
-                .ok_or(StateError::InvalidHandle),
-            Self::Recurrent(state) => RecurrentState::new(handle, state.spec())
-                .map(Self::Recurrent)
-                .ok_or(StateError::InvalidHandle),
+            Self::Kv(state) => state.handle.token_position = token_position,
+            Self::Recurrent(state) => state.handle.token_position = token_position,
         }
     }
 }
@@ -419,7 +412,15 @@ impl From<RecurrentState> for InferenceState {
 
 /// Typed state at one semantic prefix boundary. New state families extend
 /// [`InferenceState`] rather than changing scheduler/backend signatures.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// The set is an owned allocation lease; inspecting it cannot create another
+/// request owner for the same allocations.
+///
+/// ```compile_fail
+/// use engine_core::state::InferenceStateSet;
+/// let state = InferenceStateSet::new(Vec::new()).unwrap();
+/// let duplicate = state.clone();
+/// ```
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct InferenceStateSet {
     states: Vec<InferenceState>,
 }
@@ -576,7 +577,6 @@ pub struct LogicalStateManager {
     host_capacity_bytes: u64,
     device_used_bytes: u64,
     host_used_bytes: u64,
-    next_id: u64,
     allocations: HashMap<StateId, AllocationRecord>,
 }
 
@@ -597,7 +597,6 @@ impl LogicalStateManager {
             host_capacity_bytes,
             device_used_bytes: 0,
             host_used_bytes: 0,
-            next_id: 1,
             allocations: HashMap::new(),
         }
     }
@@ -648,11 +647,12 @@ impl LogicalStateManager {
             });
         }
 
-        let id = StateId::new(self.next_id).ok_or(StateError::InvalidHandle)?;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(StateError::InvalidHandle)?;
+        // Allocation identities also key backend-owned physical state, so they
+        // must not alias across independent managers in the same process.
+        let raw_id = NEXT_STATE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| StateError::InvalidHandle)?;
+        let id = StateId::new(raw_id).ok_or(StateError::InvalidHandle)?;
 
         if matches!(location, StateLocation::Device(_)) {
             self.device_used_bytes += bytes;
@@ -684,30 +684,16 @@ impl LogicalStateManager {
         }
         Ok(*record)
     }
-
-    fn update_position(
-        &mut self,
-        state: &InferenceStateSet,
-        token_position: u32,
-    ) -> Result<(), StateError> {
-        for value in state.states() {
-            let record = self.record_for(value.handle())?;
-            if token_position < record.token_position {
-                return Err(StateError::PositionRegression);
-            }
-        }
-        for value in state.states() {
-            let record = self
-                .allocations
-                .get_mut(&value.handle().id())
-                .ok_or(StateError::InvalidHandle)?;
-            record.token_position = token_position;
-        }
-        Ok(())
-    }
 }
 
 impl StateManager for LogicalStateManager {
+    fn validate(&self, state: &InferenceStateSet) -> Result<(), StateError> {
+        for value in state.states() {
+            self.record_for(value.handle())?;
+        }
+        Ok(())
+    }
+
     fn allocate_kv(
         &mut self,
         spec: KvStateSpec,
@@ -726,18 +712,43 @@ impl StateManager for LogicalStateManager {
         RecurrentState::new(handle, spec).ok_or(StateError::UnsupportedRequirement)
     }
 
-    fn commit(
+    fn commit_batch(
         &mut self,
-        state: InferenceStateSet,
-        token_position: u32,
-    ) -> Result<InferenceStateSet, StateError> {
-        self.update_position(&state, token_position)?;
-        let states = state
-            .states()
-            .iter()
-            .map(|value| value.with_position(token_position))
-            .collect::<Result<Vec<_>, _>>()?;
-        InferenceStateSet::new(states)
+        states: &mut [InferenceStateSet],
+        token_positions: &[u32],
+    ) -> Result<(), StateError> {
+        if states.len() != token_positions.len() {
+            return Err(StateError::PositionMismatch);
+        }
+        for (state, &position) in states.iter().zip(token_positions) {
+            for value in state.states() {
+                let record = self.record_for(value.handle())?;
+                if position < record.token_position {
+                    return Err(StateError::PositionRegression);
+                }
+            }
+        }
+        for (state, &position) in states.iter_mut().zip(token_positions) {
+            for value in &mut state.states {
+                self.allocations
+                    .get_mut(&value.handle().id())
+                    .expect("all allocation handles were validated")
+                    .token_position = position;
+                value.set_position(position);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_set(&mut self, state: &InferenceStateSet) -> Result<(), StateError> {
+        for value in state.states() {
+            self.record_for(value.handle())?;
+        }
+        for value in state.states() {
+            self.release(value.handle().clone())
+                .expect("all allocation handles were validated");
+        }
+        Ok(())
     }
 
     fn release(&mut self, handle: StateHandle) -> Result<(), StateError> {
@@ -753,6 +764,13 @@ impl StateManager for LogicalStateManager {
 }
 
 pub trait StateManager: Send {
+    /// Validate allocation provenance and the current logical prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale, released, or foreign allocation handles.
+    fn validate(&self, state: &InferenceStateSet) -> Result<(), StateError>;
+
     /// # Errors
     ///
     /// Returns [`StateError`] when storage cannot satisfy the KV allocation.
@@ -771,17 +789,101 @@ pub trait StateManager: Send {
         location: StateLocation,
     ) -> Result<RecurrentState, StateError>;
 
+    /// Commit a batch atomically. On error, both manager records and all
+    /// supplied state positions must remain unchanged.
+    ///
     /// # Errors
     ///
-    /// Returns [`StateError`] when the state transition cannot be committed.
+    /// Returns an error for invalid handles, positions, or mismatched lengths.
+    fn commit_batch(
+        &mut self,
+        states: &mut [InferenceStateSet],
+        token_positions: &[u32],
+    ) -> Result<(), StateError>;
+
+    /// Advance one state set without relinquishing ownership on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transition cannot be committed.
     fn commit(
         &mut self,
-        state: InferenceStateSet,
+        state: &mut InferenceStateSet,
         token_position: u32,
-    ) -> Result<InferenceStateSet, StateError>;
+    ) -> Result<(), StateError> {
+        self.commit_batch(std::slice::from_mut(state), &[token_position])
+    }
+
+    /// Release every allocation in a set atomically. On error, retain all
+    /// allocations so the caller can retry with the same state owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an allocation cannot be released.
+    fn release_set(&mut self, state: &InferenceStateSet) -> Result<(), StateError>;
 
     /// # Errors
     ///
     /// Returns [`StateError::InvalidHandle`] when the handle is unknown or was released.
     fn release(&mut self, handle: StateHandle) -> Result<(), StateError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocate(manager: &mut LogicalStateManager) -> InferenceStateSet {
+        let spec = KvStateSpec::new(1, 1, 2, 4, DataType::F16).expect("spec");
+        let kv = manager
+            .allocate_kv(spec, StateLocation::Device(DeviceId::new(0)))
+            .expect("allocation");
+        InferenceStateSet::try_new(Some(kv), None).expect("set")
+    }
+
+    #[test]
+    fn independent_managers_reject_each_others_allocations() {
+        let mut first = LogicalStateManager::new(DeviceId::new(0), 1024, 0);
+        let mut second = LogicalStateManager::new(DeviceId::new(0), 1024, 0);
+        let mut first_state = allocate(&mut first);
+        let second_state = allocate(&mut second);
+        assert_ne!(
+            first_state.states()[0].handle().id(),
+            second_state.states()[0].handle().id()
+        );
+        assert_eq!(
+            second.commit(&mut first_state, 1),
+            Err(StateError::InvalidHandle)
+        );
+        assert_eq!(
+            second.release_set(&first_state),
+            Err(StateError::InvalidHandle)
+        );
+        second
+            .validate(&second_state)
+            .expect("own allocation remains valid");
+        first
+            .validate(&first_state)
+            .expect("foreign rejection leaves owner valid");
+    }
+
+    #[test]
+    fn batch_commit_prevalidates_all_states_before_advancing_any() {
+        let mut manager = LogicalStateManager::new(DeviceId::new(0), 1024, 0);
+        let first = allocate(&mut manager);
+        let mut second = allocate(&mut manager);
+        manager.commit(&mut second, 3).expect("advance second");
+        let mut states = vec![first, second];
+        assert_eq!(
+            manager.commit_batch(&mut states, &[1, 2]),
+            Err(StateError::PositionRegression)
+        );
+        assert_eq!(states[0].token_position(), Some(0));
+        assert_eq!(states[1].token_position(), Some(3));
+        for state in &states {
+            manager.validate(state).expect("unchanged record");
+        }
+        manager.commit_batch(&mut states, &[1, 4]).expect("retry");
+        assert_eq!(states[0].token_position(), Some(1));
+        assert_eq!(states[1].token_position(), Some(4));
+    }
 }

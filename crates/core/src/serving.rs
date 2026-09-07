@@ -138,7 +138,7 @@ impl RequestProgress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ActiveRequestSlot {
     id: RequestSlotId,
     request: RequestSpec,
@@ -406,17 +406,36 @@ impl RequestSlots {
         request: RequestSpec,
         state: InferenceStateSet,
         prompt_tokens: u32,
-    ) -> Result<RequestSlotId, RequestSlotError> {
+    ) -> Result<RequestSlotId, AdmissionError<RequestSlotError>> {
+        let id = match self.reserve_slot(request.id()) {
+            Ok(id) => id,
+            Err(error) => return Err(AdmissionError::new(error, state)),
+        };
+        self.slots[id.index as usize].value = Some(ActiveRequestSlot {
+            id,
+            request,
+            state: Some(state),
+            lifecycle: RequestLifecycle::Waiting,
+            progress: RequestProgress::new(prompt_tokens),
+        });
+        Ok(id)
+    }
+
+    fn reserve_slot(&mut self, request: RequestId) -> Result<RequestSlotId, RequestSlotError> {
         if self
             .slots
             .iter()
             .filter_map(|slot| slot.value.as_ref())
-            .any(|slot| slot.request().id() == request.id())
+            .any(|slot| slot.request().id() == request)
         {
-            return Err(RequestSlotError::DuplicateRequest(request.id()));
+            return Err(RequestSlotError::DuplicateRequest(request));
         }
 
-        let index = if let Some(index) = self.free.pop() {
+        let index = if let Some(&index) = self.free.last() {
+            if self.slots[index as usize].generation == u32::MAX {
+                return Err(RequestSlotError::SlotOverflow);
+            }
+            self.free.pop();
             index
         } else {
             let index =
@@ -439,13 +458,6 @@ impl RequestSlots {
             index,
             generation: cell.generation,
         };
-        cell.value = Some(ActiveRequestSlot {
-            id,
-            request,
-            state: Some(state),
-            lifecycle: RequestLifecycle::Waiting,
-            progress: RequestProgress::new(prompt_tokens),
-        });
         Ok(id)
     }
 
@@ -554,3 +566,37 @@ mod tests {
         assert_eq!(progress.generated_tokens(), 2);
     }
 }
+
+/// Rejected admission retains the state allocation owner for retry or release.
+#[derive(Debug)]
+pub struct AdmissionError<E> {
+    error: E,
+    state: InferenceStateSet,
+}
+
+impl<E> AdmissionError<E> {
+    pub(crate) const fn new(error: E, state: InferenceStateSet) -> Self {
+        Self { error, state }
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> &E {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (E, InferenceStateSet) {
+        (self.error, self.state)
+    }
+
+    pub(crate) fn map_error<F>(self, map: impl FnOnce(E) -> F) -> AdmissionError<F> {
+        AdmissionError::new(map(self.error), self.state)
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for AdmissionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for AdmissionError<E> {}
