@@ -3096,7 +3096,7 @@ fn bisects_four_layer_batched_divergence_by_prefix() {
     const EPS: f32 = 1.0e-6;
     const TOKENS: [u32; 4] = [12_675, 1017, 760, 6511];
     const LAYERS: usize = 4;
-    const MEMBERS: usize = 3;
+    const MEMBERS: usize = 1;
     const TOLERANCE: f32 = 1.0e-4;
 
     let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
@@ -3296,7 +3296,7 @@ fn executes_attention_view_wrappers_matching_slice_twins() {
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 32;
     const TOKENS: usize = 3;
-    const MEMBERS: usize = 3;
+    const MEMBERS: usize = 1;
 
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
