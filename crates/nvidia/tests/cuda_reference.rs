@@ -4743,6 +4743,9 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
         chosen = executor
             .decode_step_batch(&mut member_refs, &tokens, &positions)
             .expect("batched prefill step");
+        for state in states.iter_mut() {
+            state.advance_to(position + 1).expect("advance prefill");
+        }
     }
     for (member, &token) in chosen.iter().enumerate() {
         assert_eq!(
@@ -4761,6 +4764,11 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
         chosen = executor
             .decode_step_batch(&mut member_refs, &tokens, &positions)
             .expect("batched continuation step");
+        for state in states.iter_mut() {
+            state
+                .advance_to(position + 1)
+                .expect("advance continuation");
+        }
         for (member, &token) in chosen.iter().enumerate() {
             assert_eq!(
                 token, LLAMA_GREEDY_CONTINUATION[index],
