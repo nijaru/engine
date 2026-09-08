@@ -1608,7 +1608,16 @@ impl CudaQwen35BatchDecode {
         let plan = validate_model_plan(context, &weights, layer_kinds, epsilon)?;
         let ops = Arc::new(CudaQwen35Ops::from_context(context, stream.clone())?);
         let embedding = Arc::new(CudaQ4KEmbedding::from_context(context, stream.clone())?);
-        Self::prepare(stream, weights, epsilon, members, plan, ops, embedding)
+        Self::prepare(
+            stream,
+            weights,
+            epsilon,
+            members,
+            plan,
+            ops,
+            embedding,
+            GemvMode::default(),
+        )
     }
 
     /// Prepare a lane on the single executor's stream, reusing its validated
