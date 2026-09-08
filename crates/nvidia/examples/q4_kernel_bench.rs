@@ -20,6 +20,7 @@ use engine_nvidia::{CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ8_1Quantizer, CudaWeightS
 const SHAPES: [(usize, usize); 3] = [(5120, 5120), (5120, 17_408), (17_408, 5120)];
 const WARMUP: usize = 10;
 
+#[allow(clippy::too_many_lines, reason = "one linear bench script")]
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let iters: usize = args
