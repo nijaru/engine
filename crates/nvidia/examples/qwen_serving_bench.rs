@@ -32,6 +32,18 @@ use engine_nvidia::{
 };
 
 const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+/// Diverse fixed prompts for the `--divergence-probe` quality gate. Each
+/// exercises different token distributions and attention/GDN mixing so the
+/// greedy argmax sees varied logit-gap profiles; one is deliberately
+/// near-tie-prone (repeated structure) to expose divergence worst cases.
+const PROBE_PROMPTS: [&[u32]; 6] = [
+    &[760, 6511, 314, 9338, 369],
+    &[15496, 11, 1938, 389, 1015, 264, 7566, 286, 3303, 13],
+    &[9311, 29892, 3300, 264, 2361, 29892, 1660, 470, 389, 304, 13],
+    &[3210, 1490, 46749, 29468, 3925, 284, 1660, 470, 304, 286, 13],
+    &[290, 428, 1838, 373, 2584, 264, 6144, 286, 3303, 30, 30],
+    &[3730, 3730, 3730, 3730, 11, 373, 25, 3303, 13],
+];
 const DEFAULT_CONCURRENCY: usize = 4;
 const DEFAULT_OUTPUT_TOKENS: u32 = 32;
 const PREFILL_CHUNK_TOKENS: u32 = 16;
@@ -176,8 +188,14 @@ fn run() -> Result<(), String> {
     let runtime = ExecutionRuntime::new(provider, backend, state_manager);
     let mut serving =
         ServingRuntime::new(scheduler, runtime, plan).map_err(|error| error.to_string())?;
-    let prompt: Arc<[u32]> = Arc::from(PROMPT);
     for (index, state) in states.into_iter().enumerate() {
+        let prompt: Arc<[u32]> = if divergence_probe {
+            // Prompts differ per request slot; each request still seeds the
+            // same token sequence in both modes because sampling is greedy.
+            Arc::from(PROBE_PROMPTS[index % PROBE_PROMPTS.len()])
+        } else {
+            Arc::from(PROMPT)
+        };
         let request_id = request_id(index)?;
         let semantics = RequestSemantics::new(
             output_tokens,
@@ -189,7 +207,7 @@ fn run() -> Result<(), String> {
             .admit(
                 RequestSpec::new(request_id, model.clone(), semantics),
                 state,
-                prompt.clone(),
+                prompt,
             )
             .map_err(|error| error.to_string())?;
     }

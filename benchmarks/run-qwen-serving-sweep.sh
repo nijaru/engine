@@ -22,10 +22,10 @@ fi
 tokens="${TOKENS:-32}"
 concurrencies="${CONCURRENCIES:-1 2 4 8}"
 gemv="${GEMV:-scalar}"
-if [[ "$gemv" != "scalar" && "$gemv" != "warp" ]]; then
-  echo "GEMV must be scalar or warp, got: $gemv" >&2
-  exit 2
-fi
+case "$gemv" in
+  scalar|warp|int-dot) ;;
+  *) echo "GEMV must be scalar, warp, or int-dot, got: $gemv" >&2; exit 2 ;;
+esac
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 out_dir="${OUT_DIR:-benchmarks/results/${stamp}-engine-qwen38-serving-sweep-gemv-${gemv}}"
 mkdir -p "$out_dir/runs"
