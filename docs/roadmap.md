@@ -74,7 +74,7 @@ Implemented correctness foundation:
 - Terminal asynchronous failure must either establish completion before physical release or retain resources in a faulted backend until teardown. Logical reclamation must not hide an unsuccessful physical release.
 - Warp-cooperative GEMV, parallel model reductions, and native batched decode have same-artifact parity evidence on the RTX 4090. The float scalar path remains the explicit oracle.
 - The measured serving baseline is approximately 20.2 tok/s at concurrency 1 and 31.7 aggregate tok/s at concurrency 8. These are historical measurements, not a performance claim for every later revision or device. [Execution history](../benchmarks/execution-history.md) records the qualification and measured progression.
-- Experimental Q8_1 activation packing and standalone Q4_K/Q5_K/Q6_K integer-dot GEMV have focused CUDA layout, arithmetic, error-bound, and rejection tests plus kernel-level A/B wins over float warp at representative shapes. Other weight families, batched integer-dot execution, full-model integration/parity, and matched throughput measurements remain unfinished. Packed loads and integer dots are the next kernel hypothesis; they are not automatically qualified by the baseline results.
+- Experimental Q8_1 activation packing and standalone Q4_K/Q5_K/Q6_K/IQ4_XS integer-dot GEMV have focused CUDA layout, arithmetic, error-bound, and rejection tests plus kernel-level A/B wins over float warp at representative shapes. Other weight families, batched integer-dot execution, full-model integration/parity, and matched throughput measurements remain unfinished. Packed loads and integer dots are the next kernel hypothesis; they are not automatically qualified by the baseline results.
 
 Next gates:
 
