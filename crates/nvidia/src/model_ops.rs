@@ -614,6 +614,11 @@ extern "C" __global__ void gdn_state_update(
     // sk = S^T k, d = (v - sk) * beta, S += k (outer) d, then
     // o = (S^T q) / sqrt(head_dim). q/k are l2-normalized per K head and
     // tiled across v heads (v head vh reads K head vh % k_heads).
+    //
+    // Two fused passes instead of four: each state element is read and
+    // written once per pass (the naive form re-reads it for sk and out).
+    // The fusion keeps per-element arithmetic and accumulation order
+    // identical to the pass-per-equation form, so results stay bit-exact.
     const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int total = v_heads * head_dim;
     if (index >= total) {
@@ -627,20 +632,23 @@ extern "C" __global__ void gdn_state_update(
     const float* k = k_normed + (long long)k_head * head_dim;
     const float* v = conv_activated + (long long)v_offset + (long long)v_head * head_dim;
 
-    for (int row = 0; row < head_dim; ++row) {
-        state[row * head_dim + col] *= decay[v_head];
-    }
+    // Pass 1: decay every state element and fold it into sk in one sweep.
     float sk = 0.0f;
     for (int row = 0; row < head_dim; ++row) {
-        sk += state[row * head_dim + col] * k[row];
+        float* element = state + row * head_dim + col;
+        const float decayed = *element * decay[v_head];
+        *element = decayed;
+        sk += decayed * k[row];
     }
     const float d = (v[col] - sk) * beta[v_head];
-    for (int row = 0; row < head_dim; ++row) {
-        state[row * head_dim + col] += k[row] * d;
-    }
+    // Pass 2: apply the outer-product update and fold the read-back into
+    // the output dot product in the same sweep.
     float out = 0.0f;
     for (int row = 0; row < head_dim; ++row) {
-        out += state[row * head_dim + col] * q[row];
+        float* element = state + row * head_dim + col;
+        const float updated = *element + k[row] * d;
+        *element = updated;
+        out += updated * q[row];
     }
     output[(long long)v_head * head_dim + col] = out * rsqrtf((float)head_dim);
 }
