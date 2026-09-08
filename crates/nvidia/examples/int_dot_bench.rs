@@ -18,8 +18,8 @@ use cudarc::driver::{CudaContext, CudaSlice};
 use engine_core::{DataType, WeightTensorSpec};
 use engine_nvidia::{
     CudaIq4XsGemv, CudaIq4XsQ8_1Gemv, CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv,
-    CudaQ6KGemv, CudaQ6KQ8_1Gemv, CudaQ8_1Quantizer, CudaQuantizedKernelError, CudaQuantizedWeight,
-    CudaWeightStore,
+    CudaQ6KGemv, CudaQ6KQ8_1Gemv, CudaQ8_0Gemv, CudaQ8_0Q8_1Gemv, CudaQ8_1Quantizer,
+    CudaQuantizedKernelError, CudaQuantizedWeight, CudaWeightStore,
 };
 const SHAPES: [(usize, usize); 3] = [(5120, 5120), (5120, 17_408), (17_408, 5120)];
 const WARMUP: usize = 10;
@@ -31,6 +31,7 @@ enum Family {
     Q5K,
     Q6K,
     Iq4Xs,
+    Q8_0,
 }
 
 impl Family {
@@ -40,6 +41,7 @@ impl Family {
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
             Self::Iq4Xs => "IQ4_XS",
+            Self::Q8_0 => "Q8_0",
         }
     }
 
@@ -49,6 +51,7 @@ impl Family {
             Self::Q5K => "q5",
             Self::Q6K => "q6",
             Self::Iq4Xs => "iq4xs",
+            Self::Q8_0 => "q8",
         }
     }
 
@@ -58,6 +61,7 @@ impl Family {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Iq4Xs => 23,
+            Self::Q8_0 => 8,
         }
     }
 
@@ -67,6 +71,7 @@ impl Family {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Iq4Xs => 136,
+            Self::Q8_0 => 34,
         }
     }
 
@@ -76,6 +81,7 @@ impl Family {
             Self::Q5K => synthetic_q5_k(inputs, rows),
             Self::Q6K => synthetic_q6_k(inputs, rows),
             Self::Iq4Xs => synthetic_iq4_xs(inputs, rows),
+            Self::Q8_0 => synthetic_q8_0(inputs, rows),
         }
     }
 }
@@ -85,6 +91,7 @@ enum FloatKernels {
     Q5K(CudaQ5KGemv),
     Q6K(CudaQ6KGemv),
     Iq4Xs(CudaIq4XsGemv),
+    Q8_0(CudaQ8_0Gemv),
 }
 
 impl FloatKernels {
@@ -99,6 +106,7 @@ impl FloatKernels {
             Self::Q5K(kernel) => kernel.execute_warp(weight, input, output),
             Self::Q6K(kernel) => kernel.execute_warp(weight, input, output),
             Self::Iq4Xs(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q8_0(kernel) => kernel.execute_warp(weight, input, output),
         }
     }
 }
@@ -108,6 +116,7 @@ enum IntKernels {
     Q5K(CudaQ5KQ8_1Gemv),
     Q6K(CudaQ6KQ8_1Gemv),
     Iq4Xs(CudaIq4XsQ8_1Gemv),
+    Q8_0(CudaQ8_0Q8_1Gemv),
 }
 impl IntKernels {
     fn execute(
@@ -121,6 +130,7 @@ impl IntKernels {
             Self::Q5K(kernel) => kernel.execute(weight, input, output),
             Self::Q6K(kernel) => kernel.execute(weight, input, output),
             Self::Iq4Xs(kernel) => kernel.execute(weight, input, output),
+            Self::Q8_0(kernel) => kernel.execute(weight, input, output),
         }
     }
 }
@@ -130,6 +140,7 @@ enum BatchFloat {
     Q5K(CudaQ5KGemv),
     Q6K(CudaQ6KGemv),
     Iq4Xs(CudaIq4XsGemv),
+    Q8_0(CudaQ8_0Gemv),
 }
 
 impl BatchFloat {
@@ -145,6 +156,7 @@ impl BatchFloat {
             Self::Q5K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
             Self::Q6K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
             Self::Iq4Xs(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Q8_0(kernel) => kernel.execute_warp_batch(weight, input, output, members),
         }
     }
 }
@@ -154,6 +166,7 @@ enum BatchInt {
     Q5K(CudaQ5KQ8_1Gemv),
     Q6K(CudaQ6KQ8_1Gemv),
     Iq4Xs(CudaIq4XsQ8_1Gemv),
+    Q8_0(CudaQ8_0Q8_1Gemv),
 }
 
 impl BatchInt {
@@ -169,6 +182,7 @@ impl BatchInt {
             Self::Q5K(kernel) => kernel.execute_batch(weight, input, output, members),
             Self::Q6K(kernel) => kernel.execute_batch(weight, input, output, members),
             Self::Iq4Xs(kernel) => kernel.execute_batch(weight, input, output, members),
+            Self::Q8_0(kernel) => kernel.execute_batch(weight, input, output, members),
         }
     }
 }
@@ -190,7 +204,13 @@ fn main() {
     println!(
         "family shape(KxN)  path            median      mean        min      weight-GB/s  max-rel-diff"
     );
-    for family in [Family::Q4K, Family::Q5K, Family::Q6K, Family::Iq4Xs] {
+    for family in [
+        Family::Q4K,
+        Family::Q5K,
+        Family::Q6K,
+        Family::Iq4Xs,
+        Family::Q8_0,
+    ] {
         let float_gemv = match family {
             Family::Q4K => FloatKernels::Q4K(
                 CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels"),
@@ -203,6 +223,9 @@ fn main() {
             ),
             Family::Iq4Xs => FloatKernels::Iq4Xs(
                 CudaIq4XsGemv::from_context(&context, stream.clone()).expect("float kernels"),
+            ),
+            Family::Q8_0 => FloatKernels::Q8_0(
+                CudaQ8_0Gemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
         };
         let int_gemv = match family {
@@ -217,6 +240,9 @@ fn main() {
             }
             Family::Iq4Xs => {
                 IntKernels::Iq4Xs(CudaIq4XsQ8_1Gemv::new(stream.clone()).expect("int kernel"))
+            }
+            Family::Q8_0 => {
+                IntKernels::Q8_0(CudaQ8_0Q8_1Gemv::new(stream.clone()).expect("int kernel"))
             }
         };
         for (inputs, rows) in SHAPES {
@@ -332,7 +358,13 @@ fn main() {
     // launch for each family with a batch variant. Float uses the batched
     // warp path; integer-dot packs all members in one quantizer call, then
     // runs one batch launch.
-    for family in [Family::Q4K, Family::Q5K, Family::Q6K, Family::Iq4Xs] {
+    for family in [
+        Family::Q4K,
+        Family::Q5K,
+        Family::Q6K,
+        Family::Iq4Xs,
+        Family::Q8_0,
+    ] {
         let batch_float = match family {
             Family::Q4K => BatchFloat::Q4K(
                 CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels"),
@@ -346,6 +378,9 @@ fn main() {
             Family::Iq4Xs => BatchFloat::Iq4Xs(
                 CudaIq4XsGemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
+            Family::Q8_0 => BatchFloat::Q8_0(
+                CudaQ8_0Gemv::from_context(&context, stream.clone()).expect("float kernels"),
+            ),
         };
         let batch_int = match family {
             Family::Q4K => BatchInt::Q4K(CudaQ4KQ8_1Gemv::new(stream.clone()).expect("int kernel")),
@@ -353,6 +388,9 @@ fn main() {
             Family::Q6K => BatchInt::Q6K(CudaQ6KQ8_1Gemv::new(stream.clone()).expect("int kernel")),
             Family::Iq4Xs => {
                 BatchInt::Iq4Xs(CudaIq4XsQ8_1Gemv::new(stream.clone()).expect("int kernel"))
+            }
+            Family::Q8_0 => {
+                BatchInt::Q8_0(CudaQ8_0Q8_1Gemv::new(stream.clone()).expect("int kernel"))
             }
         };
         for (inputs, rows) in SHAPES {
@@ -627,6 +665,25 @@ fn synthetic_iq4_xs(inputs: usize, rows: usize) -> Vec<u8> {
                         encoded[byte] |= nibble << 4;
                     }
                 }
+            }
+            out.extend_from_slice(&encoded);
+        }
+    }
+    out
+}
+
+fn synthetic_q8_0(inputs: usize, rows: usize) -> Vec<u8> {
+    const D_BITS: u16 = 0x2C00;
+    let blocks_per_row = inputs / 32;
+    let mut out = Vec::with_capacity(rows * blocks_per_row * 34);
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let seed = row * blocks_per_row + block;
+            let mut encoded = [0_u8; 34];
+            encoded[..2].copy_from_slice(&D_BITS.to_le_bytes());
+            for position in 0..32 {
+                let value = ((position * 11 + seed * 5) % 61) as i8 - 30;
+                encoded[2 + position] = value.to_ne_bytes()[0];
             }
             out.extend_from_slice(&encoded);
         }

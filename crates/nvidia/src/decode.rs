@@ -27,7 +27,7 @@ use crate::cuda::{CudaF32Weight, CudaQuantizedWeight};
 use crate::model_ops::{CudaModelKernelError, CudaQwen35Ops};
 use crate::quantized::{
     CudaIq4XsQ8_1Gemv, CudaQ4KEmbedding, CudaQ4KQ8_1Gemv, CudaQ5KQ8_1Gemv, CudaQ6KQ8_1Gemv,
-    CudaQuantizedKernelError, MAX_BATCH_MEMBERS,
+    CudaQ8_0Q8_1Gemv, CudaQuantizedKernelError, MAX_BATCH_MEMBERS,
 };
 use crate::staging::{CudaQwen35Weights, QwenGemvKernel};
 use crate::state::{CudaHybridState, CudaStateError};
@@ -1308,6 +1308,7 @@ struct CudaIntDotProjector {
     q5k: CudaQ5KQ8_1Gemv,
     q6k: CudaQ6KQ8_1Gemv,
     iq4xs: CudaIq4XsQ8_1Gemv,
+    q8_0: CudaQ8_0Q8_1Gemv,
     packed: Option<CudaSlice<u32>>,
 }
 
@@ -1319,6 +1320,7 @@ impl CudaIntDotProjector {
             q5k: CudaQ5KQ8_1Gemv::new(stream.clone())?,
             q6k: CudaQ6KQ8_1Gemv::new(stream.clone())?,
             iq4xs: CudaIq4XsQ8_1Gemv::new(stream.clone())?,
+            q8_0: CudaQ8_0Q8_1Gemv::new(stream.clone())?,
             stream,
             packed: None,
         })
@@ -1335,6 +1337,7 @@ impl CudaIntDotProjector {
         output: &mut CudaSlice<f32>,
     ) -> Result<(), CudaDecodeError> {
         let int_kernel = match weight.value_type() {
+            8 => Some(4),
             12 => Some(0),
             13 => Some(1),
             14 => Some(2),
@@ -1342,7 +1345,7 @@ impl CudaIntDotProjector {
             _ => None,
         };
         let Some(selector) = int_kernel else {
-            // Families without an integer-dot variant (Q3_K, Q8_0, IQ4_NL,
+            // Families without an integer-dot variant (Q3_K, IQ4_NL,
             // IQ3_S) stay on the qualified warp float path; correctness is
             // unchanged, only the covered families accelerate.
             return Ok(kernel.execute_warp(weight, input, output)?);
@@ -1374,7 +1377,8 @@ impl CudaIntDotProjector {
             0 => Ok(self.q4k.execute(weight, packed, output)?),
             1 => Ok(self.q5k.execute(weight, packed, output)?),
             2 => Ok(self.q6k.execute(weight, packed, output)?),
-            _ => Ok(self.iq4xs.execute(weight, packed, output)?),
+            3 => Ok(self.iq4xs.execute(weight, packed, output)?),
+            _ => Ok(self.q8_0.execute(weight, packed, output)?),
         }
     }
 
@@ -1393,6 +1397,7 @@ impl CudaIntDotProjector {
         per_row_input: usize,
     ) -> Result<(), CudaDecodeError> {
         let int_kernel = match weight.value_type() {
+            8 => Some(4),
             12 => Some(0),
             13 => Some(1),
             14 => Some(2),
@@ -1429,7 +1434,8 @@ impl CudaIntDotProjector {
             0 => Ok(self.q4k.execute_batch(weight, packed, output, members)?),
             1 => Ok(self.q5k.execute_batch(weight, packed, output, members)?),
             2 => Ok(self.q6k.execute_batch(weight, packed, output, members)?),
-            _ => Ok(self.iq4xs.execute_batch(weight, packed, output, members)?),
+            3 => Ok(self.iq4xs.execute_batch(weight, packed, output, members)?),
+            _ => Ok(self.q8_0.execute_batch(weight, packed, output, members)?),
         }
     }
 }

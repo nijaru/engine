@@ -1779,6 +1779,10 @@ fn validate_quantized_geometry(
     Ok((input_size, output_size))
 }
 
+#[path = "q8_0_q8_1.rs"]
+mod q8_0_q8_1;
+pub use q8_0_q8_1::CudaQ8_0Q8_1Gemv;
+
 #[path = "q4_q8_1.rs"]
 mod q4_q8_1;
 pub use q4_q8_1::CudaQ4KQ8_1Gemv;

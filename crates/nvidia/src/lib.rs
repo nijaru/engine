@@ -44,7 +44,7 @@ pub use model_ops::{CudaModelKernelError, CudaQwen35Ops};
 pub use quantized::{
     CudaIq3SEmbedding, CudaIq3SGemv, CudaIq4NlGemv, CudaIq4XsGemv, CudaIq4XsQ8_1Gemv, CudaQ3KGemv,
     CudaQ4KEmbedding, CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv, CudaQ6KGemv,
-    CudaQ6KQ8_1Gemv, CudaQ8_0Gemv, CudaQuantizedKernelError,
+    CudaQ6KQ8_1Gemv, CudaQ8_0Gemv, CudaQ8_0Q8_1Gemv, CudaQuantizedKernelError,
 };
 
 #[cfg(feature = "cuda")]

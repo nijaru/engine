@@ -1,0 +1,84 @@
+// Experimental Q8_0 weights x Q8_1 activations. One warp owns an output
+// row; each lane covers one packed four-byte chunk of the 32-value block.
+// Q8_0 stores plain signed bytes plus one F16 scale, so no nibble unpacking
+// or sign rebias is needed — the payload words feed __dp4a directly.
+
+// Reuses the bit-rebias F16 decoder shared with the other experimental
+// integer-dot kernels; the qualified float families keep the loop decoder.
+extern "C" __global__ void q8_0_q8_1_gemv(
+    const unsigned char* weights,
+    const unsigned int* input,
+    float* output,
+    unsigned int input_size,
+    unsigned int output_size
+) {
+    const unsigned int row = blockIdx.x * 4u + threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x & 31u;
+    if (row >= output_size) return;
+    const unsigned int blocks_per_row = input_size / 32u;
+    const unsigned int chunk = lane & 7u;
+    float accumulator = 0.0f;
+    for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        // Q8_0 block: 2-byte F16 scale, then 32 signed bytes. Payload loads
+        // are four-byte aligned because the scale header pads each block to
+        // a multiple of four (34-byte blocks, payload at offset 2).
+        const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
+        const float d = q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
+        const unsigned int* activation = input + block_index * 9u;
+        const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
+        const float activation_scale = q8_1_f16_to_f32((unsigned short)activation[0]);
+        accumulator += d * activation_scale * (float)dot;
+    }
+    accumulator = warp_sum(accumulator);
+    if (lane == 0u) output[row] = accumulator;
+}
+
+// Batched weights-read-once variant: one warp owns a weight row and reuses
+// each decoded weight word against every member's packed activations.
+// Packed inputs and float outputs are batch-major ([member][row]); each
+// member carries its own activation scales.
+extern "C" __global__ void q8_0_q8_1_gemv_batch(
+    const unsigned char* weights,
+    const unsigned int* input,
+    float* output,
+    unsigned int input_size,
+    unsigned int output_size,
+    unsigned int members
+) {
+    const unsigned int row = blockIdx.x * 4u + threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x & 31u;
+    if (row >= output_size) return;
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop would spill it to
+    // local memory and serialize the member input loads.
+    float acc[MAX_BATCH_MEMBERS] = {0.0f};
+    const unsigned int blocks_per_row = input_size / 32u;
+    const unsigned int packed_stride = input_size / 32u * 9u;
+    const unsigned int chunk = lane & 7u;
+    for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
+        const float d = q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
+        #pragma unroll
+        for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+            if (m < members) {
+                const unsigned int* activation =
+                    input + m * packed_stride + block_index * 9u;
+                const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
+                const float activation_scale =
+                    q8_1_f16_to_f32((unsigned short)activation[0]);
+                acc[m] += d * activation_scale * (float)dot;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0u) output[m * output_size + row] = total;
+        }
+    }
+}

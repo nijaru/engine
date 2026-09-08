@@ -335,7 +335,7 @@ fn run() -> Result<(), String> {
             GemvMode::Scalar => "scalar (correctness oracle, non-default)",
             GemvMode::Warp => "warp-cooperative (default)",
             GemvMode::IntegerDot => {
-                "integer-dot (experimental lossy, float fallback for Q3_K/Q8_0/IQ4_NL/IQ3_S)"
+                "integer-dot (experimental lossy, float fallback for Q3_K/IQ4_NL/IQ3_S)"
             }
         }
     );
