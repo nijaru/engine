@@ -2,7 +2,7 @@
 //!
 //! Compares the qualified float warp path against `quantize_q8_1` +
 //! integer-dot GEMV on synthetic weights at representative Qwen shapes,
-//! for each implemented (`Q4_K`, `Q5_K`, `Q6_K`) family. This measures kernel
+//! for each implemented (`Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS`) family. This measures kernel
 //! time only; it does not establish model parity or serving throughput.
 //! Float execution remains the default.
 //!
@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice};
 use engine_core::{DataType, WeightTensorSpec};
 use engine_nvidia::{
-    CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv, CudaQ6KGemv, CudaQ6KQ8_1Gemv,
-    CudaQ8_1Quantizer, CudaQuantizedKernelError, CudaQuantizedWeight, CudaWeightStore,
+    CudaIq4XsGemv, CudaIq4XsQ8_1Gemv, CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv,
+    CudaQ6KGemv, CudaQ6KQ8_1Gemv, CudaQ8_1Quantizer, CudaQuantizedKernelError, CudaQuantizedWeight,
+    CudaWeightStore,
 };
 
 const SHAPES: [(usize, usize); 3] = [(5120, 5120), (5120, 17_408), (17_408, 5120)];
@@ -29,6 +30,7 @@ enum Family {
     Q4K,
     Q5K,
     Q6K,
+    Iq4Xs,
 }
 
 impl Family {
@@ -37,6 +39,7 @@ impl Family {
             Self::Q4K => "Q4_K",
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
+            Self::Iq4Xs => "IQ4_XS",
         }
     }
 
@@ -45,6 +48,7 @@ impl Family {
             Self::Q4K => "q4",
             Self::Q5K => "q5",
             Self::Q6K => "q6",
+            Self::Iq4Xs => "iq4xs",
         }
     }
 
@@ -53,6 +57,7 @@ impl Family {
             Self::Q4K => 12,
             Self::Q5K => 13,
             Self::Q6K => 14,
+            Self::Iq4Xs => 23,
         }
     }
 
@@ -61,6 +66,7 @@ impl Family {
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
+            Self::Iq4Xs => 136,
         }
     }
 
@@ -69,6 +75,7 @@ impl Family {
             Self::Q4K => synthetic_q4_k(inputs, rows),
             Self::Q5K => synthetic_q5_k(inputs, rows),
             Self::Q6K => synthetic_q6_k(inputs, rows),
+            Self::Iq4Xs => synthetic_iq4_xs(inputs, rows),
         }
     }
 }
@@ -77,6 +84,7 @@ enum FloatKernels {
     Q4K(CudaQ4KGemv),
     Q5K(CudaQ5KGemv),
     Q6K(CudaQ6KGemv),
+    Iq4Xs(CudaIq4XsGemv),
 }
 
 impl FloatKernels {
@@ -90,6 +98,7 @@ impl FloatKernels {
             Self::Q4K(kernel) => kernel.execute_warp(weight, input, output),
             Self::Q5K(kernel) => kernel.execute_warp(weight, input, output),
             Self::Q6K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Iq4Xs(kernel) => kernel.execute_warp(weight, input, output),
         }
     }
 }
@@ -98,6 +107,7 @@ enum IntKernels {
     Q4K(CudaQ4KQ8_1Gemv),
     Q5K(CudaQ5KQ8_1Gemv),
     Q6K(CudaQ6KQ8_1Gemv),
+    Iq4Xs(CudaIq4XsQ8_1Gemv),
 }
 
 impl IntKernels {
@@ -111,6 +121,7 @@ impl IntKernels {
             Self::Q4K(kernel) => kernel.execute(weight, input, output),
             Self::Q5K(kernel) => kernel.execute(weight, input, output),
             Self::Q6K(kernel) => kernel.execute(weight, input, output),
+            Self::Iq4Xs(kernel) => kernel.execute(weight, input, output),
         }
     }
 }
@@ -132,7 +143,7 @@ fn main() {
     println!(
         "family shape(KxN)  path            median      mean        min      weight-GB/s  max-rel-diff"
     );
-    for family in [Family::Q4K, Family::Q5K, Family::Q6K] {
+    for family in [Family::Q4K, Family::Q5K, Family::Q6K, Family::Iq4Xs] {
         let float_gemv = match family {
             Family::Q4K => FloatKernels::Q4K(
                 CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels"),
@@ -142,6 +153,9 @@ fn main() {
             ),
             Family::Q6K => FloatKernels::Q6K(
                 CudaQ6KGemv::from_context(&context, stream.clone()).expect("float kernels"),
+            ),
+            Family::Iq4Xs => FloatKernels::Iq4Xs(
+                CudaIq4XsGemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
         };
         let int_gemv = match family {
@@ -153,6 +167,9 @@ fn main() {
             }
             Family::Q6K => {
                 IntKernels::Q6K(CudaQ6KQ8_1Gemv::new(stream.clone()).expect("int kernel"))
+            }
+            Family::Iq4Xs => {
+                IntKernels::Iq4Xs(CudaIq4XsQ8_1Gemv::new(stream.clone()).expect("int kernel"))
             }
         };
         for (inputs, rows) in SHAPES {
@@ -404,6 +421,43 @@ fn synthetic_q6_k(inputs: usize, rows: usize) -> Vec<u8> {
                 encoded[192 + index] = i8::to_ne_bytes(*scale)[0];
             }
             encoded[208..210].copy_from_slice(&D_BITS.to_le_bytes());
+            out.extend_from_slice(&encoded);
+        }
+    }
+    out
+}
+
+/// Deterministic synthetic `IQ4_XS` weights: fixed d, small integer group
+/// scales, and a repeating codebook-index pattern. Timing only; not a
+/// parity fixture.
+fn synthetic_iq4_xs(inputs: usize, rows: usize) -> Vec<u8> {
+    const D_BITS: u16 = 0x2C00;
+    const SCALES: [i32; 8] = [3, -7, 12, -19, 25, -31, 8, -2];
+    let blocks_per_row = inputs / 256;
+    let mut out = Vec::with_capacity(rows * blocks_per_row * 136);
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let seed = row * blocks_per_row + block;
+            let mut encoded = [0_u8; 136];
+            encoded[..2].copy_from_slice(&D_BITS.to_le_bytes());
+            let mut high_scales = 0_u16;
+            for group in 0..8 {
+                let biased = u16::try_from(SCALES[group] + 32).unwrap();
+                encoded[4 + group / 2] |= u8::try_from(biased & 15).unwrap() << ((group & 1) * 4);
+                high_scales |= (biased >> 4) << (group * 2);
+            }
+            encoded[2..4].copy_from_slice(&high_scales.to_le_bytes());
+            for group in 0..8 {
+                for position in 0..32 {
+                    let nibble = u8::try_from((position * 5 + seed * 3 + group) % 16).unwrap();
+                    let byte = 8 + group * 16 + (position % 16);
+                    if position < 16 {
+                        encoded[byte] |= nibble;
+                    } else {
+                        encoded[byte] |= nibble << 4;
+                    }
+                }
+            }
             out.extend_from_slice(&encoded);
         }
     }

@@ -1790,3 +1790,7 @@ pub use q5_q8_1::CudaQ5KQ8_1Gemv;
 #[path = "q6_q8_1.rs"]
 mod q6_q8_1;
 pub use q6_q8_1::CudaQ6KQ8_1Gemv;
+
+#[path = "iq4_xs_q8_1.rs"]
+mod iq4_xs_q8_1;
+pub use iq4_xs_q8_1::CudaIq4XsQ8_1Gemv;
