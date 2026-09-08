@@ -765,6 +765,10 @@ impl CudaQwen35Decode {
             .map_err(|error| CudaDecodeError::Driver(error.to_string()))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one block sequence per llama.cpp-verified host step"
+    )]
     fn recurrent_layer(
         &mut self,
         state: &mut CudaHybridState,
@@ -1351,7 +1355,7 @@ impl CudaIntDotProjector {
         // width changes. Only a handful of distinct widths occur per step,
         // and dropping the old buffer is stream-safe: the driver defers the
         // free until queued work that reads it completes.
-        let current = self.packed.as_ref().map(CudaSlice::len).unwrap_or(0);
+        let current = self.packed.as_ref().map_or(0, CudaSlice::len);
         if current != needed {
             self.packed = Some(
                 self.stream
