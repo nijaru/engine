@@ -22,10 +22,14 @@ use cudarc::driver::{
 };
 use engine_core::DataType;
 
-use crate::cuda::CudaF32Weight;
+use crate::activation::CudaQ8_1Quantizer;
+use crate::cuda::{CudaF32Weight, CudaQuantizedWeight};
 use crate::model_ops::{CudaModelKernelError, CudaQwen35Ops};
-use crate::quantized::{CudaQ4KEmbedding, CudaQuantizedKernelError, MAX_BATCH_MEMBERS};
-use crate::staging::CudaQwen35Weights;
+use crate::quantized::{
+    CudaIq4XsQ8_1Gemv, CudaQ4KEmbedding, CudaQ4KQ8_1Gemv, CudaQ5KQ8_1Gemv, CudaQ6KQ8_1Gemv,
+    CudaQuantizedKernelError, MAX_BATCH_MEMBERS,
+};
+use crate::staging::{CudaQwen35Weights, QwenGemvKernel};
 use crate::state::{CudaHybridState, CudaStateError};
 
 use crate::{
@@ -269,6 +273,9 @@ pub struct CudaQwen35Decode {
     scores: Option<CudaSlice<f32>>,
     scores_stride: usize,
     gemv_mode: GemvMode,
+    /// Lazily built integer-dot state for [`GemvMode::IntegerDot`]; `None`
+    /// until the first integer-dot step so float modes pay no staging cost.
+    int_dot: Option<CudaIntDotProjector>,
 }
 
 /// Which `GEMV` kernel variant the executor launches for quantized
@@ -278,6 +285,12 @@ pub struct CudaQwen35Decode {
 /// row, coalesced weight/input reads) are hardware-qualified against the
 /// scalar oracle by per-family parity tests and a full-model greedy replay.
 /// `Scalar` remains available as the parity-tested correctness oracle.
+/// `IntegerDot` is the explicit opt-in experimental path: supported families
+/// run the lossy `Q8_1` integer-dot kernels (see [`CudaIntDotProjector`]),
+/// and every other family transparently falls back to the warp float path.
+/// Integer-dot packing is lossy, so this mode is never token-identical to
+/// the float modes; it exists for measured throughput comparison, not as a
+/// qualified default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GemvMode {
     /// One-thread-per-output-row scalar kernels (correctness oracle).
@@ -285,6 +298,8 @@ pub enum GemvMode {
     /// Warp-cooperative row kernels (default qualified path).
     #[default]
     Warp,
+    /// Experimental lossy integer-dot kernels with float fallback.
+    IntegerDot,
 }
 
 struct ValidatedModelPlan {
@@ -424,6 +439,7 @@ impl CudaQwen35Decode {
             scores: None,
             scores_stride: 0,
             gemv_mode: GemvMode::default(),
+            int_dot: None,
             hidden: scratch.hidden,
             normed: scratch.normed,
             attn_incr: scratch.attn_incr,
@@ -526,6 +542,13 @@ impl CudaQwen35Decode {
         token: u32,
         position: u32,
     ) -> Result<(), CudaDecodeError> {
+        // Lazily staging the quantizer and integer-dot kernels here (rather
+        // than in the constructor) keeps float-mode startup costs unchanged.
+        // This borrows nothing else, so later projections can split borrows
+        // across `int_dot`, weights, and scratch buffers.
+        if self.gemv_mode == GemvMode::IntegerDot && self.int_dot.is_none() {
+            self.int_dot = Some(CudaIntDotProjector::new(self.stream.clone())?);
+        }
         validate_state(self.stream.context(), &self.layer_kinds, state)?;
         validate_token(token, self.logits.len())?;
         let capacity = state.kv().map_or(u32::MAX, |kv| kv.spec().block_tokens());
@@ -577,6 +600,7 @@ impl CudaQwen35Decode {
                 &self.normed,
                 &mut self.ffn_gate_buf,
                 self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             gemv(
                 &self.weights,
@@ -584,6 +608,7 @@ impl CudaQwen35Decode {
                 &self.normed,
                 &mut self.ffn_up_buf,
                 self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             self.ops
                 .silu_mul(&self.ffn_gate_buf, &self.ffn_up_buf, &mut self.ffn_act)?;
@@ -593,6 +618,7 @@ impl CudaQwen35Decode {
                 &self.ffn_act,
                 &mut self.ffn_incr,
                 self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             self.ops.residual_add(&mut self.hidden, &self.ffn_incr)?;
         }
@@ -657,6 +683,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.logits,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops
             .argmax_into(&self.logits, &mut self.selected_token)?;
@@ -762,6 +789,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.qkv_mixed,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv(
             &self.weights,
@@ -769,6 +797,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.z_gate,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv(
             &self.weights,
@@ -776,6 +805,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.beta_raw,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv(
             &self.weights,
@@ -783,6 +813,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.alpha_raw,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let dt_bias = f32_slice(&self.weights, &names.ssm_dt_bias)?;
         let ssm_a = f32_slice(&self.weights, &names.ssm_a)?;
@@ -845,6 +876,7 @@ impl CudaQwen35Decode {
             &self.gated,
             &mut self.attn_incr,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops.residual_add(&mut self.hidden, &self.attn_incr)?;
         Ok(())
@@ -868,6 +900,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.q_raw,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let q_norm = f32_slice(&self.weights, &names.q_norm)?;
         self.ops.q_gate_norm(
@@ -884,6 +917,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.k_raw,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let k_norm = f32_slice(&self.weights, &names.k_norm)?;
         self.ops.strided_rms_norm(
@@ -900,6 +934,7 @@ impl CudaQwen35Decode {
             &self.normed,
             &mut self.v_raw,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops.rope_neox(
             &mut self.q_packed,
@@ -969,6 +1004,7 @@ impl CudaQwen35Decode {
             &self.attn_out,
             &mut self.attn_incr,
             self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops.residual_add(&mut self.hidden, &self.attn_incr)?;
         Ok(())
@@ -1254,12 +1290,99 @@ fn f32_slice<'a>(
         .ok_or_else(|| CudaDecodeError::MissingTensor(name.to_owned()))
 }
 
+/// Executor-side integer-dot projection state for [`GemvMode::IntegerDot`].
+///
+/// Owns the shared `Q8_1` activation quantizer, one integer-dot kernel per
+/// supported family (`Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS`), and a growable
+/// packed-activation scratch buffer reused across projections in stream
+/// order. The executor creates this lazily on the first integer-dot step,
+/// so the float modes pay no staging cost and never observe it.
+struct CudaIntDotProjector {
+    stream: Arc<CudaStream>,
+    quantizer: CudaQ8_1Quantizer,
+    q4k: CudaQ4KQ8_1Gemv,
+    q5k: CudaQ5KQ8_1Gemv,
+    q6k: CudaQ6KQ8_1Gemv,
+    iq4xs: CudaIq4XsQ8_1Gemv,
+    packed: Option<CudaSlice<u32>>,
+}
+
+impl CudaIntDotProjector {
+    fn new(stream: Arc<CudaStream>) -> Result<Self, CudaDecodeError> {
+        Ok(Self {
+            quantizer: CudaQ8_1Quantizer::new(stream.clone())?,
+            q4k: CudaQ4KQ8_1Gemv::new(stream.clone())?,
+            q5k: CudaQ5KQ8_1Gemv::new(stream.clone())?,
+            q6k: CudaQ6KQ8_1Gemv::new(stream.clone())?,
+            iq4xs: CudaIq4XsQ8_1Gemv::new(stream.clone())?,
+            stream,
+            packed: None,
+        })
+    }
+
+    /// Run one projection: integer-dot for supported families, float warp
+    /// for the rest. Returns [`CudaDecodeError`] when packing, geometry, or
+    /// either launch path fails.
+    fn project(
+        &mut self,
+        weight: &CudaQuantizedWeight,
+        kernel: &QwenGemvKernel,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaDecodeError> {
+        let int_kernel = match weight.value_type() {
+            12 => Some(0),
+            13 => Some(1),
+            14 => Some(2),
+            23 => Some(3),
+            _ => None,
+        };
+        let Some(selector) = int_kernel else {
+            // Families without an integer-dot variant (Q3_K, Q8_0, IQ4_NL,
+            // IQ3_S) stay on the qualified warp float path; correctness is
+            // unchanged, only the covered families accelerate.
+            return Ok(kernel.execute_warp(weight, input, output)?);
+        };
+        let needed = input.len().div_ceil(32).checked_mul(9).ok_or_else(|| {
+            CudaDecodeError::Driver("int-dot packed length overflowed".to_owned())
+        })?;
+        if self
+            .packed
+            .as_ref()
+            .is_none_or(|packed| packed.len() < needed)
+        {
+            self.packed = Some(
+                self.stream
+                    .alloc_zeros::<u32>(needed)
+                    .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            );
+        }
+        let packed = self
+            .packed
+            .as_mut()
+            .ok_or_else(|| CudaDecodeError::Driver("int-dot packed scratch is unset".to_owned()))?;
+        let packed_view = packed.try_slice(0..needed).ok_or_else(|| {
+            CudaDecodeError::Driver("int-dot packed view is out of bounds".to_owned())
+        })?;
+        // Stream order guarantees the previous projection consumed the
+        // scratch before this pack overwrites it.
+        self.quantizer.execute(input, &mut packed_view)?;
+        match selector {
+            0 => Ok(self.q4k.execute(weight, &packed_view, output)?),
+            1 => Ok(self.q5k.execute(weight, &packed_view, output)?),
+            2 => Ok(self.q6k.execute(weight, &packed_view, output)?),
+            _ => Ok(self.iq4xs.execute(weight, &packed_view, output)?),
+        }
+    }
+}
+
 fn gemv(
     weights: &CudaQwen35Weights,
     name: &str,
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
     mode: GemvMode,
+    int_dot: Option<&mut CudaIntDotProjector>,
 ) -> Result<(), CudaDecodeError> {
     let weight = weights
         .quantized_tensor(name)
@@ -1270,6 +1393,12 @@ fn gemv(
     match mode {
         GemvMode::Scalar => kernel.execute(weight, input, output),
         GemvMode::Warp => kernel.execute_warp(weight, input, output),
+        GemvMode::IntegerDot => {
+            let projector = int_dot
+                .ok_or_else(|| CudaDecodeError::Driver("int-dot projector is unset".to_owned()))?;
+            projector.project(weight, kernel, input, output)?;
+            Ok(())
+        }
     }?;
     Ok(())
 }

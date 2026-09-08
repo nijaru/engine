@@ -58,6 +58,9 @@ fn run() -> Result<(), String> {
     let concurrency = parse_usize(&arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
     let output_tokens = parse_u32(&arguments, "--tokens=", DEFAULT_OUTPUT_TOKENS)?;
     let gemv_mode = parse_gemv_mode(&arguments)?;
+    let print_tokens = arguments
+        .iter()
+        .any(|argument| argument == "--print-tokens");
     if concurrency == 0 || output_tokens == 0 {
         return Err("concurrency and token count must be greater than zero".to_owned());
     }
@@ -194,6 +197,7 @@ fn run() -> Result<(), String> {
     let benchmark_started = Instant::now();
     let mut first_token = vec![None; concurrency];
     let mut previous_token = vec![None; concurrency];
+    let mut token_log = vec![Vec::<u32>::new(); concurrency];
     let mut inter_token = Vec::new();
     let mut generated_tokens = 0_u64;
     let mut remaining = concurrency;
@@ -205,6 +209,9 @@ fn run() -> Result<(), String> {
         while let Some(generated) = serving.pop_generated_token() {
             let now = benchmark_started.elapsed();
             let index = request_index(generated.request(), concurrency)?;
+            if print_tokens {
+                token_log[index].push(generated.token());
+            }
             if first_token[index].is_none() {
                 first_token[index] = Some(now);
             }
@@ -289,8 +296,21 @@ fn run() -> Result<(), String> {
         match gemv_mode {
             GemvMode::Scalar => "scalar (correctness oracle, non-default)",
             GemvMode::Warp => "warp-cooperative (default)",
+            GemvMode::IntegerDot => {
+                "integer-dot (experimental lossy, float fallback for Q3_K/Q8_0/IQ4_NL/IQ3_S)"
+            }
         }
     );
+    if print_tokens {
+        for (index, tokens) in token_log.iter().enumerate() {
+            let line = tokens
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  tokens[{index}]: {line}");
+        }
+    }
     Ok(())
 }
 
@@ -312,7 +332,10 @@ fn parse_gemv_mode(arguments: &[String]) -> Result<GemvMode, String> {
         .map_or(Ok(GemvMode::default()), |value| match value {
             "scalar" => Ok(GemvMode::Scalar),
             "warp" => Ok(GemvMode::Warp),
-            other => Err(format!("--gemv expects scalar or warp, got {other}")),
+            "int-dot" => Ok(GemvMode::IntegerDot),
+            other => Err(format!(
+                "--gemv expects scalar, warp, or int-dot, got {other}"
+            )),
         })
 }
 
