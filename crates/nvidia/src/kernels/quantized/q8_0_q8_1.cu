@@ -3,8 +3,40 @@
 // Q8_0 stores plain signed bytes plus one F16 scale, so no nibble unpacking
 // or sign rebias is needed — the payload words feed __dp4a directly.
 
-// Reuses the bit-rebias F16 decoder shared with the other experimental
-// integer-dot kernels; the qualified float families keep the loop decoder.
+// Fast F16 -> F32 for quantization parameters: rebias the exponent with
+// bit manipulation instead of the loop-based decoder, like the other
+// experimental integer-dot kernels. Kept local so the qualified float
+// families keep their existing decoder untouched.
+__device__ __forceinline__ float q8_0_q8_1_f16_to_f32(unsigned short bits) {
+    const unsigned int sign = (unsigned int)(bits >> 15) & 1u;
+    const unsigned int exponent = ((unsigned int)(bits >> 10) & 0x1fu);
+    const unsigned int fraction = (unsigned int)(bits & 0x3ffu);
+    if (exponent == 0u) {
+        if (fraction == 0u) {
+            return sign ? -0.0f : 0.0f;
+        }
+        int shift = -1;
+        unsigned int value = fraction;
+        while (value != 0u) {
+            value >>= 1u;
+            ++shift;
+        }
+        const unsigned int normalized = (fraction << (10 - shift)) & 0x3ffu;
+        const int new_exponent = -24 + shift + 127;
+        const unsigned int result = (sign << 31)
+            | ((unsigned int)new_exponent << 23) | (normalized << 13);
+        return __int_as_float(result);
+    }
+    if (exponent == 31u) {
+        const unsigned int result =
+            (sign << 31) | 0x7f800000u | (fraction ? 0x7fc00000u : 0u);
+        return __int_as_float(result);
+    }
+    const unsigned int result = (sign << 31)
+        | ((exponent - 15u + 127u) << 23)
+        | (fraction << 13);
+    return __int_as_float(result);
+}
 extern "C" __global__ void q8_0_q8_1_gemv(
     const unsigned char* weights,
     const unsigned int* input,
@@ -23,11 +55,11 @@ extern "C" __global__ void q8_0_q8_1_gemv(
         // are four-byte aligned because the scale header pads each block to
         // a multiple of four (34-byte blocks, payload at offset 2).
         const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
-        const float d = q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float d = q8_0_q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
         const unsigned int* activation = input + block_index * 9u;
         const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
-        const float activation_scale = q8_1_f16_to_f32((unsigned short)activation[0]);
+        const float activation_scale = q8_0_q8_1_f16_to_f32((unsigned short)activation[0]);
         accumulator += d * activation_scale * (float)dot;
     }
     accumulator = warp_sum(accumulator);
@@ -58,7 +90,7 @@ extern "C" __global__ void q8_0_q8_1_gemv_batch(
     const unsigned int chunk = lane & 7u;
     for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
         const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
-        const float d = q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const float d = q8_0_q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
         #pragma unroll
         for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
@@ -67,7 +99,7 @@ extern "C" __global__ void q8_0_q8_1_gemv_batch(
                     input + m * packed_stride + block_index * 9u;
                 const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
                 const float activation_scale =
-                    q8_1_f16_to_f32((unsigned short)activation[0]);
+                    q8_0_q8_1_f16_to_f32((unsigned short)activation[0]);
                 acc[m] += d * activation_scale * (float)dot;
             }
         }
