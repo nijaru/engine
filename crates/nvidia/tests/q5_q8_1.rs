@@ -348,4 +348,99 @@ mod gpu {
         }
         assert_eq!(stream.clone_dtoh(&output).unwrap(), [123.0]);
     }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and NVRTC"]
+    fn q5_k_batch_matches_per_member_host_arithmetic() {
+        const MEMBERS: usize = 3;
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let kernel = CudaQ5KQ8_1Gemv::new(stream.clone()).unwrap();
+        let quantizer = CudaQ8_1Quantizer::new(stream.clone()).unwrap();
+        let blocks = fixture();
+        let encoded: Vec<u8> = blocks.iter().flat_map(|block| block.encoded).collect();
+        let spec =
+            WeightTensorSpec::new("q5", vec![INPUTS as u64, ROWS as u64], DataType::F32).unwrap();
+        let mut store = CudaWeightStore::new(stream.clone());
+        store
+            .materialize_quantized(spec, 13, encoded.len() as u64, &mut Cursor::new(encoded))
+            .unwrap();
+        let weight = store.quantized_tensor("q5").unwrap();
+        // Batch-major activations with distinct per-member content: exact,
+        // lossy, and zero. The quantizer packs linear block streams, so one
+        // call covers the whole batch.
+        let member_inputs = [activations(true), activations(false), vec![0.0; INPUTS]];
+        let batched: Vec<f32> = member_inputs.concat();
+        let batched_device = stream.clone_htod(&batched).unwrap();
+        let mut packed_device = stream
+            .alloc_zeros::<u32>(MEMBERS * INPUTS / 32 * 9)
+            .unwrap();
+        quantizer
+            .execute(&batched_device, &mut packed_device)
+            .unwrap();
+        let packed = stream.clone_dtoh(&packed_device).unwrap();
+        let mut output = stream.alloc_zeros::<f32>(MEMBERS * ROWS).unwrap();
+        kernel
+            .execute_batch(weight, &packed_device, &mut output, MEMBERS)
+            .unwrap();
+        let actual = stream.clone_dtoh(&output).unwrap();
+        for (member, input) in member_inputs.iter().enumerate() {
+            let member_packed = pack_host(input);
+            assert_eq!(
+                packed[member * INPUTS / 32 * 9..(member + 1) * INPUTS / 32 * 9],
+                member_packed
+            );
+            let expected = reference(&blocks, input, &member_packed);
+            for (row, expected) in expected.iter().enumerate() {
+                let value = actual[member * ROWS + row];
+                let rounding =
+                    expected.arithmetic_magnitude * f64::from(f32::EPSILON) * 32.0 + 1e-5;
+                assert!(
+                    (f64::from(value) - expected.packed_output).abs() <= rounding,
+                    "member {member} row {row}: packed output {value} vs {}",
+                    expected.packed_output
+                );
+                assert!(
+                    (f64::from(value) - expected.float_output).abs()
+                        <= expected.packing_error_bound + rounding
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and NVRTC"]
+    fn q5_k_batch_rejects_invalid_storage() {
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let kernel = CudaQ5KQ8_1Gemv::new(stream.clone()).unwrap();
+        let spec = WeightTensorSpec::new("q5", vec![256, 1], DataType::F32).unwrap();
+        let mut store = CudaWeightStore::new(stream.clone());
+        store
+            .materialize_quantized(spec, 13, 176, &mut Cursor::new(fixture()[0].encoded))
+            .unwrap();
+        let weight = store.quantized_tensor("q5").unwrap();
+        // One member packs 256 inputs into 72 words with one output row.
+        let input = stream.alloc_zeros::<u32>(2 * 72).unwrap();
+        let mut output = stream.clone_htod(&[1.0_f32, 2.0]).unwrap();
+        assert!(matches!(
+            kernel.execute_batch(weight, &input, &mut output, 0),
+            Err(CudaQuantizedKernelError::InputLength { .. })
+        ));
+        assert!(matches!(
+            kernel.execute_batch(weight, &input, &mut output, 9),
+            Err(CudaQuantizedKernelError::InvalidWeight(_))
+        ));
+        let short = stream.alloc_zeros::<u32>(2 * 72 - 1).unwrap();
+        assert!(matches!(
+            kernel.execute_batch(weight, &short, &mut output, 2),
+            Err(CudaQuantizedKernelError::InputLength { .. })
+        ));
+        let mut long_output = stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(matches!(
+            kernel.execute_batch(weight, &input, &mut long_output, 2),
+            Err(CudaQuantizedKernelError::OutputLength { .. })
+        ));
+        assert_eq!(stream.clone_dtoh(&output).unwrap(), [1.0, 2.0]);
+    }
 }
