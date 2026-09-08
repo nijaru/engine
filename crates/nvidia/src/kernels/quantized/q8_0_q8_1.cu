@@ -3,6 +3,17 @@
 // Q8_0 stores plain signed bytes plus one F16 scale, so no nibble unpacking
 // or sign rebias is needed — the payload words feed __dp4a directly.
 
+// Block payload sits at byte 2 of a 34-byte block, so payload words are
+// never guaranteed u32-aligned (34 is not a multiple of 4). Assemble
+// weight words from bytes; activation words stay direct u32 loads
+// (nine-word Q8_1 blocks are always aligned).
+__device__ __forceinline__ unsigned int q8_0_q8_1_load_u32(
+    const unsigned char* p
+) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8u)
+        | ((unsigned int)p[2] << 16u) | ((unsigned int)p[3] << 24u);
+}
+
 // Fast F16 -> F32 for quantization parameters: rebias the exponent with
 // bit manipulation instead of the loop-based decoder, like the other
 // experimental integer-dot kernels. Kept local so the qualified float
@@ -51,12 +62,14 @@ extern "C" __global__ void q8_0_q8_1_gemv(
     const unsigned int chunk = lane & 7u;
     float accumulator = 0.0f;
     for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
-        // Q8_0 block: 2-byte F16 scale, then 32 signed bytes. Payload loads
-        // are four-byte aligned because the scale header pads each block to
-        // a multiple of four (34-byte blocks, payload at offset 2).
+        // Q8_0 block: 2-byte F16 scale, then 32 signed bytes. Payload words
+        // are assembled from bytes because the 34-byte block stride never
+        // guarantees u32 alignment of the payload.
         const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
-        const float d = q8_0_q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
-        const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
+        const float d = q8_0_q8_1_f16_to_f32(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned int q_weight =
+            q8_0_q8_1_load_u32(block + 2u + chunk * 4u);
         const unsigned int* activation = input + block_index * 9u;
         const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
         const float activation_scale = q8_0_q8_1_f16_to_f32((unsigned short)activation[0]);
@@ -90,8 +103,10 @@ extern "C" __global__ void q8_0_q8_1_gemv_batch(
     const unsigned int chunk = lane & 7u;
     for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
         const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
-        const float d = q8_0_q8_1_f16_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
-        const unsigned int q_weight = *(const unsigned int*)(block + 2u + chunk * 4u);
+        const float d = q8_0_q8_1_f16_to_f32(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned int q_weight =
+            q8_0_q8_1_load_u32(block + 2u + chunk * 4u);
         #pragma unroll
         for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
             if (m < members) {
