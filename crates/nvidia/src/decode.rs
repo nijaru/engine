@@ -1469,6 +1469,13 @@ fn gemv(
 
 /// Run one quantized projection for `members` batch-major rows in a single
 /// batched warp launch.
+#[cfg_attr(
+    feature = "cuda",
+    allow(
+        clippy::too_many_arguments,
+        reason = "batch executor plumbing threads weights, buffers, geometry, mode, and projector"
+    )
+)]
 fn gemv_batch(
     weights: &CudaQwen35Weights,
     name: &str,
