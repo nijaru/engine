@@ -91,7 +91,18 @@ fn run() -> Result<(), String> {
         .or_else(|| std::env::var("ENGINE_QWEN_GGUF").ok())
         .ok_or_else(|| "set ENGINE_QWEN_GGUF or pass --model=/path/to/model.gguf".to_owned())?;
 
-    let state_tokens = u32::try_from(PROMPT.len())
+    // Diverse probe prompts vary in length; capacity follows the longest
+    // one so every request fits the KV budget.
+    let longest_prompt = if divergence_probe {
+        PROBE_PROMPTS
+            .iter()
+            .map(|prompt| prompt.len())
+            .max()
+            .unwrap_or(PROMPT.len())
+    } else {
+        PROMPT.len()
+    };
+    let state_tokens = u32::try_from(longest_prompt)
         .map_err(|_| "prompt length does not fit the runtime".to_owned())?
         .checked_add(output_tokens)
         .ok_or_else(|| "prompt plus output budget overflowed".to_owned())?;
