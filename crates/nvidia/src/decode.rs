@@ -1346,11 +1346,13 @@ impl CudaIntDotProjector {
         let needed = input.len().div_ceil(32).checked_mul(9).ok_or_else(|| {
             CudaDecodeError::Driver("int-dot packed length overflowed".to_owned())
         })?;
-        if self
-            .packed
-            .as_ref()
-            .is_none_or(|packed| packed.len() < needed)
-        {
+        // The kernels validate exact packed lengths and take whole slices
+        // (not views), so the scratch is reallocated when the projection
+        // width changes. Only a handful of distinct widths occur per step,
+        // and dropping the old buffer is stream-safe: the driver defers the
+        // free until queued work that reads it completes.
+        let current = self.packed.as_ref().map(CudaSlice::len).unwrap_or(0);
+        if current != needed {
             self.packed = Some(
                 self.stream
                     .alloc_zeros::<u32>(needed)
@@ -1361,17 +1363,14 @@ impl CudaIntDotProjector {
             .packed
             .as_mut()
             .ok_or_else(|| CudaDecodeError::Driver("int-dot packed scratch is unset".to_owned()))?;
-        let packed_view = packed.try_slice(0..needed).ok_or_else(|| {
-            CudaDecodeError::Driver("int-dot packed view is out of bounds".to_owned())
-        })?;
         // Stream order guarantees the previous projection consumed the
         // scratch before this pack overwrites it.
-        self.quantizer.execute(input, &mut packed_view)?;
+        self.quantizer.execute(input, packed)?;
         match selector {
-            0 => Ok(self.q4k.execute(weight, &packed_view, output)?),
-            1 => Ok(self.q5k.execute(weight, &packed_view, output)?),
-            2 => Ok(self.q6k.execute(weight, &packed_view, output)?),
-            _ => Ok(self.iq4xs.execute(weight, &packed_view, output)?),
+            0 => Ok(self.q4k.execute(weight, packed, output)?),
+            1 => Ok(self.q5k.execute(weight, packed, output)?),
+            2 => Ok(self.q6k.execute(weight, packed, output)?),
+            _ => Ok(self.iq4xs.execute(weight, packed, output)?),
         }
     }
 }
