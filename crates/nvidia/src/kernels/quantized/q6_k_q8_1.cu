@@ -38,6 +38,15 @@ __device__ __forceinline__ float q6_q8_1_f16_to_f32(unsigned short bits) {
     return __int_as_float(result);
 }
 
+// Q6_K blocks are 210 bytes, which is not a multiple of four, so a block
+// base is not guaranteed u32-aligned. Assemble multibyte weight words from
+// bytes; activation words stay direct u32 loads (nine-word Q8_1 blocks are
+// always aligned).
+__device__ __forceinline__ unsigned int q6_load_u32(const unsigned char* p) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8u)
+        | ((unsigned int)p[2] << 16u) | ((unsigned int)p[3] << 24u);
+}
+
 extern "C" __global__ void q6_k_q8_1_gemv(
     const unsigned char* weights,
     const unsigned int* input,
@@ -73,11 +82,9 @@ extern "C" __global__ void q6_k_q8_1_gemv(
             int activation_sum = 0;
             #pragma unroll
             for (unsigned int chunk = 0; chunk < 4u; ++chunk) {
-                // All loads stay four-byte aligned: every base is a multiple
-                // of 32 and each half-span/chunk step a multiple of four.
-                const unsigned int packed_low = *(const unsigned int*)(
+                const unsigned int packed_low = q6_load_u32(
                     block + low_base + half * 16u + chunk * 4u);
-                const unsigned int packed_high = *(const unsigned int*)(
+                const unsigned int packed_high = q6_load_u32(
                     block + high_base + half * 16u + chunk * 4u);
                 const unsigned int activation_word = activation[1u + half * 4u + chunk];
                 const unsigned int low = (packed_low >> low_shift) & 0x0f0f0f0fu;
