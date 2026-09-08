@@ -83,7 +83,7 @@ Add multimodal, MoE, speculation-specific, trace-replay, and distributed cases o
 The first Engine-only serving qualification sweep exercises the real scheduler/runtime/backend boundary with the pinned Qwen3.8 GGUF path:
 
 ```text
-ENGINE_QWEN_GGUF=/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf \
+ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
   bash benchmarks/run-qwen-serving-sweep.sh
 ```
 

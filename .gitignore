@@ -16,6 +16,11 @@ target
 # Local benchmark outputs
 benchmarks/results/
 
+# Local agent state (never commit)
+.mem/
+.tasks/
+ai
+
 # Local environment/config
 .env
 .env.local
