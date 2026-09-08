@@ -80,7 +80,7 @@ Next gates:
 
 - Preserve the verified ownership contract while adding new execution variants. Admission errors return state, commitment validates before mutation, and failed reclamation retains a retry owner.
 - CUDA lanes share prepared kernels and validated bindings; unsupported batch sizes use the per-row path. Driver faults prohibit new submissions, with uncertain resources retained until teardown.
-- Real asynchronous CUDA cancellation and deferred release are verified, including a nine-row fallback followed by eight-row peer progress. Injected host faults cover malformed completion, commitment, and release errors; deliberate destructive GPU fault injection is not part of this evidence.
+- Real asynchronous CUDA cancellation and deferred release are verified, including a nine-row fallback followed by eight-row peer progress, and cancellation of a member inside a full eight-row batched-lane submission (peer tokens preserved, pinned-slot pool serviceable, registry drained). Injected host faults cover malformed completion, commitment, and release errors; deliberate destructive GPU fault injection is not part of this evidence.
 
 Current deterministic decode-first policy can theoretically starve prefill if decode work continuously consumes the entire work budget. Treat bounded fairness as a measured scheduler-policy issue; add the smallest deterministic mechanism only if real workloads require it.
 
