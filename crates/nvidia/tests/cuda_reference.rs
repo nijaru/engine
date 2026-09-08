@@ -5840,12 +5840,13 @@ fn cancels_batched_lane_member_without_losing_peers_or_state() {
         output[usize::try_from(token.request().get() - 1).unwrap()] += 1;
     }
     assert_eq!(
-        output[0], 0,
-        "cancelled in-flight batched member must suppress its output"
+        output[0], 1,
+        "cancelled member keeps its prefill token; the in-flight batched output is suppressed"
     );
-    assert_eq!(&output[1..], &[4; 7]);
+    assert_eq!(&output[1..], &[2; 7]);
     // Two more batched submissions prove the lane and the pinned-slot pool
-    // remain fully serviceable after the cancellation.
+    // remain fully serviceable after the cancellation; peers reach their
+    // four-token budget and terminalize.
     for _ in 0..2 {
         serving.submit_ready_batch().unwrap().unwrap();
         poll(&mut serving);
@@ -5853,7 +5854,7 @@ fn cancels_batched_lane_member_without_losing_peers_or_state() {
             output[usize::try_from(token.request().get() - 1).unwrap()] += 1;
         }
     }
-    assert_eq!(&output[1..], &[8; 7]);
+    assert_eq!(&output[1..], &[4; 7]);
     for _ in 0..7 {
         assert!(serving.reclaim_next().unwrap().is_some());
     }
