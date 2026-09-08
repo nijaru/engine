@@ -1,0 +1,9 @@
+{"workload": "chat", "run": 1, "prompt_chars": 292, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 154.15, "wall_ms": 7931.85, "decode_tok_s": 49.372, "text_chars": 1607}
+{"workload": "chat", "run": 2, "prompt_chars": 292, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 167.88, "wall_ms": 7919.78, "decode_tok_s": 49.536, "text_chars": 1607}
+{"workload": "chat", "run": 3, "prompt_chars": 292, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 85.03, "wall_ms": 7830.24, "decode_tok_s": 49.579, "text_chars": 1607}
+{"workload": "code", "run": 1, "prompt_chars": 1087, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 138.9, "wall_ms": 7880.44, "decode_tok_s": 49.603, "text_chars": 2138}
+{"workload": "code", "run": 2, "prompt_chars": 1087, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 166.99, "wall_ms": 7933.03, "decode_tok_s": 49.446, "text_chars": 2138}
+{"workload": "code", "run": 3, "prompt_chars": 1087, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 85.7, "wall_ms": 7858.07, "decode_tok_s": 49.406, "text_chars": 2138}
+{"workload": "reason", "run": 1, "prompt_chars": 579, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 120.71, "wall_ms": 7897.11, "decode_tok_s": 49.38, "text_chars": 1645}
+{"workload": "reason", "run": 2, "prompt_chars": 579, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 166.41, "wall_ms": 7945.08, "decode_tok_s": 49.366, "text_chars": 1645}
+{"workload": "reason", "run": 3, "prompt_chars": 579, "completion_tokens": 384, "stream_events": 384, "ttft_ms": 86.24, "wall_ms": 7870.8, "decode_tok_s": 49.328, "text_chars": 1645}

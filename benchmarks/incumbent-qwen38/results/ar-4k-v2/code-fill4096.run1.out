@@ -1,0 +1,10 @@
+We need answer user's request. Need produce final with complete module code block. Need analyze requirements.
+
+User provided 15 modules pipeline_stage_0..14, each identical except name. They ask: Based on pipeline modules above, write a new module `pipeline_aggregator` that:
+1. Collects results from run_stage_0 through run_stage_14 with the retry semantics shown,
+2. Aggregates per-stage record counts into a summary dict,
+3. Stops at the first non-retryable StageError and returns partial results plus the error.
+Emit complete module as single code block.
+
+Need infer retry semantics shown. In modules: StageError has retryable bool. run_stage functions catch KeyError and raise StageError retryable=False. There is MAX_RETRIES=3, DEFAULT_TIMEOUT_MS, but no actual retry logic in run_stage. "with the retry semantics shown" likely means aggregator should retry retryable StageErrors up to max_retries? Need design. Since modules define StageError.retryable and MAX_RETRIES. We need collect results from run_stage_0 through run_stage_14. Need import modules? In a single module, can import from pipeline_stage_0 etc. But if modules are in same package? The prompt says based on modules above, write new module pipeline_aggregator. We can assume modules available as pipeline_stage_0 ... pipeline_stage_14. Need emit complete module. Could use importlib to dynamically import? Better explicit imports? Since module names are pipeline_stage_0 etc. In code block:
+from pipeline_stage_0 import run_stage_0, StageError as StageError0, StageConfig as StageConfig0? But StageError classes are distinct per module. Need catch any StageError? Could define tuple of StageError classes. Or catch Exception and check isinstance? Need non-retryable Stage

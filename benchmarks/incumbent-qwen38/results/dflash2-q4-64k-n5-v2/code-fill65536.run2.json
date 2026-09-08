@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with complete module pipeline_aggregator as single code block. Need analyze requirements.\n\nUser provided 252 modules pipeline_stage_0..251, each identical except name and run_stage_N. They ask: Based on pipeline modules above, write a new module `pipeline_aggregator` that:\n1. Collects results from run_stage_0 through run_stage_251 with the retry semantics shown,\n2. Aggregates per-stage record counts into a summary dict,\n3. Stops at the first non-retryable StageError and returns partial results plus the error.\nEmit complete module as a single code block.\n\nNeed infer retry semantics shown. In each stage: StageError has retryable bool. run_stage_N catches KeyError and raises StageError(... retryable=False). There is MAX_RETRIES=3, DEFAULT_TIMEOUT_MS, but no actual retry logic in run_stage_N. \"with the retry semantics shown\" likely means aggregator should retry retryable StageErrors up to max_retries? But shown only StageError.retryable and MAX_RETRIES constant. Need implement aggregator that calls each stage, if StageError retryable, retry up to config max_retries? Need decide.\n\nNeed likely import all stage modules? Since modules are given as separate code blocks but not actual package? We need write module that can collect results from run_stage_0 through run_stage_251. Could use importlib to import pipeline_stage_{i} and getattr run_stage_{i}. Or assume modules available in same package? Need robust. Since user says based on modules above, write new module. We can use importlib.import_module(f\"pipeline_stage_{i}\") and getattr. But if modules are in same directory? Could be. Need maybe fallback to globals? But complete module should be standalone. Could define STAGE"
+      }
+    }
+  ],
+  "created": 1787288706,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 112992,
+    "total_tokens": 113376,
+    "prompt_tokens_details": {
+      "cached_tokens": 112988
+    }
+  },
+  "id": "chatcmpl-z7ryRHd2QYa2lxCeCKBh16jEHs8uDzbb",
+  "timings": {
+    "cache_n": 112988,
+    "prompt_n": 4,
+    "prompt_ms": 127.011,
+    "prompt_per_token_ms": 31.75275,
+    "prompt_per_second": 31.493335222933446,
+    "predicted_n": 384,
+    "predicted_ms": 5887.66,
+    "predicted_per_token_ms": 15.372480417754568,
+    "predicted_per_second": 65.05131070747971,
+    "draft_n": 572,
+    "draft_n_accepted": 266
+  }
+}

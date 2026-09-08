@@ -1,0 +1,9 @@
+We need answer user's request. Need produce final code block only? User: "Based on the pipeline modules above, write a new module `pipeline_aggregator` that:
+1. Collects results from run_stage_0 through run_stage_125 with the retry semantics shown,
+2. Aggregates per-stage record counts into a summary dict,
+3. Stops at the first non-retryable StageError and returns partial results plus the error.
+Emit the complete module as a single code block."
+
+Need infer retry semantics shown. Modules define StageError with retryable bool. run_stage_N catches KeyError and raises StageError retryable=False. No actual retry logic in modules. "with the retry semantics shown" likely means use config.max_retries? But run_stage functions don't retry. Maybe aggregator should call each stage, if StageError retryable True retry up to config.max_retries? But shown only non-retryable KeyError. Need implement aggregator that collects results from run_stage_0 through run_stage_125. Need import modules? They are given as modules pipeline_stage_0 ... pipeline_stage_125. We need write new module pipeline_aggregator. It should probably import all stage modules? Since 126 modules, can't list all? Could use importlib to dynamically import pipeline_stage_{i}. But if modules are in same package? Need robust. Could define STAGE_COUNT = 126. Use importlib.import_module(f"pipeline_stage_{i}"). But if modules are not installed? In context, they are modules above. We can assume importable. Or use globals? Better dynamic import.
+
+Need aggregate per-stage record counts into summary dict. Return partial results plus error on first non-retryable StageError. Need decide return shape. Could return dict: {"ok": bool, "summary": {

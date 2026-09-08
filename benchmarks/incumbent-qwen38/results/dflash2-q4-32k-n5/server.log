@@ -1,0 +1,45 @@
+0.00.053.352 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.126.589 W srv  llama_server: -----------------
+0.00.126.590 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.126.590 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.126.591 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.126.591 W srv  llama_server: -----------------
+0.00.127.788 I srv    load_model: loading model '/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf'
+0.00.328.037 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.350.462 W srv    load_model: [spec] failed to measure draft model memory: failed to create llama_context from model
+0.00.574.609 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 999, abort
+0.00.754.207 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.754.211 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.754.215 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.754.216 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+0.00.754.218 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+0.00.754.223 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.754.224 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.754.226 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.754.227 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.754.229 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.754.230 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.754.232 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.754.234 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.754.237 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.754.260 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.02.005.507 I cmn          init: llama threadpool init, n_threads = 8
+0.02.052.903 I common_speculative_init_result: loading draft model '/home/nick/models/qwen38-dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.02.371.570 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 45056, kv_unified = 'true'
+0.02.371.588 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.02.371.589 I common_speculative_impl_draft_dflash: - n_max=5, n_min=0, p_min=0.00
+0.02.371.590 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true
+0.02.395.639 I srv          init: chat template supports preserving reasoning, consider enabling it via --reasoning-preserve
+0.02.395.658 I srv  llama_server: model loaded
+0.02.395.660 I srv  llama_server: listening on http://127.0.0.1:9784
+0.03.220.783 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.03.220.855 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.03.221.011 E srv    send_error: task id = 0, error: request (56292 tokens) exceeds the available context size (45056 tokens), try increasing it
+0.03.221.015 I slot      release: id  3 | task 0 | stop processing: n_tokens = 0, truncated = 0
+0.03.221.089 W srv          stop: cancel task, id_task = 0
+0.03.266.017 I slot get_availabl: id  2 | task -1 | selected slot by LRU, t_last = -1
+0.03.266.112 I slot launch_slot_: id  2 | task 3 | processing task, is_child = 0
+0.03.266.248 E srv    send_error: task id = 3, error: request (56292 tokens) exceeds the available context size (45056 tokens), try increasing it
+0.03.266.249 I slot      release: id  2 | task 3 | stop processing: n_tokens = 0, truncated = 0
+0.03.266.329 W srv          stop: cancel task, id_task = 3
+0.03.271.937 I srv    operator(): operator(): cleaning up before exit...

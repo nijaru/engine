@@ -1,0 +1,25 @@
+You are working in a Python repo. Here is the current implementation of a retry decorator:
+
+```python
+import time
+import random
+import functools
+
+def retry(max_attempts=3, base_delay=0.1, jitter=0.5, exceptions=(Exception,)):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay * (1 + jitter * random.random()))
+            raise last_exc
+        return wrapper
+    return decorator
+```
+
+Task: modify it so that (1) retries are cancelled promptly when a `threading.Event` is set, (2) the delay respects a caller-provided deadline (monotonic), and (3) the decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit the full updated code as a single code block, then a short bullet list of the behavior changes.

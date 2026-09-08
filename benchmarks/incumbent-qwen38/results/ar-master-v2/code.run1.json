@@ -1,0 +1,37 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with full updated code single code block then short bullet list behavior changes. Need think through implementation.\n\nUser: Python repo current retry decorator. Task modify so that (1) retries are cancelled promptly when a threading.Event is set, (2) delay respects caller-provided deadline (monotonic), (3) decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit full updated code as single code block, then short bullet list behavior changes.\n\nNeed design. Need likely add parameters: cancel_event: threading.Event | None = None, deadline: float | None = None? Caller-provided deadline monotonic. How to pass? Could be decorator parameters or wrapper kwargs? \"caller-provided deadline\" likely decorator accepts deadline? Maybe retry(max_attempts=..., base_delay=..., jitter=..., exceptions=..., cancel_event=None, deadline=None). But if deadline is fixed at decoration time, maybe okay. Could also allow per-call override via special kwargs? Need robust. The phrase \"caller-provided deadline (monotonic)\" could mean the decorated function caller can provide deadline? In decorator context, caller-provided could be parameter to retry. But \"caller-provided\" maybe the code calling retry decorator provides deadline. We can implement both: decorator accepts deadline, and wrapper can accept optional keyword `_retry_deadline`? But adding hidden kwargs may be intrusive. Better: retry(..., deadline=None) where deadline is time.monotonic() absolute. Also maybe cancel_event. Need prompt cancellation: check event before each attempt and during sleep. Since time.sleep can't be interrupted by event except by polling. To cancel promptly, implement sleep in small increments checking event and deadline. Or use event.wait(timeout) for sleep? threading.Event.wait(timeout) returns True if set, False if timeout. That can be used to sleep and wake on"
+      }
+    }
+  ],
+  "created": 1787288096,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10548-a298422da",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 299,
+    "total_tokens": 683,
+    "prompt_tokens_details": {
+      "cached_tokens": 42
+    }
+  },
+  "id": "chatcmpl-q7QkJrsxUGLxr55ZoocPRWTlfcVrO2fI",
+  "timings": {
+    "cache_n": 42,
+    "prompt_n": 257,
+    "prompt_ms": 185.946,
+    "prompt_per_token_ms": 0.7235252918287938,
+    "prompt_per_second": 1382.1216912436944,
+    "predicted_n": 384,
+    "predicted_ms": 7733.589,
+    "predicted_per_token_ms": 20.192138381201044,
+    "predicted_per_second": 49.52422478101694
+  }
+}

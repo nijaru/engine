@@ -1,0 +1,1 @@
+Write a Python function that takes a list of (name, price, quantity) tuples and returns the total inventory value, rounding to 2 decimals. Then explain how you would handle a SKU with a negative quantity, and what invariants you would enforce at the input boundary. Include two pytest cases.

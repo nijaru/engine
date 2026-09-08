@@ -1,0 +1,5 @@
+A new version of huggingface_hub (1.29.0) is available! You are using version 1.11.0.
+
+Fetching 18 files:   0%|          | 0/18 [00:00<?, ?it/s]Fetching 18 files:   6%|▌         | 1/18 [00:00<00:05,  2.84it/s]Fetching 18 files:  39%|███▉      | 7/18 [00:00<00:00, 17.50it/s]Fetching 18 files:  39%|███▉      | 7/18 [00:19<00:00, 17.50it/s]Fetching 18 files:  44%|████▍     | 8/18 [00:40<01:11,  7.12s/it]Fetching 18 files:  50%|█████     | 9/18 [01:13<01:50, 12.25s/it]Fetching 18 files:  61%|██████    | 11/18 [01:13<00:54,  7.83s/it]Fetching 18 files:  72%|███████▏  | 13/18 [01:16<00:28,  5.67s/it]Fetching 18 files: 100%|██████████| 18/18 [01:16<00:00,  4.26s/it]
+[32m✓ Downloaded[0m
+  path: /home/nick/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea

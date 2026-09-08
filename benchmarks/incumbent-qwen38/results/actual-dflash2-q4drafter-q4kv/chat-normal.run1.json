@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final technical self-contained. Need explain why distributed system can observe stale reads even when every individual request handled correctly. Compare read-after-write consistency, monotonic reads, and linearizability using one concrete example for each. Then practical debugging checklist for distinguishing replication lag from application cache bug.\n\nNeed think carefully. Need likely define stale reads: read returns value older than some write that has become visible/committed? Even if each request handled correctly per local protocol, due to distributed state, clocks, replication, routing, caches, ordering. Need explain: correctness per request means request returns some valid state at some point, not necessarily latest global state. Stale read can be correct if read served from replica/cache that hasn't received update, or request order not globally ordered. Need mention no single global time, partial order, causal dependencies.\n\nCompare consistency models:\n- Read-after-write (session/sequential? user expects read after write by same client sees write). Concrete example: user updates profile name from Alice to Bob, immediately reads profile; should see Bob. If read served from stale replica, sees Alice. This is violation of read-your-writes/read-after-write.\n- Monotonic reads: once a client sees a value, subsequent reads by same client should not see older value. Concrete example: client reads counter 5, then 7, then due to routing to different replica sees 4. Even if 4 was valid earlier, it's stale relative to client's history. Need maybe compare with read-after-write? Monotonic doesn't require seeing own writes, just no going backwards.\n- Linearizability: every operation appears to occur atomically at some instant between its invocation and response, and all operations respect real-time order. Concrete example: two clients write 1 and 2 to same key concurrently; if write 1 completes before"
+      }
+    }
+  ],
+  "created": 1787290380,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 116,
+    "total_tokens": 500,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-lKb7tjMq5ebbnbEn6E4ZJpKDWEyF4Z4r",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 116,
+    "prompt_ms": 204.586,
+    "prompt_per_token_ms": 1.7636724137931035,
+    "prompt_per_second": 566.9987193649614,
+    "predicted_n": 384,
+    "predicted_ms": 4835.175,
+    "predicted_per_token_ms": 12.624477806788512,
+    "predicted_per_second": 79.21119711282425,
+    "draft_n": 749,
+    "draft_n_accepted": 232
+  }
+}

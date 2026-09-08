@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with full updated code single code block then short bullet list behavior changes. Need think through implementation.\n\nUser: Python repo current retry decorator. Task modify so (1) retries cancelled promptly when threading.Event is set, (2) delay respects caller-provided deadline (monotonic), (3) decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit full updated code as single code block, then short bullet list behavior changes.\n\nNeed design. Need likely add parameters: cancel_event: threading.Event | None = None, deadline: float | None = None? Caller-provided deadline monotonic. How caller provides? Could be decorator parameter? \"caller-provided deadline (monotonic)\" maybe wrapper accepts optional deadline? Need decide. The decorator can accept deadline parameter at decoration time? But caller-provided likely per call? Could support both: retry(max_attempts=..., base_delay=..., jitter=..., exceptions=..., cancel_event=None, deadline=None) and wrapper can accept keyword _retry_deadline? But task says modify it so retries cancelled promptly when threading.Event is set, delay respects caller-provided deadline (monotonic). Could mean add optional arguments to retry decorator: cancel_event and deadline. But \"caller-provided\" maybe the caller of decorated function can pass deadline? Let's parse.\n\nCurrent implementation: retry(max_attempts=3, base_delay=0.1, jitter=0.5, exceptions=(Exception,)). Need modify. We can add parameters to retry: cancel_event: threading.Event | None = None, deadline: float | None = None. But if deadline is set at decoration, it's fixed. \"caller-provided deadline\" could be passed to retry() by caller configuring decorator. That's okay. But maybe they want wrapper to accept a deadline argument? The phrase \"caller-provided"
+      }
+    }
+  ],
+  "created": 1787290439,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 299,
+    "total_tokens": 683,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-LSc7zdQUHpZpnNfgm7RCLRMKBGzbfBnk",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 299,
+    "prompt_ms": 205.387,
+    "prompt_per_token_ms": 0.6869130434782609,
+    "prompt_per_second": 1455.7883410342426,
+    "predicted_n": 384,
+    "predicted_ms": 3838.656,
+    "predicted_per_token_ms": 10.022600522193212,
+    "predicted_per_second": 99.77450440987678,
+    "draft_n": 387,
+    "draft_n_accepted": 253
+  }
+}

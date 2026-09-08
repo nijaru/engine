@@ -1,0 +1,11 @@
+We need answer user's request. Need design genuinely novel rate limiter satisfying constraints: (a) never let client exceed 100 requests per rolling hour even across 5 stateless replicas with no shared store, (b) degrade gracefully under clock skew up to 30s, (c) fail open only for requests smaller than 1KB. Walk through tradeoffs, explain which guarantee weakens first under load, argue why rejected alternative worse. Precise about state lives and network partition between replicas.
+
+We need think deeply. Need produce final answer. Need maybe propose novel design. Let's analyze constraints.
+
+We need rate limiter: 100 requests per rolling hour per client. 5 stateless replicas no shared store. Stateless replicas? But rate limiter needs state. "stateless replicas" likely means application servers stateless, no shared store. We can have local state? Need no shared store. To guarantee never exceed across replicas without shared store is impossible if truly independent and no coordination? Need use client-side state? Maybe design uses client-carried tokens / signed state, or deterministic sharding? But no shared store. Need never exceed 100 rolling hour across 5 replicas. If no shared store and no client state? Impossible due to independent replicas. But can use client-provided signed ledger (client state) or use request payload? Need novel.
+
+Constraints: fail open only for requests smaller than 1KB. Means if limiter cannot decide, allow only small requests (<1KB), deny larger? Or fail open only for small requests: under failure, small requests pass, large blocked. Need incorporate.
+
+Clock skew up to 30s between replicas. Rolling hour with skew. Need degrade gracefully.
+
+Need state lives: local replica memory? client? Maybe use "client-held signed sliding-window ledger" with per-replica local cache and deterministic replica

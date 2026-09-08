@@ -1,0 +1,56 @@
+== date
+2026-08-20T21:53:24-07:00
+== gpu
+name, memory.total [MiB], driver_version, power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max
+NVIDIA GeForce RTX 4090, 24564 MiB, 610.57.04, 450.00 W, 3120 MHz, 4
+== cuda
+== llama.cpp
+a298422da docs: fix typos in ET.md (#27457)
+## master...origin/master
+== build flags
+GGML_CUDA:BOOL=ON
+GGML_CUDA_ARCHITECTURES:UNINITIALIZED=89
+GGML_CUDA_COMPRESSION_MODE:STRING=size
+GGML_CUDA_F16:UNINITIALIZED=ON
+GGML_CUDA_FA:BOOL=ON
+GGML_CUDA_FA_ALL_QUANTS:BOOL=OFF
+GGML_CUDA_FORCE_CUBLAS:BOOL=OFF
+GGML_CUDA_FORCE_MMQ:BOOL=OFF
+GGML_CUDA_GRAPHS:BOOL=ON
+GGML_CUDA_NCCL:BOOL=ON
+GGML_CUDA_NO_PEER_COPY:BOOL=OFF
+GGML_CUDA_NO_VMM:BOOL=OFF
+GGML_CUDA_PEER_MAX_BATCH_SIZE:STRING=128
+GGML_NATIVE:BOOL=ON
+//STRINGS property for variable: GGML_CUDA_COMPRESSION_MODE
+GGML_CUDA_COMPRESSION_MODE-STRINGS:INTERNAL=none;speed;balance;size
+== binaries
+version: 0.1.2-dev (build 10548, commit a298422da)
+built with GNU 15.3.1 for Linux x86_64
+== dflash2 build (if present)
+== models
+/home/nick/models/dflash2:
+total 5778040
+drwxr-xr-x. 1 nick nick        128 Aug 19 13:35 .
+drwxr-xr-x. 1 nick nick        144 Aug 20 21:40 ..
+drwxr-xr-x. 1 nick nick         22 Aug 19 13:35 .cache
+-rw-r--r--. 1 nick nick 3860293152 Aug 19 13:35 Qwen3.8-27B-DFlash2-BF16.gguf
+-rw-r--r--. 1 nick nick 2056414752 Aug 19 13:35 Qwen3.8-27B-DFlash2-Q8_0.gguf
+
+/home/nick/models/qwen38-27b:
+total 16078556
+drwxr-xr-x. 1 nick nick          70 Aug 20 21:40 .
+drwxr-xr-x. 1 nick nick         144 Aug 20 21:40 ..
+drwxr-xr-x. 1 nick nick          22 Aug 20 21:37 .cache
+drwxr-xr-x. 1 nick nick          50 Aug 20 21:38 MTP
+-rw-r--r--. 1 nick nick 16464440224 Aug 20 21:38 Qwen3.8-27B-UD-Q4_K_M.gguf
+
+/home/nick/models/qwen38-dflash2:
+total 1116220
+drwxr-xr-x. 1 nick nick         74 Aug 19 02:27 .
+drwxr-xr-x. 1 nick nick        144 Aug 20 21:40 ..
+drwxr-xr-x. 1 nick nick         22 Aug 19 02:27 .cache
+-rw-r--r--. 1 nick nick 1143006752 Aug 19 02:27 Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+== vram now
+memory.used [MiB], memory.total [MiB]
+241 MiB, 24564 MiB

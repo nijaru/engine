@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user: \"Write a Python function that takes a list of (name, price, quantity) tuples and returns the total inventory value, rounding to 2 decimals. Then explain how you would handle a SKU with a negative quantity, and what invariants you would enforce at the input boundary. Include two pytest cases.\"\n\nNeed produce final with code, explanation, pytest cases. Need think details.\n\nFunction: total_inventory_value(items: list[tuple[str, Decimal? float? int?]]) -> float? Rounding to 2 decimals. Need decide types. For money, use Decimal to avoid float issues. But user says list of (name, price, quantity) tuples. Could accept price as Decimal or float? Better robust: convert price to Decimal(str(price)) to avoid binary float artifacts. Quantity int. Return float? \"rounding to 2 decimals\" could return float rounded. But for money, return Decimal quantized to 0.01. But if tests expect float? We can return float(total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)). Or return Decimal. The prompt says returns total inventory value, rounding to 2 decimals. In Python, round(x,2) returns float. But for inventory value, Decimal is better. Could provide function returning float for simplicity, but mention Decimal. Need include two pytest cases. Could use pytest.approx? If return float, test exact? Use Decimal? Let's design:\n\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef total_inventory_value(items):\n    total = Decimal('0')\n    for name, price, quantity in items:\n        # validate? maybe boundary invariants separate.\n        if not isinstance(quantity, int) or isinstance(quantity, bool): raise TypeError\n        if quantity < 0: raise ValueError(\"quantity must be non-negative\")\n        p"
+      }
+    }
+  ],
+  "created": 1787288156,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 112,
+    "total_tokens": 496,
+    "prompt_tokens_details": {
+      "cached_tokens": 108
+    }
+  },
+  "id": "chatcmpl-jYrfjL5DC0lRKPdmpZeypeKqAODERQyX",
+  "timings": {
+    "cache_n": 108,
+    "prompt_n": 4,
+    "prompt_ms": 86.295,
+    "prompt_per_token_ms": 21.57375,
+    "prompt_per_second": 46.3526276145779,
+    "predicted_n": 384,
+    "predicted_ms": 3161.813,
+    "predicted_per_token_ms": 8.255386422976501,
+    "predicted_per_second": 121.13303348426993,
+    "draft_n": 490,
+    "draft_n_accepted": 285
+  }
+}

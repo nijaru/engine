@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with full updated code single code block then short bullet list behavior changes. Need think through implementation.\n\nUser: Python repo current retry decorator. Task modify so that (1) retries are cancelled promptly when a threading.Event is set, (2) delay respects caller-provided deadline (monotonic), (3) decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit full updated code as single code block, then short bullet list behavior changes.\n\nNeed design. Need likely add parameters: cancel_event: threading.Event | None = None, deadline: float | None = None? Caller-provided deadline monotonic. How caller provides? Could be decorator parameter? \"caller-provided deadline (monotonic)\" likely decorator accepts deadline parameter, maybe time.monotonic() value. Or wrapper can accept optional kwargs? Need decide. The decorator currently max_attempts, base_delay, jitter, exceptions. We can add cancel_event and deadline. But \"caller-provided deadline\" could mean the decorated function caller can pass deadline? In Python decorator can't easily intercept call args unless wrapper accepts *args and maybe keyword deadline? But likely decorator parameter: retry(..., deadline=time.monotonic()+5). But \"caller-provided\" maybe the caller of retry decorator provides deadline. Need implement robustly: allow deadline as decorator argument (monotonic timestamp) and/or optional keyword argument to wrapped function? Let's parse: \"modify it so that (1) retries are cancelled promptly when a threading.Event is set, (2) the delay respects a caller-provided deadline (monotonic), and (3) the decorator logs each retry at DEBUG with attempt number, delay, and exception repr.\" It says caller-provided deadline (monotonic). Could be the caller of the decorated function provides deadline? In retry context, caller-provided"
+      }
+    }
+  ],
+  "created": 1787288497,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 299,
+    "total_tokens": 683,
+    "prompt_tokens_details": {
+      "cached_tokens": 295
+    }
+  },
+  "id": "chatcmpl-Vb6ZTHIDk0xm1LnFsEbj9BOkOvU87xA9",
+  "timings": {
+    "cache_n": 295,
+    "prompt_n": 4,
+    "prompt_ms": 91.781,
+    "prompt_per_token_ms": 22.94525,
+    "prompt_per_second": 43.582004990139566,
+    "predicted_n": 384,
+    "predicted_ms": 3465.456,
+    "predicted_per_token_ms": 9.048187989556135,
+    "predicted_per_second": 110.5193659939702,
+    "draft_n": 598,
+    "draft_n_accepted": 274
+  }
+}

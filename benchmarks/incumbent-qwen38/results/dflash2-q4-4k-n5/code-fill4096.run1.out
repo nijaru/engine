@@ -1,0 +1,11 @@
+We need answer user's request. Need produce final with complete module code block. Need analyze requirements.
+
+User provided 15 modules pipeline_stage_0..14, each identical except name. Need write new module pipeline_aggregator that:
+1. Collects results from run_stage_0 through run_stage_14 with the retry semantics shown,
+2. Aggregates per-stage record counts into a summary dict,
+3. Stops at first non-retryable StageError and returns partial results plus the error.
+Emit complete module as single code block.
+
+Need infer retry semantics shown. In modules: StageError has retryable bool. run_stage functions don't implement retries themselves; they just raise StageError if KeyError (retryable=False). There are constants MAX_RETRIES=3, DEFAULT_TIMEOUT_MS. "with the retry semantics shown" likely means aggregator should retry retryable StageErrors up to max_retries? But shown modules don't show retry loop. Maybe need implement aggregator that calls each stage, if StageError and retryable, retry up to config.max_retries? Need decide.
+
+Need likely import run_stage_0...run_stage_14 and StageConfig/StageError from each? Since each module defines its own StageError and StageConfig. Aggregator should collect results from run_stage_0 through run_stage_14. Need handle non-retryable StageError: stop and return partial results plus error. For retryable errors, retry? "with the retry semantics shown" maybe means use MAX_RETRIES = 3 from modules? But no actual retry shown. Could implement: for each stage, attempt up to max_retries (default 3) if StageError.retryable is True; if non-retryable, stop. If retries exhausted, maybe return partial plus error? The requirement only says stops at first non-retryable StageError

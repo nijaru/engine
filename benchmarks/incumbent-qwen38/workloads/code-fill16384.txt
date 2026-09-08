@@ -1,0 +1,3409 @@
+
+# --- module: pipeline_stage_0 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_0")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_0"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_0(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "0", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_1 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_1")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_1"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_1(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "1", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_2 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_2")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_2"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_2(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "2", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_3 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_3")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_3"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_3(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "3", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_4 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_4")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_4"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_4(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "4", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_5 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_5")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_5"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_5(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "5", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_6 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_6")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_6"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_6(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "6", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_7 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_7")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_7"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_7(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "7", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_8 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_8")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_8"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_8(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "8", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_9 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_9")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_9"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_9(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "9", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_10 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_10")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_10"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_10(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "10", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_11 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_11")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_11"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_11(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "11", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_12 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_12")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_12"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_12(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "12", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_13 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_13")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_13"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_13(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "13", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_14 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_14")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_14"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_14(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "14", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_15 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_15")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_15"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_15(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "15", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_16 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_16")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_16"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_16(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "16", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_17 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_17")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_17"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_17(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "17", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_18 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_18")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_18"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_18(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "18", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_19 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_19")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_19"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_19(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "19", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_20 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_20")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_20"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_20(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "20", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_21 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_21")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_21"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_21(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "21", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_22 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_22")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_22"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_22(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "22", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_23 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_23")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_23"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_23(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "23", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_24 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_24")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_24"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_24(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "24", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_25 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_25")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_25"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_25(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "25", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_26 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_26")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_26"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_26(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "26", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_27 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_27")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_27"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_27(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "27", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_28 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_28")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_28"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_28(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "28", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_29 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_29")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_29"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_29(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "29", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_30 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_30")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_30"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_30(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "30", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_31 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_31")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_31"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_31(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "31", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_32 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_32")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_32"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_32(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "32", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_33 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_33")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_33"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_33(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "33", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_34 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_34")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_34"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_34(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "34", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_35 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_35")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_35"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_35(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "35", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_36 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_36")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_36"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_36(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "36", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_37 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_37")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_37"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_37(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "37", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_38 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_38")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_38"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_38(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "38", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_39 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_39")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_39"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_39(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "39", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_40 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_40")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_40"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_40(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "40", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_41 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_41")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_41"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_41(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "41", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_42 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_42")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_42"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_42(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "42", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_43 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_43")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_43"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_43(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "43", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_44 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_44")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_44"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_44(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "44", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_45 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_45")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_45"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_45(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "45", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_46 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_46")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_46"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_46(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "46", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_47 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_47")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_47"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_47(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "47", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_48 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_48")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_48"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_48(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "48", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_49 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_49")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_49"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_49(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "49", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_50 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_50")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_50"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_50(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "50", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_51 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_51")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_51"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_51(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "51", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_52 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_52")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_52"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_52(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "52", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_53 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_53")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_53"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_53(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "53", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_54 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_54")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_54"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_54(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "54", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_55 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_55")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_55"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_55(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "55", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_56 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_56")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_56"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_56(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "56", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_57 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_57")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_57"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_57(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "57", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_58 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_58")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_58"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_58(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "58", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_59 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_59")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_59"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_59(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "59", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_60 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_60")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_60"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_60(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "60", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_61 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_61")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_61"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_61(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "61", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+# --- module: pipeline_stage_62 ---
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger("pipeline.stage_62")
+
+MAX_RETRIES = 3
+DEFAULT_TIMEOUT_MS = 2500
+STAGE_NAMES = ["ingest", "validate", "transform", "enrich", "emit"]
+
+
+@dataclass
+class StageConfig:
+    name: str = "stage_62"
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_retries: int = MAX_RETRIES
+    tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "timeout_ms": self.timeout_ms,
+            "max_retries": self.max_retries,
+            "tags": list(self.tags),
+            "enabled": self.enabled,
+        }
+
+
+class StageError(Exception):
+    def __init__(self, stage: str, message: str, retryable: bool = False):
+        super().__init__(f"[{stage}] {message}")
+        self.stage = stage
+        self.retryable = retryable
+
+
+def run_stage_62(payload: dict, config: Optional[StageConfig] = None) -> dict:
+    cfg = config or StageConfig()
+    records = payload.get("records", [])
+    out = []
+    for rec in records:
+        if not cfg.enabled:
+            break
+        try:
+            transformed = {k: v for k, v in rec.items() if k not in ("_raw", "_meta")}
+            transformed["stage"] = cfg.name
+            out.append(transformed)
+        except KeyError as exc:
+            raise StageError(cfg.name, f"missing key: {exc}", retryable=False) from exc
+    logger.debug("stage_%s processed %d records", "62", len(out))
+    return {"records": out, "stage": cfg.name, "ok": True}
+
+
+Based on the pipeline modules above, write a new module `pipeline_aggregator` that:
+1. Collects results from run_stage_0 through run_stage_62 with the retry semantics shown,
+2. Aggregates per-stage record counts into a summary dict,
+3. Stops at the first non-retryable StageError and returns partial results plus the error.
+Emit the complete module as a single code block.

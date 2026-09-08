@@ -1,0 +1,108 @@
+0.00.052.906 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.129.393 W srv  llama_server: -----------------
+0.00.129.394 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.129.395 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.129.395 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.129.395 W srv  llama_server: -----------------
+0.00.130.593 I srv    load_model: loading model '/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf'
+0.00.324.506 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.346.747 W srv    load_model: [spec] failed to measure draft model memory: failed to create llama_context from model
+0.00.749.234 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.749.238 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.749.242 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.749.244 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+0.00.749.245 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+0.00.749.251 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.749.252 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.749.254 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.749.255 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.749.257 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.749.258 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.749.281 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.749.282 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.749.284 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.749.288 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.02.018.457 I cmn          init: llama threadpool init, n_threads = 8
+0.02.066.998 I common_speculative_init_result: loading draft model '/home/nick/models/dflash2/Qwen3.8-27B-DFlash2-Q8_0.gguf'
+0.02.462.383 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 245760, kv_unified = 'false'
+0.02.462.401 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.02.462.403 I common_speculative_impl_draft_dflash: - n_max=6, n_min=0, p_min=0.00
+0.02.462.403 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true
+/home/nick/github/ggml-org/llama.cpp-dflash2-test/ggml/src/ggml-cuda/ggml-cuda.cu:106: CUDA error
+0.02.470.917 E CUDA error: out of memory
+0.02.470.918 E   current device: 0, in function alloc at /home/nick/github/ggml-org/llama.cpp-dflash2-test/ggml/src/ggml-cuda/ggml-cuda.cu:589
+0.02.470.919 E   cuMemCreate(&handle, reserve_size, &prop, 0)
+⚠️ warning: The current terminal doesn't support styling.  Styled output might not appear as expected.
+[New LWP 69989]
+[New LWP 69988]
+[New LWP 69987]
+[New LWP 69986]
+[New LWP 69985]
+[New LWP 69984]
+[New LWP 69983]
+[New LWP 69982]
+[New LWP 69981]
+[New LWP 69980]
+[New LWP 69979]
+[New LWP 69978]
+[New LWP 69977]
+[New LWP 69976]
+[New LWP 69975]
+[New LWP 69974]
+[New LWP 69973]
+[New LWP 69972]
+[New LWP 69971]
+[New LWP 69970]
+[New LWP 69969]
+[New LWP 69968]
+[New LWP 69967]
+[New LWP 69966]
+[New LWP 69965]
+[New LWP 69964]
+[New LWP 69963]
+[New LWP 69962]
+[New LWP 69961]
+[New LWP 69960]
+[New LWP 69959]
+[New LWP 69958]
+[New LWP 69957]
+[New LWP 69954]
+[New LWP 69953]
+[New LWP 69949]
+[New LWP 69948]
+[New LWP 69947]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <ima:enforcing>
+  <https://debuginfod.fedoraproject.org/>
+  <ima:ignore>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+0x00007f9157682312 in __syscall_cancel_arch () from /lib64/libc.so.6
+#0  0x00007f9157682312 in __syscall_cancel_arch () from /lib64/libc.so.6
+#1  0x00007f915767652c in __internal_syscall_cancel () from /lib64/libc.so.6
+#2  0x00007f9157676574 in __syscall_cancel () from /lib64/libc.so.6
+#3  0x00007f91576e614f in wait4 () from /lib64/libc.so.6
+#4  0x00007f9162137c33 in ggml_print_backtrace () from /home/nick/github/llama-dflash2-build/bin/libggml-base.so.0
+#5  0x00007f9162137d7f in ggml_abort () from /home/nick/github/llama-dflash2-build/bin/libggml-base.so.0
+#6  0x00007f915f1f9a53 in ggml_cuda_error(char const*, char const*, char const*, int, char const*) () from /home/nick/github/llama-dflash2-build/bin/libggml-cuda.so.0
+#7  0x00007f915f20fec3 in ggml_cuda_pool_vmm::alloc(unsigned long, unsigned long*) () from /home/nick/github/llama-dflash2-build/bin/libggml-cuda.so.0
+#8  0x00007f915f3637d1 in ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context&, ggml_tensor const*, ggml_tensor const*, ggml_tensor const*, ggml_tensor*, ggml_cuda_mm_fusion_args_host const*) () from /home/nick/github/llama-dflash2-build/bin/libggml-cuda.so.0
+#9  0x00007f915f20cb5b in ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context*, ggml_cgraph*, bool, bool, void const*) () from /home/nick/github/llama-dflash2-build/bin/libggml-cuda.so.0
+#10 0x00007f915f20d452 in ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/nick/github/llama-dflash2-build/bin/libggml-cuda.so.0
+#11 0x00007f9162154f1f in ggml_backend_sched_graph_compute_async () from /home/nick/github/llama-dflash2-build/bin/libggml-base.so.0
+#12 0x00007f9161648290 in llama_context::graph_compute(ggml_cgraph*, bool) () from /home/nick/github/llama-dflash2-build/bin/libllama.so.0
+#13 0x00007f916164bf1b in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /home/nick/github/llama-dflash2-build/bin/libllama.so.0
+#14 0x00007f9161652cc8 in llama_context::decode(llama_batch const&) () from /home/nick/github/llama-dflash2-build/bin/libllama.so.0
+#15 0x00007f91616541de in llama_decode () from /home/nick/github/llama-dflash2-build/bin/libllama.so.0
+#16 0x00007f9161d6fa56 in common_context_can_seq_rm(llama_context*) () from /home/nick/github/llama-dflash2-build/bin/libllama-common.so.0
+#17 0x00007f9162334026 in server_context_impl::load_model(common_params&) () from /home/nick/github/llama-dflash2-build/bin/libllama-server-impl.so
+#18 0x00007f9162261301 in llama_server(common_params&, int, char**) () from /home/nick/github/llama-dflash2-build/bin/libllama-server-impl.so
+#19 0x00007f91622635a7 in llama_server(int, char**) () from /home/nick/github/llama-dflash2-build/bin/libllama-server-impl.so
+#20 0x00007f915760a681 in __libc_start_call_main () from /lib64/libc.so.6
+#21 0x00007f915760a798 in __libc_start_main_impl () from /lib64/libc.so.6
+#22 0x00000000004003b5 in _start ()
+[Inferior 1 (process 69941) detached]

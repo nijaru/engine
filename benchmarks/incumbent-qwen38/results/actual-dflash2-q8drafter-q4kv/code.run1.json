@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with full updated code single code block then short bullet list behavior changes. Need think through implementation.\n\nUser: Python repo current retry decorator. Task modify so (1) retries cancelled promptly when threading.Event is set, (2) delay respects caller-provided deadline (monotonic), (3) decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit full updated code as single code block, then short bullet list.\n\nNeed design. Need likely add parameters: cancel_event: threading.Event | None = None, deadline: float | None = None? Caller-provided deadline monotonic. How caller provides? Could be decorator parameter? \"caller-provided deadline (monotonic)\" maybe decorator accepts deadline? Or wrapper can accept optional keyword? Need infer. They want modify decorator. Could add optional `deadline` parameter to retry decorator (monotonic timestamp) and/or wrapper? \"caller-provided deadline\" likely the caller of decorated function can pass deadline? But decorator signature fixed? We can add `deadline` parameter to retry() as monotonic deadline for all retries? But \"caller-provided\" could mean the function being decorated receives a `deadline` keyword? Hmm.\n\nLet's parse: \"modify it so that (1) retries are cancelled promptly when a `threading.Event` is set, (2) the delay respects a caller-provided deadline (monotonic), and (3) the decorator logs each retry at DEBUG with attempt number, delay, and exception repr.\"\n\nCould mean the retry decorator should support cancellation event and deadline. The caller (of retry decorator) provides deadline? Or caller of wrapped function? \"caller-provided deadline (monotonic)\" likely means the decorated function's caller can provide a deadline? But typical retry decorator can't easily pass per-call deadline unless wrapper accepts a special"
+      }
+    }
+  ],
+  "created": 1787290359,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 299,
+    "total_tokens": 683,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-YVJPrG772R2R3XO40cG8Cu04m0SUTABY",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 299,
+    "prompt_ms": 209.063,
+    "prompt_per_token_ms": 0.6992073578595317,
+    "prompt_per_second": 1430.1908993939628,
+    "predicted_n": 384,
+    "predicted_ms": 3726.43,
+    "predicted_per_token_ms": 9.729582245430809,
+    "predicted_per_second": 102.77933571810016,
+    "draft_n": 566,
+    "draft_n_accepted": 268
+  }
+}

@@ -1,0 +1,1 @@
+Explain why a distributed system can observe stale reads even when every individual request is handled correctly. Compare read-after-write consistency, monotonic reads, and linearizability using one concrete example for each. Then give a practical debugging checklist for distinguishing replication lag from an application cache bug. Keep the answer technical and self-contained.

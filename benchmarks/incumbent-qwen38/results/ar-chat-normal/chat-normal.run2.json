@@ -1,0 +1,37 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final technical self-contained. Need explain why distributed system can observe stale reads even when every individual request handled correctly. Compare read-after-write consistency, monotonic reads, and linearizability using one concrete example for each. Then practical debugging checklist for distinguishing replication lag from application cache bug.\n\nNeed think carefully. Need likely define stale reads: read returns value older than some write that has become visible/committed? Even if each request handled correctly per local protocol, due to distributed clocks, replication, routing, caches, ordering. Need explain: correctness local doesn't imply global consistency; each node may serve latest known state; no single global time; writes propagate asynchronously; reads may hit different replicas/caches; request can be correct relative to replica's state but stale relative to writer's committed state.\n\nCompare three properties with one concrete example each. Need maybe use same scenario? User says using one concrete example for each. Could use examples:\n- Read-after-write consistency: client writes x=1, then reads x from same client/session; must see 1. Example: user updates profile name, immediately reloads profile; if sees old name violates. But if read from different client? not required.\n- Monotonic reads: same client reads x=1, later reads x; must not see older value (e.g., 0) after seeing 1. Example: client reads counter 5, then 4 due to replica lag/cache; violates.\n- Linearizability: all operations appear to occur atomically at some point between invocation and response, in real-time order. Example: two clients write/read concurrently: C1 writes x=1 at t1, C2 reads x at t2 after C1's write response? Need linearizability requires if write completes before read starts, read sees 1. Concrete: C1 writes"
+      }
+    }
+  ],
+  "created": 1787289276,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10548-a298422da",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 116,
+    "total_tokens": 500,
+    "prompt_tokens_details": {
+      "cached_tokens": 112
+    }
+  },
+  "id": "chatcmpl-iJSgvipEduGwfXGHG9fx9FUZDfk3r5MM",
+  "timings": {
+    "cache_n": 112,
+    "prompt_n": 4,
+    "prompt_ms": 84.869,
+    "prompt_per_token_ms": 21.21725,
+    "prompt_per_second": 47.13146142879025,
+    "predicted_n": 384,
+    "predicted_ms": 7742.152,
+    "predicted_per_token_ms": 20.214496083550912,
+    "predicted_per_second": 49.469449837719544
+  }
+}

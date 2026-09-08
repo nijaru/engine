@@ -1,0 +1,9 @@
+We need answer user's request. Need produce final code block only? User: "Based on the pipeline modules above, write a new module `pipeline_aggregator` that:
+1. Collects results from run_stage_0 through run_stage_62 with the retry semantics shown,
+2. Aggregates per-stage record counts into a summary dict,
+3. Stops at the first non-retryable StageError and returns partial results plus the error.
+Emit the complete module as a single code block."
+
+Need infer retry semantics shown. Each stage module has MAX_RETRIES=3, StageError with retryable bool. But run_stage_N doesn't actually retry; it just raises StageError if KeyError. "with the retry semantics shown" likely means aggregator should retry retryable StageError up to max_retries? Need design.
+
+We need write module pipeline_aggregator. It should collect results from run_stage_0 through run_stage_62. Since modules are separate, in a single module we can import them? The prompt includes modules but not actual package. We need emit complete module. It can import pipeline_stage_0 ... pipeline_stage_62. But if not available? We can define dynamic import? Better to import all stage modules explicitly? That's 63 imports. Could use importlib to import f"pipeline_stage_{i}" and getattr run_stage_{i}. But if modules are in same directory, importlib works. Need avoid huge explicit imports? Complete module can use importlib. But maybe expected to import each? The user says based on modules above, write new module. We can use importlib to reduce. Need ensure StageError classes are distinct per module? Each module defines its own StageError. If we catch Exception and check isinstance? Since StageError classes are separate, cannot catch a common base unless we catch Exception and inspect attributes.

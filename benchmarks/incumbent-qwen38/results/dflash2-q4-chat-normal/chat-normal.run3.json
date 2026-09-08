@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final technical self-contained. Need explain why distributed system can observe stale reads even when every individual request handled correctly. Compare read-after-write consistency, monotonic reads, and linearizability using one concrete example for each. Then practical debugging checklist for distinguishing replication lag from application cache bug.\n\nNeed think carefully. Need likely define stale reads: read returns value older than some write that has become visible/committed? Even if each request handled correctly per local protocol, due to distributed clocks, replication, routing, caches, ordering. Need explain: correctness local doesn't imply global consistency; each node may serve from its own replica/cache; no single total order; network partitions; async replication; read-your-writes not guaranteed unless session affinity or versioning.\n\nCompare three properties with concrete example each. Need maybe use same scenario? User says using one concrete example for each. Could use examples:\n- Read-after-write consistency (read-your-writes): client writes x=1, then reads x from same client/session; should see 1. Example: user updates profile name, immediately reloads profile; if read routed to stale replica, sees old name. This property only requires same client's own writes visible to that client, not other clients.\n- Monotonic reads: once client sees value v, subsequent reads by same client should not see older value. Example: client reads x=1, then x=2, then due to routing to lagging replica reads x=1 again; violates monotonic reads even if no new write. Need concrete.\n- Linearizability: all operations appear to occur atomically at some instant between invocation and response, in real-time order. Example: two clients write x=1 and x=2 concurrently? Need show stale read despite correct individual requests? Maybe: W1 x=1 completes at t1, W"
+      }
+    }
+  ],
+  "created": 1787289301,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 116,
+    "total_tokens": 500,
+    "prompt_tokens_details": {
+      "cached_tokens": 112
+    }
+  },
+  "id": "chatcmpl-t7876eX0o1RhFZYnCRMDp6RwlR7uf8v3",
+  "timings": {
+    "cache_n": 112,
+    "prompt_n": 4,
+    "prompt_ms": 86.285,
+    "prompt_per_token_ms": 21.57125,
+    "prompt_per_second": 46.357999652315,
+    "predicted_n": 384,
+    "predicted_ms": 4228.359,
+    "predicted_per_token_ms": 11.04010182767624,
+    "predicted_per_second": 90.57887468873858,
+    "draft_n": 670,
+    "draft_n_accepted": 248
+  }
+}

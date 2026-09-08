@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request. Need produce final with full updated code single code block then short bullet list behavior changes. Need think through implementation.\n\nUser: Python repo current retry decorator. Task modify so (1) retries cancelled promptly when threading.Event is set, (2) delay respects caller-provided deadline (monotonic), (3) decorator logs each retry at DEBUG with attempt number, delay, and exception repr. Emit full updated code as single code block, then short bullet list behavior changes.\n\nNeed design. Need likely add parameters: cancel_event: threading.Event | None = None, deadline: float | None = None? Caller-provided deadline monotonic. How caller provides? Could be decorator parameter deadline? Or wrapper accepts special kwarg? \"caller-provided deadline (monotonic)\" likely decorator can accept deadline parameter? But caller-provided maybe at call time? Need infer. The decorator currently max_attempts, base_delay, jitter, exceptions. We can add cancel_event and deadline to decorator signature. But \"caller-provided deadline\" could mean the decorated function can accept a deadline keyword? Hmm.\n\nNeed robust. We can support both: decorator accepts optional deadline (monotonic timestamp) and cancel_event; also wrapper can accept a special keyword argument `deadline`? But that may conflict with function's own kwargs. Better: decorator parameters: `cancel_event: threading.Event | None = None`, `deadline: float | None = None`. But if deadline is set at decoration time, it's fixed, not caller-provided per call. \"caller-provided deadline (monotonic)\" likely means the caller of decorated function can pass deadline? But decorator can't know function signature. Could use contextvar? Or use `retry` decorator with `deadline` parameter? The phrase \"caller-provided deadline\" maybe means the retry decorator should accept a deadline argument from the caller ("
+      }
+    }
+  ],
+  "created": 1787289061,
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "system_fingerprint": "b10498-5ecbe1ac1",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 384,
+    "prompt_tokens": 299,
+    "total_tokens": 683,
+    "prompt_tokens_details": {
+      "cached_tokens": 42
+    }
+  },
+  "id": "chatcmpl-wqccsM5iLQgd1J4xOTNk5zIQGzaLcYIg",
+  "timings": {
+    "cache_n": 42,
+    "prompt_n": 257,
+    "prompt_ms": 293.541,
+    "prompt_per_token_ms": 1.1421828793774318,
+    "prompt_per_second": 875.5165377238615,
+    "predicted_n": 384,
+    "predicted_ms": 3296.149,
+    "predicted_per_token_ms": 8.606133159268929,
+    "predicted_per_second": 116.19620350900401,
+    "draft_n": 518,
+    "draft_n_accepted": 279
+  }
+}

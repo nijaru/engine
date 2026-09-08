@@ -1,0 +1,234 @@
+{
+  "data": [
+    {
+      "session_id": "session_000000",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": "avius Messala Lucilius and the Army OCTAVIUS What man is that MESSALA My masters man Strato where is thy master STRATO Free from the bondage you are in Messala The conquerors can but make a fire of him For Brutus only overcame himself And no man else hath honour by his death LUCILIUS So Brutus should be found I thank thee Brutus That thou hast provd Lucilius saying true OCTAVIUS All that servd Brutus I will entertain them Fellow wilt thou bestow thy time with me STRATO Ay if Messala will prefer me to you OCTAVIUS Do so good Messala MESSALA How died my master Strato STRATO I held the sword and he did run on it MESSALA Octavius then take him to follow thee That did the latest service to my master ANTONY This was the noblest Roman of them all All the conspirators save only he Did that they did in envy of great Caesar He only in a general honest thought And common good to all made one of them His life was gentle and the elements So mixd in him that Nature might stand up And say to all the world This was a man OCTAVIUS According to his virtue let"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000001",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " out countries in her ANTIPHOLUS OF SYRACUSE In what part of her body stands Ireland DROMIO OF SYRACUSE Marry sir in her buttocks I found it out by the bogs ANTIPHOLUS OF SYRACUSE Where Scotland DROMIO OF SYRACUSE I found it by the barrenness hard in the palm of the hand ANTIPHOLUS OF SYRACUSE Where France DROMIO OF SYRACUSE In her forehead armed and reverted making war against her hair ANTIPHOLUS OF SYRACUSE Where England DROMIO OF SYRACUSE I looked for the chalky cliffs but I could find no whiteness in them But I guess it stood in her chin by the salt rheum that ran between France and it ANTIPHOLUS OF SYRACUSE Where Spain DROMIO OF SYRACUSE Faith I saw it not but I felt it hot in her breath ANTIPHOLUS OF SYRACUSE Where America the Indies DROMIO OF SYRACUSE O sir upon her nose all oerembellished with rubies carbuncles sapphires declining their rich aspect to the hot breath of Spain who sent whole armadoes of carracks to be ball"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000002",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " merciful SHYLOCK On what compulsion must I Tell me that PORTIA The quality of mercy is not straind It droppeth as the gentle rain from heaven Upon the place beneath It is twice blest It blesseth him that gives and him that takes Tis mightiest in the mightiest it becomes The throned monarch better than his crown His sceptre shows the force of temporal power The attribute to awe and majesty Wherein doth sit the dread and fear of kings But mercy is above this sceptred sway It is enthroned in the hearts of kings It is an attribute to God himself And earthly power doth then show likest Gods When mercy seasons justice Therefore Jew Though justice be thy plea consider this That in the course of justice none of us Should see salvation We do pray for mercy And that same prayer doth teach us all to render The deeds of mercy I have spoke thus much To mitigate the justice of thy plea Which if thou follow this strict court of Venice Must needs give sentence gainst the merchant there SHYLOCK My deeds upon my head I crave the law The penalty and forfeit of my bond PORTIA Is he not able to discharge the money BASSANIO Yes here I tender it for him in the court Y"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000003",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": "ide me for it TROILUS When many times the captive Grecian falls Even in the fan and wind of your fair sword You bid them rise and live HECTOR O tis fair play TROILUS Fools play by heaven Hector HECTOR How now how now TROILUS For th love of all the gods Lets leave the hermit Pity with our mother And when we have our armours buckled on The venomd vengeance ride upon our swords Spur them to ruthful work rein them from ruth HECTOR Fie savage fie TROILUS Hector then tis wars HECTOR Troilus I would not have you fight today TROILUS Who should withhold me Not fate obedience nor the hand of Mars Beckoning with fiery truncheon my retire Not Priamus and Hecuba on knees Their eyes oergalled with recourse of tears Nor you my brother with your true sword drawn Opposd to hinder me should stop my way But by my ruin Reenter Cassandra with Priam CASSANDRA Lay hold upon him Priam hold him fast He is thy crutch now if thou lose thy stay Thou on him leaning and all Troy on thee Fall all together PRIAM Come Hector come go back Thy wife hath dreamt thy mother hath had visions Cassandra doth"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000004",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " mans life What was thy cause Adultery Thou shalt not die die for adultery No The wren goes tot and the small gilded fly Does lecher in my sight Let copulation thrive For Gloucesters bastard son was kinder to his father Than my daughters got tween the lawful sheets Tot luxury pellmell for I lack soldiers Behold yond simpring dame Whose face between her forks presages snow That minces virtue and does shake the head To hear of pleasures name The fitchew nor the soiled horse goes tot with a more riotous appetite Down from the waist they are centaurs though women all above But to the girdle do the gods inherit beneath is all the fiends theres hell theres darkness there is the sulphurous pit burning scalding stench consumption Fie fie fie pah pah Give me an ounce of civet good apothecary to sweeten my imagination Theres money for thee GLOUCESTER O let me kiss that hand LEAR Let me wipe it first it smells of mortality GLOUCESTER O ruind piece of nature this great world Shall so wear out to naught Dost thou know me LEAR I remember thine eyes well enough Dost thou squiny at me No do thy worst blind Cupid Ill not"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000005",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " If I might in entreaties find success As seld I have the chance I would desire My famous cousin to our Grecian tents DIOMEDES Tis Agamemnons wish and great Achilles Doth long to see unarmd the valiant Hector HECTOR Aeneas call my brother Troilus to me And signify this loving interview To the expecters of our Trojan part Desire them home Give me thy hand my cousin I will go eat with thee and see your knights Agamemnon and the rest of the Greeks come forward AJAX Great Agamemnon comes to meet us here HECTOR The worthiest of them tell me name by name But for Achilles my own searching eyes Shall find him by his large and portly size AGAMEMNON Worthy all arms as welcome as to one That would be rid of such an enemy But thats no welcome Understand more clear Whats past and whats to come is strewd with husks And formless ruin of oblivion But in this extant moment faith and troth Straind purely from all hollow biasdrawing Bids thee with most divine integrity From heart of very heart great Hector welcome HECTOR I thank thee most imperious Agamemnon AGAMEMNON To Troilus My wellfamd lord of Troy"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000006",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " lady He finds the joys of heaven here on earth And if on earth he do not merit it In reason he should never come to heaven Why if two gods should play some heavenly match And on the wager lay two earthly women And Portia one there must be something else Pawnd with the other for the poor rude world Hath not her fellow LORENZO Even such a husband Hast thou of me as she is for a wife JESSICA Nay but ask my opinion too of that LORENZO I will anon First let us go to dinner JESSICA Nay let me praise you while I have a stomach LORENZO No pray thee let it serve for tabletalk Then howsomeer thou speakst mong other things I shall digest it JESSICA Well Ill set you forth Exeunt ACT IV SCENE I Venice A court of justice Enter the Duke the Magnificoes Antonio Bassanio Gratiano Salerio and others DUKE What is Antonio here ANTONIO Ready so please your Grace DUKE I am sorry for thee thou art come to answer A stony adversary an inhuman wretch Uncapable of pity void and empty From any dram of mercy ANTONIO I have heard Your Grace hath taen great pains to qualify His rigorous course but since he stands obdurate"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000007",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " we will bind and hoodwink him so that he shall suppose no other but that he is carried into the leaguer of the adversaries when we bring him to our own tents Be but your lordship present at his examination if he do not for the promise of his life and in the highest compulsion of base fear offer to betray you and deliver all the intelligence in his power against you and that with the divine forfeit of his soul upon oath never trust my judgment in anything SECOND LORD O for the love of laughter let him fetch his drum he says he has a stratagem fort When your lordship sees the bottom of his success int and to what metal this counterfeit lump of ore will be melted if you give him not John Drums entertainment your inclining cannot be removed Here he comes Enter Parolles FIRST LORD O for the love of laughter hinder not the honour of his design let him fetch off his drum in any hand BERTRAM How now monsieur This drum sticks sorely in your disposition SECOND LORD A pox on t let it go tis but a drum PAROLLES But a drum Ist but a drum A drum so lost There was excellent command to charge in with our horse upon our own wings and to rend our own soldiers SECOND LORD That was not to be"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000008",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": "INGS Why knows not Montague that of itself England is safe if true within itself MONTAGUE But the safer when tis backed with France HASTINGS Tis better using France than trusting France Let us be backed with God and with the seas Which He hath givn for fence impregnable And with their helps only defend ourselves In them and in ourselves our safety lies GEORGE For this one speech Lord Hastings well deserves To have the heir of the Lord Hungerford KING EDWARD Ay what of that It was my will and grant And for this once my will shall stand for law RICHARD And yet methinks your Grace hath not done well To give the heir and daughter of Lord Scales Unto the brother of your loving bride She better would have fitted me or Clarence But in your bride you bury brotherhood GEORGE Or else you would not have bestowed the heir Of the Lord Bonville on your new wifes son And leave your brothers to go speed elsewhere KING EDWARD Alas poor Clarence is it for a wife That thou art malcontent I will provide thee GEORGE In choosing for yourself you showed your judgment Which being shallow you shall give me leave To play the broker in mine own behalf And to that end I shortly mind to leave you KING ED"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    },
+    {
+      "session_id": "session_000009",
+      "payloads": [
+        {
+          "messages": [
+            {
+              "role": "user",
+              "content": " Beg pardon of the Prince and call thee back With twenty hundred thousand times more joy Than thou wentst forth in lamentation Go before Nurse Commend me to thy lady And bid her hasten all the house to bed Which heavy sorrow makes them apt unto Romeo is coming NURSE O Lord I could have stayd here all the night To hear good counsel O what learning is My lord Ill tell my lady you will come ROMEO Do so and bid my sweet prepare to chide NURSE Here sir a ring she bid me give you sir Hie you make haste for it grows very late Exit ROMEO How well my comfort is revivd by this FRIAR LAWRENCE Go hence good night and here stands all your state Either be gone before the watch be set Or by the break of day disguisd from hence Sojourn in Mantua Ill find out your man And he shall signify from time to time Every good hap to you that chances here Give me thy hand tis late farewell good night ROMEO But that a joy past joy calls out on me It were a grief so brief to part with thee Farewell Exeunt SCENE IV A Room in Capulets House Enter Capulet Lady Capulet and Paris CAPULET Things have fallen out sir so"
+            }
+          ],
+          "model": "qwen3.8:27b-awq",
+          "stream": true,
+          "max_completion_tokens": 128,
+          "temperature": 0,
+          "chat_template_kwargs": {
+            "enable_thinking": false
+          },
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      ]
+    }
+  ]
+}
