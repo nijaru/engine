@@ -1377,6 +1377,61 @@ impl CudaIntDotProjector {
             _ => Ok(self.iq4xs.execute(weight, packed, output)?),
         }
     }
+
+    /// Batched variant of [`Self::project`] for `members` batch-major input
+    /// and output rows. All members pack in one quantizer launch over the
+    /// combined activation stream, then one weights-read-once integer-dot
+    /// launch consumes it.
+    #[allow(clippy::too_many_arguments)]
+    fn project_batch(
+        &mut self,
+        weight: &CudaQuantizedWeight,
+        kernel: &QwenGemvKernel,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+        per_row_input: usize,
+    ) -> Result<(), CudaDecodeError> {
+        let int_kernel = match weight.value_type() {
+            12 => Some(0),
+            13 => Some(1),
+            14 => Some(2),
+            23 => Some(3),
+            _ => None,
+        };
+        let Some(selector) = int_kernel else {
+            return Ok(kernel.execute_warp_batch(weight, input, output, members)?);
+        };
+        let per_member_words = per_row_input.div_ceil(32).checked_mul(9).ok_or_else(|| {
+            CudaDecodeError::Driver("int-dot packed length overflowed".to_owned())
+        })?;
+        let needed = per_member_words.checked_mul(members).ok_or_else(|| {
+            CudaDecodeError::Driver("int-dot batched length overflowed".to_owned())
+        })?;
+        // Exact-length scratch per (members, width) pair: the batch kernels
+        // validate whole-slice lengths, and the stream-ordered drop is safe
+        // (see `project`). Widths alternate a handful of times per step, so
+        // the realloc churn mirrors the batch-1 projector.
+        let current = self.packed.as_ref().map_or(0, CudaSlice::len);
+        if current != needed {
+            self.packed = Some(
+                self.stream
+                    .alloc_zeros::<u32>(needed)
+                    .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            );
+        }
+        let packed = self
+            .packed
+            .as_mut()
+            .ok_or_else(|| CudaDecodeError::Driver("int-dot packed scratch is unset".to_owned()))?;
+        self.quantizer.execute(input, packed)?;
+        match selector {
+            0 => Ok(self.q4k.execute_batch(weight, packed, output, members)?),
+            1 => Ok(self.q5k.execute_batch(weight, packed, output, members)?),
+            2 => Ok(self.q6k.execute_batch(weight, packed, output, members)?),
+            _ => Ok(self.iq4xs.execute_batch(weight, packed, output, members)?),
+        }
+    }
 }
 
 fn gemv(
@@ -1414,6 +1469,9 @@ fn gemv_batch(
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
     members: usize,
+    per_row_input: usize,
+    mode: GemvMode,
+    int_dot: Option<&mut CudaIntDotProjector>,
 ) -> Result<(), CudaDecodeError> {
     let weight = weights
         .quantized_tensor(name)
@@ -1421,8 +1479,32 @@ fn gemv_batch(
     let kernel = weights
         .gemv_for(weight.value_type())
         .ok_or(CudaDecodeError::MissingKernel(weight.value_type()))?;
-    kernel.execute_warp_batch(weight, input, output, members)?;
-    Ok(())
+    // Float modes never take the projector path; passing `None` keeps the
+    // call sites uniform.
+    let Some(int_dot) = int_dot else {
+        return match mode {
+            // Scalar has no batched variant; the warp-batch path is the only
+            // float batch executor and also serves as the Scalar-mode batch
+            // fallback, mirroring the batch-1 seam.
+            GemvMode::Scalar | GemvMode::Warp => {
+                kernel.execute_warp_batch(weight, input, output, members)?;
+                Ok(())
+            }
+            GemvMode::IntegerDot => Err(CudaDecodeError::Driver(
+                "int-dot projector is unset".to_owned(),
+            )),
+        };
+    };
+    match mode {
+        GemvMode::Scalar | GemvMode::Warp => {
+            kernel.execute_warp_batch(weight, input, output, members)?;
+            Ok(())
+        }
+        GemvMode::IntegerDot => {
+            int_dot.project_batch(weight, kernel, input, output, members, per_row_input)?;
+            Ok(())
+        }
+    }
 }
 
 fn copy_range(
@@ -1499,6 +1581,11 @@ pub struct CudaQwen35BatchDecode {
     members: usize,
     layer_kinds: Vec<QwenLayerKind>,
     scratch: BatchScratch,
+    gemv_mode: GemvMode,
+    /// Lazily built integer-dot state for [`GemvMode::IntegerDot`], shared
+    /// shape with the batch-1 projector but holding batch-major scratch:
+    /// one packed `[members][K/32*9]` buffer per distinct projection width.
+    int_dot: Option<CudaIntDotProjector>,
 }
 
 impl CudaQwen35BatchDecode {
@@ -1537,6 +1624,7 @@ impl CudaQwen35BatchDecode {
             recurrent_slot: single.recurrent_slot.clone(),
             vocab: single.logits.len(),
         };
+        let gemv_mode = single.gemv_mode;
         Self::prepare(
             Arc::clone(single.stream()),
             Arc::clone(&single.weights),
@@ -1545,6 +1633,7 @@ impl CudaQwen35BatchDecode {
             plan,
             Arc::clone(&single.ops),
             Arc::clone(&single.embedding),
+            gemv_mode,
         )
     }
 
@@ -1560,6 +1649,7 @@ impl CudaQwen35BatchDecode {
         plan: ValidatedModelPlan,
         ops: Arc<CudaQwen35Ops>,
         embedding: Arc<CudaQ4KEmbedding>,
+        gemv_mode: GemvMode,
     ) -> Result<Self, CudaDecodeError> {
         let ValidatedModelPlan {
             tensor_names,
@@ -1630,7 +1720,19 @@ impl CudaQwen35BatchDecode {
                 })
                 .collect(),
             scratch,
+            gemv_mode,
+            int_dot: None,
         })
+    }
+
+    /// Select which `GEMV` kernel variant subsequent batched steps launch.
+    ///
+    /// Mirrors the batch-1 executor's [`GemvMode`] seam: `Warp` is the
+    /// qualified default, `Scalar` the oracle, `IntegerDot` the explicit
+    /// opt-in lossy path. Mode changes take effect for the next launched
+    /// step and never mutate in-flight launches.
+    pub fn set_gemv_mode(&mut self, mode: GemvMode) {
+        self.gemv_mode = mode;
     }
 
     /// Number of batch rows this executor was built for.
@@ -1767,6 +1869,11 @@ impl CudaQwen35BatchDecode {
                 positions.len()
             )));
         }
+        // Lazily staging the integer-dot projector here keeps float-mode
+        // costs unchanged; see the batch-1 executor's `run_step`.
+        if self.gemv_mode == GemvMode::IntegerDot && self.int_dot.is_none() {
+            self.int_dot = Some(CudaIntDotProjector::new(self.stream.clone())?);
+        }
         // Validate every member's position against its own state's KV
         // capacity before any launch, mirroring the batch-1 executor's guard.
         for (state, &position) in states.iter().zip(positions) {
@@ -1837,6 +1944,9 @@ impl CudaQwen35BatchDecode {
                 &self.scratch.normed,
                 &mut self.scratch.ffn_gate_buf,
                 self.members,
+                N_EMBD,
+                self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             gemv_batch(
                 &self.weights,
@@ -1844,6 +1954,9 @@ impl CudaQwen35BatchDecode {
                 &self.scratch.normed,
                 &mut self.scratch.ffn_up_buf,
                 self.members,
+                N_EMBD,
+                self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             self.ops.silu_mul(
                 &self.scratch.ffn_gate_buf,
@@ -1856,6 +1969,9 @@ impl CudaQwen35BatchDecode {
                 &self.scratch.ffn_act,
                 &mut self.scratch.ffn_incr,
                 self.members,
+                N_FF,
+                self.gemv_mode,
+                self.int_dot.as_mut(),
             )?;
             self.ops
                 .residual_add(&mut self.scratch.hidden, &self.scratch.ffn_incr)?;
@@ -1875,6 +1991,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.logits,
             self.members,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops
             .argmax_into_batch(&self.scratch.logits, &mut self.scratch.selected)?;
@@ -1900,6 +2019,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.qkv_mixed,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv_batch(
             &self.weights,
@@ -1907,6 +2029,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.z_gate,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv_batch(
             &self.weights,
@@ -1914,6 +2039,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.beta_raw,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         gemv_batch(
             &self.weights,
@@ -1921,6 +2049,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.alpha_raw,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let dt_bias = f32_slice(&self.weights, &names.ssm_dt_bias)?;
         let ssm_a = f32_slice(&self.weights, &names.ssm_a)?;
@@ -2055,6 +2186,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.gated,
             &mut self.scratch.attn_incr,
             m,
+            GDN_INNER,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops
             .residual_add(&mut self.scratch.hidden, &self.scratch.attn_incr)?;
@@ -2081,6 +2215,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.q_raw,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let q_norm = f32_slice(&self.weights, &names.q_norm)?;
         self.ops.q_gate_norm_batch(
@@ -2097,6 +2234,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.k_raw,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         let k_norm = f32_slice(&self.weights, &names.k_norm)?;
         self.ops.strided_rms_norm_batch(
@@ -2113,6 +2253,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.normed,
             &mut self.scratch.v_raw,
             m,
+            N_EMBD,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         // `rope_neox_batch` takes rotation *pairs*: half the rotating dim
         // count, like the batch-1 host seam computing pairs from rot_dims.
@@ -2218,6 +2361,9 @@ impl CudaQwen35BatchDecode {
             &self.scratch.attn_out,
             &mut self.scratch.attn_incr,
             m,
+            ATTN_Q_HEADS * ATTN_HEAD_DIM,
+            self.gemv_mode,
+            self.int_dot.as_mut(),
         )?;
         self.ops
             .residual_add(&mut self.scratch.hidden, &self.scratch.attn_incr)?;
