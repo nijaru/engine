@@ -19,6 +19,10 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 engine-gguf = { path = "../gguf" }
 
 [[example]]
+name = "q4_kernel_bench"
+required-features = ["cuda"]
+
+[[example]]
 name = "qwen_decode_bench"
 required-features = ["cuda"]
 
