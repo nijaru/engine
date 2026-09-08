@@ -682,6 +682,10 @@ fn synthetic_q8_0(inputs: usize, rows: usize) -> Vec<u8> {
             let mut encoded = [0_u8; 34];
             encoded[..2].copy_from_slice(&D_BITS.to_le_bytes());
             for position in 0..32 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "synthetic byte in 0..61 fits i8 by construction"
+                )]
                 let value = ((position * 11 + seed * 5) % 61) as i8 - 30;
                 encoded[2 + position] = value.to_ne_bytes()[0];
             }
