@@ -42,7 +42,7 @@ The RTX 4090 is the first testable hardware target within the RTX 3090-and-up cl
 - Model residency is distinct from per-request inference state.
 - Model regions remain distinct from execution phases; no general compiler IR was introduced.
 - Temporary core `HybridState*` compatibility aliases and NVIDIA callers were migrated.
-- Execution variants carry explicit qualified/experimental/incompatible status.
+- Automatic variant eligibility requires variant-specific evidence matching the exact model, artifact, backend/device, runtime, and state/execution identity. Explicit baseline execution remains available without claiming automatic qualification.
 - Runtime startup has explicit readiness states.
 - Qwen recurrent state describes actual persistent matrix-bank and convolution-history storage rather than model projection-head geometry.
 
@@ -74,13 +74,13 @@ Implemented correctness foundation:
 - Terminal asynchronous failure must either establish completion before physical release or retain resources in a faulted backend until teardown. Logical reclamation must not hide an unsuccessful physical release.
 - Warp-cooperative GEMV, parallel model reductions, and native batched decode have same-artifact parity evidence on the RTX 4090. The float scalar path remains the explicit oracle.
 - The measured serving baseline is approximately 20.2 tok/s at concurrency 1 and 31.7 aggregate tok/s at concurrency 8. These are historical measurements, not a performance claim for every later revision or device. [Execution history](../benchmarks/execution-history.md) records the qualification and measured progression.
-- Experimental Q8_1 activation packing is implemented and has focused CUDA layout/rounding tests. Integer-dot GEMV integration, full-model parity, and matched throughput measurements remain unfinished. Packed loads and integer dots are the next kernel hypothesis; they are not automatically qualified by the baseline results.
+- Experimental Q8_1 activation packing and standalone Q4_K integer-dot GEMV have focused CUDA layout, arithmetic, error-bound, and rejection tests. Other weight families, batched integer-dot execution, full-model integration/parity, and matched throughput measurements remain unfinished. Packed loads and integer dots are the next kernel hypothesis; they are not automatically qualified by the baseline results.
 
 Next gates:
 
-- Verify error recovery preserves state ownership through admission, completion, and reclamation.
-- Prepare compatible CUDA execution shapes before serving; retain physical resources explicitly when a terminal driver fault prevents a successful drain.
-- Qualify cancellation/failure behavior on the real asynchronous CUDA path, not only the eager correctness dispatcher.
+- Preserve the verified ownership contract while adding new execution variants. Admission errors return state, commitment validates before mutation, and failed reclamation retains a retry owner.
+- CUDA lanes share prepared kernels and validated bindings; unsupported batch sizes use the per-row path. Driver faults prohibit new submissions, with uncertain resources retained until teardown.
+- Real asynchronous CUDA cancellation and deferred release are verified, including a nine-row fallback followed by eight-row peer progress. Injected host faults cover malformed completion, commitment, and release errors; deliberate destructive GPU fault injection is not part of this evidence.
 
 Current deterministic decode-first policy can theoretically starve prefill if decode work continuously consumes the entire work budget. Treat bounded fairness as a measured scheduler-policy issue; add the smallest deterministic mechanism only if real workloads require it.
 
