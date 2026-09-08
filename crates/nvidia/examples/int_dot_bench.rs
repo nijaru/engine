@@ -24,6 +24,7 @@ use engine_nvidia::{
 
 const SHAPES: [(usize, usize); 3] = [(5120, 5120), (5120, 17_408), (17_408, 5120)];
 const WARMUP: usize = 10;
+const BATCH_MEMBERS: usize = 8;
 
 #[derive(Clone, Copy)]
 enum Family {
@@ -284,7 +285,6 @@ fn main() {
     // Batched weights-read-once section (Q4_K template): eight batch-major
     // members per launch. Float uses the batched warp path; integer-dot
     // packs all members in one quantizer call, then runs one batch launch.
-    const BATCH_MEMBERS: usize = 8;
     let batch_float = CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels");
     let batch_int = CudaQ4KQ8_1Gemv::new(stream.clone()).expect("int kernel");
     for (inputs, rows) in SHAPES {
