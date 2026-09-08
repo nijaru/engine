@@ -1782,3 +1782,7 @@ fn validate_quantized_geometry(
 #[path = "q4_q8_1.rs"]
 mod q4_q8_1;
 pub use q4_q8_1::CudaQ4KQ8_1Gemv;
+
+#[path = "q5_q8_1.rs"]
+mod q5_q8_1;
+pub use q5_q8_1::CudaQ5KQ8_1Gemv;
