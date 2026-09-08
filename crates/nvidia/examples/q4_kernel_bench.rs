@@ -72,11 +72,16 @@ fn main() {
         stream.synchronize().expect("warmup sync");
         let reference = stream.clone_dtoh(&out_float).expect("read float");
         let candidate = stream.clone_dtoh(&out_int).expect("read int");
-        let max_diff = reference
+        let max_abs = reference
             .iter()
             .zip(candidate.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
+        let max_ref = reference
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        let max_diff = max_abs / max_ref.max(1.0e-6);
 
         let float_times = time_iters(iters, || {
             float_gemv
