@@ -129,6 +129,7 @@ enum BatchFloat {
     Q4K(CudaQ4KGemv),
     Q5K(CudaQ5KGemv),
     Q6K(CudaQ6KGemv),
+    Iq4Xs(CudaIq4XsGemv),
 }
 
 impl BatchFloat {
@@ -143,6 +144,7 @@ impl BatchFloat {
             Self::Q4K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
             Self::Q5K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
             Self::Q6K(kernel) => kernel.execute_warp_batch(weight, input, output, members),
+            Self::Iq4Xs(kernel) => kernel.execute_warp_batch(weight, input, output, members),
         }
     }
 }
@@ -151,6 +153,7 @@ enum BatchInt {
     Q4K(CudaQ4KQ8_1Gemv),
     Q5K(CudaQ5KQ8_1Gemv),
     Q6K(CudaQ6KQ8_1Gemv),
+    Iq4Xs(CudaIq4XsQ8_1Gemv),
 }
 
 impl BatchInt {
@@ -165,6 +168,7 @@ impl BatchInt {
             Self::Q4K(kernel) => kernel.execute_batch(weight, input, output, members),
             Self::Q5K(kernel) => kernel.execute_batch(weight, input, output, members),
             Self::Q6K(kernel) => kernel.execute_batch(weight, input, output, members),
+            Self::Iq4Xs(kernel) => kernel.execute_batch(weight, input, output, members),
         }
     }
 }
@@ -328,7 +332,7 @@ fn main() {
     // launch for each family with a batch variant. Float uses the batched
     // warp path; integer-dot packs all members in one quantizer call, then
     // runs one batch launch.
-    for family in [Family::Q4K, Family::Q5K, Family::Q6K] {
+    for family in [Family::Q4K, Family::Q5K, Family::Q6K, Family::Iq4Xs] {
         let batch_float = match family {
             Family::Q4K => BatchFloat::Q4K(
                 CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels"),
@@ -339,13 +343,17 @@ fn main() {
             Family::Q6K => BatchFloat::Q6K(
                 CudaQ6KGemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
-            Family::Iq4Xs => panic!("batch integer-dot not implemented for this family"),
+            Family::Iq4Xs => BatchFloat::Iq4Xs(
+                CudaIq4XsGemv::from_context(&context, stream.clone()).expect("float kernels"),
+            ),
         };
         let batch_int = match family {
             Family::Q4K => BatchInt::Q4K(CudaQ4KQ8_1Gemv::new(stream.clone()).expect("int kernel")),
             Family::Q5K => BatchInt::Q5K(CudaQ5KQ8_1Gemv::new(stream.clone()).expect("int kernel")),
             Family::Q6K => BatchInt::Q6K(CudaQ6KQ8_1Gemv::new(stream.clone()).expect("int kernel")),
-            Family::Iq4Xs => panic!("batch integer-dot not implemented for this family"),
+            Family::Iq4Xs => {
+                BatchInt::Iq4Xs(CudaIq4XsQ8_1Gemv::new(stream.clone()).expect("int kernel"))
+            }
         };
         for (inputs, rows) in SHAPES {
             let encoded = family.encode(inputs, rows);

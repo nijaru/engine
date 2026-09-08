@@ -110,3 +110,93 @@ extern "C" __global__ void iq4_xs_q8_1_gemv(
     accumulator = warp_sum(accumulator);
     if (lane == 0u) output[row] = accumulator;
 }
+
+// Batched weights-read-once variant: one warp owns a weight row; each lane
+// resolves its eight codebook values once and reuses them against every
+// member's packed activations. Packed inputs and float outputs are
+// batch-major ([member][row]); each member carries its own activation
+// scales.
+extern "C" __global__ void iq4_xs_q8_1_gemv_batch(
+    const unsigned char* weights,
+    const unsigned int* input,
+    float* output,
+    unsigned int input_size,
+    unsigned int output_size,
+    unsigned int members
+) {
+    __shared__ unsigned char grid[128];
+    {
+        const unsigned char values[16] = {
+            129, 152, 173, 191, 207, 221, 234, 246,
+            1, 13, 25, 38, 53, 69, 89, 113
+        };
+        // values[] holds two's-complement bytes of the signed grid
+        // (-127, -104, ..., 113); every thread fills one replica byte.
+        grid[threadIdx.x] = values[threadIdx.x & 15u];
+    }
+    __syncthreads();
+
+    const unsigned int row = blockIdx.x * 4u + threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x & 31u;
+    if (row >= output_size) return;
+    // Constant initializer plus fully unrolled predicated member loops keep
+    // acc[] in registers; a runtime-bounded member loop would spill it to
+    // local memory and serialize the member input loads.
+    float acc[MAX_BATCH_MEMBERS] = {0.0f};
+    const unsigned int blocks_per_row = input_size / 256u;
+    const unsigned int packed_stride = input_size / 32u * 9u;
+    const unsigned int replica = (lane >> 2u) & 7u;
+    const unsigned int replica_base = replica * 16u;
+    for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        const unsigned char* block = weights + (row * blocks_per_row + block_index) * 136u;
+        const float d = iq4_xs_q8_1_f16_to_f32(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const unsigned int high_scales =
+            (unsigned int)block[2] | ((unsigned int)block[3] << 8u);
+        const unsigned int group = lane >> 2u;
+        const unsigned int quarter = lane & 3u;
+        const int scale_low =
+            (int)((block[4u + group / 2u] >> ((group & 1u) * 4u)) & 0x0fu);
+        const int scale_high = (int)((high_scales >> (group * 2u)) & 0x03u);
+        const float group_scale = d * (float)((scale_low | (scale_high << 4)) - 32);
+        const unsigned int shift = quarter < 2u ? 0u : 4u;
+        const unsigned int word_base = 8u + group * 16u + (quarter & 1u) * 8u;
+        const unsigned int packed0 = *(const unsigned int*)(block + word_base);
+        const unsigned int packed1 = *(const unsigned int*)(block + word_base + 4u);
+        const unsigned int nibbles0 = (packed0 >> shift) & 0x0f0f0f0fu;
+        const unsigned int nibbles1 = (packed1 >> shift) & 0x0f0f0f0fu;
+        const unsigned int act_base = 1u + quarter * 2u;
+        unsigned int quad0 = 0u;
+        unsigned int quad1 = 0u;
+        #pragma unroll
+        for (unsigned int byte = 0; byte < 4u; ++byte) {
+            const unsigned int n0 = (nibbles0 >> (byte * 8u)) & 0x0fu;
+            const unsigned int n1 = (nibbles1 >> (byte * 8u)) & 0x0fu;
+            quad0 |= (unsigned int)grid[replica_base + n0] << (byte * 8u);
+            quad1 |= (unsigned int)grid[replica_base + n1] << (byte * 8u);
+        }
+        #pragma unroll
+        for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+            if (m < members) {
+                const unsigned int* activation =
+                    input + m * packed_stride + (block_index * 8u + group) * 9u;
+                const unsigned int act0 = activation[act_base];
+                const unsigned int act1 = activation[act_base + 1u];
+                const int integer_dot =
+                    __dp4a((int)quad0, (int)act0, 0) + __dp4a((int)quad1, (int)act1, 0);
+                const float activation_scale =
+                    iq4_xs_q8_1_f16_to_f32((unsigned short)activation[0]);
+                acc[m] += group_scale * activation_scale * (float)integer_dot;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+        if (m < members) {
+            // Every lane participates in the shuffle reduction; lane 0
+            // holds the full sum and writes it.
+            const float total = warp_sum(acc[m]);
+            if (lane == 0u) output[m * output_size + row] = total;
+        }
+    }
+}
