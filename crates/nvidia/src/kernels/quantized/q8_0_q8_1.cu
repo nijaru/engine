@@ -59,20 +59,28 @@ extern "C" __global__ void q8_0_q8_1_gemv(
     const unsigned int lane = threadIdx.x & 31u;
     if (row >= output_size) return;
     const unsigned int blocks_per_row = input_size / 32u;
+    // Tile mapping mirrors the K-quant template: lanes 0-31 cover eight
+    // four-byte chunks of four consecutive blocks per iteration, so every
+    // (block, chunk) pair is computed exactly once and every lane works.
+    const unsigned int tile_block = lane >> 3;
     const unsigned int chunk = lane & 7u;
     float accumulator = 0.0f;
-    for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
+    for (unsigned int base = 0; base < blocks_per_row; base += 4u) {
+        const unsigned int block_index = base + tile_block;
+        if (block_index >= blocks_per_row) continue;
         // Q8_0 block: 2-byte F16 scale, then 32 signed bytes. Payload words
         // are assembled from bytes because the 34-byte block stride never
         // guarantees u32 alignment of the payload.
-        const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
+        const unsigned char* block =
+            weights + (row * blocks_per_row + block_index) * 34u;
         const float d = q8_0_q8_1_f16_to_f32(
             (unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const unsigned int q_weight =
             q8_0_q8_1_load_u32(block + 2u + chunk * 4u);
         const unsigned int* activation = input + block_index * 9u;
         const int dot = __dp4a((int)q_weight, (int)activation[1u + chunk], 0);
-        const float activation_scale = q8_0_q8_1_f16_to_f32((unsigned short)activation[0]);
+        const float activation_scale =
+            q8_0_q8_1_f16_to_f32((unsigned short)activation[0]);
         accumulator += d * activation_scale * (float)dot;
     }
     accumulator = warp_sum(accumulator);
@@ -94,15 +102,19 @@ extern "C" __global__ void q8_0_q8_1_gemv_batch(
     const unsigned int row = blockIdx.x * 4u + threadIdx.x / 32u;
     const unsigned int lane = threadIdx.x & 31u;
     if (row >= output_size) return;
-    // Constant initializer plus fully unrolled predicated member loops keep
-    // acc[] in registers; a runtime-bounded member loop would spill it to
-    // local memory and serialize the member input loads.
+    // Tile mapping mirrors the single-row variant: lanes cover eight chunks
+    // of four consecutive blocks per iteration; each weight word is then
+    // reused against every member's packed activations.
     float acc[MAX_BATCH_MEMBERS] = {0.0f};
     const unsigned int blocks_per_row = input_size / 32u;
     const unsigned int packed_stride = input_size / 32u * 9u;
+    const unsigned int tile_block = lane >> 3;
     const unsigned int chunk = lane & 7u;
-    for (unsigned int block_index = 0; block_index < blocks_per_row; ++block_index) {
-        const unsigned char* block = weights + (row * blocks_per_row + block_index) * 34u;
+    for (unsigned int base = 0; base < blocks_per_row; base += 4u) {
+        const unsigned int block_index = base + tile_block;
+        if (block_index >= blocks_per_row) continue;
+        const unsigned char* block =
+            weights + (row * blocks_per_row + block_index) * 34u;
         const float d = q8_0_q8_1_f16_to_f32(
             (unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const unsigned int q_weight =
