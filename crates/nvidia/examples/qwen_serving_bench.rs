@@ -73,6 +73,15 @@ fn run() -> Result<(), String> {
     let print_tokens = arguments
         .iter()
         .any(|argument| argument == "--print-tokens");
+    let divergence_probe = arguments
+        .iter()
+        .any(|argument| argument == "--divergence-probe");
+    if divergence_probe && !print_tokens {
+        return Err(
+            "--divergence-probe requires --print-tokens to emit comparable token streams"
+                .to_owned(),
+        );
+    }
     if concurrency == 0 || output_tokens == 0 {
         return Err("concurrency and token count must be greater than zero".to_owned());
     }
