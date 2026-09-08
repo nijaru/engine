@@ -2,13 +2,13 @@
 //!
 //! Compares the qualified float warp path against `quantize_q8_1` +
 //! integer-dot GEMV on synthetic weights at representative Qwen shapes,
-//! for each implemented (`Q4_K`, `Q5_K`) family. This measures kernel time
-//! only; it does not establish model parity or serving throughput. Float
-//! execution remains the default.
+//! for each implemented (`Q4_K`, `Q5_K`, `Q6_K`) family. This measures kernel
+//! time only; it does not establish model parity or serving throughput.
+//! Float execution remains the default.
 //!
 //! ```text
 //! cargo run --release -p engine-nvidia --features cuda \
-//!   --example q4_kernel_bench -- --iters=100
+//!   --example int_dot_bench -- --iters=100
 //! ```
 
 use std::io::Cursor;
@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice};
 use engine_core::{DataType, WeightTensorSpec};
 use engine_nvidia::{
-    CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv, CudaQ8_1Quantizer,
-    CudaQuantizedKernelError, CudaQuantizedWeight, CudaWeightStore,
+    CudaQ4KGemv, CudaQ4KQ8_1Gemv, CudaQ5KGemv, CudaQ5KQ8_1Gemv, CudaQ6KGemv, CudaQ6KQ8_1Gemv,
+    CudaQ8_1Quantizer, CudaQuantizedKernelError, CudaQuantizedWeight, CudaWeightStore,
 };
 
 const SHAPES: [(usize, usize); 3] = [(5120, 5120), (5120, 17_408), (17_408, 5120)];
@@ -28,6 +28,7 @@ const WARMUP: usize = 10;
 enum Family {
     Q4K,
     Q5K,
+    Q6K,
 }
 
 impl Family {
@@ -35,6 +36,7 @@ impl Family {
         match self {
             Self::Q4K => "Q4_K",
             Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
         }
     }
 
@@ -42,6 +44,7 @@ impl Family {
         match self {
             Self::Q4K => "q4",
             Self::Q5K => "q5",
+            Self::Q6K => "q6",
         }
     }
 
@@ -49,6 +52,7 @@ impl Family {
         match self {
             Self::Q4K => 12,
             Self::Q5K => 13,
+            Self::Q6K => 14,
         }
     }
 
@@ -56,6 +60,7 @@ impl Family {
         match self {
             Self::Q4K => 144,
             Self::Q5K => 176,
+            Self::Q6K => 210,
         }
     }
 
@@ -63,6 +68,7 @@ impl Family {
         match self {
             Self::Q4K => synthetic_q4_k(inputs, rows),
             Self::Q5K => synthetic_q5_k(inputs, rows),
+            Self::Q6K => synthetic_q6_k(inputs, rows),
         }
     }
 }
@@ -70,6 +76,7 @@ impl Family {
 enum FloatKernels {
     Q4K(CudaQ4KGemv),
     Q5K(CudaQ5KGemv),
+    Q6K(CudaQ6KGemv),
 }
 
 impl FloatKernels {
@@ -82,6 +89,7 @@ impl FloatKernels {
         match self {
             Self::Q4K(kernel) => kernel.execute_warp(weight, input, output),
             Self::Q5K(kernel) => kernel.execute_warp(weight, input, output),
+            Self::Q6K(kernel) => kernel.execute_warp(weight, input, output),
         }
     }
 }
@@ -89,6 +97,7 @@ impl FloatKernels {
 enum IntKernels {
     Q4K(CudaQ4KQ8_1Gemv),
     Q5K(CudaQ5KQ8_1Gemv),
+    Q6K(CudaQ6KQ8_1Gemv),
 }
 
 impl IntKernels {
@@ -101,6 +110,7 @@ impl IntKernels {
         match self {
             Self::Q4K(kernel) => kernel.execute(weight, input, output),
             Self::Q5K(kernel) => kernel.execute(weight, input, output),
+            Self::Q6K(kernel) => kernel.execute(weight, input, output),
         }
     }
 }
@@ -122,13 +132,16 @@ fn main() {
     println!(
         "family shape(KxN)  path            median      mean        min      weight-GB/s  max-rel-diff"
     );
-    for family in [Family::Q4K, Family::Q5K] {
+    for family in [Family::Q4K, Family::Q5K, Family::Q6K] {
         let float_gemv = match family {
             Family::Q4K => FloatKernels::Q4K(
                 CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
             Family::Q5K => FloatKernels::Q5K(
                 CudaQ5KGemv::from_context(&context, stream.clone()).expect("float kernels"),
+            ),
+            Family::Q6K => FloatKernels::Q6K(
+                CudaQ6KGemv::from_context(&context, stream.clone()).expect("float kernels"),
             ),
         };
         let int_gemv = match family {
@@ -137,6 +150,9 @@ fn main() {
             }
             Family::Q5K => {
                 IntKernels::Q5K(CudaQ5KQ8_1Gemv::new(stream.clone()).expect("int kernel"))
+            }
+            Family::Q6K => {
+                IntKernels::Q6K(CudaQ6KQ8_1Gemv::new(stream.clone()).expect("int kernel"))
             }
         };
         for (inputs, rows) in SHAPES {
@@ -354,6 +370,41 @@ fn synthetic_q5_k(inputs: usize, rows: usize) -> Vec<u8> {
             }
             out.extend_from_slice(&high);
             out.extend_from_slice(&payload);
+        }
+    }
+    out
+}
+
+/// Deterministic synthetic `Q6_K` weights: fixed d, signed per-half scales,
+/// and a repeating 6-bit quant pattern split across the low-nibble payload
+/// and the high-bit plane. Timing only; not a parity fixture.
+fn synthetic_q6_k(inputs: usize, rows: usize) -> Vec<u8> {
+    const D_BITS: u16 = 0x2C00;
+    const SCALES: [i8; 16] = [
+        3, -5, 11, -13, 19, -23, 29, -31, 7, -9, 15, -17, 21, -25, 27, -2,
+    ];
+    let blocks_per_row = inputs / 256;
+    let mut out = Vec::with_capacity(rows * blocks_per_row * 210);
+    for row in 0..rows {
+        for block in 0..blocks_per_row {
+            let seed = row * blocks_per_row + block;
+            let mut encoded = [0_u8; 210];
+            for group in 0..8 {
+                let low_base = (group / 4) * 64 + (group % 2) * 32;
+                let low_shift = if group % 4 < 2 { 0 } else { 4 };
+                let high_base = 128 + (group / 4) * 32;
+                let high_shift = (group % 4) * 2;
+                for index in 0..32 {
+                    let q = u8::try_from((index * 7 + seed * 3 + index / 32) % 64).unwrap();
+                    encoded[low_base + index] |= (q & 15) << low_shift;
+                    encoded[high_base + index] |= ((q >> 4) & 3) << high_shift;
+                }
+            }
+            for (index, scale) in SCALES.iter().enumerate() {
+                encoded[192 + index] = i8::to_ne_bytes(*scale)[0];
+            }
+            encoded[208..210].copy_from_slice(&D_BITS.to_le_bytes());
+            out.extend_from_slice(&encoded);
         }
     }
     out

@@ -19,7 +19,7 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 engine-gguf = { path = "../gguf" }
 
 [[example]]
-name = "q4_kernel_bench"
+name = "int_dot_bench"
 required-features = ["cuda"]
 
 [[example]]
