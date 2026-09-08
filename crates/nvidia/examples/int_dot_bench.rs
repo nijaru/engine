@@ -280,6 +280,95 @@ fn main() {
             );
         }
     }
+
+    // Batched weights-read-once section (Q4_K template): eight batch-major
+    // members per launch. Float uses the batched warp path; integer-dot
+    // packs all members in one quantizer call, then runs one batch launch.
+    const BATCH_MEMBERS: usize = 8;
+    let batch_float = CudaQ4KGemv::from_context(&context, stream.clone()).expect("float kernels");
+    let batch_int = CudaQ4KQ8_1Gemv::new(stream.clone()).expect("int kernel");
+    for (inputs, rows) in SHAPES {
+        let encoded = synthetic_q4_k(inputs, rows);
+        let spec = WeightTensorSpec::new("q4", vec![inputs as u64, rows as u64], DataType::F32)
+            .expect("weight spec");
+        let mut store = CudaWeightStore::new(stream.clone());
+        store
+            .materialize_quantized(spec, 12, encoded.len() as u64, &mut Cursor::new(encoded))
+            .expect("stage weight");
+        let weight = store.quantized_tensor("q4").expect("staged weight");
+        let host_input = synthetic_activations(BATCH_MEMBERS * inputs);
+        let input_f32 = stream.clone_htod(&host_input).expect("upload f32");
+        let mut packed = stream
+            .alloc_zeros::<u32>(BATCH_MEMBERS * inputs / 32 * 9)
+            .expect("packed storage");
+        let mut out_float = stream
+            .alloc_zeros::<f32>(BATCH_MEMBERS * rows)
+            .expect("float output");
+        let mut out_int = stream
+            .alloc_zeros::<f32>(BATCH_MEMBERS * rows)
+            .expect("int output");
+        for _ in 0..WARMUP {
+            batch_float
+                .execute_warp_batch(weight, &input_f32, &mut out_float, BATCH_MEMBERS)
+                .expect("float warmup");
+            quantizer
+                .execute(&input_f32, &mut packed)
+                .expect("quant warmup");
+            batch_int
+                .execute_batch(weight, &packed, &mut out_int, BATCH_MEMBERS)
+                .expect("int warmup");
+        }
+        stream.synchronize().expect("warmup sync");
+        let reference = stream.clone_dtoh(&out_float).expect("read float");
+        let candidate = stream.clone_dtoh(&out_int).expect("read int");
+        let max_abs = reference
+            .iter()
+            .zip(candidate.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let max_ref = reference
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        let max_diff = max_abs / max_ref.max(1.0e-6);
+        let float_times = time_iters(iters, || {
+            batch_float
+                .execute_warp_batch(weight, &input_f32, &mut out_float, BATCH_MEMBERS)
+                .expect("float bench");
+            stream.synchronize().expect("float sync");
+        });
+        let int_times = time_iters(iters, || {
+            quantizer
+                .execute(&input_f32, &mut packed)
+                .expect("quant bench");
+            batch_int
+                .execute_batch(weight, &packed, &mut out_int, BATCH_MEMBERS)
+                .expect("int bench");
+            stream.synchronize().expect("int sync");
+        });
+        // Effective bandwidth counts weight bytes once: the batched layout
+        // exists to avoid re-reading them per member.
+        let weight_bytes = rows * inputs / 256 * 144;
+        let batch_tag = format!("x{BATCH_MEMBERS}");
+        report(
+            &batch_tag,
+            inputs,
+            rows,
+            "float-batch",
+            &float_times,
+            weight_bytes,
+            max_diff,
+        );
+        report(
+            &batch_tag,
+            inputs,
+            rows,
+            "q8_1+q4k-batch",
+            &int_times,
+            weight_bytes,
+            max_diff,
+        );
+    }
 }
 
 fn report(
