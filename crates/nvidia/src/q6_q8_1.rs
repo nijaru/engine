@@ -4,8 +4,8 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKern
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 
 use super::{
-    CudaQuantizedKernelError, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q6_K_VALUE_TYPE,
-    validate_quantized_geometry,
+    CudaQuantizedKernelError, MAX_BATCH_MEMBERS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS,
+    Q6_K_VALUE_TYPE, validate_quantized_geometry,
 };
 use crate::cuda::CudaQuantizedWeight;
 
@@ -26,6 +26,7 @@ static PTX: OnceLock<Result<Ptx, String>> = OnceLock::new();
 pub struct CudaQ6KQ8_1Gemv {
     stream: Arc<CudaStream>,
     kernel: CudaFunction,
+    batch_kernel: CudaFunction,
 }
 
 impl CudaQ6KQ8_1Gemv {
@@ -37,7 +38,7 @@ impl CudaQ6KQ8_1Gemv {
         let ptx = PTX
             .get_or_init(|| {
                 compile_ptx_with_opts(
-                    SOURCE,
+                    format!("#define MAX_BATCH_MEMBERS {MAX_BATCH_MEMBERS}\n{SOURCE}"),
                     CompileOptions {
                         arch: Some("compute_75"),
                         ..CompileOptions::default()
@@ -55,7 +56,14 @@ impl CudaQ6KQ8_1Gemv {
         let kernel = module
             .load_function("q6_k_q8_1_gemv")
             .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
-        Ok(Self { stream, kernel })
+        let batch_kernel = module
+            .load_function("q6_k_q8_1_gemv_batch")
+            .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        Ok(Self {
+            stream,
+            kernel,
+            batch_kernel,
+        })
     }
 
     /// Enqueue one matrix-vector product into caller-owned output storage.
@@ -119,6 +127,99 @@ impl CudaQ6KQ8_1Gemv {
                 .arg(output)
                 .arg(&input_size)
                 .arg(&output_size)
+                .launch(config)
+        }
+        .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Enqueue one weights-read-once batched matrix product over `members`
+    /// batch-major packed activation rows into a batch-major output.
+    ///
+    /// Each member contributes one `[K / 32 * 9]` packed row produced by the
+    /// `Q8_1` quantizer and owns one `[N]` output row. One warp decodes each
+    /// weight element once and accumulates it against every member. No
+    /// allocation or host synchronization occurs during this call.
+    ///
+    /// # Errors
+    /// Rejects foreign contexts, malformed `Q6_K` weights, member counts
+    /// outside `1..=8`, incorrect packed input/output lengths, overflowing
+    /// geometry, and launch failures.
+    pub fn execute_batch(
+        &self,
+        weight: &CudaQuantizedWeight,
+        input: &CudaSlice<u32>,
+        output: &mut CudaSlice<f32>,
+        members: usize,
+    ) -> Result<(), CudaQuantizedKernelError> {
+        if members == 0 {
+            return Err(CudaQuantizedKernelError::InputLength {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if members > MAX_BATCH_MEMBERS {
+            return Err(CudaQuantizedKernelError::InvalidWeight(format!(
+                "Q6_K integer-dot batch variant supports at most {MAX_BATCH_MEMBERS} members"
+            )));
+        }
+        let context = self.stream.context().as_ref();
+        if context != weight.encoded_data().context().as_ref()
+            || context != input.context().as_ref()
+            || context != output.context().as_ref()
+        {
+            return Err(CudaQuantizedKernelError::ContextMismatch);
+        }
+        let (input_size, output_size) = validate_quantized_geometry(
+            weight,
+            Q6_K_VALUE_TYPE,
+            Q6_K_BLOCK_ELEMENTS,
+            Q6_K_BLOCK_BYTES,
+            "Q6_K",
+        )?;
+        let expected_input = input_size
+            .checked_div(32)
+            .and_then(|blocks| blocks.checked_mul(9))
+            .and_then(|per_member| per_member.checked_mul(members))
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        let expected_output = output_size
+            .checked_mul(members)
+            .ok_or(CudaQuantizedKernelError::ShapeOverflow)?;
+        if input.len() != expected_input {
+            return Err(CudaQuantizedKernelError::InputLength {
+                expected: expected_input,
+                actual: input.len(),
+            });
+        }
+        if output.len() != expected_output {
+            return Err(CudaQuantizedKernelError::OutputLength {
+                expected: expected_output,
+                actual: output.len(),
+            });
+        }
+        let input_size =
+            u32::try_from(input_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let output_size =
+            u32::try_from(output_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (output_size.div_ceil(4), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: shared geometry validation bounds every weight load, each
+        // member's input storage contains complete Q8_1 blocks, and each
+        // member owns one disjoint output row.
+        unsafe {
+            self.stream
+                .launch_builder(&self.batch_kernel)
+                .arg(weight.encoded_data())
+                .arg(input)
+                .arg(output)
+                .arg(&input_size)
+                .arg(&output_size)
+                .arg(&members_u32)
                 .launch(config)
         }
         .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))?;
