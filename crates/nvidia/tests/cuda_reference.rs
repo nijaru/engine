@@ -3,7 +3,7 @@
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, ConvolutionStateShape, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage,
