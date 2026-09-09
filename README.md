@@ -2,27 +2,21 @@
 
 A Rust-first model inference runtime and serving engine.
 
-Ribn (pronounced “ribbon”) is the working project name; repository and crate identifiers still use `engine`.
+## Development
 
-## Requirements
-
-- Rust (see `rust-toolchain.toml`)
-- NVIDIA CUDA GPU for device execution
-- Pinned model artifact for hardware-gated tests and benchmarks (see `benchmarks/model-set.toml`)
-
-## Quickstart
+Use the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```sh
 cargo test --workspace
 ```
 
-GPU benchmarks and serving sweeps are documented under [`benchmarks/`](benchmarks/README.md).
+GPU execution requires NVIDIA CUDA hardware. See the [benchmark documentation](benchmarks/README.md) for model artifacts, hardware checks, and performance measurements.
 
-## Docs
+## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
-- [Benchmarks](benchmarks/)
+- [Benchmarks](benchmarks/README.md)
 
 ## License
 
