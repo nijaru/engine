@@ -1184,6 +1184,7 @@ impl CudaQwen35Ops {
             l2_norm_heads,
             strided_rms_norm,
             gdn_state_update,
+            gdn_state_update_batch,
             gdn_gated_norm,
             q_gate_norm,
             kv_append_f16,
@@ -2788,12 +2789,12 @@ impl CudaQwen35Ops {
         // member's matrix pointer is dereferenced only by its own blockIdx.y
         // band, and geometry is validated as in the single-member variant.
         unsafe {
-            let mut builder = self.stream.launch_builder(&self.gdn_state_update_batch);
+            let builder = self.stream.launch_builder(&self.gdn_state_update_batch);
             for matrix in matrices.iter_mut() {
-                builder = builder.arg(&mut **matrix);
+                builder.arg(&mut **matrix);
             }
             for view in &mut pad_views {
-                builder = builder.arg(view);
+                builder.arg(view);
             }
             builder
                 .arg(q_normed)
