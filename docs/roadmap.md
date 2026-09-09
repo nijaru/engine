@@ -29,6 +29,12 @@ This roadmap describes implementation order, not a promise of release dates. Cor
 
 Phase 3 proves a correct native execution path. It does not establish a competitive serving engine yet.
 
+## Current implementation priority — CUDA Rust NVIDIA migration
+
+The intended NVIDIA foundation is CUDA Rust, using cuTile and cuda-oxide as complementary kernel-authoring tracks. Execute the [migration design](cuda-rust-migration.md) before resuming unrelated kernel optimization: reproducible build/resource interoperability → representative quantized and recurrent kernels → asynchronous serving proof → complete coverage → qualification and legacy pipeline retirement.
+
+This changes the NVIDIA implementation direction, not the semantic runtime boundaries or the remaining serving roadmap. The current CUDA C++ path remains the migration oracle until equivalent coverage is qualified; it is not intended as a permanent parallel implementation. Other hardware backend selection is deferred until a concrete implementation target requires it.
+
 ## Phase 4 — runtime and serving foundation
 
 The architecture correction and first correctness serving loop are in place. Core interfaces do not encode the Phase-3 Qwen state bundle, and the same runtime can drive persistent scheduled requests through the CUDA Qwen executor and expose committed output to a frontend.

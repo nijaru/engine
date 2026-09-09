@@ -66,6 +66,8 @@ Inside a backend, share behavior when semantics are genuinely common and keep re
 
 Portability does not mean one lowest-common-denominator kernel stack.
 
+CUDA Rust is the intended NVIDIA implementation foundation: cuTile for tile-oriented kernels and cuda-oxide for explicit SIMT control. Its compiler, tensor, and asynchronous execution types stay inside the NVIDIA backend. Adoption preserves the semantic submit/completion and resource-lifecycle contracts; it does not imply a performance or qualification claim. See the [migration design](cuda-rust-migration.md) for the proof gates and retirement of the existing CUDA C++ authoring pipeline.
+
 ### Qualified execution variants
 
 Execution variants carry an explicit qualification status:
