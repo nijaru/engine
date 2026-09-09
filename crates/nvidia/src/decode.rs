@@ -1571,6 +1571,10 @@ struct BatchScratch {
     ffn_act: CudaSlice<f32>,
     logits: CudaSlice<f32>,
     selected: CudaSlice<u32>,
+    /// Unused GDN matrix pointer slots for members beyond the lane count;
+    /// never dereferenced (grid.y stops at the member count) but must be a
+    /// real slice so the launch builder holds distinct one-element views.
+    gdn_matrix_pad: CudaSlice<f32>,
     /// Per-member attention scores, `[m][q_heads][stride]`.
     scores: Option<CudaSlice<f32>>,
 }
@@ -1718,6 +1722,7 @@ impl CudaQwen35BatchDecode {
             selected: stream
                 .alloc_zeros::<u32>(m)
                 .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
+            gdn_matrix_pad: alloc(MAX_BATCH_MEMBERS)?,
             scores: None,
         };
 
@@ -2152,40 +2157,32 @@ impl CudaQwen35BatchDecode {
                 .l2_norm_heads_views(&mut gdn_k, GDN_K_HEADS, GDN_HEAD_DIM, self.epsilon)?;
         }
 
-        // Per-member state update with member views of decay/beta/conv_out.
-        for member in 0..m {
+        // One batched state-update launch for every member: each member's
+        // matrix is a distinct per-request allocation, gathered into a
+        // mutable slice of borrows. Unused pointer slots are filled by the
+        // kernel wrapper from the scratch pad.
+        {
             let slot = self.recurrent_slot[layer];
-            let state = states
-                .get_mut(member)
-                .ok_or_else(|| CudaDecodeError::InvalidPlan("missing member state".to_owned()))?;
-            let recurrent = state.recurrent_mut().ok_or(missing_recurrent())?;
-            let (matrix_buffer, _conv_buffer) = recurrent.layer_mut(slot).ok_or_else(|| {
-                CudaDecodeError::InvalidPlan(format!("recurrent state lacks slot {slot}"))
-            })?;
-            let matrix = matrix_buffer.as_f32_mut().ok_or_else(|| {
-                CudaDecodeError::InvalidPlan("recurrent matrix must be F32".to_owned())
-            })?;
-
-            let q_normed = member_row(&self.scratch.gdn_q, member, GDN_K_HEADS * GDN_HEAD_DIM)
-                .ok_or_else(|| CudaDecodeError::Driver("gdn_q row out of range".to_owned()))?;
-            let k_normed = member_row(&self.scratch.gdn_k, member, GDN_K_HEADS * GDN_HEAD_DIM)
-                .ok_or_else(|| CudaDecodeError::Driver("gdn_k row out of range".to_owned()))?;
-            let conv_activated = member_row(&self.scratch.conv_out, member, GDN_QKV_DIM)
-                .ok_or_else(|| CudaDecodeError::Driver("conv_out row out of range".to_owned()))?;
-            let decay = member_row(&self.scratch.decay, member, GDN_V_HEADS)
-                .ok_or_else(|| CudaDecodeError::Driver("decay row out of range".to_owned()))?;
-            let beta = member_row(&self.scratch.beta, member, GDN_V_HEADS)
-                .ok_or_else(|| CudaDecodeError::Driver("beta row out of range".to_owned()))?;
-            let mut state_out = member_row_mut(&mut self.scratch.state_out, member, GDN_INNER)
-                .ok_or_else(|| CudaDecodeError::Driver("state_out row out of range".to_owned()))?;
-            self.ops.gdn_state_update_views(
-                matrix,
-                &q_normed,
-                &k_normed,
-                &conv_activated,
-                &decay,
-                &beta,
-                &mut state_out,
+            let mut matrices: Vec<&mut CudaSlice<f32>> = Vec::with_capacity(m);
+            for state in states.iter_mut() {
+                let recurrent = state.recurrent_mut().ok_or(missing_recurrent())?;
+                let (matrix_buffer, _conv_buffer) = recurrent.layer_mut(slot).ok_or_else(|| {
+                    CudaDecodeError::InvalidPlan(format!("recurrent state lacks slot {slot}"))
+                })?;
+                let matrix = matrix_buffer.as_f32_mut().ok_or_else(|| {
+                    CudaDecodeError::InvalidPlan("recurrent matrix must be F32".to_owned())
+                })?;
+                matrices.push(matrix);
+            }
+            self.ops.gdn_state_update_batch(
+                &mut matrices,
+                &mut self.scratch.gdn_matrix_pad,
+                &self.scratch.gdn_q,
+                &self.scratch.gdn_k,
+                &self.scratch.conv_out,
+                &self.scratch.decay,
+                &self.scratch.beta,
+                &mut self.scratch.state_out,
                 GDN_V_HEADS,
                 GDN_K_HEADS,
                 GDN_HEAD_DIM,

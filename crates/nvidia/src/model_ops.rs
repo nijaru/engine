@@ -653,6 +653,79 @@ extern "C" __global__ void gdn_state_update(
     output[(long long)v_head * head_dim + col] = out * rsqrtf((float)head_dim);
 }
 
+extern "C" __global__ void gdn_state_update_batch(
+    float* matrix_0, float* matrix_1, float* matrix_2, float* matrix_3,
+    float* matrix_4, float* matrix_5, float* matrix_6, float* matrix_7,
+    const float* q_normed,
+    const float* k_normed,
+    const float* conv_activated,
+    const float* decay,
+    const float* beta,
+    float* output,
+    int v_heads,
+    int k_heads,
+    int head_dim,
+    int v_offset
+) {
+    // Batched form of gdn_state_update: one launch covers every member of a
+    // batched decode step. Member-major batch scratch rows are addressed as
+    // base + member * row_len; each member's recurrent matrix is a separate
+    // allocation, so eight pointers arrive as explicit arguments. blockIdx.y
+    // enumerates members and the grid's y dimension is sized to the member
+    // count, so unused pointer slots are never dereferenced. The switch keeps
+    // the selection in kernel-argument registers instead of a local array.
+    const int member = blockIdx.y;
+    float* matrix;
+    switch (member) {
+        case 0: matrix = matrix_0; break;
+        case 1: matrix = matrix_1; break;
+        case 2: matrix = matrix_2; break;
+        case 3: matrix = matrix_3; break;
+        case 4: matrix = matrix_4; break;
+        case 5: matrix = matrix_5; break;
+        case 6: matrix = matrix_6; break;
+        default: matrix = matrix_7; break;
+    }
+    const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)v_heads * head_dim;
+    if (index >= total) {
+        return;
+    }
+    const int v_head = (int)(index / head_dim);
+    const int col = (int)(index % head_dim);
+    const int k_head = v_head % k_heads;
+    const long long qkv_row = (long long)member * (v_offset + v_heads * head_dim);
+    const long long qk_row = (long long)member * k_heads * head_dim;
+    const long long gate_row = (long long)member * v_heads;
+    const long long out_row = (long long)member * v_heads * head_dim;
+    float* state = matrix + (long long)v_head * head_dim * head_dim;
+    const float* q = q_normed + qk_row + (long long)k_head * head_dim;
+    const float* k = k_normed + qk_row + (long long)k_head * head_dim;
+    const float* v = conv_activated + qkv_row + (long long)v_offset
+        + (long long)v_head * head_dim;
+
+    // Pass 1: decay every state element and fold it into sk in one sweep.
+    float sk = 0.0f;
+    for (int row = 0; row < head_dim; ++row) {
+        float* element = state + row * head_dim + col;
+        const float decayed = *element * decay[gate_row + v_head];
+        *element = decayed;
+        sk += decayed * k[row];
+    }
+    const float d = (v[col] - sk) * beta[gate_row + v_head];
+    // Pass 2: apply the outer-product update and fold the read-back into
+    // the output dot product in the same sweep.
+    float out = 0.0f;
+    for (int row = 0; row < head_dim; ++row) {
+        float* element = state + row * head_dim + col;
+        const float updated = *element + k[row] * d;
+        *element = updated;
+        out += updated * q[row];
+    }
+    output[out_row + (long long)v_head * head_dim + col] =
+        out * rsqrtf((float)head_dim);
+}
+
 extern "C" __global__ void gdn_gated_norm(
     const float* input,
     const float* z_gate,
@@ -970,6 +1043,7 @@ pub struct CudaQwen35Ops {
     l2_norm_heads: CudaFunction,
     strided_rms_norm: CudaFunction,
     gdn_state_update: CudaFunction,
+    gdn_state_update_batch: CudaFunction,
     gdn_gated_norm: CudaFunction,
     q_gate_norm: CudaFunction,
     kv_append_f16: CudaFunction,
@@ -1062,6 +1136,9 @@ impl CudaQwen35Ops {
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let gdn_state_update = module
             .load_function("gdn_state_update")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_state_update_batch = module
+            .load_function("gdn_state_update_batch")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let gdn_gated_norm = module
             .load_function("gdn_gated_norm")
@@ -2596,8 +2673,144 @@ impl CudaQwen35Ops {
         Ok(())
     }
 
-    /// `kv_append_f16` with view-typed arguments: the cache buffers are the
-    /// caller's state; keys/values may be views into batch-major scratch.
+    /// Batched `gdn_state_update`: one launch updates every member's
+    /// recurrent matrix using member-major rows of the shared batch buffers.
+    /// Matrices are separate per-member allocations; unused pointer slots
+    /// are filled with distinct one-element views of `pad` (the grid's y
+    /// dimension stops at the member count, so those slots are never
+    /// dereferenced) — a single slice cannot back two kernel arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_state_update_batch(
+        &self,
+        matrices: &mut [&mut CudaSlice<f32>],
+        pad: &mut CudaSlice<f32>,
+        q_normed: &CudaSlice<f32>,
+        k_normed: &CudaSlice<f32>,
+        conv_activated: &CudaSlice<f32>,
+        decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        v_heads: usize,
+        k_heads: usize,
+        head_dim: usize,
+        v_offset: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        const KERNEL_POINTER_SLOTS: usize = 8;
+        let members = matrices.len();
+        if members == 0 || members > KERNEL_POINTER_SLOTS {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        let context = self.stream.context();
+        if matrices
+            .iter()
+            .any(|matrix| context.as_ref() != matrix.context().as_ref())
+            || context.as_ref() != pad.context().as_ref()
+            || context.as_ref() != q_normed.context().as_ref()
+            || context.as_ref() != k_normed.context().as_ref()
+            || context.as_ref() != conv_activated.context().as_ref()
+            || context.as_ref() != decay.context().as_ref()
+            || context.as_ref() != beta.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if v_heads == 0 || k_heads == 0 || head_dim == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        if !v_heads.is_multiple_of(k_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        let state_len = v_heads * head_dim * head_dim;
+        let qk_len = k_heads * head_dim;
+        let conv_len = v_offset + v_heads * head_dim;
+        if matrices.iter().any(|matrix| matrix.len() != state_len)
+            || pad.len() < KERNEL_POINTER_SLOTS - members
+            || q_normed.len() != members * qk_len
+            || k_normed.len() != members * qk_len
+            || decay.len() != members * v_heads
+            || beta.len() != members * v_heads
+            || output.len() != members * v_heads * head_dim
+            || conv_activated.len() != members * conv_len
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: state_len,
+                actual: matrices
+                    .iter()
+                    .map(|matrix| matrix.len())
+                    .min()
+                    .unwrap_or(0)
+                    .min(q_normed.len())
+                    .min(output.len()),
+            });
+        }
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let k_heads_u32 =
+            u32::try_from(k_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let v_offset_u32 =
+            u32::try_from(v_offset).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let total = v_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let total_u32 = u32::try_from(total).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let members_u32 =
+            u32::try_from(members).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (total_u32.div_ceil(128), members_u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Distinct one-element views of `pad` back the unused pointer
+        // slots; a slice cannot be passed as two kernel arguments, and views
+        // into disjoint ranges are separate borrows.
+        let mut pad_views: Vec<CudaViewMut<'_, f32>> =
+            Vec::with_capacity(KERNEL_POINTER_SLOTS - members);
+        for pad_index in 0..KERNEL_POINTER_SLOTS - members {
+            let view = pad.try_slice_mut(pad_index..pad_index + 1).ok_or(
+                CudaModelKernelError::InputLength {
+                    expected: KERNEL_POINTER_SLOTS - members,
+                    actual: pad.len(),
+                },
+            )?;
+            pad_views.push(view);
+        }
+        // Safety: all slices are alive on this stream for the launch; each
+        // member's matrix pointer is dereferenced only by its own blockIdx.y
+        // band, and geometry is validated as in the single-member variant.
+        unsafe {
+            let mut builder = self.stream.launch_builder(&self.gdn_state_update_batch);
+            for matrix in matrices.iter_mut() {
+                builder = builder.arg(&mut **matrix);
+            }
+            for view in &mut pad_views {
+                builder = builder.arg(view);
+            }
+            builder
+                .arg(q_normed)
+                .arg(k_normed)
+                .arg(conv_activated)
+                .arg(decay)
+                .arg(beta)
+                .arg(&mut *output)
+                .arg(&v_heads_u32)
+                .arg(&k_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&v_offset_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
     ///
     /// # Errors
     ///

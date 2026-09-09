@@ -2505,6 +2505,152 @@ fn executes_gdn_state_update_against_host_equations() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one contiguous pinned-geometry replay"
+)]
+fn executes_gdn_state_update_batch_against_host_equations() {
+    // Three members against the pinned geometry, leaving five of the eight
+    // kernel pointer slots to the pad path: grid.y stops at three, so pad
+    // slots must never influence results.
+    const MEMBERS: usize = 3;
+    const V_HEADS: usize = 48;
+    const K_HEADS: usize = 16;
+    const HEAD_DIM: usize = 128;
+    const V_OFFSET: usize = 4096;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut seed = 7717_u32;
+    let mut fixture = || fixture_quantized_f32(&mut seed);
+    let mut matrices: Vec<Vec<f32>> = (0..MEMBERS)
+        .map(|_| {
+            (0..V_HEADS * HEAD_DIM * HEAD_DIM)
+                .map(|_| fixture() * 0.05)
+                .collect()
+        })
+        .collect();
+    let conv_activated: Vec<f32> = (0..MEMBERS * (V_OFFSET + V_HEADS * HEAD_DIM))
+        .map(|_| fixture())
+        .collect();
+    let q_normed: Vec<f32> = (0..MEMBERS * K_HEADS * HEAD_DIM)
+        .map(|_| fixture())
+        .collect();
+    let k_normed: Vec<f32> = (0..MEMBERS * K_HEADS * HEAD_DIM)
+        .map(|_| fixture())
+        .collect();
+    let decay: Vec<f32> = (0..MEMBERS * V_HEADS)
+        .map(|index| {
+            let index = u16::try_from(index).expect("index fits u16");
+            f32::from(index) * 0.01 + 0.5
+        })
+        .collect();
+    let beta: Vec<f32> = (0..MEMBERS * V_HEADS)
+        .map(|index| {
+            let index = u16::try_from(index).expect("index fits u16");
+            f32::from(index) * 0.005 + 0.1
+        })
+        .collect();
+
+    let mut matrices_device: Vec<CudaSlice<f32>> = matrices
+        .iter()
+        .map(|matrix| stream.clone_htod(matrix).expect("upload state matrix"))
+        .collect();
+    let conv_device = stream.clone_htod(&conv_activated).expect("upload conv");
+    let q_device = stream.clone_htod(&q_normed).expect("upload q");
+    let k_device = stream.clone_htod(&k_normed).expect("upload k");
+    let decay_device = stream.clone_htod(&decay).expect("upload decay");
+    let beta_device = stream.clone_htod(&beta).expect("upload beta");
+    let mut output_device = stream
+        .alloc_zeros::<f32>(MEMBERS * V_HEADS * HEAD_DIM)
+        .expect("allocate output");
+    let mut pad_device = stream.alloc_zeros::<f32>(8).expect("allocate pointer pad");
+    let matrices_refs: Vec<&mut CudaSlice<f32>> = matrices_device.iter_mut().collect();
+    ops.gdn_state_update_batch(
+        &mut matrices_refs,
+        &mut pad_device,
+        &q_device,
+        &k_device,
+        &conv_device,
+        &decay_device,
+        &beta_device,
+        &mut output_device,
+        V_HEADS,
+        K_HEADS,
+        HEAD_DIM,
+        V_OFFSET,
+    )
+    .expect("execute batched state update");
+    let actual_out = stream.clone_dtoh(&output_device).expect("download output");
+    let actual_matrices: Vec<Vec<f32>> = matrices_device
+        .iter()
+        .map(|matrix| stream.clone_dtoh(matrix).expect("download matrix"))
+        .collect();
+
+    // Host replay with the pinned equations, member by member.
+    let scale = 1.0 / f32::sqrt(f32::from(u16::try_from(HEAD_DIM).expect("dim fits u16")));
+    for member in 0..MEMBERS {
+        let matrix = &mut matrices[member];
+        for v_head in 0..V_HEADS {
+            let k_head = v_head % K_HEADS;
+            let state_offset = v_head * HEAD_DIM * HEAD_DIM;
+            let q = &q_normed[member * K_HEADS * HEAD_DIM + k_head * HEAD_DIM
+                ..member * K_HEADS * HEAD_DIM + (k_head + 1) * HEAD_DIM];
+            let k = &k_normed[member * K_HEADS * HEAD_DIM + k_head * HEAD_DIM
+                ..member * K_HEADS * HEAD_DIM + (k_head + 1) * HEAD_DIM];
+            let conv_base = member * (V_OFFSET + V_HEADS * HEAD_DIM);
+            let v = &conv_activated[conv_base + V_OFFSET + v_head * HEAD_DIM
+                ..conv_base + V_OFFSET + (v_head + 1) * HEAD_DIM];
+            let decay_v = decay[member * V_HEADS + v_head];
+            let beta_v = beta[member * V_HEADS + v_head];
+            for row in 0..HEAD_DIM {
+                for col in 0..HEAD_DIM {
+                    matrix[state_offset + row * HEAD_DIM + col] *= decay_v;
+                }
+            }
+            let mut sk = vec![0.0_f32; HEAD_DIM];
+            for row in 0..HEAD_DIM {
+                for col in 0..HEAD_DIM {
+                    sk[col] += matrix[state_offset + row * HEAD_DIM + col] * k[row];
+                }
+            }
+            let d: Vec<f32> = (0..HEAD_DIM)
+                .map(|col| (v[col] - sk[col]) * beta_v)
+                .collect();
+            for row in 0..HEAD_DIM {
+                for col in 0..HEAD_DIM {
+                    matrix[state_offset + row * HEAD_DIM + col] += k[row] * d[col];
+                }
+            }
+            for col in 0..HEAD_DIM {
+                let out: f32 = (0..HEAD_DIM)
+                    .map(|row| matrix[state_offset + row * HEAD_DIM + col] * q[row])
+                    .sum::<f32>()
+                    * scale;
+                let index = member * V_HEADS * HEAD_DIM + v_head * HEAD_DIM + col;
+                assert!(
+                    (actual_out[index] - out).abs() < 1e-2,
+                    "member {member} out[{v_head}][{col}]: {} != {out}",
+                    actual_out[index]
+                );
+            }
+        }
+        for (index, (actual, expected)) in actual_matrices[member]
+            .iter()
+            .zip(&matrices[member])
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() < 1e-2,
+                "member {member} matrix[{index}]: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn executes_gdn_gated_norm_and_residual_against_host_equations() {
     const V_HEADS: usize = 48;
     const HEAD_DIM: usize = 128;
