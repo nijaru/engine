@@ -2677,9 +2677,10 @@ impl CudaQwen35Ops {
     /// Batched `gdn_state_update`: one launch updates every member's
     /// recurrent matrix using member-major rows of the shared batch buffers.
     /// Matrices are separate per-member allocations; unused pointer slots
-    /// are filled with distinct one-element views of `pad` (the grid's y
-    /// dimension stops at the member count, so those slots are never
-    /// dereferenced) — a single slice cannot back two kernel arguments.
+    /// are filled from `pads` (the grid's y dimension stops at the member
+    /// count, so those slots are never dereferenced) — each must be a
+    /// distinct slice because a single slice cannot back two kernel
+    /// arguments.
     ///
     /// # Errors
     ///
@@ -2692,7 +2693,7 @@ impl CudaQwen35Ops {
     pub fn gdn_state_update_batch(
         &self,
         matrices: &mut [&mut CudaSlice<f32>],
-        pad: &mut CudaSlice<f32>,
+        pads: &mut [CudaSlice<f32>],
         q_normed: &CudaSlice<f32>,
         k_normed: &CudaSlice<f32>,
         conv_activated: &CudaSlice<f32>,
@@ -2713,7 +2714,9 @@ impl CudaQwen35Ops {
         if matrices
             .iter()
             .any(|matrix| context.as_ref() != matrix.context().as_ref())
-            || context.as_ref() != pad.context().as_ref()
+            || pads
+                .iter()
+                .any(|pad| context.as_ref() != pad.context().as_ref())
             || context.as_ref() != q_normed.context().as_ref()
             || context.as_ref() != k_normed.context().as_ref()
             || context.as_ref() != conv_activated.context().as_ref()
@@ -2733,7 +2736,7 @@ impl CudaQwen35Ops {
         let qk_len = k_heads * head_dim;
         let conv_len = v_offset + v_heads * head_dim;
         if matrices.iter().any(|matrix| matrix.len() != state_len)
-            || pad.len() < KERNEL_POINTER_SLOTS - members
+            || pads.len() < KERNEL_POINTER_SLOTS - members
             || q_normed.len() != members * qk_len
             || k_normed.len() != members * qk_len
             || decay.len() != members * v_heads
@@ -2771,30 +2774,17 @@ impl CudaQwen35Ops {
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
-        // Distinct one-element views of `pad` back the unused pointer
-        // slots; a slice cannot be passed as two kernel arguments, and views
-        // into disjoint ranges are separate borrows.
-        let mut pad_views: Vec<CudaViewMut<'_, f32>> =
-            Vec::with_capacity(KERNEL_POINTER_SLOTS - members);
-        for pad_index in 0..KERNEL_POINTER_SLOTS - members {
-            let view = pad.try_slice_mut(pad_index..pad_index + 1).ok_or(
-                CudaModelKernelError::InputLength {
-                    expected: KERNEL_POINTER_SLOTS - members,
-                    actual: pad.len(),
-                },
-            )?;
-            pad_views.push(view);
-        }
         // Safety: all slices are alive on this stream for the launch; each
         // member's matrix pointer is dereferenced only by its own blockIdx.y
         // band, and geometry is validated as in the single-member variant.
+        // Each unused pointer slot gets its own distinct pad slice.
         unsafe {
-            let builder = self.stream.launch_builder(&self.gdn_state_update_batch);
+            let mut builder = self.stream.launch_builder(&self.gdn_state_update_batch);
             for matrix in matrices.iter_mut() {
                 builder.arg(&mut **matrix);
             }
-            for view in &mut pad_views {
-                builder.arg(view);
+            for pad in pads.iter_mut().take(KERNEL_POINTER_SLOTS - members) {
+                builder.arg(pad);
             }
             builder
                 .arg(q_normed)

@@ -2565,11 +2565,13 @@ fn executes_gdn_state_update_batch_against_host_equations() {
     let mut output_device = stream
         .alloc_zeros::<f32>(MEMBERS * V_HEADS * HEAD_DIM)
         .expect("allocate output");
-    let mut pad_device = stream.alloc_zeros::<f32>(8).expect("allocate pointer pad");
+    let mut pads: Vec<CudaSlice<f32>> = (0..5)
+        .map(|_| stream.alloc_zeros::<f32>(1).expect("allocate pointer pad"))
+        .collect();
     let matrices_refs: Vec<&mut CudaSlice<f32>> = matrices_device.iter_mut().collect();
     ops.gdn_state_update_batch(
         &mut matrices_refs,
-        &mut pad_device,
+        &mut pads,
         &q_device,
         &k_device,
         &conv_device,

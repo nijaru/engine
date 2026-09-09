@@ -1572,9 +1572,9 @@ struct BatchScratch {
     logits: CudaSlice<f32>,
     selected: CudaSlice<u32>,
     /// Unused GDN matrix pointer slots for members beyond the lane count;
-    /// never dereferenced (grid.y stops at the member count) but must be a
-    /// real slice so the launch builder holds distinct one-element views.
-    gdn_matrix_pad: CudaSlice<f32>,
+    /// never dereferenced (grid.y stops at the member count) but each needs a
+    /// distinct slice so the launch builder holds separate borrows.
+    gdn_matrix_pads: Vec<CudaSlice<f32>>,
     /// Per-member attention scores, `[m][q_heads][stride]`.
     scores: Option<CudaSlice<f32>>,
 }
@@ -1722,7 +1722,9 @@ impl CudaQwen35BatchDecode {
             selected: stream
                 .alloc_zeros::<u32>(m)
                 .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
-            gdn_matrix_pad: alloc(MAX_BATCH_MEMBERS)?,
+            gdn_matrix_pads: (0..MAX_BATCH_MEMBERS)
+                .map(|_| alloc(stream, 1))
+                .collect::<Result<Vec<_>, _>>()?,
             scores: None,
         };
 
@@ -2176,7 +2178,7 @@ impl CudaQwen35BatchDecode {
             }
             self.ops.gdn_state_update_batch(
                 &mut matrices,
-                &mut self.scratch.gdn_matrix_pad,
+                &mut self.scratch.gdn_matrix_pads,
                 &self.scratch.gdn_q,
                 &self.scratch.gdn_k,
                 &self.scratch.conv_out,
