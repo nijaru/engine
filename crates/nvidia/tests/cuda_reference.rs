@@ -2568,7 +2568,7 @@ fn executes_gdn_state_update_batch_against_host_equations() {
     let mut pads: Vec<CudaSlice<f32>> = (0..5)
         .map(|_| stream.alloc_zeros::<f32>(1).expect("allocate pointer pad"))
         .collect();
-    let matrices_refs: Vec<&mut CudaSlice<f32>> = matrices_device.iter_mut().collect();
+    let mut matrices_refs: Vec<&mut CudaSlice<f32>> = matrices_device.iter_mut().collect();
     ops.gdn_state_update_batch(
         &mut matrices_refs,
         &mut pads,
