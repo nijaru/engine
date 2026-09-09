@@ -1,6 +1,6 @@
-# Engine agent guidance
+# Ribn agent guidance
 
-Engine is a Rust-first model inference runtime and serving engine. `engine` is a temporary working name.
+Ribn (pronounced “ribbon”) is the working name for this Rust-first model inference runtime and serving engine. Repository and crate identifiers still use `engine`; existing Engine references describe the same project.
 
 ## Repository workflow
 

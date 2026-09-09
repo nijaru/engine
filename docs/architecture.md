@@ -1,6 +1,8 @@
 # Architecture
 
-Engine is a model inference runtime and serving engine. The core design goal is to make inference a live, stateful runtime problem rather than a fixed startup configuration.
+Ribn is a model inference runtime and serving engine. Its long-term goal is broad model and hardware coverage for individual developers through research labs, with execution competitive with or better than established engines. These are goals, not claims about current coverage or performance.
+
+The core design goal is to make inference a live, stateful runtime problem rather than a fixed startup configuration.
 
 ## Scope
 
