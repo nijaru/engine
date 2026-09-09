@@ -2,7 +2,7 @@
 
 A Rust-first model inference runtime and serving engine.
 
-Early development, not for production use. The current path targets Qwen3.8-27B text inference on a single NVIDIA GPU. Next is the [CUDA Rust backend migration](docs/cuda-rust-migration.md).
+Early development, not for production use.
 
 Ribn (pronounced “ribbon”) is the working project name; repository and crate identifiers still use `engine`.
 
