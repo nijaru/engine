@@ -2,8 +2,6 @@
 
 A Rust-first model inference runtime and serving engine.
 
-Early development, not for production use.
-
 Ribn (pronounced “ribbon”) is the working project name; repository and crate identifiers still use `engine`.
 
 ## Requirements
