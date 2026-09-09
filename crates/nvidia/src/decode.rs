@@ -1723,7 +1723,7 @@ impl CudaQwen35BatchDecode {
                 .alloc_zeros::<u32>(m)
                 .map_err(|error| CudaDecodeError::Driver(error.to_string()))?,
             gdn_matrix_pads: (0..MAX_BATCH_MEMBERS)
-                .map(|_| alloc(stream, 1))
+                .map(|_| alloc(1))
                 .collect::<Result<Vec<_>, _>>()?,
             scores: None,
         };
