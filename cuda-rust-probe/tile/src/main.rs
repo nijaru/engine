@@ -81,7 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut host = vec![0f32; N];
     unsafe { cuda_core::memcpy_dtoh_async(host.as_mut_ptr(), dptr, N, &stream)? };
-    stream.synchronize()?;
+    // SAFETY: `Device::new` bound this device's context to the thread, and no
+    // other thread uses this stream.
+    unsafe { stream.synchronize()? };
     if !host.iter().all(|value| *value == EXPECTED) {
         let wrong = host.iter().filter(|value| **value != EXPECTED).count();
         return Err(format!("tile kernel left {wrong} of {N} elements wrong").into());
@@ -92,7 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allocation =
         Arc::try_unwrap(owner).map_err(|_| "a tensor still holds the foreign owner alive")?;
     unsafe { cuda_core::free_async(allocation.dptr, &stream)? };
-    stream.synchronize()?;
+    // SAFETY: see the synchronize above; the context is still current here.
+    unsafe { stream.synchronize()? };
 
     println!("tile probe: cuTile wrote {N} f32 into a cuda-core allocation it borrowed — ok");
     Ok(())
