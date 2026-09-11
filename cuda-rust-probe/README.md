@@ -42,7 +42,26 @@ compute-sanitizer --tool memcheck --leak-check full target/debug/interop
 
 ## Evidence so far
 
-Recorded in [`docs/cuda-rust-migration.md`](../docs/cuda-rust-migration.md) (2026-09-10): cuda-oxide's SIMT
-track builds and runs on CUDA 13.1, cuTile requires 13.2+ for `sm_8x`, the two tracks share one published
-`cuda-core`, and `cuda-core`'s `simt` layer offers no non-owning `DeviceBuffer`, which is why the probe
-demonstrates ownership transfer rather than a borrowed allocation.
+Run on the RTX 4090 (driver 615.71.09, CUDA toolkit 13.3, sm_89) on 2026-09-10:
+
+```text
+device: NVIDIA GeForce RTX 4090 (sm_89)
+
+case A: cuda-core owns, cudarc wrote async over the borrowed stream — ok
+case B: cudarc owns, cuda-core borrowed and wrote, release order safe — ok
+
+interop smoke: both ownership directions passed
+```
+
+```text
+========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
+========= ERROR SUMMARY: 0 errors
+```
+
+Toolchain context, all recorded in [`docs/cuda-rust-migration.md`](../docs/cuda-rust-migration.md): cuda-oxide's SIMT
+track builds and runs on CUDA 13.1, cuTile needs 13.2+ before it can target `sm_8x` at all, the two tracks share
+one published `cuda-core`, and `cuda-core`'s `simt` layer offers no non-owning `DeviceBuffer` — which is why
+this probe demonstrates ownership transfer rather than a borrowed allocation.
+
+Not yet covered here: an Engine-authored kernel (SIMT or tile) executing over these shared resources, and the
+same smoke test wired to the project's own fixtures.
