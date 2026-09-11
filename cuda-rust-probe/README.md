@@ -71,26 +71,29 @@ cd simt && cargo oxide doctor && cargo oxide run
 
 ## Evidence so far
 
-Run on the RTX 4090 (driver 615.71.09, CUDA toolkit 13.3, sm_89) on 2026-09-10:
+Run on the RTX 4090 (driver 615.71.09, CUDA toolkit 13.3, sm_89) on 2026-09-10 with `./run.sh`, which
+builds every probe, runs it, and then repeats it under `compute-sanitizer --tool memcheck
+--leak-check full`. Every probe reports `0 bytes leaked in 0 allocations` and `0 errors`:
 
 ```text
-device: NVIDIA GeForce RTX 4090 (sm_89)
-
-case A: cuda-core owns, cudarc wrote async over the borrowed stream — ok
-case B: cudarc owns, cuda-core borrowed and wrote, release order safe — ok
-
 interop smoke: both ownership directions passed
+tile probe: cuTile wrote 1024 f32 into a cuda-core allocation it borrowed — ok
+simt probe: cuda-oxide kernel wrote 1024 f32 through cuda-core buffers — ok
+
+gate 1 smoke test: all probes passed
 ```
 
-```text
-========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
-========= ERROR SUMMARY: 0 errors
-```
+Preparation, measured separately from execution because the tracks differ. The `interop` probe has
+nothing to prepare. The `simt` probe's device bundle is produced at build time, so its runs are uniform
+(~0.22s). The `tile` probe JIT-compiles through CUDA Tile IR, so the first run after `COLD=1` drops
+`~/.cache/cutile` pays for compilation and later runs load from the cache: 0.43s cold against 0.38s warm
+for one 128-tile kernel. That gap is small for a single small kernel; it is not evidence about a model's
+worth of kernels.
 
 Toolchain context, all recorded in [`docs/cuda-rust-migration.md`](../docs/cuda-rust-migration.md): cuda-oxide's SIMT
 track builds and runs on CUDA 13.1, cuTile needs 13.2+ before it can target `sm_8x` at all, the two tracks share
 one published `cuda-core`, and `cuda-core`'s `simt` layer offers no non-owning `DeviceBuffer` — which is why
-this probe demonstrates ownership transfer rather than a borrowed allocation.
+the interop probe demonstrates ownership transfer while the tile probe demonstrates borrowing.
 
-Not yet covered here: an Engine-authored kernel (SIMT or tile) executing over these shared resources, and the
-same smoke test wired to the project's own fixtures.
+Not yet covered here: Engine's own kernels — a quantized projection, a GDN state update — rather than probes,
+and a smoke test wired to the project's own fixtures. Those are migration gates 2 and 3.
