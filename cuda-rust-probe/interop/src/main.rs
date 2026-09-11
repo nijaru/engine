@@ -114,7 +114,7 @@ fn case_b_cudarc_owns() -> Fallible {
     // the allocation pinned for the enqueue may now lapse.
     drop(guard);
 
-    let host = stream.memcpy_dtov(&buf)?;
+    let host = stream.clone_dtoh(&buf)?;
     if host.len() != N || !host.iter().all(|word| *word == WORD_PATTERN) {
         return Err("case B: cuda-core's write did not land in cudarc's allocation".into());
     }
@@ -123,7 +123,7 @@ fn case_b_cudarc_owns() -> Fallible {
     // are foreign, the allocation survives and still reads correctly.
     drop(core_stream);
     drop(core_device);
-    let still_there = stream.memcpy_dtov(&buf)?;
+    let still_there = stream.clone_dtoh(&buf)?;
     if still_there != host {
         return Err("case B: dropping cuda-core's borrowed handles disturbed cudarc's allocation".into());
     }

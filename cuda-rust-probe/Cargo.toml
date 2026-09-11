@@ -11,7 +11,10 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+# This workspace exists to exercise FFI seams across two CUDA libraries, so
+# unsafe blocks are the subject rather than a smell. The main repository
+# workspace keeps `unsafe_code = "forbid"`.
+unsafe_code = "allow"
 
 [workspace.lints.clippy]
 all = "warn"
