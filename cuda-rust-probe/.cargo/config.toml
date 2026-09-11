@@ -1,0 +1,4 @@
+# Pin the toolkit instead of inheriting /usr/local/cuda, which the CUDA
+# 13.1 and 13.3 installs have both owned at different times.
+[env]
+CUDA_TOOLKIT_PATH = { value = "/usr/local/cuda-13.3", relative = false }

@@ -5,6 +5,9 @@ members = [
     "crates/nvidia",
     "crates/server",
 ]
+# Hardware-gated CUDA Rust probes: their own workspace, so the toolchain-free
+# workspace build and test above stay that way.
+exclude = ["cuda-rust-probe"]
 resolver = "2"
 
 [workspace.package]

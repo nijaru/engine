@@ -1,0 +1,23 @@
+[package]
+name = "interop"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The Rust CUDA stack Engine is migrating to. cuda-core and cuda-bindings are
+# published from NVlabs/cutile-rs and shared by cuda-oxide.
+cuda-core = "0.3.1"
+
+# The stack Engine uses today. Features mirror crates/nvidia/Cargo.toml so the
+# probe exercises the same binding surface as the engine.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "cuda-13020",
+    "dynamic-loading",
+] }
+
+[lints]
+workspace = true
