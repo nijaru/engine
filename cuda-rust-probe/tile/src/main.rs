@@ -12,10 +12,9 @@ use std::sync::Arc;
 use cuda_async::device_buffer::DeviceAllocation;
 use cuda_async::device_operation::DeviceOp;
 use cutile::prelude::*;
-use cutile::tile_kernel::TileKernel;
 
 const N: usize = 1024;
-const TILE: i32 = 128;
+const TILE: usize = 128;
 const EXPECTED: f32 = 2.0;
 
 #[cutile::module]
@@ -63,15 +62,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = N * std::mem::size_of::<f32>();
 
     // One owner: cuda-core allocates the buffer cuTile will write.
-    let dptr = unsafe { cuda_core::malloc_async(stream.cu_stream(), bytes)? };
+    let dptr = unsafe { cuda_core::malloc_async(bytes, &stream)? };
     let owner = Arc::new(ProbeAllocation {
         dptr,
         len_bytes: bytes,
         device_id: 0,
     });
 
-    let z = unsafe { Tensor::<f32>::from_foreign(Arc::clone(&owner), vec![N as i32], vec![1]) };
-    let x = cutile::api::ones::<f32>(&[N as i32]);
+    let borrowed: Arc<dyn DeviceAllocation> = owner.clone();
+    let z = unsafe { Tensor::<f32>::from_foreign(borrowed, vec![N as i32], vec![1]) };
+    let x = cutile::api::ones::<f32>(&[N]);
 
     // Launch on the same stream the owner allocated on, and let every tensor
     // drop before the owner reads or frees anything.
