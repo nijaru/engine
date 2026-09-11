@@ -103,13 +103,16 @@ fn case_b_cudarc_owns() -> Fallible {
         )
     };
 
-    let (dptr, _guard) = buf.device_ptr(&stream);
     let bytes = N * size_of::<u32>();
+    let (dptr, guard) = buf.device_ptr(&stream);
     let dptr = dptr as cuda_core::sys::CUdeviceptr;
 
     unsafe { cuda_core::memset_d8_async(dptr, BYTE_FILL, bytes, &core_stream)? };
     unsafe { cuda_core::memcpy_htod_async(dptr, [WORD_PATTERN; N].as_ptr(), N, &core_stream)? };
     stream.synchronize()?;
+    // Both libraries' enqueued work has completed; the pointer guard that kept
+    // the allocation pinned for the enqueue may now lapse.
+    drop(guard);
 
     let host = stream.memcpy_dtov(&buf)?;
     if host.len() != N || !host.iter().all(|word| *word == WORD_PATTERN) {
@@ -131,8 +134,8 @@ fn case_b_cudarc_owns() -> Fallible {
 }
 
 fn ensure(result: cudarc::driver::sys::CUresult, call: &str) -> Fallible {
-    if result == 0 {
+    if result == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
         return Ok(());
     }
-    Err(format!("{call} failed with CUresult {result}").into())
+    Err(format!("{call} failed with {result:?}").into())
 }
