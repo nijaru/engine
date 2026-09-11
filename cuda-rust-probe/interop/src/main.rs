@@ -107,10 +107,8 @@ fn case_b_cudarc_owns() -> Fallible {
     let bytes = N * size_of::<u32>();
     let dptr = dptr as cuda_core::sys::CUdeviceptr;
 
-    unsafe { cuda_core::api::memset_d8_async(dptr, BYTE_FILL, bytes, &core_stream)? };
-    unsafe {
-        cuda_core::api::memcpy_htod_async(dptr, [WORD_PATTERN; N].as_ptr(), N, &core_stream)?
-    };
+    unsafe { cuda_core::memset_d8_async(dptr, BYTE_FILL, bytes, &core_stream)? };
+    unsafe { cuda_core::memcpy_htod_async(dptr, [WORD_PATTERN; N].as_ptr(), N, &core_stream)? };
     stream.synchronize()?;
 
     let host = stream.memcpy_dtov(&buf)?;

@@ -11,10 +11,12 @@ publish.workspace = true
 # published from NVlabs/cutile-rs and shared by cuda-oxide.
 cuda-core = "0.3.1"
 
-# The stack Engine uses today. Features mirror crates/nvidia/Cargo.toml so the
-# probe exercises the same binding surface as the engine.
+# The stack Engine uses today. Features mirror crates/nvidia/Cargo.toml, plus
+# `driver`: Engine gets that module through `cublas`, which the probe does not
+# need, and cudarc gates `cudarc::driver` behind the feature directly.
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
+    "driver",
     "cuda-13020",
     "dynamic-loading",
 ] }
