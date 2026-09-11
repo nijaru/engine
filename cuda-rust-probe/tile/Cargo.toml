@@ -1,0 +1,17 @@
+[package]
+name = "tile"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The Rust CUDA stack: cuda-core owns context, stream, and allocation;
+# cuda-async supplies the DeviceAllocation contract; cutile authors the kernel.
+cuda-core = "0.3.1"
+cuda-async = "0.3.1"
+cutile = "0.3.1"
+
+[lints]
+workspace = true

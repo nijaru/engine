@@ -1,7 +1,7 @@
 [workspace]
 # Deliberately its own workspace: these crates need the NVIDIA toolchain at
 # build time, and `cargo test --workspace` in the repository root must not.
-members = ["interop"]
+members = ["interop", "tile"]
 resolver = "3"
 
 [workspace.package]
