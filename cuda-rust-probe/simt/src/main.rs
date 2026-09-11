@@ -25,8 +25,8 @@ mod kernels {
 
     /// `z[i] = 2 * x[i] + y[i]`, one thread per element.
     #[kernel]
-    #[launch_bounds(BLOCK)]
-    #[launch_contract(domain = 1, block = (BLOCK, 1, 1))]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn double_add(x: &[f32], y: &[f32], mut z: DisjointSlice<f32>) {
         let index = thread::index_1d();
         if let Some(slot) = z.get_mut(index) {
