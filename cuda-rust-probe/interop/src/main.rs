@@ -49,8 +49,7 @@ fn case_a_cuda_core_owns() -> Fallible {
     let words = vec![WORD_PATTERN; N];
     let bytes = N * size_of::<u32>();
     let dptr = buf.cu_deviceptr() as cudarc::driver::sys::CUdeviceptr;
-    let cu_stream = stream.cu_stream() as *mut c_void
-        as *mut cudarc::driver::sys::CUstream_st
+    let cu_stream = stream.cu_stream() as *mut c_void as *mut cudarc::driver::sys::CUstream_st
         as cudarc::driver::sys::CUstream;
 
     // Same context, same stream, same allocation: no host round trip between
@@ -125,7 +124,9 @@ fn case_b_cudarc_owns() -> Fallible {
     drop(core_device);
     let still_there = stream.clone_dtoh(&buf)?;
     if still_there != host {
-        return Err("case B: dropping cuda-core's borrowed handles disturbed cudarc's allocation".into());
+        return Err(
+            "case B: dropping cuda-core's borrowed handles disturbed cudarc's allocation".into(),
+        );
     }
 
     println!("case B: cudarc owns, cuda-core borrowed and wrote, release order safe — ok");
