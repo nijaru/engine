@@ -57,6 +57,12 @@ unsafe impl DeviceAllocation for ProbeAllocation {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Kernel preparation is part of what this gate measures. cuTile JIT-compiles
+    // a kernel through CUDA Tile IR on first use; the on-disk cache makes that
+    // once per kernel, per toolkit fingerprint, rather than once per run. Run
+    // this probe twice (or with the runner's COLD=1) to see both costs.
+    cutile::jit_cache::enable_default()?;
+
     let device = cuda_core::Device::new(0)?;
     let stream = device.new_stream()?;
     let bytes = N * std::mem::size_of::<f32>();
