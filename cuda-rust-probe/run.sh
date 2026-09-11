@@ -56,7 +56,9 @@ timed() {
 
 echo "build"
 timed "interop, tile" cargo build --quiet -p interop -p tile
-timed "simt" bash -c "cd simt && cargo build --quiet --release"
+# cuda-oxide embeds the device bundle at build time, so this member builds
+# through its own subcommand rather than plain cargo.
+timed "simt" bash -c "cd simt && cargo oxide build"
 
 echo
 echo "run (warm preparation unless COLD=1)"
