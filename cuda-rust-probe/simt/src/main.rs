@@ -29,9 +29,9 @@ mod kernels {
     #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn double_add(x: &[f32], y: &[f32], mut z: DisjointSlice<f32>) {
         let index = thread::index_1d();
+        let raw = index.get();
         if let Some(slot) = z.get_mut(index) {
-            let i = index.get();
-            *slot = 2.0 * x[i] + y[i];
+            *slot = 2.0 * x[raw] + y[raw];
         }
     }
 }
