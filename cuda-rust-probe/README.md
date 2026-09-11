@@ -40,6 +40,35 @@ For the release and leak sides of the same claim, run it under the compute sanit
 compute-sanitizer --tool memcheck --leak-check full target/debug/interop
 ```
 
+## `tile`
+
+The tile-track kernel proof. `cuda-core` allocates the buffer and owns the stream, cuTile wraps that allocation
+with `Tensor::from_foreign` — its documented interop entry point, which holds a foreign owner alive and takes
+no copy and no ownership transfer — and a cutile kernel writes into it. The probe reads the result back
+through `cuda-core` and only then reclaims the owner with `Arc::try_unwrap`, so a tensor that outlived its
+borrow, or an allocation freed early, fails the run instead of passing quietly.
+
+```sh
+cargo run -p tile
+```
+
+## `simt`
+
+The SIMT-track kernel proof, and the migration's target ownership shape: `cuda-core` owns the context, the
+stream, and every buffer, and an Engine-authored cuda-oxide kernel borrows them. No second allocator, no
+second runtime.
+
+This member is **its own workspace** because cuda-oxide authors kernels through a rustc codegen backend on a
+pinned nightly, which the stable `interop` and `tile` crates must not inherit. cuda-oxide's own
+kernel-authoring crates are unpublished, so the manifest pins the git revision; its `cargo oxide` subcommand
+has to be installed once:
+
+```sh
+cargo +nightly-2026-08-28 install --git https://github.com/NVlabs/cuda-oxide.git \
+  --rev 26754ae52c26c097dc1c465a1e42c4c5d05a3d40 cargo-oxide
+cd simt && cargo oxide doctor && cargo oxide run
+```
+
 ## Evidence so far
 
 Run on the RTX 4090 (driver 615.71.09, CUDA toolkit 13.3, sm_89) on 2026-09-10:

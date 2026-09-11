@@ -1,0 +1,18 @@
+[package]
+name = "simt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: cuda-oxide authors kernels through a rustc codegen backend
+# on a pinned nightly, and the probe workspace's stable crates must not inherit
+# that. See ../README.md.
+[workspace]
+
+[dependencies]
+# Pinned full revisions: cuda-oxide's kernel-authoring crates are not published,
+# so this is the only way to hold the executable proof to a known revision.
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+# Shared host-side runtime, published from NVlabs/cutile-rs.
+cuda-core = "0.3.1"

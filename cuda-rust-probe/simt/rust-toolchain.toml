@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned by cuda-oxide's rustc codegen backend, which needs rustc-dev.
+channel = "nightly-2026-08-28"
+components = ["rust-src", "rustc-dev", "llvm-tools"]
