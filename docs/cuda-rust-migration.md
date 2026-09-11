@@ -66,7 +66,25 @@ Source review on 2026-09-09 used [cuTile Rust](https://github.com/NVlabs/cutile-
 - cuTile source says sm8x support starts with CUDA 13.2, with CUDA 13.3 recommended. This is more specific than the introductory blog's blanket 13.3 requirement. Check the actual qualification host rather than inferring its toolkit from cudarc's `cuda-13020` feature.
 - cuda-oxide source currently pins nightly-2026-08-28 and lists CUDA 13.x host requirements, differing from the blog's older setup. Isolate kernel compilation/toolchain requirements from non-CUDA workspace development where practical; prove the build arrangement rather than assuming a nightly backend invalidates stable core code.
 
-No CUDA Rust kernel has been compiled or executed for Engine yet. Published results on other models and GPUs do not establish performance on Qwen3.8-27B Q4 GGUF or the RTX 4090.
+That review is now backed by a hardware probe on the qualification host (below). No Engine kernel has been authored in Rust yet, and nothing has been measured on Qwen3.8-27B Q4 GGUF; published results on other models and GPUs do not transfer to this artifact or device.
+
+## Hardware probe on the qualification host, 2026-09-10
+
+The RTX 4090 host runs Fedora 44 with driver 615.71.09 (CUDA UMD 13.4), an NVIDIA-runfile toolkit 13.1 at `/usr/local/cuda-13.1` (with `/usr/local/cuda` pointing at it), rustup stable plus nightly, and the pinned Qwen3.8-27B Q4 artifact present. Both upstream trees were cloned at the reviewed revisions and checked out there: cuTile Rust `2eed75e`, cuda-oxide `26754ae` — the same commits the table above was reviewed against, so those citations are current rather than stale.
+
+**The SIMT track runs on the existing toolkit.** `cargo oxide doctor` reports every requirement satisfied on CUDA 13.1: `cuda.h`, nvcc 13.1.80, libNVVM 2.0, nvJitLink 13.1, `libdevice.10.bc`, `llc` from the pinned nightly's rustlib, the clang 22 resource directory, the RTX 4090 at compute capability 8.9, and both optional debuggers. `cargo oxide setup` then built and published the `librustc_codegen_cuda.so` backend for revision `26754ae52c`, and `cargo oxide run vecadd` compiled and executed a Rust-authored kernel on the 4090 with all 1024 elements correct. cuda-oxide needs CUDA 13.0+ only; a toolkit upgrade is not on its critical path.
+
+**The tile track needs a newer toolkit before it can run on this GPU.** With `CUDA_TOOLKIT_PATH=/usr/local/cuda-13.1`, the cuTile `hello_world` example generates Tile IR and then fails at `tileiras` discovery with the compiler's own 13.2 floor:
+
+```text
+ERROR cuTile requires CUDA 13.2 or newer: the resolved toolkit at /usr/local/cuda-13.1 is CUDA 13.1. Set CUDA_TOOLKIT_PATH or CUDA_HOME to a CUDA 13.2+ install (the shared CUDA host-side crates themselves support 13.0+).
+```
+
+Three independent checks agree, so this is a real floor rather than a message artifact: `cutile-compiler` sets `MIN_TILE_CUDA_VERSION = 13020` and asserts that exact 13.1 diagnostic in its own tests; the 13.1 `tileiras --help` lists only `sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121` for `--gpu-name`, so it cannot target the 4090's `sm_89`; and the cutile-rs README places `sm_8x` support at CUDA 13.2. A versioned toolkit install is therefore gate-1 work. The host's NVIDIA `cuda-fedora44.repo` offers `cuda-toolkit-13-3` (13.3.0/13.3.1), which requires only toolkit components — compiler, libraries, tools, NVML, documentation — and no driver package, so installing it beside 13.1 is additive and leaves the existing install and driver untouched. CUDA 13.3 is the version cutile-rs recommends and the one `cuda-core`'s default toolkit candidate list names.
+
+**One shared substrate, confirmed by dependency direction rather than by convention.** `cuda-bindings`, `cuda-core`, and `cuda-async` are published from NVlabs/cutile-rs at 0.3.1 (crates.io, 2026-09-04); cuda-oxide 0.3.1 depends on those crates.io versions and keeps its SIMT surface in their `simt` modules. cuda-oxide's kernel-authoring crates (`cuda-device`, `cuda-macros`, `cuda-host`, `cuda-artifact-finalizer`) are not published, so any Engine kernel-authoring proof pins the cuda-oxide revision. The shared layer also reuses cuda-oxide's published `oxide-artifacts` 0.2.1 for artifact loading. There is no second host runtime to reconcile and no allocation bridge to invent between the two tracks.
+
+**The resource-owner decision is constrained by what cuda-core can borrow.** Its `runtime` layer exposes deliberately non-owning foreign adoption: `Device::borrow_raw` / `borrow_with_owner`, `Stream::borrow_raw` / `borrow_with_owner`, and module/function `borrow_raw`, documented for external frameworks including cudarc. The `simt` layer that both kernel tracks launch through is different: the only raw-construction path for `DeviceBuffer` is `from_raw_parts`, whose contract transfers ownership and frees the pointer on drop, and `CudaStream` has no foreign-handle constructor at all. So Engine cannot adopt a cudarc allocation into cuda-core without handing over ownership, and should not keep two live wrappers over one allocation. The coherent target is the one the migration already names: make cuda-core the single context/stream/buffer owner, and let any remaining legacy code receive borrowed raw handles until it is retired. Proving exactly that mix — a cuda-oxide kernel launched over memory whose lifetime one owner owns — is the remaining gate-1 deliverable.
 
 ## Ordered proof and migration gates
 
@@ -75,6 +93,8 @@ No CUDA Rust kernel has been compiled or executed for Engine yet. Published resu
 Pin compatible upstream revisions and verify the Linux GPU host, toolkit, driver, and Rust toolchains. Build and run both tracks on the 4090. Demonstrate operations over the same context, stream, and allocation without a host round trip, double ownership, or premature release. Inspect compatibility between the shared runtime versions rather than assuming matching crate names imply compatibility.
 
 Deliverable: a repeatable hardware-gated smoke test, explicit toolchain setup, and a decision on the common resource owner. Non-CUDA builds must remain usable without the NVIDIA toolchain. Do not upgrade the host or disrupt another GPU workload as an incidental setup action.
+
+Status (2026-09-10): the pinned revisions are cloned on the host, cuda-oxide's SIMT track builds and runs on the existing toolkit 13.1, and the shared-substrate and resource-owner questions are answered by the probe above. Remaining: install a versioned CUDA 13.2+ toolkit for the tile track beside 13.1, run the cuTile hello world on the 4090, and demonstrate the mixed ownership case — one owner for context, stream, and allocation, with the other side holding borrowed handles only.
 
 ### 2. Representative quantized and stateful execution
 
