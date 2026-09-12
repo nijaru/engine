@@ -16,11 +16,11 @@ cross-component scheduling.
 | Area | Current evidence | Main gap |
 | --- | --- | --- |
 | Shared execution foundation | Dependency-free parameter/version/materialization metadata; node/device/link topology; same logical model placed locally or across nodes; preparation-time semantic-op dispatch experiment | Physical storage/device primitives, broader operator/backend evidence, second hardware backend |
-| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation | New-path GPU qualification; fixed-shape/model assumptions |
+| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; experimental same-sequence multi-token prefill path and parity/benchmark harness compile but are not device-qualified or serving-selected | Run the new prefill parity/timing gates on the 4090; new-path GPU qualification; fixed-shape/model assumptions; true chunked GDN/full-attention prefill after evidence |
 | AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation |
-| Non-AR runtime validation | Generic bounded batch runtime; parameter-version pinning; executor-informed FIFO batch sizing; an actual BERT encoder reference path loads HF/SafeTensors weights and executes embeddings, self-attention, residual/LayerNorm, FFN and pooler semantics | Attention masks/padding/ragged batching, async/cancellation/resource admission, device execution and optimized kernels |
+| Non-AR runtime validation | Generic bounded batch runtime; parameter-version pinning; executor-informed FIFO batch sizing; actual BERT encoder semantics; attention masks and padded-versus-ragged batch-cost tests pass without a common-runtime change | Async/cancellation/resource admission, device execution and optimized kernels |
 | Text facade | Raw/chat/token inputs, tokenizer/template reuse, streaming/offline batch | Hardwired Qwen GGUF/CUDA loading; mutable single-caller handle |
-| Model/artifact separation | `QwenConfig` independent of GGUF; thin SafeTensors artifact adapter; local HF-style config + unsharded/sharded weight-package resolver; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution/model package, reusable shard opening/materialization path |
+| Model/artifact separation | `QwenConfig` independent of GGUF; thin SafeTensors artifact adapter; local HF-style config + unsharded/sharded weight-package resolver; `LocalWeightSet` lazily reuses opened shards; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution when a second production model justifies it, backend materialization path |
 | Cross-runtime composition | Sequential batch-encoder -> AR handoff passes prepared state in-process; stable request identity survives out-of-order handoff; cancellation ownership is validated before and after AR admission | Genuine encoder-decoder model, cross-attention/device-state lifetime, async failure propagation and version compatibility |
 | Multimodal/iterative | VLM pressure test models prompt-positioned encoder items with independent encoder-compute and encoder-cache pressure; staged-vs-coupled distinction is validated | Typed media processor path, real VLM integration and production coupled scheduler/resource seam; iterative/diffusion runtime; realtime session path |
 | CUDA Rust | Resource/toolchain gate complete | Representative quantized/recurrent kernels and full execution integration |
@@ -74,13 +74,14 @@ VLM test's dependency representation remain pressure-test interfaces.
 
 Remaining work in this architecture-validation stage:
 
-- pressure-test attention masks, padding/ragged shapes and real device resource
-  costs on the encoder path; let that evidence refine non-AR batching/admission
-  rather than inventing a universal cost unit;
+- pressure-test real device resource costs, asynchronous execution, cancellation
+  and failure behavior on the encoder path; masks plus padded/ragged host execution
+  already fit executor-owned batch selection without a universal cost unit;
 - establish the general loaded-model/model-package and architecture-resolution
-  boundary using the concrete Qwen and BERT integrations. An ordinary central Rust
-  enum/registry/factory is acceptable if it is the simplest fit; extensibility does
-  not require a plugin ABI or a scheduler that never changes;
+  boundary when another production model makes it useful. Qwen is still the only
+  production model path and BERT is a pressure-test integration, so a registry now
+  would mostly formalize strings rather than remove real duplication. An ordinary
+  central Rust enum/registry/factory remains acceptable when evidence justifies it;
 - add tokenizer/processor/package metadata and model capability/operation
   introspection without a user-visible task-default workflow;
 - integrate a genuine encoder-decoder model to validate cross-attention state,
@@ -211,11 +212,10 @@ code. Qwen and BERT provide two concrete model-family integrations against which
 pressure-test architecture resolution. Extend these layers deliberately rather than
 making the artifact parser responsible for model semantics.
 
-First make repeated tensor access practical for real checkpoints: one resolved
-SafeTensors shard should be opened/owned once and provide many borrowed parameter
-views or prepared materializations. The BERT reference path currently proves this
-need with a private per-loader artifact cache; promote only the reusable artifact
-ownership mechanism, not BERT-specific semantics.
+Repeated tensor access is now practical without moving model semantics into the
+package layer: `LocalWeightSet` lazily opens each resolved SafeTensors shard once and
+reuses it for many borrowed tensor views. Backend-specific prepared materialization
+and streaming/loading policy remain future work.
 
 Add Hugging Face repository IDs/revisions, tokenizer/chat-template and processor
 metadata as first-class sources alongside local directories. GGUF remains supported

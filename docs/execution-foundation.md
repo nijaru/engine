@@ -136,10 +136,10 @@ not production BERT support or a general model registry.
 
 It also exposed a concrete loading concern that toy fixtures could hide: repeatedly
 calling a per-parameter helper that reopens a SafeTensors shard would reread the same
-checkpoint bytes many times. The BERT loader therefore keeps a private artifact cache
-and opens each unique shard once. A reusable package/weight-set owner should preserve
-that property for real integrations, while model-specific tensor names, expected
-shapes and semantic mapping remain above it.
+checkpoint bytes many times. `ribn-hf::LocalWeightSet` now owns that reusable behavior:
+it opens each resolved shard lazily on first use, reuses it for later tensor views,
+and leaves unused shards unopened. Model-specific tensor aliases, expected shapes
+and semantic mapping remain above the package layer.
 
 Remote repository IDs/revisions, tokenizer/processor metadata, prepared backend
 storage and the general architecture resolver remain future work.
@@ -198,10 +198,13 @@ common runtime.
 
 The BERT architecture pressure test is the first substantially real model-semantic
 use of this path. It preserves the same executor-defined request/result boundary and
-uses sequence length to constrain batching while running actual BERT attention and
-feed-forward structure. No new universal batching abstraction was required. The
-next useful pressure comes from attention masks, padding/ragged layouts and real
-device memory/compute admission rather than another synthetic cost type.
+runs actual BERT attention and feed-forward structure. Follow-up tests add attention
+masks and compare padded versus ragged batch cost: masked padding is semantically
+inert for real tokens, and the concrete executor can shorten a padded FIFO batch even
+when the same requests fit a ragged token budget. No new common batching abstraction
+was required. The next useful pressure comes from real device memory/compute
+admission, asynchronous execution and optimized kernels rather than another synthetic
+cost type.
 
 `ribn-batch` is not yet an embedding API or the final encoder scheduler. In
 particular, cancellation, asynchronous device execution, resource admission,
@@ -288,8 +291,10 @@ Implemented as provisional scaffolding:
 - local HF-style config plus single/sharded SafeTensors package resolution;
 - an actual BERT architecture reference path over that package boundary, including
   embeddings, self-attention, residual/LayerNorm, FFN and pooler execution;
-- evidence that real model loading needs each SafeTensors shard owned/opened once
-  for repeated tensor access rather than reread per parameter;
+- `LocalWeightSet` lazily owns each resolved SafeTensors shard once for repeated
+  parameter access while leaving model semantics above the package layer;
+- BERT attention-mask semantics and padded-versus-ragged batch-cost pressure tests
+  pass without changing the common `ribn-batch` contract;
 - stable AR `RequestId` passed separately from `SequenceId` into executor admission;
 - sequential encoder->AR handoff, out-of-order correlation, request-local failure,
   and cancellation ownership before/after admission;
@@ -298,8 +303,8 @@ Implemented as provisional scaffolding:
 
 This validates that the broad boundary is implementable and has forced several
 interface changes. It does **not** validate that these exact types are sufficient or
-optimal. The next high-value pressure tests are masked/padded/ragged encoder/device
-execution, ordinary architecture resolution using the concrete Qwen+BERT evidence,
-a genuine encoder-decoder model, a real VLM/processor integration, an iterative
-non-AR runtime, more real semantic-op/backend implementations, and a second hardware
-backend.
+optimal. The next high-value pressure tests are real encoder device execution/resource
+admission, ordinary architecture resolution once another production model makes that
+boundary useful, a genuine encoder-decoder model, a real VLM/processor integration,
+an iterative non-AR runtime, more real semantic-op/backend implementations, and a
+second hardware backend.

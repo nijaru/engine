@@ -5,10 +5,11 @@
 //! sequencing across [`CudaHybridState`], FFN, and the greedy output head.
 //! Layer sequencing mirrors `host_gdn_ar_step`/`host_full_attn_ar_step`,
 //! which are llama.cpp-verified at `cc83d7b48`; each launch is the
-//! corresponding parity-tested CUDA kernel. Prefill uses the same
-//! state-advancing model body autoregressively, one token at a time, but can
-//! skip the output head for intermediate prompt tokens whose successor is
-//! already known.
+//! corresponding parity-tested CUDA kernel. The default serving prefill still uses
+//! the state-advancing model body autoregressively, one token at a time. An
+//! experimental same-sequence chunk path batches token-independent work while
+//! keeping recurrent/KV updates causal; it remains unwired pending device parity
+//! and performance qualification.
 //!
 //! The executor defines its own [`QwenLayerKind`] so `engine-gguf` remains
 //! optional; model providers translate their layer catalogs into this

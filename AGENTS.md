@@ -194,6 +194,12 @@ proposal for an arbitrary generic resource vector. Let an actual VLM integration
 determine the minimum production scheduler/resource-planner seam. Raw media and
 processor implementation details remain above it.
 
+The NVIDIA package now contains an experimental same-sequence multi-token Qwen
+prefill path that batches projection/norm/FFN work while keeping recurrent and KV
+state updates causal. It is intentionally unwired from serving. Its ignored hybrid
+parity test and opt-in benchmark harness must run on the 4090 before any automatic
+selection or performance claim; compilation is not GPU evidence.
+
 Optimized variants need correctness qualification for the scope in which they are
 automatically selected. Compilation or host tests are not GPU evidence.
 
@@ -225,21 +231,24 @@ Current validation evidence includes:
   parameter version;
 - variable-length encoder inputs forced executor-informed FIFO batch selection;
 - SafeTensors + local HF-style package code keeps artifact semantics separate from
-  model semantics;
-- an actual BERT architecture reference path executes over that package boundary and
-  confirms sequence-length batching without another common scheduling abstraction;
+  model semantics, while `LocalWeightSet` lazily reuses each opened shard across
+  parameter views;
+- an actual BERT architecture reference path executes over that package boundary;
+  attention masks and padded-versus-ragged batch-cost tests still fit executor-owned
+  `select_batch` without another common scheduling abstraction;
 - sequential batch-encoder -> AR handoff passes prepared state in-process, correlates
   by AR `RequestId` independent of handoff order, and transfers cancellation cleanup
   ownership at admission;
 - VLM prompt-position tests show encoder dependencies can interleave with AR prefill
   and that encoder compute and cache capacity are distinct scheduling concerns.
 
-Next evidence-driven pressure points are masked/padded/ragged encoder/device
-execution, ordinary architecture resolution using the concrete Qwen+BERT cases, a
-genuine encoder-decoder model, and an actual VLM/processor integration. Prefer those
-over another synthetic framework layer. The actual VLM should determine whether the
-AR scheduler needs explicit per-item dependency descriptors, a model/resource
-planner, or another representation.
+Next evidence-driven pressure points are real encoder device/resource execution,
+a genuine encoder-decoder model, and an actual VLM/processor integration. Delay a
+central architecture resolver until another production model makes it useful rather
+than formalizing the current Qwen-only product path plus test-only BERT. Prefer these
+concrete integrations over another synthetic framework layer. The actual VLM should
+determine whether the AR scheduler needs explicit per-item dependency descriptors,
+a model/resource planner, or another representation.
 
 ## Verification
 
