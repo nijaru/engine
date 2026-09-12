@@ -1,0 +1,39 @@
+name: Temporary full-model Qwen prefill parity validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/qwen-full-prefill-parity-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Add full-model ignored parity gate
+        run: |
+          python3 tools/temp_qwen_full_prefill_parity.py
+          cargo fmt --all
+      - name: Validate CUDA test source
+        run: |
+          set -euo pipefail
+          cargo test -p engine-nvidia --features cuda --locked
+          cargo clippy -p engine-nvidia --features cuda --all-targets --locked -- -D warnings
+      - name: Commit validated parity gate
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/nvidia/tests/cuda_reference.rs
+          git commit -m 'Add full-model Qwen prefill parity gate'
+          git push origin HEAD:main
