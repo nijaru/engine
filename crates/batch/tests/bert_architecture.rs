@@ -190,8 +190,8 @@ impl BertConfig {
 }
 
 fn config_usize(value: Option<u64>, key: &'static str) -> Result<usize, ModelError> {
-    let value = value
-        .ok_or_else(|| ModelError::InvalidConfig(format!("missing integer field {key}")))?;
+    let value =
+        value.ok_or_else(|| ModelError::InvalidConfig(format!("missing integer field {key}")))?;
     usize::try_from(value)
         .map_err(|_| ModelError::InvalidConfig(format!("field {key} does not fit usize")))
 }
@@ -280,9 +280,9 @@ fn decode_f32_tensor(
             tensor.shape()
         )));
     }
-    let expected_elements = expected_shape.iter().try_fold(1_usize, |count, dimension| {
-        count.checked_mul(*dimension)
-    });
+    let expected_elements = expected_shape
+        .iter()
+        .try_fold(1_usize, |count, dimension| count.checked_mul(*dimension));
     let Some(expected_elements) = expected_elements else {
         return Err(ModelError::UnsupportedTensor(format!(
             "{name} shape overflows usize"
@@ -644,8 +644,7 @@ fn erf(value: f32) -> f32 {
     let sign = if value < 0.0 { -1.0 } else { 1.0 };
     let input = value.abs();
     let factor = 1.0 / input.mul_add(0.327_591_1, 1.0);
-    let polynomial = (((1.061_405_4 * factor - 1.453_152_1) * factor + 1.421_413_8)
-        * factor
+    let polynomial = (((1.061_405_4 * factor - 1.453_152_1) * factor + 1.421_413_8) * factor
         - 0.284_496_72)
         * factor
         + 0.254_829_6;
@@ -835,11 +834,7 @@ fn bert_fixture_tensors() -> Vec<TensorFixture> {
         tensor(
             "bert.embeddings.word_embeddings.weight",
             &[3, hidden],
-            vec![
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-            ],
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         ),
         tensor(
             "bert.embeddings.position_embeddings.weight",
