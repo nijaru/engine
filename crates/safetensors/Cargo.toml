@@ -1,5 +1,5 @@
 [package]
-name = "ribn-batch"
+name = "ribn-safetensors"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,7 @@ publish = false
 
 [dependencies]
 ribn-foundation = { path = "../foundation" }
-
-[dev-dependencies]
-ribn-safetensors = { path = "../safetensors" }
+safetensors = { version = "0.8.0", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

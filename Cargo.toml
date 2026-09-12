@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/foundation",
+    "crates/safetensors",
     "crates/batch",
     "crates/core",
     "crates/runtime",
