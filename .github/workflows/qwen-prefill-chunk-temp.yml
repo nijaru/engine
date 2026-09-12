@@ -23,6 +23,13 @@ jobs:
       - name: Apply experimental prefill chunk path
         run: |
           python3 tools/temp_qwen_prefill_chunk.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/nvidia/src/decode.rs')
+          text = path.read_text()
+          text = text.replace('Q/K/V and RoPE', 'Q/K/V and `RoPE`', 1)
+          path.write_text(text)
+          PY
           cargo fmt --all
       - name: Validate CUDA source and reference test
         run: |
