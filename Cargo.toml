@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/foundation",
+    "crates/batch",
     "crates/core",
     "crates/runtime",
     "crates/text",
