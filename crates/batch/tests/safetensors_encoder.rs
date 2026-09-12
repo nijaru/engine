@@ -42,7 +42,7 @@ impl fmt::Display for EncoderError {
 impl Error for EncoderError {}
 
 /// Artifact-backed reference encoder used only to pressure-test model loading and
-/// non-AR batching. SafeTensors remains an artifact representation; this model
+/// non-AR batching. `SafeTensors` remains an artifact representation; this model
 /// integration decides that `embeddings.weight` is a logical embedding parameter.
 struct ArtifactEncoder {
     version: ParameterVersion,
@@ -74,13 +74,14 @@ impl ArtifactEncoder {
         if tensor.data().len() != expected_bytes {
             return Err(EncoderError::InvalidPayload);
         }
-        let mut embeddings = Vec::with_capacity(elements);
-        for encoded in tensor.data().chunks_exact(4) {
-            let bytes: [u8; 4] = encoded
-                .try_into()
-                .map_err(|_| EncoderError::InvalidPayload)?;
-            embeddings.push(f32::from_le_bytes(bytes));
+        let (encoded_values, remainder) = tensor.data().as_chunks::<4>();
+        if !remainder.is_empty() {
+            return Err(EncoderError::InvalidPayload);
         }
+        let embeddings = encoded_values
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect();
         Ok(Self {
             version,
             vocab,
