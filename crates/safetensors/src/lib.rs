@@ -1,4 +1,4 @@
-//! SafeTensors artifact adapter for Ribn's model-loading pressure tests.
+//! `SafeTensors` artifact adapter for Ribn's model-loading pressure tests.
 //!
 //! This crate validates artifact bytes and exposes borrowed tensor payloads plus
 //! format metadata. It does not allocate execution tensors, choose parameter
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use ribn_foundation::ScalarType;
 use safetensors::tensor::{Dtype, SafeTensors};
 
-/// Validated SafeTensors bytes owned independently of any execution backend.
+/// Validated `SafeTensors` bytes owned independently of any execution backend.
 #[derive(Clone)]
 pub struct SafeTensorArtifact {
     bytes: Arc<[u8]>,
@@ -21,11 +21,11 @@ pub struct SafeTensorArtifact {
 }
 
 impl SafeTensorArtifact {
-    /// Validate and retain an in-memory SafeTensors artifact.
+    /// Validate and retain an in-memory `SafeTensors` artifact.
     ///
     /// # Errors
     /// Returns [`ArtifactError::InvalidFormat`] when the bytes are not a valid
-    /// SafeTensors artifact.
+    /// `SafeTensors` artifact.
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, ArtifactError> {
         let bytes = bytes.into();
         SafeTensors::deserialize(bytes.as_ref()).map_err(ArtifactError::format)?;
@@ -35,11 +35,11 @@ impl SafeTensorArtifact {
         })
     }
 
-    /// Read and validate a SafeTensors artifact from a local file.
+    /// Read and validate a `SafeTensors` artifact from a local file.
     ///
     /// # Errors
     /// Returns an I/O error when the file cannot be read, or a format error when
-    /// its contents are not a valid SafeTensors artifact.
+    /// its contents are not a valid `SafeTensors` artifact.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let path = path.into();
         let bytes = fs::read(&path).map_err(|error| ArtifactError::Io {
