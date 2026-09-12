@@ -11,6 +11,7 @@ publish = false
 ribn-foundation = { path = "../foundation" }
 
 [dev-dependencies]
+ribn = { path = "../runtime" }
 ribn-hf = { path = "../hf" }
 ribn-safetensors = { path = "../safetensors" }
 

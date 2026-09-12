@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
-    FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, SchedulePolicy,
-    SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,
+    FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, RequestId,
+    SchedulePolicy, SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,
 };
 
 #[allow(
@@ -100,6 +100,7 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
 
     fn admit(
         &mut self,
+        _request_id: RequestId,
         sequence: SequenceId,
         _request: &TokenRequest,
     ) -> Result<Admission, ExecutionError> {

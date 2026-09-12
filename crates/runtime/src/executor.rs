@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::TokenRequest;
+use crate::{RequestId, TokenRequest};
 
 /// Engine-issued logical identity, not an allocation pointer or a cache layout.
 /// Models must not infer state contents from this value or from its prefix.
@@ -131,7 +131,10 @@ pub trait GenerationExecutor: Send {
     /// Immutable scheduling metadata, resolved before the engine is created.
     fn info(&self) -> &ExecutorInfo;
 
-    /// Validate request semantics and reserve the complete continuation bundle
+    /// Validate request semantics and reserve the complete continuation bundle.
+    /// `request_id` is stable for the runtime request and may correlate model-
+    /// prepared inputs or tracing; `sequence` identifies executor continuation
+    /// ownership.
     /// at prefix zero. `Deferred` or an error must retain no admission resources.
     /// Preparation, restore, fork, and migration need their own concrete proofs;
     /// an arbitrary nonzero logical prefix is not a restoration API.
@@ -140,6 +143,7 @@ pub trait GenerationExecutor: Send {
     /// Returns an unsupported-input or resource error before execution.
     fn admit(
         &mut self,
+        request_id: RequestId,
         sequence: SequenceId,
         request: &TokenRequest,
     ) -> Result<Admission, ExecutionError>;

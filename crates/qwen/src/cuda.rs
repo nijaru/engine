@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use ribn::{
-    Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, SequenceId,
+    Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, RequestId, SequenceId,
     StepCompletion, SubmissionId, TokenRequest,
 };
 
@@ -55,6 +55,7 @@ impl GenerationExecutor for QwenCuda {
     }
     fn admit(
         &mut self,
+        _request_id: RequestId,
         id: SequenceId,
         request: &TokenRequest,
     ) -> Result<Admission, ExecutionError> {

@@ -393,11 +393,11 @@ impl Engine {
                 .expect("waiting queue was nonempty");
             let sequence = self.slots[index].as_ref().expect("waiting slot exists");
             let input = sequence.input.as_ref().expect("waiting input exists");
-            let admitted = self
-                .model
-                .as_mut()
-                .expect("engine owns model")
-                .admit(sequence.id, input);
+            let admitted = self.model.as_mut().expect("engine owns model").admit(
+                sequence.request,
+                sequence.id,
+                input,
+            );
             match admitted {
                 Ok(Admission::Ready) => {
                     let sequence = self.slots[index].as_mut().expect("waiting slot exists");

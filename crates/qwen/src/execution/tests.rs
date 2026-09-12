@@ -8,7 +8,7 @@ use engine_core::{
 };
 use ribn::{
     Engine, EngineConfig, Event, GenerationExecutor, GenerationLimits, GenerationOptions,
-    SchedulePolicy,
+    RequestId, SchedulePolicy,
 };
 
 use super::*;
@@ -110,6 +110,7 @@ impl GenerationExecutor for Model {
     }
     fn admit(
         &mut self,
+        _request_id: RequestId,
         id: SequenceId,
         request: &TokenRequest,
     ) -> Result<Admission, ExecutionError> {

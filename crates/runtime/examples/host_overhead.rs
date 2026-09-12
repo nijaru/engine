@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, ExecutionError, ExecutorInfo, GenerationExecutor,
-    GenerationLimits, GenerationOptions, SchedulePolicy, SequenceId, StepCompletion, SubmissionId,
-    TokenRequest,
+    GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId, StepCompletion,
+    SubmissionId, TokenRequest,
 };
 
 struct ImmediateModel {
@@ -20,7 +20,12 @@ impl GenerationExecutor for ImmediateModel {
     fn info(&self) -> &ExecutorInfo {
         &self.info
     }
-    fn admit(&mut self, id: SequenceId, _: &TokenRequest) -> Result<Admission, ExecutionError> {
+    fn admit(
+        &mut self,
+        _: RequestId,
+        id: SequenceId,
+        _: &TokenRequest,
+    ) -> Result<Admission, ExecutionError> {
         self.prefixes.insert(id, 0);
         Ok(Admission::Ready)
     }
