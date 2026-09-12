@@ -22,8 +22,8 @@ use engine_core::{
     RecurrentStateSpec,
 };
 use engine_nvidia::{
-    CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights,
-    QwenLayerKind, StagedTensorSource,
+    CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind,
+    StagedTensorSource,
 };
 use engine_qwen::QwenGguf;
 
@@ -40,15 +40,20 @@ fn main() {
         .map_or(64, |value| {
             value.parse().expect("--tokens expects a number")
         });
+    assert!(token_count > 0, "--tokens must be nonzero");
     let prompt_token_count = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--prompt-tokens="))
         .map_or(BASE_PROMPT.len(), |value| {
             value.parse().expect("--prompt-tokens expects a number")
         });
+    let decode_token_count = usize::try_from(token_count).expect("token count fits usize");
+    let total_token_count = prompt_token_count
+        .checked_add(decode_token_count)
+        .expect("prompt plus decode token count fits usize");
     assert!(
-        (1..=KV_CAPACITY).contains(&prompt_token_count),
-        "--prompt-tokens must be in 1..={KV_CAPACITY}"
+        prompt_token_count > 0 && total_token_count <= KV_CAPACITY,
+        "--prompt-tokens + --tokens must fit the {KV_CAPACITY}-token benchmark KV cache"
     );
     let prefill_chunk = args
         .iter()
@@ -160,14 +165,8 @@ fn main() {
             .expect("physical hybrid state");
     state.zero().expect("zero state");
 
-    let mut executor = CudaQwen35Decode::new(
-        &context,
-        stream.clone(),
-        staged,
-        layer_kinds,
-        EPS,
-    )
-    .expect("build decode executor");
+    let mut executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPS)
+        .expect("build decode executor");
     let mut chunk_executor = prefill_chunk.map(|members| {
         CudaQwen35BatchDecode::from_decode(&executor, members)
             .unwrap_or_else(|error| panic!("invalid --prefill-chunk={members}: {error}"))
