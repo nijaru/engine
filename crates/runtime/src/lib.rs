@@ -20,4 +20,6 @@ pub use executor::{
     Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, GenerationLimits,
     SequenceId, StepCompletion, StepKind, SubmissionId,
 };
-pub use request::{Event, FinishReason, GenerationOptions, RequestId, Sampling, TokenRequest};
+pub use request::{
+    Event, FinishReason, GenerationOptions, RequestId, Sampling, TokenRequest, Usage,
+};
