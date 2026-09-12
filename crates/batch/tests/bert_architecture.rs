@@ -38,7 +38,6 @@ impl Drop for TestDir {
 #[derive(Debug)]
 enum ModelError {
     InvalidConfig(String),
-    Package(String),
     Artifact(String),
     MissingParameter(String),
     UnsupportedTensor(String),
@@ -49,7 +48,6 @@ impl fmt::Display for ModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(message) => write!(formatter, "invalid BERT config: {message}"),
-            Self::Package(message) => write!(formatter, "model package error: {message}"),
             Self::Artifact(message) => write!(formatter, "weight artifact error: {message}"),
             Self::MissingParameter(name) => write!(formatter, "missing BERT parameter {name}"),
             Self::UnsupportedTensor(message) => {
@@ -77,24 +75,18 @@ struct BertConfig {
 impl BertConfig {
     fn from_package(package: &LocalModelPackage) -> Result<Self, ModelError> {
         let config = package.config();
-        if config.get("model_type").and_then(|value| value.as_str()) != Some("bert") {
+        if config["model_type"].as_str() != Some("bert") {
             return Err(ModelError::InvalidConfig(
                 "model_type must be \"bert\"".to_owned(),
             ));
         }
-        if config
-            .get("hidden_act")
-            .and_then(|value| value.as_str())
-            .unwrap_or("gelu")
-            != "gelu"
-        {
+        if config["hidden_act"].as_str().unwrap_or("gelu") != "gelu" {
             return Err(ModelError::InvalidConfig(
                 "the reference path currently supports hidden_act=gelu".to_owned(),
             ));
         }
-        if config
-            .get("position_embedding_type")
-            .and_then(|value| value.as_str())
+        if config["position_embedding_type"]
+            .as_str()
             .unwrap_or("absolute")
             != "absolute"
         {
@@ -102,14 +94,8 @@ impl BertConfig {
                 "the reference path currently supports absolute positions".to_owned(),
             ));
         }
-        if config
-            .get("is_decoder")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-            || config
-                .get("add_cross_attention")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
+        if config["is_decoder"].as_bool().unwrap_or(false)
+            || config["add_cross_attention"].as_bool().unwrap_or(false)
         {
             return Err(ModelError::InvalidConfig(
                 "decoder/cross-attention BERT is outside this encoder pressure test".to_owned(),
@@ -117,48 +103,27 @@ impl BertConfig {
         }
 
         let parsed = Self {
-            vocab_size: config_usize(
-                config.get("vocab_size").and_then(|value| value.as_u64()),
-                "vocab_size",
-            )?,
-            hidden_size: config_usize(
-                config.get("hidden_size").and_then(|value| value.as_u64()),
-                "hidden_size",
-            )?,
+            vocab_size: config_usize(config["vocab_size"].as_u64(), "vocab_size")?,
+            hidden_size: config_usize(config["hidden_size"].as_u64(), "hidden_size")?,
             num_hidden_layers: config_usize(
-                config
-                    .get("num_hidden_layers")
-                    .and_then(|value| value.as_u64()),
+                config["num_hidden_layers"].as_u64(),
                 "num_hidden_layers",
             )?,
             num_attention_heads: config_usize(
-                config
-                    .get("num_attention_heads")
-                    .and_then(|value| value.as_u64()),
+                config["num_attention_heads"].as_u64(),
                 "num_attention_heads",
             )?,
             intermediate_size: config_usize(
-                config
-                    .get("intermediate_size")
-                    .and_then(|value| value.as_u64()),
+                config["intermediate_size"].as_u64(),
                 "intermediate_size",
             )?,
             max_position_embeddings: config_usize(
-                config
-                    .get("max_position_embeddings")
-                    .and_then(|value| value.as_u64()),
+                config["max_position_embeddings"].as_u64(),
                 "max_position_embeddings",
             )?,
-            type_vocab_size: config_usize(
-                config
-                    .get("type_vocab_size")
-                    .and_then(|value| value.as_u64()),
-                "type_vocab_size",
-            )?,
+            type_vocab_size: config_usize(config["type_vocab_size"].as_u64(), "type_vocab_size")?,
             layer_norm_eps: config_f32(
-                config
-                    .get("layer_norm_eps")
-                    .and_then(|value| value.as_f64()),
+                config["layer_norm_eps"].as_f64(),
                 "layer_norm_eps",
                 1.0e-12,
             )?,
@@ -175,7 +140,7 @@ impl BertConfig {
             || self.intermediate_size == 0
             || self.max_position_embeddings == 0
             || self.type_vocab_size == 0
-            || self.hidden_size % self.num_attention_heads != 0
+            || !self.hidden_size.is_multiple_of(self.num_attention_heads)
             || self.hidden_size > usize::from(u16::MAX)
             || !self.layer_norm_eps.is_finite()
             || self.layer_norm_eps <= 0.0
@@ -827,6 +792,7 @@ fn identity(width: usize) -> Vec<f32> {
     values
 }
 
+#[allow(clippy::too_many_lines)]
 fn bert_fixture_tensors() -> Vec<TensorFixture> {
     let hidden = 4;
     let intermediate = 4;
@@ -962,7 +928,7 @@ fn safetensors_fixture(tensors: &[TensorFixture]) -> Vec<u8> {
         }
         write!(
             header,
-            r#"\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}"#,
+            "\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
             tensor.name, shape, start, end
         )
         .expect("fixture header");
