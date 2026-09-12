@@ -73,12 +73,11 @@ impl LocalModelPackage {
             path: config_path.clone(),
             message: error.to_string(),
         })?;
-        let config: Value = serde_json::from_slice(&config_bytes).map_err(|error| {
-            PackageError::InvalidJson {
+        let config: Value =
+            serde_json::from_slice(&config_bytes).map_err(|error| PackageError::InvalidJson {
                 path: config_path.clone(),
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         if !config.is_object() {
             return Err(PackageError::InvalidConfig(
                 "config.json must contain a JSON object",
@@ -142,9 +141,7 @@ impl LocalModelPackage {
     pub fn weight_file(&self, parameter: &str) -> Option<&Path> {
         match &self.weights {
             Weights::Single(path) => Some(path),
-            Weights::Sharded { weight_map, .. } => {
-                weight_map.get(parameter).map(PathBuf::as_path)
-            }
+            Weights::Sharded { weight_map, .. } => weight_map.get(parameter).map(PathBuf::as_path),
         }
     }
 
@@ -153,10 +150,7 @@ impl LocalModelPackage {
     /// # Errors
     /// Returns [`PackageError::UnknownParameter`] for a name absent from a
     /// sharded index, or an artifact error when the resolved shard is invalid.
-    pub fn open_weights_for(
-        &self,
-        parameter: &str,
-    ) -> Result<SafeTensorArtifact, PackageError> {
+    pub fn open_weights_for(&self, parameter: &str) -> Result<SafeTensorArtifact, PackageError> {
         let path = self
             .weight_file(parameter)
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?;
@@ -183,18 +177,16 @@ impl Weights {
             path: index_path.clone(),
             message: error.to_string(),
         })?;
-        let index: Value = serde_json::from_slice(&bytes).map_err(|error| {
-            PackageError::InvalidJson {
+        let index: Value =
+            serde_json::from_slice(&bytes).map_err(|error| PackageError::InvalidJson {
                 path: index_path.clone(),
                 message: error.to_string(),
-            }
-        })?;
-        let weight_map = index
-            .get("weight_map")
-            .and_then(Value::as_object)
-            .ok_or(PackageError::InvalidWeightIndex(
+            })?;
+        let weight_map = index.get("weight_map").and_then(Value::as_object).ok_or(
+            PackageError::InvalidWeightIndex(
                 "weight index must contain an object-valued weight_map",
-            ))?;
+            ),
+        )?;
         if weight_map.is_empty() {
             return Err(PackageError::InvalidWeightIndex(
                 "weight_map must contain at least one parameter",
@@ -297,7 +289,9 @@ impl fmt::Display for PackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, message } => write!(f, "could not read {}: {message}", path.display()),
-            Self::NotDirectory(path) => write!(f, "{} is not a model-package directory", path.display()),
+            Self::NotDirectory(path) => {
+                write!(f, "{} is not a model-package directory", path.display())
+            }
             Self::InvalidJson { path, message } => {
                 write!(f, "invalid JSON in {}: {message}", path.display())
             }
@@ -307,15 +301,29 @@ impl fmt::Display for PackageError {
                 "model package {} has neither model.safetensors nor model.safetensors.index.json",
                 root.display()
             ),
-            Self::InvalidWeightIndex(message) => write!(f, "invalid SafeTensors weight index: {message}"),
+            Self::InvalidWeightIndex(message) => {
+                write!(f, "invalid SafeTensors weight index: {message}")
+            }
             Self::MissingShard { path, message } => {
-                write!(f, "model weight shard {} is unavailable: {message}", path.display())
+                write!(
+                    f,
+                    "model weight shard {} is unavailable: {message}",
+                    path.display()
+                )
             }
             Self::UnsafeShardPath(path) => {
-                write!(f, "weight index shard path {:?} escapes the model package", path)
+                write!(
+                    f,
+                    "weight index shard path {:?} escapes the model package",
+                    path
+                )
             }
             Self::MissingPackageFile { path, message } => {
-                write!(f, "model package file {} is unavailable: {message}", path.display())
+                write!(
+                    f,
+                    "model package file {} is unavailable: {message}",
+                    path.display()
+                )
             }
             Self::UnsafePackagePath(path) => {
                 write!(f, "package path {:?} escapes the model package", path)
@@ -416,15 +424,26 @@ mod tests {
             package.config()["architectures"][0],
             Value::String("FixtureEncoder".to_owned())
         );
-        assert!(matches!(package.weight_layout(), WeightLayout::Single { .. }));
+        assert!(matches!(
+            package.weight_layout(),
+            WeightLayout::Single { .. }
+        ));
         let artifact = package
             .open_weights_for("embeddings.weight")
             .expect("artifact");
         assert_eq!(
-            artifact.tensor("embeddings.weight").expect("tensor").shape(),
+            artifact
+                .tensor("embeddings.weight")
+                .expect("tensor")
+                .shape(),
             [1, 3]
         );
-        assert!(package.package_file("tokenizer.json").expect("tokenizer").is_file());
+        assert!(
+            package
+                .package_file("tokenizer.json")
+                .expect("tokenizer")
+                .is_file()
+        );
     }
 
     #[test]

@@ -97,7 +97,8 @@ impl PackageEncoder {
     fn encode(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
         let mut output = vec![0.0_f32; self.width];
         for &token_id in tokens {
-            let token = usize::try_from(token_id).map_err(|_| ModelError::TokenOutOfRange(token_id))?;
+            let token =
+                usize::try_from(token_id).map_err(|_| ModelError::TokenOutOfRange(token_id))?;
             if token >= self.vocab {
                 return Err(ModelError::TokenOutOfRange(token_id));
             }
