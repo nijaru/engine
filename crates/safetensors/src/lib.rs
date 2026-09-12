@@ -128,15 +128,7 @@ fn scalar_type(dtype: Dtype) -> ScalarType {
         Dtype::I64 => ScalarType::I64,
         Dtype::U64 => ScalarType::U64,
         Dtype::BOOL => ScalarType::Bool,
-        Dtype::C64
-        | Dtype::F4
-        | Dtype::F6_E2M3
-        | Dtype::F6_E3M2
-        | Dtype::F8_E4M3
-        | Dtype::F8_E4M3FNUZ
-        | Dtype::F8_E5M2
-        | Dtype::F8_E5M2FNUZ
-        | Dtype::F8_E8M0 => ScalarType::Named(dtype.to_string()),
+        _ => ScalarType::Named(dtype.to_string()),
     }
 }
 
