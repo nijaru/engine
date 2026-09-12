@@ -35,6 +35,21 @@ The intended NVIDIA foundation is CUDA Rust, using cuTile and cuda-oxide as comp
 
 This changes the NVIDIA implementation direction, not the semantic runtime boundaries or the remaining serving roadmap. The current CUDA C++ path remains the migration oracle until equivalent coverage is qualified; it is not intended as a permanent parallel implementation. Other hardware backend selection is deferred until a concrete implementation target requires it.
 
+Do not interrupt these proof gates with speculative framework work. Core changes should move ahead during the migration only when the migration would otherwise lock in a known-wrong semantic contract.
+
+## Architecture hardening before the next model family
+
+The current high-level runtime boundary remains the intended direction, but several first-Qwen implementation details are not long-term semantic invariants. After the CUDA Rust proof sequence is sufficiently stable, and before native implementation of the next major architecture family, make one narrow state/execution-boundary pass:
+
+- Separate semantic continuation-state requirements from physical dtype/encoding/layout. Current `KvStateSpec` / `RecurrentStateSpec` storage dtypes and semantic `byte_size()` accounting are transitional.
+- Remove set-wide `StateLocation` equality from `InferenceStateSet`; preserve one coherent semantic prefix while allowing a qualified backend variant to validate per-component placement.
+- Keep packed/sub-byte/block-scaled physical state encodings outside ordinary whole-byte scalar semantics. Do not add an `F4` variant merely to preserve `byte_width()`.
+- Clean up request lifecycle phase versus model structure. `Encoder` and `MoEExpert` should not accumulate scheduler semantics merely because they exist in the current `ExecutionPhase` enum.
+- Preserve exact qualification identity for the selected physical state realization rather than putting representation choices into semantic state families.
+- Add tests that prove semantic identity remains stable across distinct physical representations once a second real representation exists, mixed placement is rejected or accepted by the selected backend rather than by the semantic container, and lifecycle/release ownership remains exact.
+
+Do not build paging, automatic tiering, a universal state IR, or a generalized storage service as part of this pass. The goal is to remove false semantic assumptions, not to pre-implement every mechanism those types could eventually represent.
+
 ## Phase 4 — runtime and serving foundation
 
 The architecture correction and first correctness serving loop are in place. Core interfaces do not encode the Phase-3 Qwen state bundle, and the same runtime can drive persistent scheduled requests through the CUDA Qwen executor and expose committed output to a frontend.
@@ -51,6 +66,8 @@ The RTX 4090 is the first testable hardware target within the RTX 3090-and-up cl
 - Automatic variant eligibility requires variant-specific evidence matching the exact model, artifact, backend/device, runtime, and state/execution identity. Explicit baseline execution remains available without claiming automatic qualification.
 - Runtime startup has explicit readiness states.
 - Qwen recurrent state describes actual persistent matrix-bank and convolution-history storage rather than model projection-head geometry.
+
+The semantic/physical state split listed above is a follow-up hardening pass, not a rollback of these completed ownership/container boundaries.
 
 ### 4B — persistent request/runtime foundation — complete
 
@@ -102,7 +119,8 @@ Remaining work:
 - Preserve recurrent/other required state at reusable prefix boundaries.
 - Add exact prefix reuse only when the complete model-required state can be reconstructed correctly.
 - For Qwen3.8, reuse/restore must include both full-attention KV and recurrent/Gated-DeltaNet matrix plus convolution history at the same semantic prefix.
-- Make allocation/reuse/transfer costs visible to scheduling.
+- Treat transfer, restore, reconstruction, and resident reuse as explicit materialization mechanisms rather than manufacturing a logical prefix from empty storage.
+- Make allocation/reuse/transfer/materialization costs visible to scheduling.
 - Add preemption only with explicit state ownership/reclamation semantics.
 
 ### 4E — minimal serving surface
@@ -123,6 +141,7 @@ Remaining work:
 - Fused/vendor/custom kernel selection based on measurements.
 - Persistent and larger execution regions where they beat simpler paths.
 - Runtime profiling and empirical cost models.
+- Allow phase-specific empirical costs and resource choices without making the scheduler architecture-specific.
 - Versioned live policy with safe application boundaries and rollback.
 - Transparent preparation cache for packed weights, compiled/JIT kernels, graphs, profiles, and warmup products.
 - Exact artifact identity/invalidation and safe fallback; no surprise first-request compilation stall on a path reported ready.
@@ -134,15 +153,76 @@ The common path should first improve by removing host work, allocations, copies,
 - Use Qwen3.8 native MTP as the first speculation path.
 - Treat propose/verify/state/cost behavior as a provider/runtime capability, not a Qwen-specific scheduler API.
 - Add acceptance/cost telemetry and adaptive policy only after ordinary decode is competitive and stable.
-- Qualify speculation jointly with graph mode, quantization, state layout, and hardware before automatic selection.
+- Qualify speculation jointly with graph mode, quantization, physical state representation, and hardware before automatic selection.
 
-## Phase 7 — broader model and hardware coverage
+## Phase 7 — next model architectures and broader hardware coverage
 
 Prioritize architectures and devices that force useful generalization rather than a long checklist of similar dense decoders.
 
-- Additional dense/hybrid model families.
-- MoE/expert execution and sparse-attention architectures.
-- Multimodal/encoder stages.
+### Next major native architecture pressure test — Qwen3.8-Flash-Next
+
+After the current Qwen3.8-27B foundation, CUDA Rust migration, and state-boundary hardening are stable enough, make Qwen3.8-Flash-Next the next serious native model-family target.
+
+It is a useful pressure test because it combines recurrent state, sparse/global attention, ultra-sparse MoE, model-native speculation, long context, multimodality, and a large host-resident N-gram lookup memory in one open model family. Its architecture is also explicitly presented as a preview of the direction toward Qwen4.
+
+Implementation order should be driven by the real model rather than a speculative generic framework:
+
+1. model metadata/provider description;
+2. classify QSA structures into persistent semantic request state versus derived/backend scratch;
+3. map the N-gram lookup memory as model-owned residency with an asynchronous host-prefetch path;
+4. adapt/validate existing recurrent/GDN state semantics;
+5. implement and qualify MoE execution in backend/runtime layers rather than teaching the common request scheduler expert identities;
+6. add MTP speculation only after ordinary execution is correct;
+7. add multimodal stages after the text path is stable unless a concrete artifact requires them earlier;
+8. qualify long-context/state-memory behavior;
+9. add performance variants only after exact correctness/reference evidence.
+
+Primary architecture reference: <https://qwen.ai/blog?id=qwen3.8-flash-next>
+
+### DeepSeek-V4.1-Flash — architecture compatibility spike before full support
+
+Use DeepSeek-V4.1-Flash as a strong boundary stress test before committing to full native support. Its deployment scale makes it a less practical immediate local target than Qwen3.8-Flash-Next, but its architecture tests whether Ribn's semantic/physical boundaries remain coherent under very different choices.
+
+The design spike should answer:
+
+- Can causal-encoder/decoder prefill and decode be expressed without turning model structure into global request phases?
+- Can cross-layer shared KV/index state fit semantic continuation requirements while physical sharing/layout remains backend-owned?
+- Can FP4/block-scaled state storage be qualified without putting physical encoding in semantic state identity?
+- Can bounded replay be represented as explicit state materialization rather than fake residency?
+- Does Engram-style lookup memory map naturally to model-owned host residency?
+- Does model-native DSpark speculation fit the existing speculation capability boundary?
+
+If those answers require major core surgery, fix the boundary before broader Qwen4-like support makes the assumptions harder to remove. Full 552B-class model support should follow only when hardware/resources and user value justify it.
+
+Primary references: <https://www.deepseek.com/en/news/deepseek-v4-1-flash/> and <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash>
+
+### Other architecture references
+
+Use Kimi K3 and MiniMax M3 as independent evidence that the runtime should not assume one sparse/linear-attention mechanism. They are architecture references, not immediate implementation targets. Do not add KDA/MSA-specific core abstractions until Ribn actually targets those models.
+
+References: <https://www.kimi.com/en/blog/kimi-k3> and <https://www.minimax.io/blog/minimax-m3>
+
+### Benchmark gate for a new model family
+
+Supporting a model is not itself the strategic win. For each serious new family, compare equivalent artifacts/quality/settings against the incumbents that can make a meaningful comparison, including vLLM, SGLang, llama.cpp where artifact/quantization semantics align, and TensorRT-LLM where practical.
+
+Measure at minimum:
+
+- time to first token;
+- inter-token latency / TPOT;
+- aggregate throughput across concurrency;
+- accelerator and host memory consumption;
+- startup/readiness time;
+- long-context behavior;
+- prefix/state reuse when implemented;
+- model-owned host-prefetch overhead when applicable;
+- performance per accelerator;
+- token parity or model-appropriate numerical acceptance gates.
+
+The useful strategic outcome is not merely broad model coverage; it is evidence that Ribn is unusually good at serving heterogeneous, stateful, sparse, or host-memory-assisted architectures without compromising correctness or runtime ownership semantics.
+
+### Broader hardware
+
 - Newer NVIDIA generations and materially different CUDA capabilities.
 - Metal and AMD when the backend/runtime contracts are mature enough to test portability honestly.
 - Additional checkpoint/quantization formats based on user value.
@@ -159,12 +239,14 @@ Only after the single-node runtime is competitive and observable:
 - prefill/decode or other disaggregation where workload measurements justify it;
 - topology-aware communication and placement within externally allocated resources.
 
-Engine remains a standalone inference runtime; fleet allocation belongs outside the project.
+Engine remains a standalone inference runtime; fleet allocation belongs outside the project. Archon or another fleet manager may consume Ribn's distributed execution/resource options later, but it must not become a required dependency.
 
 ## Research track
 
 Research can proceed alongside implementation but does not block the roadmap unless evidence shows a required boundary is wrong.
 
-Potential directions include joint optimization of scheduling, execution variants, state placement, speculation, and topology; broader persistent/mega-kernel execution; state compression/reuse techniques; and new hardware-aware compilation strategies.
+Potential directions include joint optimization of scheduling, execution variants, state placement/materialization, speculation, and topology; broader persistent/mega-kernel execution; state compression/reuse techniques; and new hardware-aware compilation strategies.
+
+Do not promote a research idea into the common runtime merely because a frontier model demonstrates one mechanism. First classify whether the object is model-owned/static, request-owned persistent semantic state, reconstructable state, or submission-local backend scratch; then generalize only where concrete implementation pressure justifies it.
 
 No novelty claim is required for the project to be useful. Near-term success is strong execution across performance, latency, memory efficiency, startup, portability, correctness, observability, configuration, and usability.
