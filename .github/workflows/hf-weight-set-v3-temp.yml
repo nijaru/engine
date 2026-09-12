@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/hf-weight-set-v3-temp.yml
+      - tools/temp_hf_weight_set_migration.py
 
 permissions:
   contents: write
