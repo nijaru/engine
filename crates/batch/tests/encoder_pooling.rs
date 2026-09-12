@@ -7,6 +7,7 @@ use ribn_foundation::ParameterVersion;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EncoderError {
     EmptyInput,
+    InputTooLong,
     TokenOutOfRange(u32),
     BatchTooLarge { tokens: usize, limit: usize },
 }
@@ -15,9 +16,13 @@ impl fmt::Display for EncoderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyInput => f.write_str("encoder input must not be empty"),
+            Self::InputTooLong => f.write_str("encoder input is too long for the reference fixture"),
             Self::TokenOutOfRange(token) => write!(f, "encoder token {token} is out of range"),
             Self::BatchTooLarge { tokens, limit } => {
-                write!(f, "encoder batch has {tokens} tokens but its limit is {limit}")
+                write!(
+                    f,
+                    "encoder batch has {tokens} tokens but its limit is {limit}"
+                )
             }
         }
     }
@@ -58,15 +63,17 @@ impl ReferenceEncoder {
         }
         let mut output = [0.0_f32; 3];
         for &token in tokens {
+            let index = usize::try_from(token).map_err(|_| EncoderError::TokenOutOfRange(token))?;
             let row = self
                 .embeddings
-                .get(usize::try_from(token).unwrap_or(usize::MAX))
+                .get(index)
                 .ok_or(EncoderError::TokenOutOfRange(token))?;
             for (destination, value) in output.iter_mut().zip(row) {
                 *destination += value;
             }
         }
-        let scale = 1.0 / tokens.len() as f32;
+        let length = u16::try_from(tokens.len()).map_err(|_| EncoderError::InputTooLong)?;
+        let scale = 1.0 / f32::from(length);
         for value in &mut output {
             *value *= scale;
         }
@@ -136,10 +143,7 @@ fn variable_length_encoder_inputs_batch_without_ar_semantics() {
     assert_eq!(first_output.parameter_version(), ParameterVersion::new(11));
     assert_eq!(second_output.parameter_version(), ParameterVersion::new(11));
     assert_close(*first_output.output(), [0.5, 0.5, 0.0]);
-    assert_close(
-        *second_output.output(),
-        [2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0],
-    );
+    assert_close(*second_output.output(), [2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0]);
 }
 
 #[test]
