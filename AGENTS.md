@@ -88,13 +88,22 @@ core contracts can be removed as replacement paths qualify.
 
 `crates/batch` (`ribn-batch`) is likewise a design-validation runtime, not a final
 embedding scheduler. It proves non-AR work need not inherit token/prefix/KV
-semantics and currently uses only a deliberately minimal item-count batching
-policy. Do not add generic work-unit, shape, or cost abstractions until real
-encoder/pooling models show what information scheduling actually needs.
+semantics. A variable-length reference encoder already showed that request count
+alone cannot safely form all batches, so the concrete executor can shorten the
+oldest FIFO candidate set using its own shape/memory/compute constraints. Do not
+replace that with a universal cost or work-unit abstraction without evidence.
+Reordering, bucketing, heterogeneous batching, async execution and resource-aware
+admission remain open until real models justify their shared contracts.
 
 A future trainer may reuse lower-level parameter/device/operator/collective
 infrastructure, but it remains a separate execution system. Shared infrastructure
 and shared physical representations are not the same requirement.
+
+A semantic-operator experiment currently exists only as a test: semantic matching
+chooses specialized versus reference RMSNorm during preparation, after which normal
+execution does not repeat support-predicate/registry lookup. Do not promote that
+fixture into a production IR/operator framework until real model/backend work shows
+that it reduces duplication without adding hot-path dispatch or compiler machinery.
 
 ## Model and artifact support
 
@@ -160,11 +169,12 @@ model, a non-AR text model if practical, and eventually another hardware backend
 Small reference-backed implementations are enough to expose a wrong boundary; full
 optimized support is not required for every pressure test.
 
-The first synthetic validation is now present: the same logical model can be placed
-against local or multi-node resource topologies, and a non-AR batch runtime can
-execute generic inputs while pinning them to a parameter version. This is evidence
-that the split is implementable, not proof that the current type shapes are final.
-The next useful pressure test is a real small encoder/pooling model path.
+Current validation evidence includes: the same logical model can be placed against
+local or multi-node resource topologies; non-AR work can execute without token/KV
+semantics while remaining pinned to a parameter version; and a variable-length
+reference encoder forced executor-informed FIFO batch selection. The next useful
+pressure test is an artifact-backed small encoder/pooling path using the modern
+model-loading direction rather than more synthetic scheduling abstractions.
 
 ## Verification
 
