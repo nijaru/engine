@@ -8,6 +8,16 @@ Focus on NVIDIA now. A second hardware backend should test the semantic boundary
 
 Vendor libraries remain valid implementation choices. “Rust-first” does not require rewriting cuBLAS or every third-party kernel. Full migration means replacing Engine-owned CUDA C++ kernels and their NVRTC authoring pipeline, and converging on one coherent NVIDIA resource/execution owner. It does not mean replacing the CUDA driver or NVIDIA's compilers with Engine code.
 
+## Runtime integration update (2026-09-11)
+
+The model-neutral `ribn::PreparedModel` boundary now has a host-tested runtime
+and an experimental Qwen adapter. Qualify that adapter using the existing kernels
+before gate 3 integrates CUDA Rust kernels through it. Do not integrate a second
+new serving path around the legacy request API. Kernel gate 2 remains independent;
+none of the runtime tests claims it has passed. The older boundary descriptions
+below explain the retained comparison path during this transition. See
+[runtime redesign](runtime-redesign.md) and [roadmap](roadmap.md).
+
 ## Boundary review
 
 The current `ComputeBackend` in `crates/core/src/backend.rs` validates semantic plans and typed state, submits batches, polls completion, and releases physical state through an explicit lifecycle operation. No cudarc buffer, stream, event, or CUDA Rust type crosses this interface. Stream and graph support are capability flags, not requirements every backend must implement.
