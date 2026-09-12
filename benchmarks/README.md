@@ -95,7 +95,7 @@ TOKENS=64 CONCURRENCIES="1 4 8" \
   bash benchmarks/run-qwen-serving-sweep.sh
 ```
 
-The script captures the Engine commit and local environment, builds the benchmark once, and writes one raw log per concurrency under a timestamped `benchmarks/results/` directory. The current CUDA dispatcher executes scheduler-selected batches sequentially internally, so these results qualify the serving boundary and expose its current scaling behavior; they are not a native CUDA batching claim.
+The script captures the Engine commit and local environment, builds the benchmark once, and writes one raw log per concurrency under a timestamped `benchmarks/results/` directory. The current CUDA dispatcher selects native batched execution for eligible multi-row greedy decode batches and falls back to the per-row path for single-row, mixed, or otherwise unsupported batches. These results therefore exercise the real serving boundary and its current batch-selection behavior; interpret them with the exact commit, mode, workload, and concurrency recorded for each run.
 
 ## Qwen multi-token prefill gate
 
