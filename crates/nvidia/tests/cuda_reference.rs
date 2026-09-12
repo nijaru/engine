@@ -3212,6 +3212,173 @@ fn decodes_four_layers_against_the_host_reference() {
     }
 }
 
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real-weight hybrid-prefix parity gate between token-major and chunk-prefill execution"
+)]
+fn same_sequence_prefill_chunk_matches_batch1_hybrid_prefix() {
+    use engine_core::{
+        ConvolutionStateShape, DataType, KvStateSpec, RecurrentMatrixShape, RecurrentStateSpec,
+    };
+    use engine_nvidia::{
+        CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind,
+        StagedTensorSource,
+    };
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const TOKENS: [u32; 4] = [12_675, 1017, 760, 6511];
+    const NEXT_TOKEN: u32 = 42;
+    const LAYERS: usize = 4;
+    const TOLERANCE: f32 = 5.0e-3;
+
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let device = DeviceId::new(0);
+
+    let mut names: Vec<String> = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+        "output.weight".to_owned(),
+    ];
+    for layer in 0..LAYERS {
+        let binding = provider
+            .layer_weight_binding(device, u32::try_from(layer).expect("layer fits u32"))
+            .expect("layer binding");
+        for spec in binding.tensors() {
+            names.push(spec.name().to_owned());
+        }
+    }
+    let tensors: Vec<StagedTensorSource> = names
+        .iter()
+        .map(|name| {
+            let reader = provider.open_tensor(name).expect("open tensor");
+            let spec = reader.spec().clone();
+            let value_type = reader.value_type();
+            let encoded_bytes = reader.remaining();
+            if matches!(value_type, 0 | 1) {
+                let blocks = engine_nvidia::wrap_f32_stream(reader);
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(std::io::empty()),
+                    f32_blocks: Some(Box::new(blocks)),
+                }
+            } else {
+                StagedTensorSource {
+                    spec,
+                    value_type,
+                    encoded_bytes,
+                    reader: Box::new(reader),
+                    f32_blocks: None,
+                }
+            }
+        })
+        .collect();
+    let staged = Arc::new(
+        CudaQwen35Weights::stage(&context, &stream, 4_u64 << 30, tensors)
+            .expect("stage the four-layer prefix"),
+    );
+    let layer_kinds = [QwenLayerKind::Recurrent; 3]
+        .into_iter()
+        .chain([QwenLayerKind::FullAttention])
+        .collect::<Vec<_>>();
+    let kv_spec = KvStateSpec::new(1, 4, 256, 8, DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        3,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        DataType::F32,
+        DataType::F32,
+    )
+    .expect("recurrent spec");
+    let fresh_state = || {
+        let mut state =
+            CudaHybridState::from_specs(stream.clone(), Some(kv_spec), Some(recurrent_spec))
+                .expect("physical hybrid state");
+        state.zero().expect("zero state");
+        state
+    };
+
+    let mut oracle = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("batch-1 oracle");
+    let mut oracle_state = fresh_state();
+    let mut oracle_hidden = Vec::with_capacity(TOKENS.len());
+    for (position, &token) in TOKENS.iter().enumerate() {
+        let position = u32::try_from(position).expect("position fits u32");
+        oracle
+            .prefill_step(&mut oracle_state, token, position)
+            .expect("oracle prefill");
+        oracle_state
+            .advance_to(position + 1)
+            .expect("oracle advance");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    }
+
+    let mut candidate_single = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("candidate single executor");
+    let mut chunk = CudaQwen35BatchDecode::from_decode(&candidate_single, TOKENS.len())
+        .expect("chunk executor");
+    let mut chunk_state = fresh_state();
+    chunk
+        .prefill_chunk(&mut chunk_state, &TOKENS, 0)
+        .expect("same-sequence prefill chunk");
+    chunk_state
+        .advance_to(u32::try_from(TOKENS.len()).expect("chunk length fits u32"))
+        .expect("chunk advance");
+
+    for (member, expected) in oracle_hidden.iter().enumerate() {
+        let actual = chunk.copy_hidden_member(member).expect("chunk hidden row");
+        let max_abs = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < TOLERANCE,
+            "chunk residual diverged at prompt row {member}: max abs {max_abs}"
+        );
+    }
+
+    let next_position = u32::try_from(TOKENS.len()).expect("chunk length fits u32");
+    oracle
+        .prefill_step(&mut oracle_state, NEXT_TOKEN, next_position)
+        .expect("oracle continuation");
+    candidate_single
+        .prefill_step(&mut chunk_state, NEXT_TOKEN, next_position)
+        .expect("chunk continuation");
+    let oracle_next = oracle.copy_hidden().expect("oracle continuation hidden");
+    let chunk_next = candidate_single
+        .copy_hidden()
+        .expect("chunk continuation hidden");
+    let max_abs = oracle_next
+        .iter()
+        .zip(&chunk_next)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_abs < TOLERANCE,
+        "chunk continuation state diverged: max abs {max_abs}"
+    );
+}
+
 /// Bisect the batched divergence by real-weight prefix: plans [R], [R,R],
 /// [R,R,R], and [R,R,R,A] over the pinned artifact (attention tensors exist
 /// only at plan index 3, matching the real layer layout), each run through
