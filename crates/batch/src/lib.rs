@@ -197,7 +197,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     /// # Errors
     /// Rejects a parameter-version change while queued work still targets the
     /// previous version, invalid executor batch selection, malformed executor
-    /// output, or an executor failure.
+    /// output, an internal queue invariant failure, or an executor failure.
     pub fn step(&mut self) -> Result<bool, RuntimeError<E::Error>> {
         let Some(front) = self.queue.front() else {
             return Ok(false);
@@ -226,9 +226,13 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         }
         drop(candidates);
 
-        let queued = (0..selected)
-            .map(|_| self.queue.pop_front().expect("selected queue item exists"))
-            .collect::<Vec<_>>();
+        let mut queued = Vec::with_capacity(selected);
+        while queued.len() < selected {
+            let Some(next) = self.queue.pop_front() else {
+                return Err(RuntimeError::QueueInvariant);
+            };
+            queued.push(next);
+        }
         let expected = queued.iter().map(|item| item.request).collect::<Vec<_>>();
         let jobs = queued
             .into_iter()
@@ -297,6 +301,7 @@ pub enum RuntimeError<E> {
         selected: usize,
         candidates: usize,
     },
+    QueueInvariant,
     MalformedCompletion {
         requests: Vec<RequestId>,
     },
@@ -327,6 +332,9 @@ impl<E: fmt::Display> fmt::Display for RuntimeError<E> {
                 f,
                 "batch executor selected {selected} requests from {candidates} candidates"
             ),
+            Self::QueueInvariant => {
+                f.write_str("batch runtime queue changed while draining a selected batch")
+            }
             Self::MalformedCompletion { requests } => write!(
                 f,
                 "batch executor returned malformed completion metadata for {} requests",
