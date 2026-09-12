@@ -1,15 +1,16 @@
-//! Batch-1 greedy decode timing over the pinned Qwen3.8-27B GGUF text path.
+//! Batch-1 greedy decode and experimental prompt-prefill timing over the pinned
+//! Qwen3.8-27B GGUF text path.
 //!
-//! Stages the full text path onto the device, prefills the raw prompt
-//! "The capital of France is", then greedily decodes `N` tokens while
-//! timing prefill and decode separately. Correctness gating lives in the
-//! `decodes_greedy_tokens_matching_llama_server` test; this example only
-//! measures and reports host-driven, batch-1, unoptimized throughput with
-//! explicit caveats.
+//! Stages the full text path onto the device, prefills a raw token prompt, then
+//! greedily decodes `N` tokens while timing prefill and decode separately. The
+//! default remains the serial batch-1 correctness path. `--prefill-chunk=N`
+//! opts only this benchmark into the experimental same-sequence chunk executor;
+//! it does not change serving behavior or constitute performance qualification.
 //!
 //! ```text
 //! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
-//! cargo run --release -p engine-nvidia --features cuda --example qwen_decode_bench -- --tokens=64
+//! cargo run --release -p engine-nvidia --features cuda --example qwen_decode_bench -- \
+//!   --tokens=64 --prompt-tokens=257 --prefill-chunk=8
 //! ```
 
 use std::sync::Arc;
@@ -21,12 +22,14 @@ use engine_core::{
     RecurrentStateSpec,
 };
 use engine_nvidia::{
-    CudaHybridState, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource,
+    CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights,
+    QwenLayerKind, StagedTensorSource,
 };
 use engine_qwen::QwenGguf;
 
-const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
+const BASE_PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 const EPS: f32 = 1.0e-6;
+const KV_CAPACITY: usize = 512;
 
 #[allow(clippy::too_many_lines, reason = "one linear bench script")]
 fn main() {
@@ -37,6 +40,34 @@ fn main() {
         .map_or(64, |value| {
             value.parse().expect("--tokens expects a number")
         });
+    let prompt_token_count = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prompt-tokens="))
+        .map_or(BASE_PROMPT.len(), |value| {
+            value.parse().expect("--prompt-tokens expects a number")
+        });
+    assert!(
+        (1..=KV_CAPACITY).contains(&prompt_token_count),
+        "--prompt-tokens must be in 1..={KV_CAPACITY}"
+    );
+    let prefill_chunk = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prefill-chunk="))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("--prefill-chunk expects a number")
+        });
+    let prompt = if prompt_token_count == BASE_PROMPT.len() {
+        BASE_PROMPT.to_vec()
+    } else {
+        BASE_PROMPT
+            .iter()
+            .copied()
+            .cycle()
+            .take(prompt_token_count)
+            .collect::<Vec<_>>()
+    };
     let model_path = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--model=").map(str::to_owned))
@@ -108,7 +139,14 @@ fn main() {
         )
         .collect::<Vec<_>>();
 
-    let kv_spec = KvStateSpec::new(16, 4, 256, 512, DataType::F16).expect("KV spec");
+    let kv_spec = KvStateSpec::new(
+        16,
+        4,
+        256,
+        u32::try_from(KV_CAPACITY).expect("KV capacity fits u32"),
+        DataType::F16,
+    )
+    .expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         48,
         RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
@@ -122,42 +160,67 @@ fn main() {
             .expect("physical hybrid state");
     state.zero().expect("zero state");
 
-    let mut executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPS)
-        .expect("build decode executor");
+    let mut executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        staged,
+        layer_kinds,
+        EPS,
+    )
+    .expect("build decode executor");
+    let mut chunk_executor = prefill_chunk.map(|members| {
+        CudaQwen35BatchDecode::from_decode(&executor, members)
+            .unwrap_or_else(|error| panic!("invalid --prefill-chunk={members}: {error}"))
+    });
 
     let prefill_start = Instant::now();
-    let last_prompt_index = PROMPT.len() - 1;
-    let mut chosen = 0_u32;
-    for (position, token) in PROMPT.iter().enumerate() {
-        let position_u32 = u32::try_from(position).expect("fits u32");
-        if position == last_prompt_index {
-            chosen = executor
-                .decode_step(&mut state, *token, position_u32)
-                .expect("final prefill step");
-        } else {
-            executor
-                .prefill_step(&mut state, *token, position_u32)
-                .expect("prefill step");
+    let last_prompt_index = prompt.len() - 1;
+    let mut position = 0_usize;
+    if let Some(chunk) = chunk_executor.as_mut() {
+        let members = chunk.members();
+        while position + members <= last_prompt_index {
+            let start = u32::try_from(position).expect("prefill position fits u32");
+            chunk
+                .prefill_chunk(&mut state, &prompt[position..position + members], start)
+                .expect("chunked prefill");
+            position += members;
         }
     }
+    while position < last_prompt_index {
+        executor
+            .prefill_step(
+                &mut state,
+                prompt[position],
+                u32::try_from(position).expect("prefill position fits u32"),
+            )
+            .expect("serial prefill step");
+        position += 1;
+    }
+    let final_position = u32::try_from(last_prompt_index).expect("prompt position fits u32");
+    let mut chosen = executor
+        .decode_step(&mut state, prompt[last_prompt_index], final_position)
+        .expect("final prefill step");
     stream.synchronize().expect("sync after prefill");
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+    let prefill_mode = prefill_chunk.map_or_else(
+        || "serial batch-1 AR loop".to_owned(),
+        |members| format!("experimental same-sequence chunks of {members}"),
+    );
     println!(
-        "prefill {} tokens in {prefill_seconds:.3} s ({:.3} s/token, batch-1 AR loop)",
-        PROMPT.len(),
-        prefill_seconds / f64::from(u32::try_from(PROMPT.len()).expect("fits u32"))
+        "prefill {} tokens in {prefill_seconds:.3} s ({:.3} s/token, {prefill_mode})",
+        prompt.len(),
+        prefill_seconds / f64::from(u32::try_from(prompt.len()).expect("fits u32"))
     );
 
     let tokens_f64 = f64::from(token_count);
     let decode_start = Instant::now();
-    let mut next_token = chosen;
-    let first_decode_position = u32::try_from(PROMPT.len()).expect("prompt length fits u32");
+    let first_decode_position = u32::try_from(prompt.len()).expect("prompt length fits u32");
     for step in 0..token_count {
-        let position = first_decode_position
+        let decode_position = first_decode_position
             .checked_add(step)
             .expect("decode position fits u32");
-        next_token = executor
-            .decode_step(&mut state, next_token, position)
+        chosen = executor
+            .decode_step(&mut state, chosen, decode_position)
             .expect("decode step");
     }
     stream.synchronize().expect("sync after decode");
@@ -169,8 +232,7 @@ fn main() {
         tokens_f64 / decode_seconds
     );
     println!(
-        "caveat: per-step argmax synchronization and ~{} kernel launches per step dominate; \
-         this is a correctness-path measurement, not a serving-throughput claim",
+        "caveat: prefill chunking is experimental and unqualified; decode still has per-step argmax synchronization and ~{} kernel launches per step. This is a local measurement, not a serving-throughput claim",
         per_step_launches()
     );
 }
