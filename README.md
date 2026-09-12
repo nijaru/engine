@@ -50,7 +50,9 @@ comparison frontend during migration.
 `crates/foundation` (`ribn-foundation`) is a **design-validation** layer for shared
 execution infrastructure. It currently models logical parameter versions and
 physical materializations, resource topology, and prepared stage placement without
-request, token, KV, autograd, or optimizer semantics.
+request, token, KV, autograd, or optimizer semantics. A test-only RMSNorm experiment
+also checks that semantic/backend compatibility can be resolved at preparation time
+without committing Ribn to a general operator IR.
 
 `crates/runtime` (`ribn`) is currently the low-level **AR generation runtime**. It
 owns token-generation request lifecycle, scheduling, cancellation, bounded output,
@@ -59,9 +61,10 @@ contracts for every inference workload.
 
 `crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
 encoder/pooling-style batching. Its inputs and outputs are executor-defined and it
-contains no token/prefix/KV concepts. It is not yet a production embedding runtime;
-real model pressure tests must determine shape-, memory-, async-, and
-resource-aware batching semantics.
+contains no token/prefix/KV concepts. A variable-length reference encoder already
+showed that request count alone is not enough to form safe batches, so the executor
+can shorten the oldest FIFO candidate set using its own concrete constraints. There
+is deliberately no universal work/cost unit or length-bucketing policy yet.
 
 `crates/text` (`ribn-text`) is the current shared text frontend used by the CLI: raw
 prompt, chat-message and token-ID input, tokenization/chat-template handling,
@@ -112,9 +115,9 @@ requires an actual compatible NVIDIA GPU.
 
 | Location | Current responsibility |
 | --- | --- |
-| `crates/foundation` (`ribn-foundation`) | Provisional parameter/version/materialization, resource-topology, and prepared-placement validation |
+| `crates/foundation` (`ribn-foundation`) | Provisional parameter/version/materialization, resource-topology, prepared-placement, and test-only semantic-op validation |
 | `crates/runtime` (`ribn`) | AR token-generation lifecycle/scheduling/output/executor contract |
-| `crates/batch` (`ribn-batch`) | Provisional non-AR batch/encoder runtime pressure test |
+| `crates/batch` (`ribn-batch`) | Provisional non-AR batch/encoder runtime with executor-informed FIFO batch sizing |
 | `crates/text` (`ribn-text`) | Current shared text/chat/token input and generation-result frontend |
 | `crates/qwen` | Qwen definition, GGUF mapping, and current CUDA AR executor |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
