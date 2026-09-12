@@ -23,6 +23,17 @@ jobs:
       - name: Apply masked and padded BERT pressure test
         run: |
           python3 tools/temp_bert_masked_batching.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/batch/tests/bert_architecture.rs')
+          text = path.read_text()
+          old = '''next_max
+                    .checked_mul(next_selected)
+                    .unwrap_or(usize::MAX)'''
+          if old not in text:
+              raise SystemExit('padded-cost lint anchor not found')
+          path.write_text(text.replace(old, 'next_max.saturating_mul(next_selected)', 1))
+          PY
           cargo fmt --all
       - name: Validate BERT pressure test
         run: |
