@@ -1,1 +1,51 @@
-x
+name: Apply verified API integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-ribn-final.yml
+      - .github/ribn-final.patch.xz
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply exact locally verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          xz -dc .github/ribn-final.patch.xz > /tmp/ribn-final.patch
+          echo '31445bb1441c1aaacb737d778240889219545e171fe1f7ec1d7639d948d2e35b  /tmp/ribn-final.patch' | sha256sum -c -
+          git apply --index --check /tmp/ribn-final.patch
+          git apply --index /tmp/ribn-final.patch
+          git rm .github/ribn-final.patch.xz .github/workflows/apply-ribn-final.yml
+          git diff --cached --check
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - run: python3 tools/check-boundaries.py
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo clippy -p engine-nvidia -p engine-qwen -p ribn-text -p ribn-cli --features cuda --all-targets --locked -- -D warnings
+      - run: cargo test -p engine-qwen -p ribn-text -p ribn-cli --features cuda --locked
+      - name: Commit and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git commit -m 'Add shared text generation API and update SOTA roadmap'
+          git push origin HEAD:main
