@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths:
       - .github/workflows/apply-ribn-final.yml
-      - .github/patchparts/**
 
 permissions:
   contents: write
@@ -31,9 +30,15 @@ jobs:
           echo '255b5a89bb9152f41a7a16eaf860027091f94d30fd4b5d19a6a9fd5f192efe7e  /tmp/ribn-final.patch.xz' | sha256sum -c -
           xz -dc /tmp/ribn-final.patch.xz > /tmp/ribn-final.patch
           echo '31445bb1441c1aaacb737d778240889219545e171fe1f7ec1d7639d948d2e35b  /tmp/ribn-final.patch' | sha256sum -c -
-          git apply --index --check /tmp/ribn-final.patch
-          git apply --index /tmp/ribn-final.patch
-          git rm -r .github/patchparts .github/ribn-final.patch.xz .github/workflows/apply-ribn-final.yml
+          git apply --index --check \
+            --exclude=.github/workflows/ci.yml \
+            --exclude=.github/workflows/source-snapshot-temp.yml \
+            /tmp/ribn-final.patch
+          git apply --index \
+            --exclude=.github/workflows/ci.yml \
+            --exclude=.github/workflows/source-snapshot-temp.yml \
+            /tmp/ribn-final.patch
+          git rm -r .github/patchparts .github/ribn-final.patch.xz
           git diff --cached --check
       - uses: dtolnay/rust-toolchain@master
         with:
