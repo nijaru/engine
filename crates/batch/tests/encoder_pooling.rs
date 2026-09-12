@@ -16,7 +16,9 @@ impl fmt::Display for EncoderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyInput => f.write_str("encoder input must not be empty"),
-            Self::InputTooLong => f.write_str("encoder input is too long for the reference fixture"),
+            Self::InputTooLong => {
+                f.write_str("encoder input is too long for the reference fixture")
+            }
             Self::TokenOutOfRange(token) => write!(f, "encoder token {token} is out of range"),
             Self::BatchTooLarge { tokens, limit } => {
                 write!(
@@ -175,9 +177,15 @@ fn executor_informed_selection_respects_encoder_batch_cost() {
 
     assert!(runtime.step().expect("first encoder batch"));
     assert_eq!(runtime.queued(), 1);
-    assert_eq!(runtime.pop_completed().expect("first output").request(), first);
+    assert_eq!(
+        runtime.pop_completed().expect("first output").request(),
+        first
+    );
 
     assert!(runtime.step().expect("second encoder batch"));
     assert_eq!(runtime.queued(), 0);
-    assert_eq!(runtime.pop_completed().expect("second output").request(), second);
+    assert_eq!(
+        runtime.pop_completed().expect("second output").request(),
+        second
+    );
 }
