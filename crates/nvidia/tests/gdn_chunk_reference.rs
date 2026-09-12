@@ -4,8 +4,23 @@
 //! proves the chunk transform against the token-recurrent definition before a CUDA
 //! chunk kernel exists. Device qualification remains a separate gate.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    reason = "the tiny mathematical reference keeps matrix indices and tensor roles explicit"
+)]
+
 fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(left, right)| left * right).sum()
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn attention_scale(key_dim: usize) -> f32 {
+    f32::from(u16::try_from(key_dim).expect("reference key dimension fits u16"))
+        .sqrt()
+        .recip()
 }
 
 fn recurrent_rule(
@@ -21,7 +36,7 @@ fn recurrent_rule(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut state = initial_state.to_vec();
     let mut output = vec![0.0_f32; sequence * value_dim];
-    let scale = (key_dim as f32).sqrt().recip();
+    let scale = attention_scale(key_dim);
 
     for token in 0..sequence {
         let q = &query[token * key_dim..(token + 1) * key_dim];
@@ -35,7 +50,8 @@ fn recurrent_rule(
         let mut prediction = vec![0.0_f32; value_dim];
         for key_index in 0..key_dim {
             for value_index in 0..value_dim {
-                prediction[value_index] += state[key_index * value_dim + value_index] * k[key_index];
+                prediction[value_index] +=
+                    state[key_index * value_dim + value_index] * k[key_index];
             }
         }
         let correction = (0..value_dim)
@@ -58,7 +74,6 @@ fn recurrent_rule(
     (output, state)
 }
 
-#[allow(clippy::too_many_arguments, reason = "tiny mathematical reference keeps tensor roles explicit")]
 fn chunk_rule(
     query: &[f32],
     key: &[f32],
@@ -74,7 +89,7 @@ fn chunk_rule(
     assert!(chunk_size > 0);
     let mut state = initial_state.to_vec();
     let mut output = vec![0.0_f32; sequence * value_dim];
-    let scale = (key_dim as f32).sqrt().recip();
+    let scale = attention_scale(key_dim);
 
     let mut chunk_start = 0;
     while chunk_start < sequence {
@@ -100,7 +115,8 @@ fn chunk_rule(
                 let decay = (cumulative_decay[row] - cumulative_decay[column]).exp();
                 intra[row * chunk_len + column] = dot(q, k_column) * scale * decay;
                 if column < row {
-                    lower[row * chunk_len + column] = beta[token_row] * dot(k_row, k_column) * decay;
+                    lower[row * chunk_len + column] =
+                        beta[token_row] * dot(k_row, k_column) * decay;
                 }
             }
         }
@@ -121,9 +137,8 @@ fn chunk_rule(
                 new_values[row * value_dim + value_index] = solved;
             }
             for key_index in 0..key_dim {
-                let mut solved = key[token * key_dim + key_index]
-                    * beta[token]
-                    * cumulative_decay[row].exp();
+                let mut solved =
+                    key[token * key_dim + key_index] * beta[token] * cumulative_decay[row].exp();
                 for previous in 0..row {
                     solved -= lower[row * chunk_len + previous]
                         * decayed_keys[previous * key_dim + key_index];
@@ -211,12 +226,12 @@ fn chunked_gated_delta_rule_matches_token_recurrence() {
     const VALUE_DIM: usize = 2;
 
     let query = [
-        0.2, -0.1, 0.7, 0.5, 0.3, -0.4, -0.6, 0.8, 0.1, 0.9, -0.2, 0.4, 0.3, 0.6,
-        -0.5, -0.7, -0.1, 0.8, 0.4, -0.9, 0.2,
+        0.2, -0.1, 0.7, 0.5, 0.3, -0.4, -0.6, 0.8, 0.1, 0.9, -0.2, 0.4, 0.3, 0.6, -0.5, -0.7, -0.1,
+        0.8, 0.4, -0.9, 0.2,
     ];
     let key = [
-        0.4, -0.3, 0.5, -0.2, 0.7, 0.1, 0.6, 0.2, -0.4, -0.5, 0.3, 0.8, 0.1, -0.8,
-        0.6, 0.7, 0.4, -0.2, -0.3, 0.9, 0.2,
+        0.4, -0.3, 0.5, -0.2, 0.7, 0.1, 0.6, 0.2, -0.4, -0.5, 0.3, 0.8, 0.1, -0.8, 0.6, 0.7, 0.4,
+        -0.2, -0.3, 0.9, 0.2,
     ];
     let value = [
         0.7, -0.2, 0.1, 0.8, -0.6, 0.5, 0.4, -0.9, 0.3, 0.2, -0.1, 0.6, 0.9, -0.4,
