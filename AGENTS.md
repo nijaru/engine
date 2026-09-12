@@ -11,8 +11,9 @@ Keep commits focused and leave the tree green. Public architecture/roadmap decis
 belong in `docs/`; do not make repository behavior depend on private context files.
 
 At session start, read `README.md`, `docs/inference-engine-design.md`,
-`docs/architecture.md`, and `docs/roadmap.md`, then inspect the actual code/tests
-relevant to the change. Keep correctness and performance claims tied to evidence.
+`docs/execution-foundation.md`, `docs/architecture.md`, and `docs/roadmap.md`, then
+inspect the actual code/tests relevant to the change. Keep correctness and
+performance claims tied to evidence.
 
 ## Product direction
 
@@ -57,6 +58,43 @@ Target decomposition:
 
 Logical stages are not mandatory processes. Single-stage models should take a
 short direct path. Avoid pass-through Worker/Executor/Engine layer stacks.
+
+## Shared execution foundation
+
+`crates/foundation` (`ribn-foundation`) is a provisional pressure-test of the
+shared layer beneath inference policy. It currently models parameter identity and
+versions, physical materializations, resource topology, and prepared placement.
+Its types are **not stable APIs** and should change when real model/backend work
+shows a better representation.
+
+Keep this boundary neutral where reuse is natural:
+
+- inference-specific concepts such as requests, tokens, KV caches, prefix reuse,
+  serving, or continuous batching must not become requirements for parameter,
+  device, operator, collective, placement, or storage primitives;
+- future training compatibility does not justify adding gradients, `requires_grad`,
+  autograd tape, optimizer state, losses, backward graphs, or training schedulers
+  to Ribn inference;
+- logical parameter identity is distinct from checkpoint representation, dtype,
+  quantization, sharding, layout, device placement, and storage materialization;
+- inference work and reusable state must be associated with a coherent parameter
+  version rather than assuming weights are immutable forever;
+- logical model topology is distinct from deployment topology so the same model
+  semantics can be prepared for one device or many devices/nodes.
+
+Do not turn the transitional `engine-core` into this foundation by expanding its
+prototype enums. New shared primitives should be justified independently, and old
+core contracts can be removed as replacement paths qualify.
+
+`crates/batch` (`ribn-batch`) is likewise a design-validation runtime, not a final
+embedding scheduler. It proves non-AR work need not inherit token/prefix/KV
+semantics and currently uses only a deliberately minimal item-count batching
+policy. Do not add generic work-unit, shape, or cost abstractions until real
+encoder/pooling models show what information scheduling actually needs.
+
+A future trainer may reuse lower-level parameter/device/operator/collective
+infrastructure, but it remains a separate execution system. Shared infrastructure
+and shared physical representations are not the same requirement.
 
 ## Model and artifact support
 
@@ -121,6 +159,12 @@ embedding model, an encoder-decoder speech model, a VLM, a diffusion image/video
 model, a non-AR text model if practical, and eventually another hardware backend.
 Small reference-backed implementations are enough to expose a wrong boundary; full
 optimized support is not required for every pressure test.
+
+The first synthetic validation is now present: the same logical model can be placed
+against local or multi-node resource topologies, and a non-AR batch runtime can
+execute generic inputs while pinning them to a parameter version. This is evidence
+that the split is implementable, not proof that the current type shapes are final.
+The next useful pressure test is a real small encoder/pooling model path.
 
 ## Verification
 
