@@ -97,6 +97,15 @@ TOKENS=64 CONCURRENCIES="1 4 8" \
 
 The script captures the Engine commit and local environment, builds the benchmark once, and writes one raw log per concurrency under a timestamped `benchmarks/results/` directory. The current CUDA dispatcher executes scheduler-selected batches sequentially internally, so these results qualify the serving boundary and expose its current scaling behavior; they are not a native CUDA batching claim.
 
+## Qwen multi-token prefill gate
+
+Before selecting the experimental same-sequence Qwen prefill path in serving, follow
+[`qwen-prefill-qualification.md`](qwen-prefill-qualification.md). It records the
+four-layer diagnostic and full 64-layer ignored parity gates plus a matched serial
+versus chunk-size 2/4/8 timing matrix for the RTX 4090. The path remains unqualified
+until those device gates run successfully; CPU CI and CUDA-feature compilation are
+not performance or numerical evidence.
+
 ## Baseline run shape
 
 For an OpenAI-compatible completion endpoint, a current AIPerf synthetic example is conceptually:
