@@ -166,6 +166,16 @@ fn engine(shared: Arc<Mutex<Shared>>) -> Engine {
     .expect("decoder engine")
 }
 
+fn one_token_request() -> TokenRequest {
+    TokenRequest::new(
+        [1_u32],
+        GenerationOptions {
+            max_output_tokens: 1,
+            ..GenerationOptions::default()
+        },
+    )
+}
+
 fn run_until_finished(engine: &mut Engine, request: RequestId) -> (u32, FinishReason) {
     let mut token = None;
     for _ in 0..8 {
@@ -176,6 +186,18 @@ fn run_until_finished(engine: &mut Engine, request: RequestId) -> (u32, FinishRe
                 Event::Finished { reason, .. } => {
                     return (token.expect("generated token"), reason);
                 }
+            }
+        }
+    }
+    panic!("decoder request did not finish")
+}
+
+fn run_until_terminal(engine: &mut Engine, request: RequestId) -> FinishReason {
+    for _ in 0..8 {
+        engine.step().expect("decoder step");
+        while let Some(event) = engine.pop_event_for(request) {
+            if let Event::Finished { reason, .. } = event {
+                return reason;
             }
         }
     }
@@ -236,17 +258,79 @@ fn sequential_encoder_state_is_correlated_by_request_identity_without_serializat
 }
 
 #[test]
+fn prepared_state_owner_reclaims_cancellation_before_ar_admission() {
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let mut decoder = engine(Arc::clone(&shared));
+    let request = decoder
+        .enqueue(one_token_request())
+        .expect("decode request");
+    let state = Arc::<[u32]>::from([5_u32, 50]);
+    let weak = Arc::downgrade(&state);
+    shared
+        .lock()
+        .expect("shared conditioning")
+        .prepared
+        .insert(request, state);
+
+    decoder.cancel(request).expect("cancel queued request");
+
+    // Before executor admission, the producer/orchestrator still owns the prepared
+    // state and therefore reclaims it when the downstream request is cancelled.
+    let prepared = shared
+        .lock()
+        .expect("shared conditioning")
+        .prepared
+        .remove(&request)
+        .expect("prepared state");
+    drop(prepared);
+
+    assert_eq!(run_until_terminal(&mut decoder, request), FinishReason::Cancelled);
+    assert!(weak.upgrade().is_none());
+    assert!(shared
+        .lock()
+        .expect("shared conditioning")
+        .admitted
+        .get(&request)
+        .is_none());
+}
+
+#[test]
+fn executor_reclaims_conditioning_after_cancellation_post_admission() {
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let mut decoder = engine(Arc::clone(&shared));
+    let request = decoder
+        .enqueue(one_token_request())
+        .expect("decode request");
+    let state = Arc::<[u32]>::from([9_u32, 90]);
+    let weak = Arc::downgrade(&state);
+    shared
+        .lock()
+        .expect("shared conditioning")
+        .prepared
+        .insert(request, state);
+
+    // Admission transfers the only strong state owner from the prepared-state map
+    // into the executor's sequence state before work is submitted.
+    assert!(decoder.step().expect("admit and submit").submitted);
+    assert!(shared
+        .lock()
+        .expect("shared conditioning")
+        .prepared
+        .get(&request)
+        .is_none());
+    assert!(weak.upgrade().is_some());
+
+    decoder.cancel(request).expect("cancel admitted request");
+    assert_eq!(run_until_terminal(&mut decoder, request), FinishReason::Cancelled);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
 fn decoder_rejects_missing_prepared_encoder_state() {
     let shared = Arc::new(Mutex::new(Shared::default()));
     let mut decoder = engine(shared);
     let request = decoder
-        .enqueue(TokenRequest::new(
-            [1_u32],
-            GenerationOptions {
-                max_output_tokens: 1,
-                ..GenerationOptions::default()
-            },
-        ))
+        .enqueue(one_token_request())
         .expect("decode request");
     decoder.step().expect("admission failure is request-local");
     let event = decoder.pop_event_for(request).expect("terminal event");
