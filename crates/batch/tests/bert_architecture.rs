@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
@@ -9,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
 use ribn_foundation::{ParameterVersion, ScalarType};
-use ribn_hf::LocalModelPackage;
-use ribn_safetensors::{ArtifactError, SafeTensorArtifact};
+use ribn_hf::{LocalModelPackage, LocalWeightSet, PackageError};
+use ribn_safetensors::ArtifactError;
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
@@ -174,29 +173,15 @@ fn config_f32(value: Option<f64>, key: &'static str, default: f32) -> Result<f32
     Ok(value as f32)
 }
 
-struct ArtifactCache<'a> {
-    package: &'a LocalModelPackage,
-    artifacts: BTreeMap<PathBuf, SafeTensorArtifact>,
+struct ModelWeights<'a> {
+    weights: LocalWeightSet<'a>,
 }
 
-impl<'a> ArtifactCache<'a> {
+impl<'a> ModelWeights<'a> {
     fn new(package: &'a LocalModelPackage) -> Self {
         Self {
-            package,
-            artifacts: BTreeMap::new(),
+            weights: package.weight_set(),
         }
-    }
-
-    fn artifact(&mut self, path: &Path) -> Result<&SafeTensorArtifact, ModelError> {
-        if !self.artifacts.contains_key(path) {
-            let artifact = SafeTensorArtifact::open(path)
-                .map_err(|error| ModelError::Artifact(error.to_string()))?;
-            self.artifacts.insert(path.to_owned(), artifact);
-        }
-        Ok(self
-            .artifacts
-            .get(path)
-            .expect("artifact was inserted before lookup"))
     }
 
     fn load_required(
@@ -214,10 +199,11 @@ impl<'a> ArtifactCache<'a> {
         expected_shape: &[usize],
     ) -> Result<Option<Vec<f32>>, ModelError> {
         for name in [format!("bert.{suffix}"), suffix.to_owned()] {
-            let Some(path) = self.package.weight_file(&name).map(Path::to_owned) else {
-                continue;
+            let artifact = match self.weights.artifact(&name) {
+                Ok(artifact) => artifact,
+                Err(PackageError::UnknownParameter(_)) => continue,
+                Err(error) => return Err(ModelError::Artifact(error.to_string())),
             };
-            let artifact = self.artifact(&path)?;
             let tensor = match artifact.tensor(&name) {
                 Ok(tensor) => tensor,
                 Err(ArtifactError::MissingTensor(_)) => continue,
@@ -229,7 +215,7 @@ impl<'a> ArtifactCache<'a> {
     }
 
     fn artifact_count(&self) -> usize {
-        self.artifacts.len()
+        self.weights.opened_shard_count()
     }
 }
 
@@ -274,7 +260,7 @@ struct Dense {
 
 impl Dense {
     fn load(
-        cache: &mut ArtifactCache<'_>,
+        cache: &mut ModelWeights<'_>,
         prefix: &str,
         input: usize,
         output: usize,
@@ -317,7 +303,7 @@ struct LayerNorm {
 
 impl LayerNorm {
     fn load(
-        cache: &mut ArtifactCache<'_>,
+        cache: &mut ModelWeights<'_>,
         prefix: &str,
         width: usize,
         epsilon: f32,
@@ -358,7 +344,7 @@ struct Embeddings {
 }
 
 impl Embeddings {
-    fn load(cache: &mut ArtifactCache<'_>, config: &BertConfig) -> Result<Self, ModelError> {
+    fn load(cache: &mut ModelWeights<'_>, config: &BertConfig) -> Result<Self, ModelError> {
         Ok(Self {
             word: cache.load_required(
                 "embeddings.word_embeddings.weight",
@@ -454,7 +440,7 @@ struct BertLayer {
 
 impl BertLayer {
     fn load(
-        cache: &mut ArtifactCache<'_>,
+        cache: &mut ModelWeights<'_>,
         config: &BertConfig,
         layer: usize,
     ) -> Result<Self, ModelError> {
@@ -662,7 +648,7 @@ impl BertReference {
             ));
         }
         let config = BertConfig::from_package(package)?;
-        let mut cache = ArtifactCache::new(package);
+        let mut cache = ModelWeights::new(package);
         let embeddings = Embeddings::load(&mut cache, &config)?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer in 0..config.num_hidden_layers {

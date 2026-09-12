@@ -47,7 +47,7 @@ enum Weights {
     },
 }
 
-/// Lazy reusable view over the SafeTensors files resolved by one local package.
+/// Lazy reusable view over the `SafeTensors` files resolved by one local package.
 ///
 /// The first tensor requested from a shard opens and validates that artifact; later
 /// tensors from the same shard reuse the owned bytes. The set still does not assign
@@ -196,10 +196,32 @@ impl LocalModelPackage {
 }
 
 impl LocalWeightSet<'_> {
-    /// Number of unique SafeTensors shards opened so far.
+    /// Number of unique `SafeTensors` shards opened so far.
     #[must_use]
     pub fn opened_shard_count(&self) -> usize {
         self.artifacts.len()
+    }
+
+    /// Resolve and borrow the `SafeTensors` artifact containing one parameter.
+    ///
+    /// This exposes format-level access for model integrations that need to try
+    /// architecture-specific parameter aliases while keeping shard ownership and
+    /// reuse in the package layer.
+    ///
+    /// # Errors
+    /// Returns [`PackageError::UnknownParameter`] for a name absent from a sharded
+    /// index, or an artifact error when the resolved shard is invalid.
+    pub fn artifact(&mut self, parameter: &str) -> Result<&SafeTensorArtifact, PackageError> {
+        let path = self
+            .weight_path(parameter)
+            .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
+            .to_owned();
+        match self.artifacts.entry(path.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                Ok(entry.insert(open_artifact(&path)?))
+            }
+        }
     }
 
     /// Resolve and borrow one parameter tensor, lazily opening its shard once.
@@ -215,12 +237,7 @@ impl LocalWeightSet<'_> {
             .weight_path(parameter)
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
             .to_owned();
-        if !self.artifacts.contains_key(&path) {
-            self.artifacts.insert(path.clone(), open_artifact(&path)?);
-        }
-        self.artifacts
-            .get(&path)
-            .expect("opened artifact remains owned by the weight set")
+        self.artifact(parameter)?
             .tensor(parameter)
             .map_err(|error| PackageError::Artifact {
                 path,
@@ -231,9 +248,7 @@ impl LocalWeightSet<'_> {
     fn weight_path(&self, parameter: &str) -> Option<&Path> {
         match self.weights {
             Weights::Single(path) => Some(path),
-            Weights::Sharded { weight_map, .. } => {
-                weight_map.get(parameter).map(PathBuf::as_path)
-            }
+            Weights::Sharded { weight_map, .. } => weight_map.get(parameter).map(PathBuf::as_path),
         }
     }
 }
