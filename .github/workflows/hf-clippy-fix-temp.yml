@@ -1,0 +1,56 @@
+name: Temporary HF Clippy fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/hf-clippy-fix-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply mechanical Clippy fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/hf/src/lib.rs')
+          text = path.read_text()
+          text = text.replace(
+              '    /// Open the SafeTensors shard associated with `parameter`.',
+              '    /// Open the `SafeTensors` shard associated with `parameter`.',
+          )
+          text = text.replace(
+              '''            Self::UnsafeShardPath(path) => {\n                write!(\n                    f,\n                    "weight index shard path {:?} escapes the model package",\n                    path\n                )\n            }''',
+              '''            Self::UnsafeShardPath(path) => write!(\n                f,\n                "weight index shard path {} escapes the model package",\n                path.display()\n            ),''',
+          )
+          text = text.replace(
+              '''            Self::UnsafePackagePath(path) => {\n                write!(f, "package path {:?} escapes the model package", path)\n            }''',
+              '''            Self::UnsafePackagePath(path) => {\n                write!(f, "package path {} escapes the model package", path.display())\n            }''',
+          )
+          path.write_text(text)
+          PY
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Commit fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/hf/src/lib.rs
+          git commit -m 'Fix HF package Clippy findings'
+          git push origin HEAD:main
