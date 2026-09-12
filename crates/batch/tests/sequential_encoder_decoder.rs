@@ -284,14 +284,19 @@ fn prepared_state_owner_reclaims_cancellation_before_ar_admission() {
         .expect("prepared state");
     drop(prepared);
 
-    assert_eq!(run_until_terminal(&mut decoder, request), FinishReason::Cancelled);
+    assert_eq!(
+        run_until_terminal(&mut decoder, request),
+        FinishReason::Cancelled
+    );
     assert!(weak.upgrade().is_none());
-    assert!(shared
-        .lock()
-        .expect("shared conditioning")
-        .admitted
-        .get(&request)
-        .is_none());
+    assert!(
+        shared
+            .lock()
+            .expect("shared conditioning")
+            .admitted
+            .get(&request)
+            .is_none()
+    );
 }
 
 #[test]
@@ -312,16 +317,21 @@ fn executor_reclaims_conditioning_after_cancellation_post_admission() {
     // Admission transfers the only strong state owner from the prepared-state map
     // into the executor's sequence state before work is submitted.
     assert!(decoder.step().expect("admit and submit").submitted);
-    assert!(shared
-        .lock()
-        .expect("shared conditioning")
-        .prepared
-        .get(&request)
-        .is_none());
+    assert!(
+        shared
+            .lock()
+            .expect("shared conditioning")
+            .prepared
+            .get(&request)
+            .is_none()
+    );
     assert!(weak.upgrade().is_some());
 
     decoder.cancel(request).expect("cancel admitted request");
-    assert_eq!(run_until_terminal(&mut decoder, request), FinishReason::Cancelled);
+    assert_eq!(
+        run_until_terminal(&mut decoder, request),
+        FinishReason::Cancelled
+    );
     assert!(weak.upgrade().is_none());
 }
 
