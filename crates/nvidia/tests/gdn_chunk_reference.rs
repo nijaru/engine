@@ -7,6 +7,7 @@
 #![allow(
     clippy::needless_range_loop,
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the tiny mathematical reference keeps matrix indices and tensor roles explicit"
 )]
 
