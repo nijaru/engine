@@ -64,6 +64,12 @@ encoder-decoder models can use a staged handoff; VLM/omni models may need a coup
 runtime where encoder readiness/cache and AR prompt progress participate in the same
 resource decision. See `docs/pipeline-composition.md`.
 
+Architecture extensibility is not a purity constraint. A central Rust enum,
+registry, factory, capability record, or shared-code change is acceptable when it is
+the simplest representation of actual supported architectures. Avoid scattered
+model-family branches through unrelated scheduling/server code; do not invent a
+plugin ABI or generic framework merely so adding a model never changes central code.
+
 ## Shared execution foundation
 
 `crates/foundation` (`ribn-foundation`) is a provisional pressure-test of the
@@ -95,10 +101,12 @@ core contracts can be removed as replacement paths qualify.
 embedding scheduler. It proves non-AR work need not inherit token/prefix/KV
 semantics. A variable-length reference encoder showed that request count alone
 cannot safely form all batches, so the concrete executor can shorten the oldest
-FIFO candidate set using its own shape/memory/compute constraints. Do not replace
-that with a universal cost or work-unit abstraction without evidence. Reordering,
-bucketing, heterogeneous batching, async execution and resource-aware admission
-remain open until real models justify their shared contracts.
+FIFO candidate set using its own shape/memory/compute constraints. The actual BERT
+architecture pressure test then ran embeddings, self-attention, residual/LayerNorm,
+FFN and pooler semantics through the same boundary without requiring a new universal
+cost abstraction. Do not replace executor-owned constraints with a universal work
+unit unless real device workloads justify it. Reordering, bucketing,
+heterogeneous batching, async execution and resource-aware admission remain open.
 
 A future trainer may reuse lower-level parameter/device/operator/collective
 infrastructure, but it remains a separate execution system. Shared infrastructure
@@ -115,12 +123,20 @@ that it reduces duplication without adding hot-path dispatch or compiler machine
 Model configuration and artifact representation are separate concerns. The current
 `QwenConfig` / `QwenGguf` split is directionally correct.
 
-`crates/safetensors` now provides a thin format adapter that validates artifacts and
+`crates/safetensors` provides a thin format adapter that validates artifacts and
 exposes format-level tensor views without assigning model semantics or allocating
 execution tensors. `crates/hf` resolves local HF-style `config.json` plus single or
 sharded SafeTensors weights without choosing architecture/runtime/backend. Preserve
 that separation as remote repository/revision, tokenizer and processor support are
 added.
+
+The BERT architecture pressure test is now concrete evidence for this separation:
+model code interprets the raw HF config and parameter names, validates expected
+shapes, and executes the architecture while the package/artifact layers remain
+model-agnostic. It also exposed a practical loader requirement: a resolved
+SafeTensors shard should be opened/owned once and serve repeated tensor views rather
+than rereading the whole shard for every parameter. Promote that reusable ownership
+mechanism without moving BERT/Qwen semantics down into `ribn-hf`.
 
 Hugging Face repository IDs/local directories, config JSON, SafeTensors, tokenizer
 and processor metadata should become first-class. GGUF remains important for
@@ -151,6 +167,12 @@ prepared request state or tracing can correlate with the logical request without
 making `TokenRequest` a generic payload container. Do not put raw media or a vague
 universal multimodal object into `TokenRequest` merely because this seam exists.
 
+Sequential cross-runtime tests establish the current ownership rule: before AR
+admission, prepared state belongs to the producer/orchestrator; after successful
+admission, it belongs to executor sequence state and is reclaimed through the normal
+`release` path. Do not add a generic prepared-state cleanup trait unless another
+real integration demonstrates that this ownership split is insufficient.
+
 Do not assume continuation state is KV. Full/SWA/MLA/sparse attention, recurrent or
 SSM state, speculative/draft state and other components can coexist. Future dynamic
 resource management must cooperate with scheduling around allocation, prefix reuse,
@@ -165,10 +187,12 @@ The current separate prefill/decode queues, one in-flight batch, static
 mechanics, not architectural commitments. Revisit them once the real resource model
 exists; unified token-budget scheduling is one strong candidate.
 
-For VLM-style coupled generation, be prepared for scheduler/resource cooperation
-around model-prepared encoder-item identity, token-span dependency, readiness,
-encoder-compute cost and encoder-cache capacity. Raw media and processor
-implementation details remain above that boundary.
+The VLM prompt-position pressure test demonstrates that coupled generation can need
+scheduler-visible model-prepared feature identity/span/readiness plus **separate**
+encoder-compute and encoder-cache constraints. Those integer test budgets are not a
+proposal for an arbitrary generic resource vector. Let an actual VLM integration
+determine the minimum production scheduler/resource-planner seam. Raw media and
+processor implementation details remain above it.
 
 Optimized variants need correctness qualification for the scope in which they are
 automatically selected. Compilation or host tests are not GPU evidence.
@@ -193,19 +217,29 @@ model, a non-AR text model if practical, and eventually another hardware backend
 Small reference-backed implementations are enough to expose a wrong boundary; full
 optimized support is not required for every pressure test.
 
-Current validation evidence includes: the same logical model can be placed against
-local or multi-node resource topologies; non-AR work can execute without token/KV
-semantics while remaining pinned to a parameter version; a variable-length encoder
-forced executor-informed FIFO batch selection; SafeTensors + local HF-style package
-fixtures keep artifact semantics separate from model semantics; and a sequential
-batch-encoder -> AR test passes prepared state in-process and correlates it by AR
-`RequestId` independent of handoff order.
+Current validation evidence includes:
 
-Next composition pressure tests are an actual encoder architecture/checkpoint and a
-VLM-style prompt-positioned encoder dependency path. The latter should determine
-whether the AR scheduler needs explicit per-item dependency descriptors,
-resource-manager cooperation, or another representation; do not assume the
-sequential staged handoff solves multimodal scheduling.
+- the same logical model can be placed against local or multi-node resource
+  topologies;
+- non-AR work can execute without token/KV semantics while remaining pinned to a
+  parameter version;
+- variable-length encoder inputs forced executor-informed FIFO batch selection;
+- SafeTensors + local HF-style package code keeps artifact semantics separate from
+  model semantics;
+- an actual BERT architecture reference path executes over that package boundary and
+  confirms sequence-length batching without another common scheduling abstraction;
+- sequential batch-encoder -> AR handoff passes prepared state in-process, correlates
+  by AR `RequestId` independent of handoff order, and transfers cancellation cleanup
+  ownership at admission;
+- VLM prompt-position tests show encoder dependencies can interleave with AR prefill
+  and that encoder compute and cache capacity are distinct scheduling concerns.
+
+Next evidence-driven pressure points are masked/padded/ragged encoder/device
+execution, ordinary architecture resolution using the concrete Qwen+BERT cases, a
+genuine encoder-decoder model, and an actual VLM/processor integration. Prefer those
+over another synthetic framework layer. The actual VLM should determine whether the
+AR scheduler needs explicit per-item dependency descriptors, a model/resource
+planner, or another representation.
 
 ## Verification
 
