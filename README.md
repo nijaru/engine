@@ -15,6 +15,12 @@ orchestrator design that can also support encoder/pooling, multimodal/omni,
 encoder-decoder speech, diffusion/media, and other execution regimes without
 forcing them through token-generation contracts.
 
+A provisional [shared execution foundation](docs/execution-foundation.md) now
+pressure-tests two additional boundaries: logical parameter/version identity is
+separate from physical materialization, and model semantics are separate from
+resource/deployment topology. These validation types are intentionally not stable
+public APIs yet.
+
 ## Current interfaces
 
 Metadata inspection requires no GPU:
@@ -41,10 +47,21 @@ comparison frontend during migration.
 
 ## Library layers
 
+`crates/foundation` (`ribn-foundation`) is a **design-validation** layer for shared
+execution infrastructure. It currently models logical parameter versions and
+physical materializations, resource topology, and prepared stage placement without
+request, token, KV, autograd, or optimizer semantics.
+
 `crates/runtime` (`ribn`) is currently the low-level **AR generation runtime**. It
 owns token-generation request lifecycle, scheduling, cancellation, bounded output,
 and the current `GenerationExecutor` contract. Those are not intended as universal
 contracts for every inference workload.
+
+`crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
+encoder/pooling-style batching. Its inputs and outputs are executor-defined and it
+contains no token/prefix/KV concepts. It is not yet a production embedding runtime;
+real model pressure tests must determine shape-, memory-, async-, and
+resource-aware batching semantics.
 
 `crates/text` (`ribn-text`) is the current shared text frontend used by the CLI: raw
 prompt, chat-message and token-ID input, tokenization/chat-template handling,
@@ -72,6 +89,11 @@ The public UX should stay conventional: load or serve a model and invoke the
 operation you need. Internal AR/encoder/diffusion runtime selection should not turn
 into a mandatory user-facing task-default system.
 
+The shared foundation is intentionally reusable below inference policy. That keeps
+future training or other compute runtimes from needing to reimplement parameter,
+device, operator, placement, and collective infrastructure, without adding autograd
+or training semantics to Ribn's inference fast path.
+
 ## Development
 
 Use the Rust toolchain pinned in `rust-toolchain.toml`:
@@ -90,7 +112,9 @@ requires an actual compatible NVIDIA GPU.
 
 | Location | Current responsibility |
 | --- | --- |
+| `crates/foundation` (`ribn-foundation`) | Provisional parameter/version/materialization, resource-topology, and prepared-placement validation |
 | `crates/runtime` (`ribn`) | AR token-generation lifecycle/scheduling/output/executor contract |
+| `crates/batch` (`ribn-batch`) | Provisional non-AR batch/encoder runtime pressure test |
 | `crates/text` (`ribn-text`) | Current shared text/chat/token input and generation-result frontend |
 | `crates/qwen` | Qwen definition, GGUF mapping, and current CUDA AR executor |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
@@ -101,8 +125,10 @@ requires an actual compatible NVIDIA GPU.
 ## Documentation
 
 - [Inference engine design](docs/inference-engine-design.md)
+- [Shared execution foundation](docs/execution-foundation.md)
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
+- [Research agenda](docs/research-agenda.md)
 - [Runtime redesign history](docs/runtime-redesign.md)
 - [Runtime verification](benchmarks/runtime-contract.md)
 - [Benchmarks](benchmarks/README.md)
