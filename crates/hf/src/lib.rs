@@ -145,7 +145,7 @@ impl LocalModelPackage {
         }
     }
 
-    /// Open the SafeTensors shard associated with `parameter`.
+    /// Open the `SafeTensors` shard associated with `parameter`.
     ///
     /// # Errors
     /// Returns [`PackageError::UnknownParameter`] for a name absent from a
@@ -311,13 +311,11 @@ impl fmt::Display for PackageError {
                     path.display()
                 )
             }
-            Self::UnsafeShardPath(path) => {
-                write!(
-                    f,
-                    "weight index shard path {:?} escapes the model package",
-                    path
-                )
-            }
+            Self::UnsafeShardPath(path) => write!(
+                f,
+                "weight index shard path {} escapes the model package",
+                path.display()
+            ),
             Self::MissingPackageFile { path, message } => {
                 write!(
                     f,
@@ -326,7 +324,11 @@ impl fmt::Display for PackageError {
                 )
             }
             Self::UnsafePackagePath(path) => {
-                write!(f, "package path {:?} escapes the model package", path)
+                write!(
+                    f,
+                    "package path {} escapes the model package",
+                    path.display()
+                )
             }
             Self::UnknownParameter(name) => {
                 write!(f, "weight index has no parameter {name:?}")
