@@ -15,10 +15,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Export the exact source under review
-        run: git archive --format=tar.gz HEAD > "$RUNNER_TEMP/engine-source.tar.gz"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - run: cargo fetch --locked
+      - name: Export the exact source and host validation toolchain
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/engine-source.tar.gz"
+          toolchain="$(rustc --print sysroot)"
+          mkdir -p "$RUNNER_TEMP/validation"
+          cp -a "$toolchain" "$RUNNER_TEMP/validation/toolchain"
+          cp -a "$HOME/.cargo/registry" "$RUNNER_TEMP/validation/registry"
+          tar -C "$RUNNER_TEMP/validation" -czf "$RUNNER_TEMP/engine-validation.tar.gz" toolchain registry
       - uses: actions/upload-artifact@v4
         with:
           name: engine-source
           path: ${{ runner.temp }}/engine-source.tar.gz
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-validation
+          path: ${{ runner.temp }}/engine-validation.tar.gz
           retention-days: 1
