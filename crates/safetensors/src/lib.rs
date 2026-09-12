@@ -149,7 +149,11 @@ impl fmt::Display for ArtifactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, message } => {
-                write!(f, "could not read SafeTensors artifact {}: {message}", path.display())
+                write!(
+                    f,
+                    "could not read SafeTensors artifact {}: {message}",
+                    path.display()
+                )
             }
             Self::InvalidFormat(message) => write!(f, "invalid SafeTensors artifact: {message}"),
             Self::MissingTensor(name) => write!(f, "SafeTensors artifact has no tensor {name:?}"),
