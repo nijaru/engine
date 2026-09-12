@@ -1,0 +1,47 @@
+name: Temporary request validation workflow fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fix-request-validation-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Correct validation workflow
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/request-id-admit-temp.yml')
+          text = p.read_text()
+          text = text.replace(
+              '                      max_decode_steps_before_prefill: 1,',
+              '                      decode_tokens: 1,\n                      max_decode_only_steps: 1,',
+              1,
+          )
+          text = text.replace('          cargo test --workspace --locked', '          cargo test --workspace', 1)
+          text = text.replace(
+              'crates/batch/Cargo.toml crates/batch/tests/sequential_encoder_decoder.rs',
+              'crates/batch/Cargo.toml crates/batch/tests/sequential_encoder_decoder.rs Cargo.lock',
+              1,
+          )
+          p.write_text(text)
+          PY
+      - name: Commit correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add .github/workflows/request-id-admit-temp.yml
+          git commit -m 'Fix cross-runtime validation workflow'
+          git push origin HEAD:main
