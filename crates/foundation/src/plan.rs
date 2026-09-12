@@ -120,7 +120,11 @@ impl ExecutionPlan {
             if !stage_ids.insert(stage.stage()) {
                 return Err(PlanError::DuplicateStage(stage.stage()));
             }
-            if stage.devices().iter().any(|device| !topology.contains(device)) {
+            if stage
+                .devices()
+                .iter()
+                .any(|device| !topology.contains(device))
+            {
                 return Err(PlanError::UnknownDevice(stage.stage()));
             }
         }
@@ -166,7 +170,11 @@ impl fmt::Display for PlanError {
                 write!(f, "execution plan contains duplicate stage {}", stage.get())
             }
             Self::UnknownDevice(stage) => {
-                write!(f, "stage {} references a device outside the resource topology", stage.get())
+                write!(
+                    f,
+                    "stage {} references a device outside the resource topology",
+                    stage.get()
+                )
             }
         }
     }
@@ -207,8 +215,10 @@ mod tests {
         let local = ExecutionPlan::new(
             model.clone(),
             ParameterVersion::new(7),
-            vec![StagePlacement::new(StageId::new(0), runtime.clone(), vec![first.clone()])
-                .expect("placement")],
+            vec![
+                StagePlacement::new(StageId::new(0), runtime.clone(), vec![first.clone()])
+                    .expect("placement"),
+            ],
             &local_topology,
         )
         .expect("local plan");
@@ -218,8 +228,7 @@ mod tests {
             vec![
                 StagePlacement::new(StageId::new(0), runtime.clone(), vec![first])
                     .expect("placement"),
-                StagePlacement::new(StageId::new(1), runtime, vec![second])
-                    .expect("placement"),
+                StagePlacement::new(StageId::new(1), runtime, vec![second]).expect("placement"),
             ],
             &distributed_topology,
         )

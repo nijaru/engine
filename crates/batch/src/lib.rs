@@ -229,11 +229,12 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         {
             return Err(RuntimeError::MalformedCompletion { requests: expected });
         }
-        self.completed.extend(outputs.into_iter().map(|output| Completed {
-            request: output.request,
-            output: output.output,
-            parameter_version: version,
-        }));
+        self.completed
+            .extend(outputs.into_iter().map(|output| Completed {
+                request: output.request,
+                output: output.output,
+                parameter_version: version,
+            }));
         Ok(true)
     }
 
@@ -373,7 +374,10 @@ mod tests {
         assert_eq!(second_output.request(), second);
         assert_eq!(*second_output.output(), 12.0);
         assert!(runtime.step().expect("second step"));
-        assert_eq!(runtime.pop_completed().expect("third output").request(), third);
+        assert_eq!(
+            runtime.pop_completed().expect("third output").request(),
+            third
+        );
     }
 
     #[test]

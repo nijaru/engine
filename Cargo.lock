@@ -223,6 +223,13 @@ name = "ribn"
 version = "0.0.0"
 
 [[package]]
+name = "ribn-batch"
+version = "0.0.0"
+dependencies = [
+ "ribn-foundation",
+]
+
+[[package]]
 name = "ribn-cli"
 version = "0.0.0"
 dependencies = [
@@ -233,6 +240,10 @@ dependencies = [
  "engine-qwen",
  "ribn-text",
 ]
+
+[[package]]
+name = "ribn-foundation"
+version = "0.0.0"
 
 [[package]]
 name = "ribn-text"
