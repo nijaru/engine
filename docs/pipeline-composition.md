@@ -33,8 +33,23 @@ begins. In that case the shallow orchestrator can own the dependency between the
 runtimes. If both stages are co-located, the prepared encoder state should remain in
 device memory; a logical stage boundary must not imply host serialization or RPC.
 
-This is the next cross-runtime pressure test because it exercises typed intermediate
-state and cancellation without forcing encoder semantics into the AR scheduler.
+The current pressure test validates a narrow version of this boundary. A batch
+encoder produces `Arc`-owned prepared state. AR executor admission receives stable
+`RequestId` separately from internal `SequenceId`, takes ownership of the state for
+that request, and the test proves handoff order does not determine which request
+receives which state.
+
+Cancellation also establishes a useful ownership rule without a new generic cleanup
+interface:
+
+- before AR admission, prepared state is still owned by its producer/orchestrator,
+  which reclaims it when the downstream request is cancelled;
+- after admission, ownership has moved to executor sequence state and the existing
+  executor `release` path reclaims it after cancellation/completion is established.
+
+This is validation of the ownership transition, not a finished orchestrator API. A
+real encoder-decoder model still needs to test device state, cross-attention layout,
+async completion, failure propagation, and version compatibility.
 
 ## Coupled multimodal generation
 
@@ -76,6 +91,13 @@ or backend tensor classes. It may, however, need model-prepared dependency metad
 such as feature identity, prompt span/position, readiness, and resource cost when
 those facts affect whether a prompt range can execute.
 
+The current AR `Engine` deliberately hides prompt-prefix progress from an external
+orchestrator. That is desirable for ordinary staged execution, but it means a simple
+wrapper around the existing engine cannot efficiently decide when a prompt-positioned
+encoder item becomes relevant. The coupled VLM pressure test therefore needs to run
+at the AR scheduler/resource boundary rather than pretending the validated sequential
+handoff solves this case.
+
 ## Do not choose an opaque request handle too early
 
 A single opaque "prepared multimodal input" handle would be easy to add to the
@@ -83,12 +105,11 @@ current `TokenRequest`, but it may be too coarse. Efficient VLM execution can ne
 per-item readiness and cache lifetime because different encoder items become relevant
 at different prompt positions.
 
-Do not stabilize that handle yet. Pressure-test both of these cases first:
+Do not stabilize that handle yet. The whole-input sequential case has now passed;
+the remaining pressure test is prompt-positioned multimodal encoder items interleaved
+with AR prefill.
 
-1. whole-input sequential encoder -> AR decoder;
-2. prompt-positioned multimodal encoder items interleaved with AR prefill.
-
-The resulting AR request contract should expose only the minimum dependency
+The resulting AR request/resource contract should expose only the minimum dependency
 information scheduling actually needs. Raw media stays above the runtime in the
 model processor/application layer.
 
@@ -120,16 +141,24 @@ coupled components.
 
 ## Validation targets
 
-Before stabilizing the pipeline/orchestrator contracts:
+Completed sequential pressure tests:
 
-- implement a small sequential encoder-decoder integration over `ribn-batch` and
-  the AR runtime;
-- model cancellation before and after the intermediate state becomes owned by the
-  decoder;
-- prove co-located execution does not require serialization;
-- then pressure-test VLM-style prompt-positioned encoder dependencies and let that
-  evidence determine whether the AR request needs explicit per-item dependency
-  descriptors, a resource-manager interface, or another representation.
+- batch-encoder -> AR request-state handoff;
+- handoff correlated by stable request identity rather than incidental FIFO order;
+- in-process state retains the same allocation in the fixture rather than being
+  serialized across the stage boundary;
+- cancellation before admission reclaims producer-owned state;
+- cancellation after admission reclaims executor-owned state through `release`;
+- missing prepared state fails only the affected AR request.
+
+Remaining before stabilizing composition contracts:
+
+- use an actual encoder-decoder architecture/checkpoint to validate real prepared
+  device-state and cross-attention semantics;
+- pressure-test VLM-style prompt-positioned encoder dependencies with separate
+  encoder compute/cache pressure;
+- let that evidence determine whether AR scheduling needs explicit per-item
+  dependency descriptors, a resource-manager interface, or another representation.
 
 The goal is not a universal pipeline graph. The goal is to preserve direct fast
 paths while giving genuinely heterogeneous models the coordination they require.
