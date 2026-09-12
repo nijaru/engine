@@ -290,12 +290,11 @@ fn prepared_state_owner_reclaims_cancellation_before_ar_admission() {
     );
     assert!(weak.upgrade().is_none());
     assert!(
-        shared
+        !shared
             .lock()
             .expect("shared conditioning")
             .admitted
-            .get(&request)
-            .is_none()
+            .contains_key(&request)
     );
 }
 
@@ -318,12 +317,11 @@ fn executor_reclaims_conditioning_after_cancellation_post_admission() {
     // into the executor's sequence state before work is submitted.
     assert!(decoder.step().expect("admit and submit").submitted);
     assert!(
-        shared
+        !shared
             .lock()
             .expect("shared conditioning")
             .prepared
-            .get(&request)
-            .is_none()
+            .contains_key(&request)
     );
     assert!(weak.upgrade().is_some());
 
