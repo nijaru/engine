@@ -136,14 +136,22 @@ The first two runtime families are now deliberately different:
 - `ribn` (`crates/runtime`) is the existing autoregressive token runtime. Tokens,
   prefill/decode, continuation state, speculation, and AR scheduling belong here.
 - `ribn-batch` (`crates/batch`) is a minimal non-AR pressure test. Its executor owns
-  input/output types, concrete batch formation, tensor shapes, padding/ragged
-  layout, and device buffers; the common runtime currently knows only bounded
-  request identity, parameter version, and a maximum item count.
+  input/output types, tensor shapes, padding/ragged layout, device buffers, and can
+  shorten the oldest FIFO candidate set when concrete shape/memory/compute
+  constraints make the entire candidate batch unsuitable.
+
+The reference encoder test uses variable-length token inputs, embedding lookup plus
+mean pooling, vector outputs, and a model-specific total-token batch limit. This
+immediately showed that request count alone is not enough to form a safe encoder
+batch. The resulting `select_batch` hook deliberately exposes no universal cost
+unit: the executor sees its own inputs and returns a shorter FIFO prefix. Reordering,
+length bucketing, heterogeneous batching, and shared cost metadata remain unresolved
+until a real workload demonstrates that they belong in the common runtime.
 
 `ribn-batch` is not yet an embedding API or the final encoder scheduler. In
-particular, request cost, shape compatibility, memory-aware packing, cancellation,
-async execution, and resource admission are intentionally absent until a real
-encoder/pooling implementation provides evidence for them.
+particular, cancellation, asynchronous device execution, resource admission,
+per-request failures, and optimal batching for real model shapes are intentionally
+unfinished.
 
 Further runtime families should be introduced only when real execution regimes
 justify them. Iterative diffusion/flow work and full-duplex sessions are known
@@ -173,11 +181,15 @@ Implemented as provisional scaffolding:
 - a prepared execution-plan representation that can place the same logical model
   locally or across nodes;
 - `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
-- tests proving the non-AR runtime batches generic inputs and detects an
-  uncoordinated parameter-version transition.
+- coherent parameter-version checks for queued non-AR work;
+- a tiny reference encoder/pooling path with variable-length inputs and vector
+  outputs;
+- executor-informed FIFO batch sizing that arose from the encoder's concrete
+  batch-cost constraint rather than a generic work-unit abstraction.
 
-This validates that the boundary is implementable; it does **not** validate that
-these exact types are sufficient or optimal. The next pressure tests are a real
-small encoder/pooling model path, a multi-stage multimodal/encoder-decoder path,
-an iterative non-AR path, semantic-op dispatch, a modern model-loading/reference
-path, and a second hardware backend.
+This validates that the boundary is implementable and has already forced one
+runtime-interface change. It does **not** validate that these exact types are
+sufficient or optimal. The next pressure tests are an artifact-backed small
+encoder/pooling model path, a multi-stage multimodal/encoder-decoder path, an
+iterative non-AR path, semantic-op dispatch, a modern model-loading/reference path,
+and a second hardware backend.
