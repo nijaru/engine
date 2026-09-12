@@ -2,6 +2,7 @@
 members = [
     "crates/foundation",
     "crates/safetensors",
+    "crates/hf",
     "crates/batch",
     "crates/core",
     "crates/runtime",

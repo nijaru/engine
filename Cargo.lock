@@ -258,6 +258,7 @@ name = "ribn-batch"
 version = "0.0.0"
 dependencies = [
  "ribn-foundation",
+ "ribn-hf",
  "ribn-safetensors",
 ]
 
@@ -276,6 +277,14 @@ dependencies = [
 [[package]]
 name = "ribn-foundation"
 version = "0.0.0"
+
+[[package]]
+name = "ribn-hf"
+version = "0.0.0"
+dependencies = [
+ "ribn-safetensors",
+ "serde_json",
+]
 
 [[package]]
 name = "ribn-safetensors"
