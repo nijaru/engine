@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ribn::{
-    Admission, BatchItem, Engine, EngineConfig, EngineError, Event, FinishReason,
-    GenerationOptions, ModelError, ModelInfo, ModelLimits, PreparedModel, SchedulePolicy,
+    Admission, BatchItem, Engine, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
+    FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, SchedulePolicy,
     SequenceId, StepCompletion, SubmissionId, TokenRequest,
 };
 
@@ -64,7 +64,7 @@ impl PrivateState for HybridState {
 }
 
 struct Model<S> {
-    info: ModelInfo,
+    info: ExecutorInfo,
     control: Shared,
     states: HashMap<SequenceId, S>,
     pending: Option<Vec<BatchItem>>,
@@ -75,9 +75,9 @@ struct Model<S> {
 impl<S> Model<S> {
     fn new(control: Shared) -> Self {
         Self {
-            info: ModelInfo {
+            info: ExecutorInfo {
                 name: std::any::type_name::<S>().to_owned(),
-                limits: ModelLimits {
+                limits: GenerationLimits {
                     context_tokens: 1024,
                     max_sequences: 8,
                     max_batch_tokens: 128,
@@ -93,8 +93,8 @@ impl<S> Model<S> {
     }
 }
 
-impl<S: PrivateState> PreparedModel for Model<S> {
-    fn info(&self) -> &ModelInfo {
+impl<S: PrivateState> GenerationExecutor for Model<S> {
+    fn info(&self) -> &ExecutorInfo {
         &self.info
     }
 
@@ -102,10 +102,10 @@ impl<S: PrivateState> PreparedModel for Model<S> {
         &mut self,
         sequence: SequenceId,
         _request: &TokenRequest,
-    ) -> Result<Admission, ModelError> {
+    ) -> Result<Admission, ExecutionError> {
         let mut control = self.control.lock().unwrap();
         if control.reject_admission {
-            return Err(ModelError::new("unsupported request"));
+            return Err(ExecutionError::new("unsupported request"));
         }
         if control.defer {
             return Ok(Admission::Deferred);
@@ -115,10 +115,10 @@ impl<S: PrivateState> PreparedModel for Model<S> {
         Ok(Admission::Ready)
     }
 
-    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ModelError> {
+    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         let mut control = self.control.lock().unwrap();
         if control.fail_submit {
-            return Err(ModelError::new("partial submission fault"));
+            return Err(ExecutionError::new("partial submission fault"));
         }
         assert!(self.pending.is_none());
         for item in batch {
@@ -134,11 +134,11 @@ impl<S: PrivateState> PreparedModel for Model<S> {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ModelError> {
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         assert_eq!(submission.get(), self.next_submission);
         let control = self.control.lock().unwrap();
         if control.fail_poll {
-            return Err(ModelError::new("device completion uncertain"));
+            return Err(ExecutionError::new("device completion uncertain"));
         }
         if self.delay {
             self.delay = false;
@@ -164,11 +164,11 @@ impl<S: PrivateState> PreparedModel for Model<S> {
         Ok(Some(rows))
     }
 
-    fn release(&mut self, sequence: SequenceId) -> Result<(), ModelError> {
+    fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {
         let mut control = self.control.lock().unwrap();
         if control.fail_release > 0 {
             control.fail_release -= 1;
-            return Err(ModelError::new("release must be retried"));
+            return Err(ExecutionError::new("release must be retried"));
         }
         assert!(
             self.pending
@@ -181,11 +181,11 @@ impl<S: PrivateState> PreparedModel for Model<S> {
         Ok(())
     }
 
-    fn synchronize(&mut self) -> Result<(), ModelError> {
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
         let mut control = self.control.lock().unwrap();
         control.synchronizations += 1;
         if control.fail_sync {
-            return Err(ModelError::new("cannot prove device completion"));
+            return Err(ExecutionError::new("cannot prove device completion"));
         }
         self.pending = None;
         Ok(())
@@ -208,6 +208,7 @@ fn config() -> EngineConfig {
         max_queued_requests: 4,
         max_queued_input_tokens: 4096,
         max_buffered_events: 32,
+        max_events_per_request: 64,
     }
 }
 
@@ -444,7 +445,7 @@ fn failed_release_retains_its_owner_and_terminal_event_is_not_duplicated() {
     runtime.enqueue(request(1, 1)).unwrap();
     runtime.step().unwrap();
     runtime.step().unwrap();
-    assert!(matches!(runtime.step(), Err(EngineError::Model(_))));
+    assert!(matches!(runtime.step(), Err(EngineError::Execution(_))));
     assert_eq!(runtime.status().active_sequences, 1);
     assert_eq!(runtime.status().requests, 1);
     let events = drain(&mut runtime);
@@ -638,4 +639,107 @@ fn invalid_requests_and_policy_are_rejected_before_model_admission() {
         Err(EngineError::InvalidConfig)
     );
     assert!(control.lock().unwrap().admitted.is_empty());
+}
+
+#[test]
+fn stalled_consumer_does_not_block_a_peer_with_output_capacity() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut cfg = config();
+    cfg.max_buffered_events = 8;
+    cfg.max_events_per_request = 2;
+    let mut runtime = Engine::new(
+        Model::<DenseState>::new(control.clone()),
+        cfg,
+        SchedulePolicy::default(),
+    )
+    .unwrap();
+    let slow = runtime.enqueue(request(1, 8)).unwrap();
+    let peer = runtime.enqueue(request(1, 5)).unwrap();
+    let mut peer_tokens = 0;
+    let mut peer_finished = false;
+    for _ in 0..100 {
+        runtime.step().unwrap();
+        while let Some(event) = runtime.pop_event_for(peer) {
+            match event {
+                Event::Token { .. } => peer_tokens += 1,
+                Event::Finished { reason, .. } => {
+                    assert_eq!(reason, FinishReason::Length);
+                    peer_finished = true;
+                }
+            }
+        }
+        assert!(runtime.status().buffered_events <= cfg.max_buffered_events);
+        if peer_finished {
+            break;
+        }
+    }
+    assert!(peer_finished, "ready peer was blocked by another consumer");
+    assert_eq!(peer_tokens, 5);
+    assert_eq!(runtime.committed_prefix(slow), Some(1));
+    assert_eq!(runtime.status().active_sequences, 1);
+    runtime.cancel(slow).unwrap();
+    runtime.step().unwrap();
+    assert!(matches!(
+        runtime.pop_event_for(slow),
+        Some(Event::Token { .. })
+    ));
+    assert_eq!(
+        runtime.pop_event_for(slow),
+        Some(Event::Finished {
+            request: slow,
+            reason: FinishReason::Cancelled,
+        })
+    );
+    assert!(runtime.pop_event().is_none());
+    assert_eq!(runtime.status().requests, 0);
+    assert_eq!(control.lock().unwrap().released.len(), 2);
+}
+
+#[test]
+fn model_compatible_defaults_work_for_small_executors() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut model = Model::<DenseState>::new(control.clone());
+    model.info.limits.max_sequences = 1;
+    model.info.limits.max_batch_tokens = 1;
+    let mut runtime = Engine::with_defaults(model).unwrap();
+    runtime.enqueue(request(3, 2)).unwrap();
+    runtime.enqueue(request(2, 2)).unwrap();
+    assert_eq!(drain(&mut runtime).len(), 6);
+    assert!(
+        control
+            .lock()
+            .unwrap()
+            .batches
+            .iter()
+            .all(|batch| batch.len() == 1 && batch[0].token_budget == 1)
+    );
+}
+
+#[test]
+fn request_mailboxes_survive_slot_reuse_without_cross_delivery() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut runtime = engine::<DenseState>(&control);
+    let mut retained = Vec::new();
+    for _ in 0..8 {
+        let id = runtime.enqueue(request(1, 1)).unwrap();
+        for _ in 0..4 {
+            runtime.step().unwrap();
+        }
+        assert_eq!(runtime.status().requests, 0);
+        retained.push(id);
+    }
+    for id in retained.into_iter().rev() {
+        assert!(
+            matches!(runtime.pop_event_for(id), Some(Event::Token { request, .. }) if request == id)
+        );
+        assert_eq!(
+            runtime.pop_event_for(id),
+            Some(Event::Finished {
+                request: id,
+                reason: FinishReason::Length
+            })
+        );
+        assert!(runtime.pop_event_for(id).is_none());
+    }
+    assert!(runtime.pop_event().is_none());
 }

@@ -8,11 +8,12 @@ use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, ConvolutionStateShape, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionSegment, ExecutionStage,
     InferenceStateSet, LogicalStateManager, ModelCapabilities, ModelDescription, ModelId,
-    ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, NvidiaBackend, PolicyVersion,
-    Quantization, RecurrentMatrixShape, RecurrentStateSpec, StateLocation, StateManager,
-    WeightBinding, WeightDescription, WeightFormat, WeightTensorSpec,
+    ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, PolicyVersion, Quantization,
+    RecurrentMatrixShape, RecurrentStateSpec, StateLocation, StateManager, WeightBinding,
+    WeightDescription, WeightFormat, WeightTensorSpec,
 };
-use engine_gguf::{GgufFile, Qwen35LayerKind, Qwen35ModelProvider};
+use engine_gguf::GgufFile;
+use engine_nvidia::NvidiaBackend;
 use engine_nvidia::QwenGemvKernel;
 use engine_nvidia::{
     ATTN_HEAD_DIM, ATTN_Q_HEADS, AttnLayerWeights, CudaHybridState, CudaIq3SEmbedding,
@@ -23,6 +24,7 @@ use engine_nvidia::{
     StagedTensorSource, host_ffn_step, host_full_attn_ar_step_traced, host_gdn_ar_step,
     host_gdn_ar_step_traced,
 };
+use engine_qwen::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 
 fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend(value.to_le_bytes());
@@ -260,16 +262,15 @@ fn materializes_a_bounded_gguf_tensor_before_reference_execution() {
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     assert_eq!(
         provider.layer_kind(0).expect("recurrent layer kind"),
-        Qwen35LayerKind::Recurrent
+        GgufQwenLayerKind::Recurrent
     );
     assert_eq!(
         provider.layer_kind(3).expect("full-attention layer kind"),
-        Qwen35LayerKind::FullAttention
+        GgufQwenLayerKind::FullAttention
     );
     assert_eq!(
         provider
@@ -327,9 +328,8 @@ fn materializes_a_pinned_qwen_scalar_tensor_without_claiming_model_execution() {
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
 fn materializes_a_pinned_qwen_quantized_block_without_host_dequantization() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     let mut source = provider
         .open_tensor("blk.0.attn_qkv.weight")
         .expect("open pinned quantized tensor");
@@ -1291,7 +1291,7 @@ fn hybrid_state_fixture() -> (engine_core::KvStateSpec, RecurrentStateSpec) {
 
 /// Dequantize one entire pinned tensor to host F32 in GGUF flat order
 /// (column-major over [ne0, ne1]: element (i0, i1) at i0 + i1*ne0).
-fn pinned_tensor_f32(provider: &Qwen35ModelProvider, name: &str) -> Vec<f32> {
+fn pinned_tensor_f32(provider: &QwenGguf, name: &str) -> Vec<f32> {
     let mut reader = provider.open_tensor(name).expect("open pinned tensor");
     let mut values = Vec::new();
     while let Some(block) = reader
@@ -1323,9 +1323,8 @@ fn deterministic_hidden_state() -> Vec<f32> {
 #[test]
 #[ignore = "requires the pinned Qwen GGUF"]
 fn host_reference_gdn_ar_step_is_deterministic_and_self_consistent() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     let prefix = "blk.0.";
     let names = [
         "attn_qkv.weight",
@@ -1396,9 +1395,8 @@ fn host_reference_gdn_ar_step_is_deterministic_and_self_consistent() {
 #[test]
 #[ignore = "requires the pinned Qwen GGUF"]
 fn host_reference_gdn_ar_step_evolves_and_depends_on_state() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     let prefix = "blk.0.";
     let names = [
         "attn_qkv.weight",
@@ -1519,7 +1517,7 @@ fn sum_close(actual: f64, expected: f64, elements: usize) -> bool {
     relative < 0.01 || (actual - expected).abs() < absolute
 }
 
-fn pinned_embedding_row(provider: &Qwen35ModelProvider, token: usize) -> Vec<f32> {
+fn pinned_embedding_row(provider: &QwenGguf, token: usize) -> Vec<f32> {
     let mut reader = provider
         .open_tensor("token_embd.weight")
         .expect("open token embedding");
@@ -1547,16 +1545,15 @@ fn pinned_embedding_row(provider: &Qwen35ModelProvider, token: usize) -> Vec<f32
     row
 }
 
-fn pinned_norm_weights(provider: &Qwen35ModelProvider, name: &str) -> Vec<f32> {
+fn pinned_norm_weights(provider: &QwenGguf, name: &str) -> Vec<f32> {
     pinned_tensor_f32(provider, name)
 }
 
 #[test]
 #[ignore = "requires the pinned Qwen GGUF"]
 fn host_reference_gdn_step_matches_llama_debug_capture() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     let hi_token = 12_675_usize;
 
     // Embedding gather for the single prompt token.
@@ -1751,7 +1748,7 @@ fn fixture_f16_bits(value: f32) -> u16 {
 
 use engine_nvidia::rms_norm_raw as host_rms_norm;
 
-fn load_gdn_layer(provider: &Qwen35ModelProvider, layer: usize) -> GdnLayerWeights {
+fn load_gdn_layer(provider: &QwenGguf, layer: usize) -> GdnLayerWeights {
     let prefix = format!("blk.{layer}.");
     GdnLayerWeights {
         attn_qkv: pinned_tensor_f32(provider, &format!("{prefix}attn_qkv.weight")),
@@ -1766,7 +1763,7 @@ fn load_gdn_layer(provider: &Qwen35ModelProvider, layer: usize) -> GdnLayerWeigh
     }
 }
 
-fn load_attn_layer(provider: &Qwen35ModelProvider, layer: usize) -> AttnLayerWeights {
+fn load_attn_layer(provider: &QwenGguf, layer: usize) -> AttnLayerWeights {
     let prefix = format!("blk.{layer}.");
     AttnLayerWeights {
         attn_q: pinned_tensor_f32(provider, &format!("{prefix}attn_q.weight")),
@@ -1778,7 +1775,7 @@ fn load_attn_layer(provider: &Qwen35ModelProvider, layer: usize) -> AttnLayerWei
     }
 }
 
-fn load_ffn_layer(provider: &Qwen35ModelProvider, layer: usize) -> FfnLayerWeights {
+fn load_ffn_layer(provider: &QwenGguf, layer: usize) -> FfnLayerWeights {
     let prefix = format!("blk.{layer}.");
     FfnLayerWeights {
         ffn_gate: pinned_tensor_f32(provider, &format!("{prefix}ffn_gate.weight")),
@@ -1804,9 +1801,8 @@ fn gate_half(q_gate: &[f32]) -> Vec<f32> {
 // cross-layer state evolution that this gate exists to validate.
 #[allow(clippy::too_many_lines)]
 fn host_reference_full_attn_matches_llama_debug_capture() {
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
     let eps = 1.0e-6_f32;
     let tokens = [12_675_usize, 1017];
 
@@ -2735,9 +2731,8 @@ fn executes_gdn_gated_norm_and_residual_against_host_equations() {
 fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
 
     let collect = |names: &[&str]| {
         names
@@ -2834,9 +2829,8 @@ fn stages_qwen_tensors_with_budget_validation_and_gemv_lookup() {
 fn stages_the_full_pinned_qwen_text_path() {
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
-    let provider =
-        Qwen35ModelProvider::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
-            .expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open("/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        .expect("open pinned Qwen GGUF");
 
     // Enumerate the full text path: globals plus every language layer's
     // validated binding. The pinned artifact has 64 language layers; the
@@ -3052,7 +3046,7 @@ fn decodes_four_layers_against_the_host_reference() {
     const TOKENS: [usize; 2] = [12_675, 1017];
     const LAYERS: usize = 4;
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let _ = &provider;
     let stream = context.default_stream();
@@ -3247,7 +3241,7 @@ fn bisects_four_layer_batched_divergence_by_prefix() {
     const MEMBERS: usize = 1;
     const TOLERANCE: f32 = 1.0e-4;
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
 
@@ -3813,7 +3807,7 @@ fn decodes_greedy_tokens_matching_llama_server() {
     const EPS: f32 = 1.0e-6;
     const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
 
@@ -3868,8 +3862,8 @@ fn decodes_greedy_tokens_matching_llama_server() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                engine_gguf::Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                engine_gguf::Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                engine_qwen::QwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                engine_qwen::QwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -4002,7 +3996,7 @@ fn decodes_greedy_tokens_matching_llama_server_in_warp_mode() {
     const EPS: f32 = 1.0e-6;
     const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let staged = stage_full_text_path(&provider, &context, &stream);
@@ -4010,8 +4004,8 @@ fn decodes_greedy_tokens_matching_llama_server_in_warp_mode() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -4675,7 +4669,7 @@ fn finds_first_diverging_batched_step_against_batch1() {
     const MEMBERS: usize = 3;
     const STEPS: usize = 12;
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let staged = stage_full_text_path(&provider, &context, &stream);
@@ -4683,8 +4677,8 @@ fn finds_first_diverging_batched_step_against_batch1() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -4866,9 +4860,10 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
     use engine_core::{
         BackendCapabilities, BackendFeatures, BackendKind, BackendSubmissionId, ComputeBackend,
         DataType, ExecutionBatch, ExecutionPhase, ExecutionPlan, ExecutionStage, InferenceState,
-        LogicalStateManager, ModelProvider, NvidiaBackend, PolicyVersion, Quantization, RequestId,
-        SamplingParams, StateLocation, StateManager, StateRequirement,
+        LogicalStateManager, ModelProvider, PolicyVersion, Quantization, RequestId, SamplingParams,
+        StateLocation, StateManager, StateRequirement,
     };
+    use engine_nvidia::NvidiaBackend;
     use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
     use std::time::Duration;
 
@@ -4878,7 +4873,7 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
     const ROWS: usize = 3;
     const COMPARE_TOKENS: usize = 8;
 
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+    let provider = QwenGguf::open_with_kv_block_tokens(
         GGUF,
         u32::try_from(PROMPT.len() + COMPARE_TOKENS + 4).expect("fits u32"),
     )
@@ -4890,8 +4885,8 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -5207,7 +5202,7 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
     const MEMBERS: usize = 3;
     const COMPARE_TOKENS: usize = 16;
 
-    let provider = Qwen35ModelProvider::open(GGUF).expect("open pinned Qwen GGUF");
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let staged = stage_full_text_path(&provider, &context, &stream);
@@ -5215,8 +5210,8 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -5318,7 +5313,7 @@ fn decodes_greedy_tokens_in_batch_mode_matching_llama_server() {
 /// language layer of the pinned artifact, through the validated provider
 /// bindings.
 fn stage_full_text_path(
-    provider: &Qwen35ModelProvider,
+    provider: &QwenGguf,
     context: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
 ) -> Arc<CudaQwen35Weights> {
@@ -5386,9 +5381,10 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     use engine_core::{
         BackendCapabilities, BackendFeatures, BackendKind, ComputeBackend, DataType,
         ExecutionBatch, ExecutionPhase, ExecutionPlan, ExecutionStage, InferenceState,
-        LogicalStateManager, ModelProvider, NvidiaBackend, PolicyVersion, Quantization, RequestId,
-        SamplingParams, StateLocation, StateManager, StateRequirement,
+        LogicalStateManager, ModelProvider, PolicyVersion, Quantization, RequestId, SamplingParams,
+        StateLocation, StateManager, StateRequirement,
     };
+    use engine_nvidia::NvidiaBackend;
     use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
     use std::time::Duration;
 
@@ -5397,7 +5393,7 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
     const COMPARE_TOKENS: usize = 16;
 
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+    let provider = QwenGguf::open_with_kv_block_tokens(
         GGUF,
         u32::try_from(PROMPT.len() + COMPARE_TOKENS + 4).expect("fits u32"),
     )
@@ -5409,8 +5405,8 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();
@@ -5699,7 +5695,7 @@ fn cancels_cuda_request_without_losing_peers_or_state() {
         SpeculationPolicy, StateTierPreference, ThinkingMode,
     };
     use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+    let provider = QwenGguf::open_with_kv_block_tokens(
         "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
         16,
     )
@@ -5710,8 +5706,8 @@ fn cancels_cuda_request_without_losing_peers_or_state() {
     let staged = stage_full_text_path(&provider, &context, &stream);
     let kinds = (0..64)
         .map(|layer| match provider.layer_kind(layer).unwrap() {
-            Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-            Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+            GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
         })
         .collect();
     let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, kinds, 1e-6).unwrap();
@@ -5863,7 +5859,7 @@ fn cancels_batched_lane_member_without_losing_peers_or_state() {
         ServingScheduler, SpeculationPolicy, StateLocation, StateTierPreference, ThinkingMode,
     };
     use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(
+    let provider = QwenGguf::open_with_kv_block_tokens(
         "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
         16,
     )
@@ -5874,8 +5870,8 @@ fn cancels_batched_lane_member_without_losing_peers_or_state() {
     let staged = stage_full_text_path(&provider, &context, &stream);
     let kinds = (0..64)
         .map(|layer| match provider.layer_kind(layer).unwrap() {
-            Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-            Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+            GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+            GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
         })
         .collect();
     let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, kinds, 1e-6).unwrap();

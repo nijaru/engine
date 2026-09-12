@@ -1,7 +1,14 @@
 # Model-neutral runtime redesign
 
 Date: 2026-09-11 (America/Los_Angeles)
-Status: initial implementation; CUDA integration experimental
+Status: historical decision at `47878859`; CUDA integration experimental
+
+The current target and implemented boundaries are in [ground-up design](ground-up-design.md)
+and [architecture](architecture.md). Names below describe the first redesign:
+`PreparedModel` is now `GenerationExecutor`, `QwenPrepared` is `QwenCuda`, the
+CLI is `ribn`, Qwen interpretation no longer lives in GGUF, and output now uses
+per-request mailboxes. This document is retained as decision history, not a
+second active architecture or roadmap.
 
 ## Decision
 

@@ -9,7 +9,6 @@ pub mod backend;
 pub mod device;
 pub mod execution;
 pub mod model;
-pub mod nvidia;
 pub mod policy;
 pub mod qualification;
 pub mod readiness;
@@ -38,7 +37,6 @@ pub use model::{
     ModelLoadError, ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, MtpCapability,
     WeightArtifact, WeightDescription, WeightLoader, WeightSource,
 };
-pub use nvidia::{NvidiaBackend, NvidiaDispatcher};
 pub use policy::{
     PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
 };

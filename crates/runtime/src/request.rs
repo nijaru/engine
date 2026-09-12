@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::ModelError;
+use crate::ExecutionError;
 
 /// User-visible identity. A sequence has a separate, model-facing identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -34,14 +34,14 @@ impl Default for Sampling {
 }
 
 impl Sampling {
-    pub(crate) fn validate(self) -> Result<(), ModelError> {
+    pub(crate) fn validate(self) -> Result<(), ExecutionError> {
         if !self.temperature.is_finite() || self.temperature < 0.0 {
-            return Err(ModelError::new(
+            return Err(ExecutionError::new(
                 "temperature must be finite and nonnegative",
             ));
         }
         if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
-            return Err(ModelError::new("top_p must be in (0, 1]"));
+            return Err(ExecutionError::new("top_p must be in (0, 1]"));
         }
         Ok(())
     }
@@ -88,7 +88,7 @@ pub enum FinishReason {
     Length,
     Stop,
     Cancelled,
-    Failed(ModelError),
+    Failed(ExecutionError),
 }
 
 /// Each request emits ordered tokens followed by exactly one terminal event.
@@ -103,4 +103,13 @@ pub enum Event {
         request: RequestId,
         reason: FinishReason,
     },
+}
+
+impl Event {
+    #[must_use]
+    pub const fn request(&self) -> RequestId {
+        match self {
+            Self::Token { request, .. } | Self::Finished { request, .. } => *request,
+        }
+    }
 }

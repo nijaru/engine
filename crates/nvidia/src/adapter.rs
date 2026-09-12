@@ -1,17 +1,17 @@
-//! NVIDIA backend adapter without a CUDA dependency in the core crate.
+//! NVIDIA submission adapter. Host-reference dispatchers need no CUDA library.
 
 use std::collections::HashMap;
 
-use crate::backend::{
+use engine_core::backend::{
     BackendCapabilities, BackendError, BackendKind, BackendSubmissionId, ComputeBackend,
 };
-use crate::execution::{
+use engine_core::execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionOutcome, ExecutionPlan,
     ExecutionSegment,
 };
-use crate::policy::PolicyVersion;
-use crate::state::InferenceStateSet;
-use crate::weights::WeightBinding;
+use engine_core::policy::PolicyVersion;
+use engine_core::state::InferenceStateSet;
+use engine_core::weights::WeightBinding;
 
 pub trait NvidiaDispatcher: Send {
     /// Dispatch one request segment.
@@ -296,17 +296,17 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendFeatures, BackendId};
-    use crate::device::DeviceId;
-    use crate::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};
-    use crate::model::{ModelId, ModelRegionId};
-    use crate::policy::PolicyVersion;
-    use crate::request::{RequestId, SamplingParams};
-    use crate::state::{
+    use engine_core::backend::{BackendFeatures, BackendId};
+    use engine_core::device::DeviceId;
+    use engine_core::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};
+    use engine_core::model::{ModelId, ModelRegionId};
+    use engine_core::policy::PolicyVersion;
+    use engine_core::request::{RequestId, SamplingParams};
+    use engine_core::state::{
         InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,
         StateRequirement,
     };
-    use crate::tensor::{DataType, Quantization};
+    use engine_core::tensor::{DataType, Quantization};
     use std::collections::HashSet;
 
     struct TestDispatcher;

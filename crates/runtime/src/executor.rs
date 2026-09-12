@@ -40,7 +40,7 @@ pub enum StepKind {
 
 /// Bounds for scheduling, not a checklist of model architectures or features.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ModelLimits {
+pub struct GenerationLimits {
     pub context_tokens: u32,
     pub max_sequences: usize,
     pub max_batch_tokens: u32,
@@ -49,25 +49,25 @@ pub struct ModelLimits {
     pub max_decode_tokens: u32,
 }
 
-impl ModelLimits {
-    pub(crate) fn validate(self) -> Result<(), ModelError> {
+impl GenerationLimits {
+    pub(crate) fn validate(self) -> Result<(), ExecutionError> {
         if self.context_tokens == 0
             || self.max_sequences == 0
             || self.max_batch_tokens == 0
             || self.max_decode_tokens == 0
         {
-            return Err(ModelError::new("prepared model limits must be nonzero"));
+            return Err(ExecutionError::new("prepared model limits must be nonzero"));
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelInfo {
+pub struct ExecutorInfo {
     /// Display identity only. Persistent cache/qualification keys must be
     /// established from the exact prepared implementation and artifact.
     pub name: String,
-    pub limits: ModelLimits,
+    pub limits: GenerationLimits,
 }
 
 /// A scalar scheduling record. It owns no physical state or transient tensors.
@@ -101,22 +101,22 @@ pub enum Admission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelError(String);
+pub struct ExecutionError(String);
 
-impl ModelError {
+impl ExecutionError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
-impl fmt::Display for ModelError {
+impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for ModelError {}
+impl std::error::Error for ExecutionError {}
 
 /// A loaded and prepared model/backend combination. Concrete implementations
 /// retain strongly typed model state; the common runtime sees only sequences.
@@ -127,9 +127,9 @@ impl std::error::Error for ModelError {}
 /// A method returning an error never transfers cleanup ownership to nobody:
 /// the implementation must keep uncertain resources alive until `synchronize`
 /// establishes completion, and must reject unsafe release.
-pub trait PreparedModel: Send {
+pub trait GenerationExecutor: Send {
     /// Immutable scheduling metadata, resolved before the engine is created.
-    fn info(&self) -> &ModelInfo;
+    fn info(&self) -> &ExecutorInfo;
 
     /// Validate request semantics and reserve the complete continuation bundle
     /// at prefix zero. `Deferred` or an error must retain no admission resources.
@@ -142,7 +142,7 @@ pub trait PreparedModel: Send {
         &mut self,
         sequence: SequenceId,
         request: &TokenRequest,
-    ) -> Result<Admission, ModelError>;
+    ) -> Result<Admission, ExecutionError>;
 
     /// Queue an accepted batch. Copy/retain everything needed after this call;
     /// references to the borrowed batch must not escape it. Logical prefixes
@@ -151,21 +151,23 @@ pub trait PreparedModel: Send {
     /// # Errors
     /// A submission error faults the engine. Retain resources if completion of
     /// partially queued work is uncertain; never silently retry mutated state.
-    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ModelError>;
+    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError>;
 
     /// Observe completion once, in batch order. Partial results stay internal.
     ///
     /// # Errors
     /// A terminal device/completion error faults the engine. Ownership remains
     /// with the prepared model until safe release or teardown.
-    fn poll(&mut self, submission: SubmissionId)
-    -> Result<Option<Vec<StepCompletion>>, ModelError>;
+    fn poll(
+        &mut self,
+        submission: SubmissionId,
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError>;
 
     /// Free one completed sequence. Successful release must be idempotent.
     ///
     /// # Errors
     /// An unsuccessful release must retain enough ownership for a later retry.
-    fn release(&mut self, sequence: SequenceId) -> Result<(), ModelError>;
+    fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError>;
 
     /// Establish completion of ALL queued work, including partial submissions
     /// and faulted batches. Used for explicit shutdown and defensive Drop.
@@ -175,5 +177,5 @@ pub trait PreparedModel: Send {
     ///
     /// # Errors
     /// On uncertain completion return an error and retain physical resources.
-    fn synchronize(&mut self) -> Result<(), ModelError>;
+    fn synchronize(&mut self) -> Result<(), ExecutionError>;
 }

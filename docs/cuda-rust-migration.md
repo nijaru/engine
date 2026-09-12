@@ -10,7 +10,7 @@ Vendor libraries remain valid implementation choices. “Rust-first” does not 
 
 ## Runtime integration update (2026-09-11)
 
-The model-neutral `ribn::PreparedModel` boundary now has a host-tested runtime
+The model-neutral `ribn::GenerationExecutor` boundary now has a host-tested runtime
 and an experimental Qwen adapter. Qualify that adapter using the existing kernels
 before gate 3 integrates CUDA Rust kernels through it. Do not integrate a second
 new serving path around the legacy request API. Kernel gate 2 remains independent;
@@ -22,7 +22,7 @@ below explain the retained comparison path during this transition. See
 
 The current `ComputeBackend` in `crates/core/src/backend.rs` validates semantic plans and typed state, submits batches, polls completion, and releases physical state through an explicit lifecycle operation. No cudarc buffer, stream, event, or CUDA Rust type crosses this interface. Stream and graph support are capability flags, not requirements every backend must implement.
 
-Core currently also contains the NVIDIA-specific `NvidiaDispatcher` and adapter in `crates/core/src/nvidia.rs`. Those names are not a CUDA library dependency: the seam exchanges Engine plans, state, submission identities, and outcomes. Moving that adapter is not needed to adopt CUDA Rust; do not conflate organizational cleanup with the migration.
+The NVIDIA-specific `NvidiaDispatcher` and adapter now live in `crates/nvidia/src/adapter.rs`, not core. The retained legacy seam still exchanges execution plans, state, submission identities, and outcomes. Its relocation changes ownership of the code, not GPU qualification or CUDA Rust kernel status.
 
 Keep these ownership boundaries:
 
@@ -66,7 +66,7 @@ Select Tile versus SIMT per operation. Start by investigating Tile for normaliza
 
 Do not assume Rust removes runtime shape/context checks, every unsafe operation, or launch geometry. Do not rebuild lazy operation graphs or synchronize once per kernel merely because a tutorial does so. Persistent resources and bounded submission work remain requirements.
 
-## Evidence checked
+## Historical evidence checked before the gate-1 update
 
 Source review on 2026-09-09 used [cuTile Rust](https://github.com/NVlabs/cutile-rs/tree/2eed75e) and [cuda-oxide](https://github.com/NVlabs/cuda-oxide/tree/26754ae). Pin full revisions for the executable proof; these moving upstream sources are not yet Engine dependencies.
 
@@ -76,7 +76,7 @@ Source review on 2026-09-09 used [cuTile Rust](https://github.com/NVlabs/cutile-
 - cuTile source says sm8x support starts with CUDA 13.2, with CUDA 13.3 recommended. This is more specific than the introductory blog's blanket 13.3 requirement. Check the actual qualification host rather than inferring its toolkit from cudarc's `cuda-13020` feature.
 - cuda-oxide source currently pins nightly-2026-08-28 and lists CUDA 13.x host requirements, differing from the blog's older setup. Isolate kernel compilation/toolchain requirements from non-CUDA workspace development where practical; prove the build arrangement rather than assuming a nightly backend invalidates stable core code.
 
-That review is now backed by a hardware probe on the qualification host (below). No Engine kernel has been authored in Rust yet, and nothing has been measured on Qwen3.8-27B Q4 GGUF; published results on other models and GPUs do not transfer to this artifact or device.
+That review is now backed by a hardware probe on the qualification host (below). At that initial review no Engine kernel had been authored in Rust; gate 1 below subsequently added smoke kernels. Full-model CUDA Rust execution has not been measured on Qwen3.8-27B Q4 GGUF; published results on other models and GPUs do not transfer to this artifact or device.
 
 ## Hardware probe on the qualification host, 2026-09-10
 

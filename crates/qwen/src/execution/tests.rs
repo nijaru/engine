@@ -7,7 +7,8 @@ use engine_core::{
     ModelRegionId, PolicyVersion, StateRequirement, WeightBinding,
 };
 use ribn::{
-    Engine, EngineConfig, Event, GenerationOptions, ModelLimits, PreparedModel, SchedulePolicy,
+    Engine, EngineConfig, Event, GenerationExecutor, GenerationLimits, GenerationOptions,
+    SchedulePolicy,
 };
 
 use super::*;
@@ -103,24 +104,28 @@ impl ComputeBackend for Backend {
 }
 
 struct Model(QwenExecution<Backend>);
-impl PreparedModel for Model {
-    fn info(&self) -> &ModelInfo {
+impl GenerationExecutor for Model {
+    fn info(&self) -> &ExecutorInfo {
         self.0.info()
     }
-    fn admit(&mut self, id: SequenceId, request: &TokenRequest) -> Result<Admission, ModelError> {
+    fn admit(
+        &mut self,
+        id: SequenceId,
+        request: &TokenRequest,
+    ) -> Result<Admission, ExecutionError> {
         self.0.backend.control.lock().unwrap().admissions.push(id);
         self.0.admit(id, request)
     }
-    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ModelError> {
+    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.0.submit(batch)
     }
-    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ModelError> {
+    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         self.0.poll(id)
     }
-    fn release(&mut self, id: SequenceId) -> Result<(), ModelError> {
+    fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {
         self.0.release(id)
     }
-    fn synchronize(&mut self) -> Result<(), ModelError> {
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
         self.0.backend.control.lock().unwrap().pending_polls = 0;
         self.0.drain_after_barrier()
     }
@@ -147,9 +152,9 @@ fn model(control: Arc<Mutex<Control>>) -> Model {
         WeightBinding::empty(model, device),
     )
     .unwrap();
-    let info = ModelInfo {
+    let info = ExecutorInfo {
         name: "Qwen adapter fixture".into(),
-        limits: ModelLimits {
+        limits: GenerationLimits {
             context_tokens: 64,
             max_sequences: 2,
             max_batch_tokens: 8,
@@ -184,6 +189,7 @@ fn engine(control: Arc<Mutex<Control>>) -> Engine {
             max_queued_requests: 2,
             max_queued_input_tokens: 128,
             max_buffered_events: 32,
+            max_events_per_request: 64,
         },
         SchedulePolicy {
             max_batch_tokens: 8,

@@ -15,9 +15,7 @@ use engine_core::{
 };
 
 mod iq3_s;
-mod qwen;
 mod tokenizer;
-pub use qwen::{Qwen35Config, Qwen35LayerKind, Qwen35ModelProvider};
 pub use tokenizer::{ChatMessage, ChatTemplateOptions, GgufTokenizer};
 
 const GGUF_MAGIC: u32 = 0x4655_4747;
@@ -377,26 +375,6 @@ impl GgufFile {
     #[must_use]
     pub const fn tensor_data_offset(&self) -> u64 {
         self.tensor_data_offset
-    }
-
-    /// Decode and validate the Qwen3.8 hybrid dimensions carried by this
-    /// artifact. This remains a GGUF adapter; it does not create model kernels.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GgufError`] when the architecture marker, metadata, or hybrid
-    /// dimensions are missing or inconsistent.
-    pub fn qwen35_config(&self) -> Result<Qwen35Config, GgufError> {
-        let architecture = self
-            .metadata("general.architecture")
-            .and_then(MetadataValue::as_str)
-            .ok_or_else(|| GgufError::MissingMetadata("general.architecture".to_owned()))?;
-        if architecture != "qwen35" {
-            return Err(GgufError::UnsupportedArchitecture(architecture.to_owned()));
-        }
-        let config = Qwen35Config::from_metadata(&self.metadata)?;
-        config.validate()?;
-        Ok(config)
     }
 
     /// Extract the embedded GPT-2/BPE vocabulary and merge table.

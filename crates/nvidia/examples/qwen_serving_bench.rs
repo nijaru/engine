@@ -20,16 +20,17 @@ use cudarc::driver::CudaContext;
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, DataType, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionStage, InferenceState,
-    InferenceStateSet, LogicalStateManager, ModelProvider, NvidiaBackend, PolicySnapshot,
-    PolicyVersion, Quantization, RequestId, RequestSemantics, RequestSpec, SamplingParams,
-    SchedulerConfig, ServingRuntime, SpeculationPolicy, StateLocation, StateManager,
-    StateRequirement, StateTierPreference, ThinkingMode, WeightBinding,
+    InferenceStateSet, LogicalStateManager, ModelProvider, PolicySnapshot, PolicyVersion,
+    Quantization, RequestId, RequestSemantics, RequestSpec, SamplingParams, SchedulerConfig,
+    ServingRuntime, SpeculationPolicy, StateLocation, StateManager, StateRequirement,
+    StateTierPreference, ThinkingMode, WeightBinding,
 };
-use engine_gguf::{Qwen35LayerKind, Qwen35ModelProvider};
+use engine_nvidia::NvidiaBackend;
 use engine_nvidia::{
     CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, GemvMode, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
+use engine_qwen::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 
 const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 /// Diverse fixed prompts for the `--divergence-probe` quality gate. Each
@@ -106,7 +107,7 @@ fn run() -> Result<(), String> {
         .map_err(|_| "prompt length does not fit the runtime".to_owned())?
         .checked_add(output_tokens)
         .ok_or_else(|| "prompt plus output budget overflowed".to_owned())?;
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(&model_path, state_tokens)
+    let provider = QwenGguf::open_with_kv_block_tokens(&model_path, state_tokens)
         .map_err(|error| error.to_string())?;
     if u64::from(state_tokens) > provider.config().context_length() {
         return Err("prompt plus output budget exceeds the model context".to_owned());
@@ -420,7 +421,7 @@ fn duration_mean_max(values: &[Duration]) -> (Duration, Duration) {
 }
 
 fn stage_weights(
-    provider: &Qwen35ModelProvider,
+    provider: &QwenGguf,
     device: DeviceId,
     context: &Arc<CudaContext>,
     stream: &Arc<cudarc::driver::CudaStream>,
@@ -477,7 +478,7 @@ fn stage_weights(
         .map_err(|error| error.to_string())
 }
 
-fn qwen_layer_kinds(provider: &Qwen35ModelProvider) -> Result<Vec<QwenLayerKind>, String> {
+fn qwen_layer_kinds(provider: &QwenGguf) -> Result<Vec<QwenLayerKind>, String> {
     let layer_count = provider
         .config()
         .language_layer_count()
@@ -487,8 +488,8 @@ fn qwen_layer_kinds(provider: &Qwen35ModelProvider) -> Result<Vec<QwenLayerKind>
             provider
                 .layer_kind(layer)
                 .map(|kind| match kind {
-                    Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                    Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                    GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                    GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
                 })
                 .map_err(|error| error.to_string())
         })

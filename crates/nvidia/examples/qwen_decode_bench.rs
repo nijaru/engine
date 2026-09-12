@@ -20,10 +20,10 @@ use engine_core::{
     ConvolutionStateShape, DataType, DeviceId, KvStateSpec, RecurrentMatrixShape,
     RecurrentStateSpec,
 };
-use engine_gguf::Qwen35ModelProvider;
 use engine_nvidia::{
     CudaHybridState, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind, StagedTensorSource,
 };
+use engine_qwen::QwenGguf;
 
 const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 const EPS: f32 = 1.0e-6;
@@ -43,7 +43,7 @@ fn main() {
         .or_else(|| std::env::var("ENGINE_QWEN_GGUF").ok())
         .expect("set ENGINE_QWEN_GGUF or pass --model=/path/to/model.gguf");
 
-    let provider = Qwen35ModelProvider::open(&model_path).expect("open Qwen GGUF");
+    let provider = QwenGguf::open(&model_path).expect("open Qwen GGUF");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
 
@@ -102,8 +102,8 @@ fn main() {
     let layer_kinds = (0..64_u32)
         .map(
             |layer| match provider.layer_kind(layer).expect("layer kind") {
-                engine_gguf::Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                engine_gguf::Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                engine_qwen::QwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                engine_qwen::QwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
             },
         )
         .collect::<Vec<_>>();

@@ -83,7 +83,6 @@ dependencies = [
  "minijinja-contrib",
  "regex",
  "serde",
- "sha2",
 ]
 
 [[package]]
@@ -93,6 +92,7 @@ dependencies = [
  "cudarc",
  "engine-core",
  "engine-gguf",
+ "engine-qwen",
 ]
 
 [[package]]
@@ -104,18 +104,7 @@ dependencies = [
  "engine-gguf",
  "engine-nvidia",
  "ribn",
-]
-
-[[package]]
-name = "engine-server"
-version = "0.0.0"
-dependencies = [
- "cudarc",
- "engine-core",
- "engine-gguf",
- "engine-nvidia",
- "engine-qwen",
- "ribn",
+ "sha2",
 ]
 
 [[package]]
@@ -232,6 +221,18 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "ribn"
 version = "0.0.0"
+
+[[package]]
+name = "ribn-cli"
+version = "0.0.0"
+dependencies = [
+ "cudarc",
+ "engine-core",
+ "engine-gguf",
+ "engine-nvidia",
+ "engine-qwen",
+ "ribn",
+]
 
 [[package]]
 name = "serde"

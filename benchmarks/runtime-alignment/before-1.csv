@@ -1,0 +1,6 @@
+# synthetic host dispatch; includes mock completion allocation; no model/device work
+concurrency,measured_iterations,median_ns_per_iteration,p99_ns_per_iteration,median_ns_per_row
+1,10000,110,130,110
+8,10000,430,661,53
+32,10000,1923,2283,60
+128,10000,7882,21432,61

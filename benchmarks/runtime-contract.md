@@ -8,14 +8,16 @@ layouts. Qwen bridge tests inject a host backend into the actual translation and
 lease code. These tests do not evaluate model numerics or execute GPU kernels.
 
 ```sh
+python3 tools/check-boundaries.py
+cargo test -p engine-qwen --no-default-features --test model_config
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
 cargo clippy -p engine-qwen --features cuda --all-targets -- -D warnings
-cargo clippy -p engine-server --features cuda --all-targets -- -D warnings
+cargo clippy -p ribn-cli --features cuda --all-targets -- -D warnings
 cargo test -p engine-qwen --features cuda
-cargo test -p engine-server --features cuda
+cargo test -p ribn-cli --features cuda
 ```
 
 CUDA-feature compilation and the nonignored adapter tests run on a CPU CI host.
@@ -26,7 +28,9 @@ Coverage includes atomic batch commitment, delayed completion, in-flight
 cancellation with peer progress, multi-token completion, live-policy changes,
 queue/input limits, output credit reservation, admission rollback, deferred
 admission, invalid output, release retries, partial submission and poll failures,
-shutdown retries, and conservative retention after uncertain teardown.
+shutdown retries, and conservative retention after uncertain teardown. New tests also cover
+per-request mailbox isolation, draining after execution-slot reuse, bounded ready
+list membership, source-format-independent model geometry, and small-executor defaults.
 
 ## Synthetic CPU benchmark
 
@@ -37,7 +41,7 @@ cargo run -p ribn --release --example host_overhead
 This reports median/p99 nanoseconds per warm scheduling iteration and median
 cost per row at concurrency 1/8/32/128. Each run warms 128 iterations and measures
 10,000. The mock immediately completes work and allocates its result vectors;
-those costs are included. The event queue has room for both completed output
+those costs are included. The aggregate event bound has room for both completed output
 and the next batch's reserved credits. Admission, preparation, and teardown are
 outside the samples.
 
@@ -88,7 +92,7 @@ specified in the roadmap.
 ## Experimental CLI
 
 ```sh
-cargo run -p engine-server --features cuda -- run \
+cargo run -p ribn-cli --features cuda -- run \
   --model /absolute/path/model.gguf --prompt 'Explain a mutex.' --max-tokens 128
 ```
 
@@ -98,3 +102,15 @@ existing Qwen text artifact path, not arbitrary GGUF architectures. Compare toke
 fixtures rather than raw stdout: `run` streams bytes without an added newline,
 whereas `local` prints a finalized string. A token limit can truncate a UTF-8
 code point in the raw streaming output.
+
+## Ground-up alignment cost and isolation
+
+The current mailbox implementation reserves both global and per-request event
+capacity. Request-specific draining does not need an unbounded frontend event
+buffer. Aggregate draining is round-robin across clients, preserving each client's
+order rather than a global arrival order. Stalled-consumer and mailbox/slot reuse
+tests run in the ordinary host suite.
+
+[Host comparison](runtime-alignment/README.md) records the additional synthetic
+CPU cost relative to the original global-queue runtime. Stable internal mailbox
+slots avoid repeated hashing, but the result is not an inference speedup claim.

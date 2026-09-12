@@ -5,25 +5,26 @@ use cudarc::driver::CudaContext;
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, DataType, DeviceId,
     ExecutionPhase, ExecutionPlan, ExecutionRuntime, ExecutionStage, InferenceState,
-    InferenceStateSet, LogicalStateManager, ModelProvider, NvidiaBackend, PolicySnapshot,
-    PolicyVersion, PromptFormat, PromptPolicy, Quantization, RequestId, RequestSemantics,
-    RequestSpec, SamplingParams, SchedulerConfig, ServingRuntime, SpecialTokenPolicy,
-    SpeculationPolicy, StateLocation, StateManager, StateRequirement, StateTierPreference,
-    ThinkingMode, WeightBinding,
+    InferenceStateSet, LogicalStateManager, ModelProvider, PolicySnapshot, PolicyVersion,
+    PromptFormat, PromptPolicy, Quantization, RequestId, RequestSemantics, RequestSpec,
+    SamplingParams, SchedulerConfig, ServingRuntime, SpecialTokenPolicy, SpeculationPolicy,
+    StateLocation, StateManager, StateRequirement, StateTierPreference, ThinkingMode,
+    WeightBinding,
 };
-use engine_gguf::{
-    ChatMessage, ChatTemplateOptions, GgufFile, Qwen35LayerKind, Qwen35ModelProvider,
-};
+use engine_gguf::{ChatMessage, ChatTemplateOptions, GgufFile};
+use engine_nvidia::NvidiaBackend;
 use engine_nvidia::{
     CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
+use engine_qwen::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 
 const DEFAULT_PREFILL_CHUNK_TOKENS: u32 = 16;
 const WEIGHT_BUDGET_BYTES: u64 = 20_u64 << 30;
 const EPSILON: f32 = 1.0e-6;
 
-pub const USAGE: &str = "engine-server local --model <model.gguf> --prompt <text> [--max-tokens <n>] [--device <ordinal>]";
+pub const USAGE: &str =
+    "ribn local --model <model.gguf> --prompt <text> [--max-tokens <n>] [--device <ordinal>]";
 
 #[allow(
     clippy::too_many_lines,
@@ -56,7 +57,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .ok_or_else(|| "prompt plus output budget exceeds the current state index".to_owned())?;
     drop(tokenizer_file);
 
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(options.model, state_tokens)
+    let provider = QwenGguf::open_with_kv_block_tokens(options.model, state_tokens)
         .map_err(|error| error.to_string())?;
     if u64::from(state_tokens) > provider.config().context_length() {
         return Err(format!(
@@ -177,7 +178,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
 }
 
 fn stage_weights(
-    provider: &Qwen35ModelProvider,
+    provider: &QwenGguf,
     device: DeviceId,
     context: &Arc<CudaContext>,
     stream: &Arc<cudarc::driver::CudaStream>,
@@ -240,7 +241,7 @@ fn stage_weights(
         .map_err(|error| error.to_string())
 }
 
-fn qwen_layer_kinds(provider: &Qwen35ModelProvider) -> Result<Vec<QwenLayerKind>, String> {
+fn qwen_layer_kinds(provider: &QwenGguf) -> Result<Vec<QwenLayerKind>, String> {
     let layer_count = provider
         .config()
         .language_layer_count()
@@ -250,8 +251,8 @@ fn qwen_layer_kinds(provider: &Qwen35ModelProvider) -> Result<Vec<QwenLayerKind>
             provider
                 .layer_kind(layer)
                 .map(|kind| match kind {
-                    Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                    Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                    GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                    GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
                 })
                 .map_err(|error| error.to_string())
         })

@@ -1,10 +1,8 @@
-//! Optional NVIDIA backend substrate.
+//! NVIDIA execution mechanisms and the current specialized Qwen CUDA path.
 //!
-//! The crate remains optional on hosts without CUDA. Its first concrete
-//! implementation includes a stateless F32 linear reference path and a
-//! correctness-oriented `Q4_K` GEMV primitive used to validate device setup,
-//! transfers, NVRTC dispatch, timing, and the core runtime boundary before
-//! model-specific Qwen3.8 execution is attempted.
+//! Host reference mathematics and the submission adapter build without CUDA.
+//! Device resources, kernels, and Qwen execution are behind the `cuda` feature.
+//! Model loading and generic request scheduling belong to their own packages.
 
 #[cfg(feature = "cuda")]
 mod activation;
@@ -74,3 +72,6 @@ pub use qwen_reference::{
 
 #[cfg(feature = "cuda")]
 pub use serving::CudaQwen35ServingDispatcher;
+
+mod adapter;
+pub use adapter::{NvidiaBackend, NvidiaDispatcher};

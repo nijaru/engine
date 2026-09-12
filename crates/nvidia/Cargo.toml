@@ -16,6 +16,7 @@ engine-core = { path = "../core" }
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
 
 [dev-dependencies]
+engine-qwen = { path = "../qwen", default-features = false, features = ["gguf"] }
 engine-gguf = { path = "../gguf" }
 
 [[example]]

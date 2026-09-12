@@ -3,7 +3,7 @@
 This is an ordered engineering plan, not release dates or a performance claim.
 New runtime work targets `crates/runtime` (`ribn`), not the legacy request layer
 in `crates/core`. [Architecture](architecture.md) defines ownership;
-[the redesign decision](runtime-redesign.md) records the research and tradeoffs.
+[the ground-up target](ground-up-design.md) records the research and tradeoffs.
 
 ## Status
 
@@ -20,6 +20,24 @@ Historical kernel/serving numbers remain in
 [execution history](../benchmarks/execution-history.md), not as claims about the
 new runtime. [CUDA migration](cuda-rust-migration.md) remains authoritative for
 kernel proof gates.
+
+## Ground-up alignment completed
+
+- The runtime-facing contract is `GenerationExecutor`, not a universal model API.
+- Qwen configuration/layer semantics are artifact-independent; `QwenGguf` mapping
+  moved out of the generic format reader. Source-format-free tests run in CI.
+- NVIDIA submission glue and its integration tests moved out of neutral core.
+- Per-request mailboxes isolate stalled consumers within aggregate/model capacity;
+  execution uses stable mailbox slots and preserves completion credits.
+- Runtime configuration, selection, commitment, and output are separate modules
+  with one owner. Compatible defaults and the `ribn` CLI reduce manual setup.
+- `ribn inspect` reads generic GGUF metadata without GPU initialization.
+
+This closes concrete structural gaps, not the full target. The highest remaining
+code-design issue is the fixed-shape Qwen body: validate backend support at
+preparation, normalize parameter roles, and make shape-dependent plans explicit
+before adding another geometry or checkpoint format. Do not expose arbitrary
+configurations while silently running kernels specialized to the first artifact.
 
 ## 1. Qualify the new runtime boundary
 
@@ -51,7 +69,7 @@ of request scheduling. Prove Q8_1 packing → quantized integer-dot projection a
 batched GDN state updates, with layout, arithmetic, tails, repeated updates,
 generated-code inspection, and matched timings.
 
-Gate 3's asynchronous serving integration should target `PreparedModel` after
+Gate 3's asynchronous serving integration should target `GenerationExecutor` after
 the boundary qualification above. Preserve exact output/prefix commitment,
 completion, cancellation, and one deallocation owner. Complete remaining kernel
 families, then rerun full-model/serving gates before retiring CUDA C++ authoring.
@@ -66,11 +84,11 @@ supported path for the existing target.
 
 Then remove the duplicate `local` serving path and the old request/scheduler
 runtime. Remove Qwen's temporary batch/lease translation as its backend adopts
-the new boundary directly. Relocate surviving NVIDIA and model-specific helpers
-out of neutral core; delete region/phase metadata with no execution role.
+the new boundary directly. NVIDIA submission glue is already relocated; move remaining model-specific helpers
+out of neutral core as their actual owners are established; delete region/phase metadata with no execution role.
 
-Separate Qwen model interpretation from GGUF parsing before implementing a
-second artifact format. Serialized GGUF identifiers stay unchanged. Keep tests
+Qwen configuration and GGUF interpretation are now separate. Normalize remaining
+weight roles and backend shape assumptions before implementing a second artifact format. Serialized GGUF identifiers stay unchanged. Keep tests
 and numerical references independent of optimized implementations. Do not add
 new model features to both old and new runtimes while waiting for cutover.
 
@@ -87,12 +105,12 @@ actual usage, queue delay, prefill/decode cost, cancellation, and retained fault
 resources visible. Split live scheduling changes from settings that require
 quiescence or re-preparation. Unsupported settings must fail explicitly.
 
-Converge packaging on a `ribn` CLI and a small application API. Add model
-inspection and hardware diagnostics before an extensive flag surface. A network
-surface needs per-request bounded output, disconnect cancellation, structured
-errors, stop semantics, and bounded tokenization/template work. Reuse the same
-Engine; keep HTTP/chat protocols outside model execution. These commands and
-network features are not shipped by the initial redesign.
+The `ribn` CLI and CPU-only artifact inspection now exist. Complete a small
+application API, model/backend resolution, and hardware diagnostics before an
+extensive flag surface. A network
+surface must use the implemented per-request output limits and add disconnect
+cancellation, wakeups, structured errors, and bounded input preparation. Reuse the same
+Engine; keep HTTP/chat protocols outside model execution. A network service, model auto-resolution, and hardware diagnostics are not shipped.
 
 ## 5. Optimize measured execution and state costs
 

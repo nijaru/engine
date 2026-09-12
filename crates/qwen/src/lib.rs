@@ -2,7 +2,7 @@
 //!
 //! The CUDA implementation bridges the existing Qwen executor while the new
 //! runtime is qualified. Legacy state/plan types stay behind this boundary;
-//! they are not requirements for other `ribn::PreparedModel` implementations.
+//! they are not requirements for other `ribn::GenerationExecutor` implementations.
 
 #[cfg(feature = "cuda")]
 mod cuda;
@@ -14,6 +14,13 @@ mod loading;
 mod state;
 
 #[cfg(feature = "cuda")]
-pub use cuda::QwenPrepared;
+pub use cuda::QwenCuda;
 #[cfg(feature = "cuda")]
 pub use loading::{MemoryReport, QwenLoadOptions};
+
+mod config;
+pub use config::{ConfigError, QwenConfig, QwenLayerKind};
+#[cfg(feature = "gguf")]
+mod gguf;
+#[cfg(feature = "gguf")]
+pub use gguf::QwenGguf;

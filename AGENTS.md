@@ -18,13 +18,21 @@ If maintainer-local companion context is available, use it for private planning 
 
 ## Runtime migration
 
-New request/runtime work belongs in `crates/runtime`, through `PreparedModel`.
+New request/runtime work belongs in `crates/runtime`, through `GenerationExecutor`.
 Keep concrete model state, layouts, artifact formats, and kernel mechanisms in
 model/backend implementations. Do not add model-family variants to the new
 scheduler. `crates/qwen` currently bridges the existing CUDA executor; the new
 `run` path remains experimental until hardware qualification. `local` and legacy
 core serving types remain comparison oracles, not a second feature target.
-Read `docs/runtime-redesign.md` and the cutover gates before changing this boundary.
+Read `docs/ground-up-design.md` and the cutover gates before changing this boundary.
+
+## Dependency and task boundaries
+
+Model definitions do not belong in artifact readers; NVIDIA glue does not belong
+in neutral core. The new runtime owns generation lifecycle, not every future
+inference task. Preserve per-request and aggregate output limits. Keep one active
+runtime direction; retained legacy code is a numerical/cutover oracle, not a
+second feature target.
 
 ## Current first target
 
@@ -53,6 +61,7 @@ Read `docs/runtime-redesign.md` and the cutover gates before changing this bound
 ## Verification
 
 ```text
+python3 tools/check-boundaries.py
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings

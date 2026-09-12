@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use engine_qwen::{QwenLoadOptions, QwenPrepared};
+use engine_qwen::{QwenCuda, QwenLoadOptions};
 use ribn::{
-    Engine, EngineConfig, Event, FinishReason, GenerationOptions, PreparedModel, SchedulePolicy,
-    TokenRequest,
+    Engine, EngineConfig, Event, FinishReason, GenerationExecutor, GenerationOptions,
+    SchedulePolicy, TokenRequest,
 };
 
 struct Reference {
@@ -87,7 +87,7 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
     let max_output_tokens = u32::try_from(reference.output.len()).unwrap();
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
     let context_tokens = prompt_tokens.checked_add(max_output_tokens).unwrap();
-    let prepared = QwenPrepared::load_gguf(
+    let prepared = QwenCuda::load_gguf(
         model,
         QwenLoadOptions {
             context_tokens,
@@ -105,6 +105,7 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
             max_queued_requests: 0,
             max_queued_input_tokens: reference.prompt.len() as u64 * concurrency as u64,
             max_buffered_events: concurrency * 4,
+            max_events_per_request: 64,
         },
         SchedulePolicy::default(),
     )

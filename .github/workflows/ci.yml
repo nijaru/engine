@@ -17,9 +17,14 @@ jobs:
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
+      - run: python3 tools/check-boundaries.py
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p engine-qwen --no-default-features --test model_config --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
   cuda-feature-check:
     runs-on: ubuntu-latest
     steps:
@@ -28,8 +33,8 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy, rustfmt
-      - run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
-      - run: cargo clippy -p engine-server --features cuda --all-targets -- -D warnings
-      - run: cargo clippy -p engine-qwen --features cuda --all-targets -- -D warnings
-      - run: cargo test -p engine-qwen --features cuda
-      - run: cargo test -p engine-server --features cuda
+      - run: cargo clippy -p engine-nvidia --features cuda --all-targets --locked -- -D warnings
+      - run: cargo clippy -p ribn-cli --features cuda --all-targets --locked -- -D warnings
+      - run: cargo clippy -p engine-qwen --features cuda --all-targets --locked -- -D warnings
+      - run: cargo test -p engine-qwen --features cuda --locked
+      - run: cargo test -p ribn-cli --features cuda --locked

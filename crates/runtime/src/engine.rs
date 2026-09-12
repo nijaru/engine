@@ -1,59 +1,19 @@
 use std::collections::{HashMap, VecDeque};
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    Admission, BatchItem, Event, FinishReason, ModelError, ModelInfo, PreparedModel, RequestId,
-    SequenceId, StepCompletion, StepKind, SubmissionId, TokenRequest,
+    Admission, BatchItem, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
+    FinishReason, GenerationExecutor, RequestId, SchedulePolicy, SequenceId, SubmissionId,
+    TokenRequest,
 };
 
+use crate::config::validate_policy;
+use crate::output::{Output, OutputId};
+
+mod completion;
+mod scheduling;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Resource bounds for the engine, fixed for its lifetime. Model-owned device
-/// and host allocation limits are resolved by the prepared implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EngineConfig {
-    pub max_active_requests: usize,
-    /// Additional capacity beyond active requests. The total resident request
-    /// bound is active plus queued; requests may wait before the first step.
-    pub max_queued_requests: usize,
-    pub max_queued_input_tokens: u64,
-    pub max_buffered_events: usize,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            max_active_requests: 8,
-            max_queued_requests: 64,
-            max_queued_input_tokens: 1_048_576,
-            max_buffered_events: 1024,
-        }
-    }
-}
-
-/// Live scheduling policy. Updating it does not change request semantics or
-/// invalidate in-flight work; completions are checked against their saved batch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SchedulePolicy {
-    pub max_batch_tokens: u32,
-    pub prefill_chunk_tokens: u32,
-    pub decode_tokens: u32,
-    /// Force admitted prefill after this many decode-only submissions.
-    /// This is a step bound, not a wall-clock latency guarantee.
-    pub max_decode_only_steps: u32,
-}
-
-impl Default for SchedulePolicy {
-    fn default() -> Self {
-        Self {
-            max_batch_tokens: 128,
-            prefill_chunk_tokens: 16,
-            decode_tokens: 1,
-            max_decode_only_steps: 8,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StepStatus {
@@ -87,6 +47,7 @@ struct Sequence {
     input: Option<TokenRequest>,
     prompt_tokens: u32,
     options: crate::GenerationOptions,
+    output: OutputId,
     prefix: u32,
     generated: u32,
     admitted: bool,
@@ -102,8 +63,8 @@ struct Sequence {
 /// synchronization; if completion cannot be established, it intentionally
 /// retains the model rather than freeing device-visible memory prematurely.
 pub struct Engine {
-    model: Option<Box<dyn PreparedModel>>,
-    info: ModelInfo,
+    model: Option<Box<dyn GenerationExecutor>>,
+    info: ExecutorInfo,
     config: EngineConfig,
     policy: SchedulePolicy,
     slots: Vec<Option<Sequence>>,
@@ -115,13 +76,12 @@ pub struct Engine {
     terminal: VecDeque<usize>,
     active: usize,
     queued_input_tokens: u64,
-    events: VecDeque<Event>,
+    output: Output,
     batch: Vec<BatchItem>,
     batch_slots: Vec<usize>,
     pending: Option<SubmissionId>,
-    reserved_events: usize,
     decode_only_steps: u32,
-    fault: Option<ModelError>,
+    fault: Option<ExecutionError>,
     uncertain: bool,
     closed: bool,
 }
@@ -130,7 +90,7 @@ impl Engine {
     /// # Errors
     /// Rejects invalid or unsupported engine/model scheduling limits.
     pub fn new(
-        model: impl PreparedModel + 'static,
+        model: impl GenerationExecutor + 'static,
         config: EngineConfig,
         policy: SchedulePolicy,
     ) -> Result<Self, EngineError> {
@@ -144,6 +104,7 @@ impl Engine {
         if config.max_active_requests == 0
             || config.max_active_requests > info.limits.max_sequences
             || config.max_buffered_events < 2
+            || config.max_events_per_request < 2
             || config.max_queued_input_tokens == 0
         {
             return Err(EngineError::InvalidConfig);
@@ -162,11 +123,14 @@ impl Engine {
             terminal: VecDeque::with_capacity(capacity),
             active: 0,
             queued_input_tokens: 0,
-            events: VecDeque::with_capacity(config.max_buffered_events),
+            output: Output::new(
+                config.max_buffered_events,
+                config.max_events_per_request,
+                capacity,
+            ),
             batch: Vec::with_capacity(config.max_active_requests),
             batch_slots: Vec::with_capacity(config.max_active_requests),
             pending: None,
-            reserved_events: 0,
             decode_only_steps: 0,
             fault: None,
             uncertain: false,
@@ -174,8 +138,30 @@ impl Engine {
         })
     }
 
+    /// Construct model-compatible limits without forcing callers to repeat the
+    /// prepared model's sequence and token limits. Explicit `new` stays strict.
+    ///
+    /// # Errors
+    /// Reports invalid prepared model limits.
+    pub fn with_defaults(model: impl GenerationExecutor + 'static) -> Result<Self, EngineError> {
+        let limits = model.info().limits;
+        let config = EngineConfig {
+            max_active_requests: EngineConfig::default()
+                .max_active_requests
+                .min(limits.max_sequences),
+            ..EngineConfig::default()
+        };
+        let policy = SchedulePolicy {
+            max_batch_tokens: SchedulePolicy::default()
+                .max_batch_tokens
+                .min(limits.max_batch_tokens),
+            ..SchedulePolicy::default()
+        };
+        Self::new(model, config, policy)
+    }
+
     #[must_use]
-    pub const fn info(&self) -> &ModelInfo {
+    pub const fn info(&self) -> &ExecutorInfo {
         &self.info
     }
 
@@ -185,7 +171,7 @@ impl Engine {
             requests: self.requests.len(),
             active_sequences: self.active,
             waiting: self.waiting.len(),
-            buffered_events: self.events.len(),
+            buffered_events: self.output.len(),
             in_flight: self.pending.is_some(),
             faulted: self.fault.is_some(),
             closed: self.closed,
@@ -242,7 +228,9 @@ impl Engine {
             self.slots.push(None);
             self.slots.len() - 1
         });
+        let output = self.output.register(request);
         self.slots[index] = Some(Sequence {
+            output,
             request,
             id,
             options: input.options.clone(),
@@ -289,8 +277,15 @@ impl Engine {
         Ok(())
     }
 
+    /// Drain ready requests round-robin, preserving each request's event order.
     pub fn pop_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        self.output.pop()
+    }
+
+    /// Drain only this request. Other clients' output remains bounded and does
+    /// not need to be copied into an unbounded frontend-side demultiplexer.
+    pub fn pop_event_for(&mut self, request: RequestId) -> Option<Event> {
+        self.output.pop_for(request)
     }
 
     /// Observe one completion, reclaim terminal work, admit waiting requests,
@@ -361,7 +356,7 @@ impl Engine {
             .synchronize()?;
         self.uncertain = false;
         self.pending = None;
-        self.reserved_events = 0;
+        self.release_output_reservations();
         self.batch.clear();
         self.batch_slots.clear();
         self.waiting.clear();
@@ -418,187 +413,6 @@ impl Engine {
         }
     }
 
-    fn build_batch(&mut self) {
-        self.batch.clear();
-        self.batch_slots.clear();
-        let mut budget = self.policy.max_batch_tokens;
-        let mut credits = self.config.max_buffered_events - self.events.len();
-        let force_prefill =
-            !self.prefill.is_empty() && self.decode_only_steps >= self.policy.max_decode_only_steps;
-        if force_prefill {
-            // One chunk satisfies the fairness debt without monopolizing a batch.
-            self.schedule_one(StepKind::Prefill, &mut budget, &mut credits);
-        }
-        while self.schedule_one(StepKind::Decode, &mut budget, &mut credits) {}
-        while self.schedule_one(StepKind::Prefill, &mut budget, &mut credits) {}
-        self.reserved_events = self.config.max_buffered_events - self.events.len() - credits;
-        if self.batch.iter().any(|item| item.kind == StepKind::Prefill) {
-            self.decode_only_steps = 0;
-        } else if !self.batch.is_empty() && !self.prefill.is_empty() {
-            self.decode_only_steps = self.decode_only_steps.saturating_add(1);
-        }
-    }
-
-    fn schedule_one(&mut self, kind: StepKind, budget: &mut u32, credits: &mut usize) -> bool {
-        if self.batch.len() >= self.config.max_active_requests || *budget == 0 || *credits == 0 {
-            return false;
-        }
-        let queue = match kind {
-            StepKind::Prefill => &mut self.prefill,
-            StepKind::Decode => &mut self.decode,
-        };
-        let Some(&index) = queue.front() else {
-            return false;
-        };
-        let sequence = self.slots[index].as_mut().expect("runnable slot exists");
-        let (tokens, outputs) = match kind {
-            StepKind::Prefill => {
-                let tokens = (sequence.prompt_tokens - sequence.prefix)
-                    .min(self.policy.prefill_chunk_tokens)
-                    .min(*budget);
-                let outputs = u32::from(sequence.prefix + tokens == sequence.prompt_tokens);
-                (tokens, outputs)
-            }
-            StepKind::Decode => {
-                let output_credits = u32::try_from(credits.saturating_sub(1)).unwrap_or(u32::MAX);
-                let tokens = self
-                    .policy
-                    .decode_tokens
-                    .min(sequence.options.max_output_tokens - sequence.generated)
-                    .min(*budget)
-                    .min(output_credits);
-                (tokens, tokens)
-            }
-        };
-        if tokens == 0 || u64::from(outputs) + 1 > *credits as u64 {
-            return false;
-        }
-        queue.pop_front();
-        sequence.work = WorkState::InFlight;
-        self.batch.push(BatchItem {
-            sequence: sequence.id,
-            kind,
-            prefix: sequence.prefix,
-            token_budget: tokens,
-            output_budget: outputs,
-        });
-        self.batch_slots.push(index);
-        *budget -= tokens;
-        *credits -= outputs as usize + 1;
-        true
-    }
-
-    fn poll_completion(&mut self) -> Result<bool, EngineError> {
-        let Some(submission) = self.pending else {
-            return Ok(false);
-        };
-        let completion = self
-            .model
-            .as_mut()
-            .expect("engine owns model")
-            .poll(submission);
-        let rows = match completion {
-            Ok(None) => return Ok(false),
-            Ok(Some(rows)) => rows,
-            Err(error) => {
-                self.fault_all(&error);
-                self.flush_terminals()?;
-                return Err(EngineError::Faulted(error));
-            }
-        };
-        if !self.valid_completion(&rows) {
-            let error = ModelError::new(
-                "completion does not match its submitted sequence, prefix, or output budget",
-            );
-            self.fault_all(&error);
-            self.flush_terminals()?;
-            return Err(EngineError::Faulted(error));
-        }
-        self.pending = None;
-        self.reserved_events = 0;
-        // Every row was checked before any logical prefix or output is changed.
-        for (row_index, row) in rows.into_iter().enumerate() {
-            let index = self.batch_slots[row_index];
-            self.commit_row(index, row);
-        }
-        self.batch.clear();
-        self.batch_slots.clear();
-        Ok(true)
-    }
-
-    fn valid_completion(&self, rows: &[StepCompletion]) -> bool {
-        rows.len() == self.batch.len()
-            && rows
-                .iter()
-                .zip(&self.batch)
-                .zip(&self.batch_slots)
-                .all(|((row, item), &index)| {
-                    let Some(sequence) = self.slots[index].as_ref() else {
-                        return false;
-                    };
-                    if sequence.work == WorkState::Idle
-                        || sequence.id != row.sequence
-                        || row.sequence != item.sequence
-                        || sequence.prefix != item.prefix
-                    {
-                        return false;
-                    }
-                    let Some(advance) = row.prefix.checked_sub(item.prefix) else {
-                        return false;
-                    };
-                    let Ok(outputs) = u32::try_from(row.tokens.len()) else {
-                        return false;
-                    };
-                    match item.kind {
-                        StepKind::Prefill => {
-                            advance == item.token_budget && outputs == item.output_budget
-                        }
-                        StepKind::Decode => {
-                            advance > 0
-                                && advance <= item.token_budget
-                                && outputs == advance
-                                && outputs <= item.output_budget
-                        }
-                    }
-                })
-    }
-
-    fn commit_row(&mut self, index: usize, row: StepCompletion) {
-        let sequence = self.slots[index]
-            .as_mut()
-            .expect("validated completion slot");
-        let cancelled = sequence.work == WorkState::Cancelling;
-        sequence.work = WorkState::Idle;
-        sequence.prefix = row.prefix;
-        if cancelled {
-            self.terminate(index, FinishReason::Cancelled);
-            return;
-        }
-        let mut reason = None;
-        for token in row.tokens {
-            sequence.generated += 1;
-            if sequence.options.stop_tokens.contains(&token) {
-                reason = Some(FinishReason::Stop);
-                break;
-            }
-            self.events.push_back(Event::Token {
-                request: sequence.request,
-                token,
-            });
-            if sequence.generated == sequence.options.max_output_tokens {
-                reason = Some(FinishReason::Length);
-                break;
-            }
-        }
-        if let Some(reason) = reason {
-            self.terminate(index, reason);
-        } else if sequence.prefix < sequence.prompt_tokens {
-            self.prefill.push_back(index);
-        } else {
-            self.decode.push_back(index);
-        }
-    }
-
     fn terminate(&mut self, index: usize, reason: FinishReason) {
         let sequence = self.slots[index].as_mut().expect("terminal slot exists");
         if sequence.terminal.is_some() {
@@ -632,17 +446,18 @@ impl Engine {
                 .pop_front()
                 .expect("terminal queue was nonempty");
             let sequence = self.slots[index].as_mut().expect("terminal slot exists");
-            if !sequence.notified
-                && self.events.len() + self.reserved_events < self.config.max_buffered_events
-            {
-                self.events.push_back(Event::Finished {
-                    request: sequence.request,
-                    reason: sequence
-                        .terminal
-                        .as_ref()
-                        .expect("terminal reason exists")
-                        .clone(),
-                });
+            if !sequence.notified && self.output.credits(sequence.output) > 0 {
+                self.output.push_to(
+                    sequence.output,
+                    Event::Finished {
+                        request: sequence.request,
+                        reason: sequence
+                            .terminal
+                            .as_ref()
+                            .expect("terminal reason exists")
+                            .clone(),
+                    },
+                );
                 sequence.notified = true;
             }
             if !self.uncertain
@@ -663,11 +478,11 @@ impl Engine {
         Ok(())
     }
 
-    fn fault_all(&mut self, error: &ModelError) {
+    fn fault_all(&mut self, error: &ExecutionError) {
         self.fault = Some(error.clone());
         self.uncertain = true;
         self.pending = None;
-        self.reserved_events = 0;
+        self.release_output_reservations();
         self.waiting.clear();
         self.prefill.clear();
         self.decode.clear();
@@ -700,60 +515,3 @@ fn next_id() -> Result<u64, EngineError> {
         })
         .map_err(|_| EngineError::IdentityExhausted)
 }
-
-fn validate_policy(policy: SchedulePolicy, info: &ModelInfo) -> Result<(), EngineError> {
-    if policy.max_batch_tokens == 0
-        || policy.prefill_chunk_tokens == 0
-        || policy.decode_tokens == 0
-        || policy.max_decode_only_steps == 0
-        || policy.max_batch_tokens > info.limits.max_batch_tokens
-        || policy.decode_tokens > info.limits.max_decode_tokens
-    {
-        return Err(EngineError::InvalidConfig);
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EngineError {
-    InvalidConfig,
-    InvalidRequest,
-    QueueFull,
-    UnknownRequest(RequestId),
-    IdentityExhausted,
-    Closed,
-    Model(ModelError),
-    Faulted(ModelError),
-}
-
-impl From<ModelError> for EngineError {
-    fn from(error: ModelError) -> Self {
-        Self::Model(error)
-    }
-}
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidConfig => {
-                f.write_str("engine/policy limits are invalid or exceed the prepared model")
-            }
-            Self::InvalidRequest => {
-                f.write_str("input/output token limits are invalid or exceed the model context")
-            }
-            Self::QueueFull => f.write_str("request queue or queued-input token budget is full"),
-            Self::UnknownRequest(request) => {
-                write!(f, "request {} is unknown or reclaimed", request.get())
-            }
-            Self::IdentityExhausted => f.write_str("runtime identity space is exhausted"),
-            Self::Closed => f.write_str("engine is closed"),
-            Self::Model(error) => error.fmt(f),
-            Self::Faulted(error) => write!(
-                f,
-                "engine is faulted; shutdown retains cleanup ownership: {error}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EngineError {}

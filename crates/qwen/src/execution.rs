@@ -7,7 +7,7 @@ use engine_core::{
     RequestId, SamplingParams, StateManager,
 };
 use ribn::{
-    Admission, BatchItem, ModelError, ModelInfo, SequenceId, StepCompletion, StepKind,
+    Admission, BatchItem, ExecutionError, ExecutorInfo, SequenceId, StepCompletion, StepKind,
     SubmissionId, TokenRequest,
 };
 
@@ -32,7 +32,7 @@ struct Pending {
 /// Generic backend injection lets host tests exercise the real lease protocol.
 pub(crate) struct QwenExecution<B> {
     pub(crate) backend: B,
-    info: ModelInfo,
+    info: ExecutorInfo,
     plan: ExecutionPlan,
     manager: LogicalStateManager,
     sequences: HashMap<SequenceId, Sequence>,
@@ -44,7 +44,7 @@ pub(crate) struct QwenExecution<B> {
 impl<B: ComputeBackend> QwenExecution<B> {
     pub(crate) fn new(
         backend: B,
-        info: ModelInfo,
+        info: ExecutorInfo,
         plan: ExecutionPlan,
         manager: LogicalStateManager,
         vocabulary_size: u32,
@@ -61,7 +61,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
         }
     }
 
-    pub(crate) fn info(&self) -> &ModelInfo {
+    pub(crate) fn info(&self) -> &ExecutorInfo {
         &self.info
     }
 
@@ -69,12 +69,12 @@ impl<B: ComputeBackend> QwenExecution<B> {
         &mut self,
         id: SequenceId,
         request: &TokenRequest,
-    ) -> Result<Admission, ModelError> {
+    ) -> Result<Admission, ExecutionError> {
         if self.faulted {
-            return Err(ModelError::new("Qwen execution is faulted"));
+            return Err(ExecutionError::new("Qwen execution is faulted"));
         }
         if self.sequences.contains_key(&id) {
-            return Err(ModelError::new("duplicate sequence"));
+            return Err(ExecutionError::new("duplicate sequence"));
         }
         let total = u32::try_from(request.tokens.len())
             .ok()
@@ -88,12 +88,12 @@ impl<B: ComputeBackend> QwenExecution<B> {
                 .chain(&request.options.stop_tokens)
                 .any(|&token| token >= self.vocabulary_size)
         {
-            return Err(ModelError::new(
+            return Err(ExecutionError::new(
                 "Qwen input/output limits or token IDs are invalid",
             ));
         }
         if request.options.sampling.temperature != 0.0 {
-            return Err(ModelError::new(
+            return Err(ExecutionError::new(
                 "the experimental Qwen adapter currently supports greedy sampling only",
             ));
         }
@@ -122,66 +122,65 @@ impl<B: ComputeBackend> QwenExecution<B> {
         Ok(Admission::Ready)
     }
 
-    fn segment(&self, item: &BatchItem) -> Result<ExecutionSegment, ModelError> {
+    fn segment(&self, item: &BatchItem) -> Result<ExecutionSegment, ExecutionError> {
         let sequence = self
             .sequences
             .get(&item.sequence)
-            .ok_or_else(|| ModelError::new("unknown Qwen sequence"))?;
+            .ok_or_else(|| ExecutionError::new("unknown Qwen sequence"))?;
         let state = sequence
             .state
             .as_ref()
-            .ok_or_else(|| ModelError::new("Qwen sequence is in flight"))?;
+            .ok_or_else(|| ExecutionError::new("Qwen sequence is in flight"))?;
         let end = item
             .prefix
             .checked_add(item.token_budget)
-            .ok_or_else(|| ModelError::new("Qwen prefix overflow"))?;
+            .ok_or_else(|| ExecutionError::new("Qwen prefix overflow"))?;
         if item.token_budget == 0
             || state.token_position() != Some(item.prefix)
             || end > self.info.limits.context_tokens
         {
-            return Err(ModelError::new(
+            return Err(ExecutionError::new(
                 "Qwen work does not match the sequence prefix/capacity",
             ));
         }
-        let (phase, input) =
-            match item.kind {
-                StepKind::Prefill => {
-                    if end > sequence.prompt_len
-                        || item.output_budget != u32::from(end == sequence.prompt_len)
-                    {
-                        return Err(ModelError::new("Qwen prefill boundary/output mismatch"));
-                    }
-                    (
-                        ExecutionPhase::Prefill,
-                        ExecutionTokenInput::prompt(
-                            Arc::clone(sequence.prompt.as_ref().ok_or_else(|| {
-                                ModelError::new("Qwen prompt was already consumed")
-                            })?),
-                            item.prefix,
-                            item.token_budget,
-                        )
-                        .map_err(model_error)?,
-                    )
+        let (phase, input) = match item.kind {
+            StepKind::Prefill => {
+                if end > sequence.prompt_len
+                    || item.output_budget != u32::from(end == sequence.prompt_len)
+                {
+                    return Err(ExecutionError::new("Qwen prefill boundary/output mismatch"));
                 }
-                StepKind::Decode => {
-                    if item.token_budget != 1
-                        || item.output_budget != 1
-                        || item.prefix < sequence.prompt_len
-                    {
-                        return Err(ModelError::new(
-                            "Qwen adapter only supports one-token ordinary decode",
-                        ));
-                    }
-                    (
-                        ExecutionPhase::Decode,
-                        ExecutionTokenInput::decode(
-                            sequence
-                                .next
-                                .ok_or_else(|| ModelError::new("Qwen decode has no next token"))?,
-                        ),
+                (
+                    ExecutionPhase::Prefill,
+                    ExecutionTokenInput::prompt(
+                        Arc::clone(sequence.prompt.as_ref().ok_or_else(|| {
+                            ExecutionError::new("Qwen prompt was already consumed")
+                        })?),
+                        item.prefix,
+                        item.token_budget,
                     )
+                    .map_err(model_error)?,
+                )
+            }
+            StepKind::Decode => {
+                if item.token_budget != 1
+                    || item.output_budget != 1
+                    || item.prefix < sequence.prompt_len
+                {
+                    return Err(ExecutionError::new(
+                        "Qwen adapter only supports one-token ordinary decode",
+                    ));
                 }
-            };
+                (
+                    ExecutionPhase::Decode,
+                    ExecutionTokenInput::decode(
+                        sequence
+                            .next
+                            .ok_or_else(|| ExecutionError::new("Qwen decode has no next token"))?,
+                    ),
+                )
+            }
+        };
         let segment = ExecutionSegment::new_shared(
             RequestId::new(item.sequence.get()).expect("engine sequence ID"),
             phase,
@@ -200,9 +199,9 @@ impl<B: ComputeBackend> QwenExecution<B> {
         })
     }
 
-    pub(crate) fn submit(&mut self, items: &[BatchItem]) -> Result<SubmissionId, ModelError> {
+    pub(crate) fn submit(&mut self, items: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         if self.faulted || self.pending.is_some() {
-            return Err(ModelError::new("Qwen execution is faulted or busy"));
+            return Err(ExecutionError::new("Qwen execution is faulted or busy"));
         }
         let tokens = items
             .iter()
@@ -210,7 +209,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
         if items.len() > self.info.limits.max_sequences
             || tokens.is_none_or(|tokens| tokens > self.info.limits.max_batch_tokens)
         {
-            return Err(ModelError::new("Qwen batch exceeds prepared limits"));
+            return Err(ExecutionError::new("Qwen batch exceeds prepared limits"));
         }
         let segments = items
             .iter()
@@ -261,13 +260,13 @@ impl<B: ComputeBackend> QwenExecution<B> {
     pub(crate) fn poll(
         &mut self,
         id: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ModelError> {
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         let pending = self
             .pending
             .as_ref()
-            .ok_or_else(|| ModelError::new("unknown Qwen submission"))?;
+            .ok_or_else(|| ExecutionError::new("unknown Qwen submission"))?;
         if pending.id.get() != id.get() {
-            return Err(ModelError::new("Qwen submission identity mismatch"));
+            return Err(ExecutionError::new("Qwen submission identity mismatch"));
         }
         let event = match self.backend.poll(pending.id) {
             Ok(None) => return Ok(None),
@@ -292,9 +291,9 @@ impl<B: ComputeBackend> QwenExecution<B> {
         &mut self,
         pending: &mut Pending,
         event: &ExecutionBatchEvent,
-    ) -> Result<Vec<StepCompletion>, ModelError> {
+    ) -> Result<Vec<StepCompletion>, ExecutionError> {
         if event.len() != pending.items.len() {
-            return Err(ModelError::new("Qwen completion row count mismatch"));
+            return Err(ExecutionError::new("Qwen completion row count mismatch"));
         }
         for (segment, result) in pending.batch.segments().iter().zip(event.events()) {
             if result.request() != segment.request()
@@ -306,7 +305,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
                     .output_token()
                     .is_some_and(|token| token >= self.vocabulary_size)
             {
-                return Err(ModelError::new(
+                return Err(ExecutionError::new(
                     "Qwen completion does not match submitted work",
                 ));
             }
@@ -344,14 +343,14 @@ impl<B: ComputeBackend> QwenExecution<B> {
             .collect())
     }
 
-    pub(crate) fn release(&mut self, id: SequenceId) -> Result<(), ModelError> {
+    pub(crate) fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {
         let Some(sequence) = self.sequences.get(&id) else {
             return Ok(());
         };
         let state = sequence
             .state
             .as_ref()
-            .ok_or_else(|| ModelError::new("cannot release in-flight Qwen state"))?;
+            .ok_or_else(|| ExecutionError::new("cannot release in-flight Qwen state"))?;
         self.backend
             .release_inference_state(state)
             .map_err(model_error)?;
@@ -362,11 +361,11 @@ impl<B: ComputeBackend> QwenExecution<B> {
 
     /// After the CUDA owner establishes a stream barrier, collect pending
     /// outcomes to return leases. Shutdown may discard their unreported output.
-    pub(crate) fn drain_after_barrier(&mut self) -> Result<(), ModelError> {
+    pub(crate) fn drain_after_barrier(&mut self) -> Result<(), ExecutionError> {
         if let Some(pending) = self.pending.as_ref() {
             let id = SubmissionId::new(pending.id.get());
             if self.poll(id)?.is_none() {
-                return Err(ModelError::new(
+                return Err(ExecutionError::new(
                     "Qwen submission remained pending after synchronization",
                 ));
             }
@@ -375,8 +374,8 @@ impl<B: ComputeBackend> QwenExecution<B> {
     }
 }
 
-pub(crate) fn model_error(error: impl std::fmt::Display) -> ModelError {
-    ModelError::new(error.to_string())
+pub(crate) fn model_error(error: impl std::fmt::Display) -> ExecutionError {
+    ExecutionError::new(error.to_string())
 }
 
 #[cfg(test)]

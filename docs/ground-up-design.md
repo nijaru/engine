@@ -1,0 +1,200 @@
+# Ground-up design and alignment
+
+Date: 2026-09-11 (America/Los_Angeles)
+Status: target design with an explicit implementation gap map
+Baseline reviewed: `4787885949c4f89f6ed62a9757e3daef88fdf667`
+
+## What I would build without the existing code
+
+Ribn should be a small, stateful execution runtime with reusable model and device
+implementations, not a universal model compiler and not a separate bespoke engine
+for every model. Stable application behavior comes from keeping changing model
+mechanisms below explicit task, preparation, resource, and completion contracts.
+
+The public entry point should do the ordinary work automatically: resolve an
+artifact, identify its architecture, validate the requested task/options, choose
+an eligible execution implementation, prepare it, and return an observable ready
+handle. Experts can override those decisions without assembling queues, layer
+catalogues, state shapes, and CUDA streams in application code.
+
+The execution interface should operate on a prepared task. Generation is the
+first task, not the definition of inference. Embedding, transcription, and
+iterative image generation may share loading, memory, readiness, cancellation,
+and diagnostics without pretending they share a prefill/decode state machine.
+A new attention mechanism should not change the generation API; a genuinely new
+task may require an additive task interface.
+
+## Boundaries and the data they own
+
+| Boundary | Owned information and responsibility | Kept out |
+| --- | --- | --- |
+| Application/task API | Inputs, output semantics, cancellation, bounded result streams | Model layer geometry and device allocations |
+| Artifact reader | Container metadata, tensor directory, encoded bytes, exact source identity | Request scheduling and architecture execution |
+| Model definition | Validated model dimensions, layer semantics, parameter roles, input preparation rules | GGUF field names, CUDA pointers, serving queues |
+| Preparation | Resolve definition + artifact + device + options into a supported execution; report identity, limits, costs, readiness | Per-token expensive search or compilation |
+| Task runtime | Sequence identity, committed progress, admission, scheduling, output, failure ownership | KV/GDN/MoE families and physical state formats |
+| Model executor | Concrete forward/speculation algorithms, typed continuation bundle, execution-local resource decisions | Fleet allocation and application protocols |
+| Device implementation | Allocations, transfers, streams, completion, kernels, vendor primitives | Application request semantics |
+
+These are ownership boundaries, not a mandate for seven traits, crates, threads,
+or processes. The code should have fewer modules when there is no independent
+lifetime or implementation choice to justify a split.
+
+### Model portability is not just an opaque handle
+
+A coarse executor interface insulates the scheduler, but a model author should
+not have to rebuild tokenization, lifecycle, scheduling, diagnostics, sampling,
+and every kernel to implement it. Reuse validated model configuration and math;
+reuse device primitives when their layouts and numerical contracts really match.
+Keep specialized attention, routing, packed projections, and state allocators
+replaceable. Do not standardize a lowest-common-denominator operator graph to
+make every backend look identical.
+
+The useful change matrix is:
+
+| Change | Expected place to change |
+| --- | --- |
+| Checkpoint revision with the same architecture | Artifact/configuration and requalification |
+| GGUF to another container | Reader and tensor/metadata mapping; not generation lifecycle |
+| Another valid model geometry | Model configuration and backend preparation/kernels as needed |
+| New attention/state mechanism | Model definition/execution and physical state; not request queues |
+| Different GPU vendor | Device implementation and model lowering where required |
+| Different speculative proposer | Executor composition and qualification; accepted-result contract remains |
+| New input/output task | A task adapter/API, with shared resource and lifecycle rules where applicable |
+
+New kernels are legitimate work. Editing the common request scheduler for each
+new attention mechanism is not. Moving code between files does not by itself
+establish portability or numerical correctness.
+
+## Preparation and resources
+
+Model identity, artifact identity, prepared execution identity, and sequence ID
+are different things. A prepared execution binds exact weight bytes/revision,
+model implementation, numerical policy, device capability/runtime, kernel set,
+state encoding/layout, capture mode, speculation, and distributed layout where
+relevant. Use a canonical, versioned compatibility manifest for automatic
+selection, persistent preparation products, and state reuse. A display label or
+caller-authored string with missing dimensions is not proof of compatibility.
+
+Preparation reports why it selected an implementation, whether it is experimental
+or qualified for the exact scope, required and optional work, estimated versus
+actual memory, and readiness. Failure should identify the unsupported geometry,
+option, artifact, or resource budget before a long load wherever possible.
+Ordinary users should not need a manual compile ceremony.
+
+A process-local resource owner can share device/model allocations across task
+instances later. Executors must expose actual reservations, capacity pressure,
+and materialization cost to policy without exposing model tensor internals.
+Keeping state opaque must not turn the scheduler into a blind token counter.
+The existing admission result (`Ready`/`Deferred`) is a useful minimum, not the
+complete resource/cost interface. Build that richer interface against real paging,
+host lookup, or multi-executor contention measurements rather than guessed fields.
+
+Live scheduling policy can change at step boundaries. A different physical layout,
+precision, backend, or model requires a prepared replacement and compatible state
+migration or draining—not merely changing a live flag. Fleet placement remains
+external; a process-local resource budget is not a cluster scheduler.
+
+## Fast path and correctness
+
+Keep active requests in stable slots. Prepare only incremental batch metadata;
+separate persistent CPU state from memory borrowed by asynchronous device work.
+Do not reuse a staging allocation until completion proves it is no longer read.
+Validate immutable model/implementation compatibility during preparation, and
+retain per-submission validation of mutable identity, prefix, budgets, and results.
+
+The state model must distinguish allocated capacity, valid continuation contents,
+physical work that is in flight, and committed output. A nonzero position is not
+proof of retained state. Restoring/forking a prefix needs exact compatible content
+and a completed materialization operation. Recurrent state, sparse structures,
+shared state, and compressed state need not share one physical allocation shape.
+
+Generation consumes inputs and produces outputs; those counts are not identical
+at every lifecycle boundary. Final prefill produces the first token without
+consuming it. Speculative execution may compute more work than it commits. Only
+accepted progress appears in public completion. Stop handling must not expose
+rejected output or silently reuse state beyond a stopped prefix.
+
+Output must have per-request limits as well as an aggregate bound. Reserve credits
+before submitting work. One client should not consume the whole output budget
+when other admitted clients have credits. Preserve each request's order; a global
+arrival order across clients is not a generation semantic. Execution state can
+be reclaimed while committed output remains deliverable.
+
+Cancellation is intent, not completion. Failed submission can leave partially
+queued work; failed release can leave an allocation owner. Retain a retry or
+quarantine owner rather than reconstructing state from counters. Explicit shutdown
+must report uncertainty. Conservative retention after a failed device barrier is
+preferable to freeing memory that may still be device-visible, but a leak is a
+fault containment policy, not successful cleanup.
+
+A ground-up fast path would support asynchronous completion/wakeup integration
+and independently schedulable work without unnecessary host/device barriers.
+Overlap, multiple batches, and graph execution still require proof of dependency,
+cancellation, and buffer lifetimes. They are not obtained merely by naming a
+method `submit`.
+
+## Alignment implemented in this pass
+
+| Gap at the reviewed baseline | Change made | What remains |
+| --- | --- | --- |
+| `PreparedModel` implied universal inference while its contract was token generation | Renamed to `GenerationExecutor`; metadata is `ExecutorInfo`/`GenerationLimits`, errors are `ExecutionError` | Other task interfaces are not implemented |
+| Qwen model definition lived in the GGUF reader | `QwenConfig` and layer classification now live in `engine-qwen`, with no normal dependency when its features are disabled | The existing forward executor is still fixed-shape |
+| The format reader exported Qwen-specific providers | `QwenGguf` owns metadata/tensor mapping in the model package; the GGUF crate no longer knows the model | Safetensors and normalized weight-binding portability need a real second adapter |
+| Neutral core exported NVIDIA submission glue | Moved the adapter and its integration tests into the NVIDIA package | The legacy execution/state types still need staged retirement |
+| One shared event queue let a slow consumer stop peers | Per-request mailboxes, aggregate and local credits, request-specific draining, bounded ready-list membership | Aggregate saturation and occupied model capacity still backpressure work; disconnect/wakeup integration is not done |
+| Output isolation initially added repeated hashing | Stable mailbox slots for the execution path; public request lookup is separate | No allocation-free or inference speedup claim |
+| New engine combined configuration, selection, completion, and output internals in one file | Separate modules with one request owner, not another scheduler abstraction | Lifecycle remains conservative and one batch is in flight |
+| Defaults could exceed a small prepared model's limits | `Engine::with_defaults` derives compatible sequence/token limits | General model/variant resolution is not implemented |
+| A local CLI was named `engine-server` | Package `ribn-cli`, binary `ribn`, and CPU-only `inspect` | `serve`, broad model auto-detection, packaging and SDK wrappers remain |
+
+Production dependency direction is checked by `tools/check-boundaries.py` in CI.
+Format-free configuration tests run without GGUF/CUDA features. Contract tests
+cover a stalled client beside a progressing peer, event delivery after execution
+slot reuse, mixed draining, credit reservations, and model-compatible defaults.
+These are concrete boundary and lifecycle tests, not model-quality tests.
+
+## Remaining distance from the ground-up target
+
+**Execution portability is the largest remaining gap.** The CUDA Qwen body still
+uses pinned dimensions and serialized tensor names in parts of its execution
+implementation. Introduce a validated backend preparation/profile description,
+normalize weight roles, and replace fixed assumptions incrementally. Reuse the
+current numerical references. Do not accept arbitrary configurations while
+quietly running kernels for the original geometry.
+
+**The compatibility bridge is not the destination.** `QwenCuda` still translates
+to legacy segments and state leases; `core` still compiles old runtime code and
+Qwen still uses old fixed-context state reservations. Run the GPU cutover gate,
+then remove this translation and the old serving runtime. Kernel migration and
+request-runtime retirement are different proof gates. Do not add a third runtime
+or maintain parallel feature roadmaps.
+
+**Preparation, resource observability, and asynchronous integration remain thin.**
+The current code has memory checks, explicit admission, synchronous preparation,
+one in-flight batch, and polling. It lacks the full resource report, canonical
+qualification/selection manifest, state restore/reuse, wakeup integration, and
+multi-executor memory coordination described above. A persistent release failure
+can still stall normal driving; retry/quarantine telemetry and independent cleanup
+progress need a specific design and fault tests before network serving.
+
+The API is experimental. These changes align the code with the target; they do
+not make every item in the target implemented or hardware-qualified.
+
+## External evidence checked for this decision
+
+These primary sources support the engineering pressures, not a claim that Ribn
+has matched their performance or implemented their complete architecture:
+
+- [vLLM Model Runner V2](https://docs.vllm.ai/en/stable/design/model_runner_v2/):
+  separates persistent request state from per-step inputs and uses incremental
+  device metadata. This supports stable slots and explicit async staging lifetime.
+- [TensorRT-LLM PyTorch architecture](https://nvidia.github.io/TensorRT-LLM/latest/torch/arch_overview.html):
+  separates execution/scheduling and resource managers with prepare/update/free
+  operations. This supports exposing resource behavior without a universal tensor
+  representation in the request scheduler.
+- [vLLM hybrid cache manager](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/):
+  describes grouping and padding needed by its shared-page allocation design.
+  Ribn should not impose a common physical page size on every continuation type.
+
+The boundary decisions and gap map above are this project's design judgments.

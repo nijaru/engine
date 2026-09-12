@@ -137,23 +137,23 @@ fn gdn_conv_step(qkv_mixed: &[f32], ssm_conv1d: &[f32], conv: &mut [f32]) -> (Ve
 
 /// Dequantized weights for one GDN layer, in GGUF flat order.
 pub struct GdnLayerWeights {
-    /// `attn_qkv` [5120][10240].
+    /// `attn_qkv` `[5120][10240]`.
     pub attn_qkv: Vec<f32>,
-    /// `attn_gate` [5120][6144].
+    /// `attn_gate` `[5120][6144]`.
     pub attn_gate: Vec<f32>,
-    /// `ssm_beta` [5120][48].
+    /// `ssm_beta` `[5120][48]`.
     pub ssm_beta: Vec<f32>,
-    /// `ssm_alpha` [5120][48].
+    /// `ssm_alpha` `[5120][48]`.
     pub ssm_alpha: Vec<f32>,
-    /// `ssm_dt.bias` [48].
+    /// `ssm_dt.bias` `[48]`.
     pub ssm_dt_bias: Vec<f32>,
-    /// `ssm_a` [48], already `-exp(A_log)`.
+    /// `ssm_a` `[48]`, already `-exp(A_log)`.
     pub ssm_a: Vec<f32>,
-    /// `ssm_conv1d` [4][10240], element (tap, channel) at tap + channel*4.
+    /// `ssm_conv1d` `[4][10240]`, element (tap, channel) at tap + channel*4.
     pub ssm_conv1d: Vec<f32>,
-    /// `ssm_norm` [128], NOT +1'd.
+    /// `ssm_norm` `[128]`, NOT +1'd.
     pub ssm_norm: Vec<f32>,
-    /// `ssm_out` [6144][5120].
+    /// `ssm_out` `[6144][5120]`.
     pub ssm_out: Vec<f32>,
 }
 
@@ -313,17 +313,17 @@ pub const ATTN_ROPE_BASE: f32 = 1.0e7;
 
 /// Dequantized weights for one full-attention layer, in GGUF flat order.
 pub struct AttnLayerWeights {
-    /// `attn_q` [5120][12288], per-head `[q(256) | gate(256)]` at stride 512.
+    /// `attn_q` `[5120][12288]`, per-head `[q(256) | gate(256)]` at stride 512.
     pub attn_q: Vec<f32>,
-    /// `attn_k` [5120][1024].
+    /// `attn_k` `[5120][1024]`.
     pub attn_k: Vec<f32>,
-    /// `attn_v` [5120][1024].
+    /// `attn_v` `[5120][1024]`.
     pub attn_v: Vec<f32>,
-    /// `attn_q_norm` [256], raw (already +1'd).
+    /// `attn_q_norm` `[256]`, raw (already +1'd).
     pub attn_q_norm: Vec<f32>,
-    /// `attn_k_norm` [256], raw (already +1'd).
+    /// `attn_k_norm` `[256]`, raw (already +1'd).
     pub attn_k_norm: Vec<f32>,
-    /// `attn_output` [6144][5120].
+    /// `attn_output` `[6144][5120]`.
     pub attn_output: Vec<f32>,
 }
 
@@ -512,11 +512,11 @@ pub const N_FF: usize = 17408;
 
 /// Dequantized FFN weights for one layer, in GGUF flat order.
 pub struct FfnLayerWeights {
-    /// `ffn_gate` [5120][17408].
+    /// `ffn_gate` `[5120][17408]`.
     pub ffn_gate: Vec<f32>,
-    /// `ffn_up` [5120][17408].
+    /// `ffn_up` `[5120][17408]`.
     pub ffn_up: Vec<f32>,
-    /// `ffn_down` [17408][5120].
+    /// `ffn_down` `[17408][5120]`.
     pub ffn_down: Vec<f32>,
 }
 

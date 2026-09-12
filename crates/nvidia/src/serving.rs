@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::NvidiaDispatcher;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream, PinnedHostSlice};
 use engine_core::{
     BackendError, BackendSubmissionId, ExecutionBatch, ExecutionMetrics, ExecutionOutcome,
-    ExecutionPhase, ExecutionPlan, ExecutionSegment, InferenceStateSet, NvidiaDispatcher,
-    WeightBinding,
+    ExecutionPhase, ExecutionPlan, ExecutionSegment, InferenceStateSet, WeightBinding,
 };
 
 use crate::decode::{CudaQwen35BatchDecode, CudaQwen35Decode};

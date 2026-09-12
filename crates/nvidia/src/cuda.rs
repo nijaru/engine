@@ -4,12 +4,13 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::NvidiaDispatcher;
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use engine_core::{
     BackendError, DataType, ExecutionMetrics, ExecutionOutcome, ExecutionPlan, ExecutionSegment,
-    F32BlockStream, InferenceStateSet, NvidiaDispatcher, WeightBinding, WeightTensorSpec,
+    F32BlockStream, InferenceStateSet, WeightBinding, WeightTensorSpec,
 };
 
 const INPUT: [f32; 4] = [1.0, 2.0, 3.0, 4.0];

@@ -4,27 +4,27 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ribn::{
-    Admission, BatchItem, Engine, EngineConfig, GenerationOptions, ModelError, ModelInfo,
-    ModelLimits, PreparedModel, SchedulePolicy, SequenceId, StepCompletion, SubmissionId,
+    Admission, BatchItem, Engine, EngineConfig, ExecutionError, ExecutorInfo, GenerationExecutor,
+    GenerationLimits, GenerationOptions, SchedulePolicy, SequenceId, StepCompletion, SubmissionId,
     TokenRequest,
 };
 
 struct ImmediateModel {
-    info: ModelInfo,
+    info: ExecutorInfo,
     prefixes: HashMap<SequenceId, u32>,
     pending: Option<Vec<StepCompletion>>,
     next_submission: u64,
 }
 
-impl PreparedModel for ImmediateModel {
-    fn info(&self) -> &ModelInfo {
+impl GenerationExecutor for ImmediateModel {
+    fn info(&self) -> &ExecutorInfo {
         &self.info
     }
-    fn admit(&mut self, id: SequenceId, _: &TokenRequest) -> Result<Admission, ModelError> {
+    fn admit(&mut self, id: SequenceId, _: &TokenRequest) -> Result<Admission, ExecutionError> {
         self.prefixes.insert(id, 0);
         Ok(Admission::Ready)
     }
-    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ModelError> {
+    fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         assert!(self.pending.is_none());
         self.next_submission += 1;
         self.pending = Some(
@@ -42,7 +42,7 @@ impl PreparedModel for ImmediateModel {
         );
         Ok(SubmissionId::new(self.next_submission))
     }
-    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ModelError> {
+    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         if let Some(rows) = &self.pending {
             for row in rows {
                 self.prefixes.insert(row.sequence, row.prefix);
@@ -50,12 +50,12 @@ impl PreparedModel for ImmediateModel {
         }
         Ok(self.pending.take())
     }
-    fn release(&mut self, id: SequenceId) -> Result<(), ModelError> {
+    fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {
         assert!(self.pending.is_none());
         self.prefixes.remove(&id);
         Ok(())
     }
-    fn synchronize(&mut self) -> Result<(), ModelError> {
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
         self.pending = None;
         Ok(())
     }
@@ -77,9 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn measure(concurrency: usize) -> Result<(), Box<dyn std::error::Error>> {
     let output_tokens = 10_256;
     let rows = u32::try_from(concurrency)?;
-    let info = ModelInfo {
+    let info = ExecutorInfo {
         name: "synthetic-host-only".into(),
-        limits: ModelLimits {
+        limits: GenerationLimits {
             context_tokens: output_tokens + 1,
             max_sequences: concurrency,
             max_batch_tokens: rows,
@@ -99,6 +99,7 @@ fn measure(concurrency: usize) -> Result<(), Box<dyn std::error::Error>> {
             max_queued_requests: 0,
             max_queued_input_tokens: u64::from(rows),
             max_buffered_events: concurrency * 4,
+            max_events_per_request: 64,
         },
         SchedulePolicy {
             max_batch_tokens: rows,

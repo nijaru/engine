@@ -2,18 +2,18 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 use cudarc::driver::{CudaContext, CudaStream};
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, DataType, DeviceId,
-    ExecutionPhase, ExecutionPlan, ExecutionStage, ModelProvider, NvidiaBackend, PolicyVersion,
-    WeightBinding,
+    ExecutionPhase, ExecutionPlan, ExecutionStage, ModelProvider, PolicyVersion, WeightBinding,
 };
-use engine_gguf::{Qwen35LayerKind, Qwen35ModelProvider};
+use engine_nvidia::NvidiaBackend;
 use engine_nvidia::{
     CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
-use ribn::{ModelError, ModelInfo, ModelLimits};
+use ribn::{ExecutionError, ExecutorInfo, GenerationLimits};
 
 use crate::execution::{QwenExecution, model_error};
 use crate::state;
@@ -63,16 +63,16 @@ pub(crate) struct Resources {
 pub(crate) fn load(
     path: PathBuf,
     options: QwenLoadOptions,
-) -> Result<(Resources, MemoryReport), ModelError> {
+) -> Result<(Resources, MemoryReport), ExecutionError> {
     if options.context_tokens == 0 || options.max_sequences == 0 {
-        return Err(ModelError::new(
+        return Err(ExecutionError::new(
             "Qwen context and sequence limits must be nonzero",
         ));
     }
-    let provider = Qwen35ModelProvider::open_with_kv_block_tokens(path, options.context_tokens)
-        .map_err(model_error)?;
+    let provider =
+        QwenGguf::open_with_kv_block_tokens(path, options.context_tokens).map_err(model_error)?;
     if u64::from(options.context_tokens) > provider.config().context_length() {
-        return Err(ModelError::new(
+        return Err(ExecutionError::new(
             "requested context exceeds the Qwen artifact limit",
         ));
     }
@@ -90,17 +90,17 @@ pub(crate) fn load(
         provider.description().state_requirements(),
         options.max_sequences,
     )
-    .ok_or_else(|| ModelError::new("Qwen state reservation overflow"))?;
+    .ok_or_else(|| ExecutionError::new("Qwen state reservation overflow"))?;
     let context = CudaContext::new(usize::from(options.device)).map_err(model_error)?;
     let stream = context.default_stream();
     let free_before_preparation_bytes =
         u64::try_from(context.mem_get_info().map_err(model_error)?.0).map_err(model_error)?;
     let available = free_before_preparation_bytes.checked_sub(reserved_sequence_bytes)
         .and_then(|bytes| bytes.checked_sub(options.headroom_bytes))
-        .ok_or_else(|| ModelError::new(format!("Qwen state requires {reserved_sequence_bytes} bytes plus {} bytes headroom, but only {free_before_preparation_bytes} bytes are free", options.headroom_bytes)))?;
+        .ok_or_else(|| ExecutionError::new(format!("Qwen state requires {reserved_sequence_bytes} bytes plus {} bytes headroom, but only {free_before_preparation_bytes} bytes are free", options.headroom_bytes)))?;
     let weight_budget_bytes = options.weight_budget_bytes.unwrap_or(available);
     if weight_budget_bytes == 0 || weight_budget_bytes > available {
-        return Err(ModelError::new(format!(
+        return Err(ExecutionError::new(format!(
             "weight budget {weight_budget_bytes} exceeds the available {available} bytes after state/headroom reservations"
         )));
     }
@@ -123,14 +123,14 @@ pub(crate) fn load(
     let free_after_preparation_bytes =
         u64::try_from(context.mem_get_info().map_err(model_error)?.0).map_err(model_error)?;
     if free_after_preparation_bytes < reserved_sequence_bytes {
-        return Err(ModelError::new(format!(
+        return Err(ExecutionError::new(format!(
             "prepared Qwen leaves {free_after_preparation_bytes} free bytes, below its {reserved_sequence_bytes}-byte sequence reservation"
         )));
     }
     let (backend, plan) = prepare_execution(&provider, &context, dispatcher, device)?;
-    let info = ModelInfo {
+    let info = ExecutorInfo {
         name: provider.description().id().to_string(),
-        limits: ModelLimits {
+        limits: GenerationLimits {
             context_tokens: options.context_tokens,
             max_sequences: options.max_sequences,
             max_batch_tokens: 128,
@@ -156,11 +156,11 @@ pub(crate) fn load(
 }
 
 fn prepare_execution(
-    provider: &Qwen35ModelProvider,
+    provider: &QwenGguf,
     context: &Arc<CudaContext>,
     dispatcher: CudaQwen35ServingDispatcher,
     device: DeviceId,
-) -> Result<(Backend, ExecutionPlan), ModelError> {
+) -> Result<(Backend, ExecutionPlan), ExecutionError> {
     let description = provider.description();
     let backend_id = BackendId::new("cuda").map_err(model_error)?;
     let capabilities = BackendCapabilities::new(
@@ -201,12 +201,12 @@ fn prepare_execution(
 }
 
 fn stage_weights(
-    provider: &Qwen35ModelProvider,
+    provider: &QwenGguf,
     device: DeviceId,
     context: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
     budget: u64,
-) -> Result<CudaQwen35Weights, ModelError> {
+) -> Result<CudaQwen35Weights, ExecutionError> {
     let mut names = vec![
         "token_embd.weight".to_owned(),
         "output_norm.weight".to_owned(),
@@ -215,7 +215,7 @@ fn stage_weights(
     let count = provider
         .config()
         .language_layer_count()
-        .ok_or_else(|| ModelError::new("invalid Qwen language layer count"))?;
+        .ok_or_else(|| ExecutionError::new("invalid Qwen language layer count"))?;
     for layer in 0..count {
         let binding = provider
             .layer_weight_binding(device, layer)
@@ -252,22 +252,22 @@ fn stage_weights(
                 }
             })
         })
-        .collect::<Result<Vec<_>, ModelError>>()?;
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
     CudaQwen35Weights::stage(context, stream, budget, tensors).map_err(model_error)
 }
 
-fn layer_kinds(provider: &Qwen35ModelProvider) -> Result<Vec<QwenLayerKind>, ModelError> {
+fn layer_kinds(provider: &QwenGguf) -> Result<Vec<QwenLayerKind>, ExecutionError> {
     let count = provider
         .config()
         .language_layer_count()
-        .ok_or_else(|| ModelError::new("invalid Qwen language layer count"))?;
+        .ok_or_else(|| ExecutionError::new("invalid Qwen language layer count"))?;
     (0..count)
         .map(|layer| {
             provider
                 .layer_kind(layer)
                 .map(|kind| match kind {
-                    Qwen35LayerKind::Recurrent => QwenLayerKind::Recurrent,
-                    Qwen35LayerKind::FullAttention => QwenLayerKind::FullAttention,
+                    GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                    GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
                 })
                 .map_err(model_error)
         })

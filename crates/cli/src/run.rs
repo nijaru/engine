@@ -1,12 +1,13 @@
 use std::io::{self, Write};
 
 use engine_gguf::{ChatMessage, ChatTemplateOptions, GgufFile, GgufTokenizer};
-use engine_qwen::{QwenLoadOptions, QwenPrepared};
+use engine_qwen::{QwenCuda, QwenLoadOptions};
 use ribn::{
     Engine, EngineConfig, Event, FinishReason, GenerationOptions, SchedulePolicy, TokenRequest,
 };
 
-const USAGE: &str = "engine-server run --model <model.gguf> --prompt <text> [--max-tokens <n>] [--device <ordinal>]";
+const USAGE: &str =
+    "ribn run --model <model.gguf> --prompt <text> [--max-tokens <n>] [--device <ordinal>]";
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
     if matches!(arguments, [help] if matches!(help.as_str(), "-h" | "--help")) {
@@ -33,7 +34,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         "preparing Qwen on CUDA device {} (experimental Ribn runtime)",
         options.device
     );
-    let prepared = QwenPrepared::load_gguf(
+    let prepared = QwenCuda::load_gguf(
         options.model,
         QwenLoadOptions {
             device: options.device,
@@ -54,6 +55,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
             max_queued_requests: 0,
             max_queued_input_tokens: u64::from(prompt_tokens),
             max_buffered_events: 16,
+            max_events_per_request: 64,
         },
         SchedulePolicy::default(),
     )

@@ -5,7 +5,7 @@ members = [
     "crates/qwen",
     "crates/gguf",
     "crates/nvidia",
-    "crates/server",
+    "crates/cli",
 ]
 # Hardware-gated CUDA Rust probes: their own workspace, so the toolchain-free
 # workspace build and test above stay that way.
