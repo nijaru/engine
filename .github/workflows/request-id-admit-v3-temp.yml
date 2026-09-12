@@ -1,0 +1,70 @@
+name: Temporary request identity admission refactor v3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/request-id-admit-v3-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Reuse v2 candidate generator
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('.github/workflows/request-id-admit-v2-temp.yml').read_text()
+          section = source.split('      - name: Apply request identity admission refactor\n', 1)[1]
+          section = section.split('      - name: Validate candidate\n', 1)[0]
+          block = section.split('        run: |\n', 1)[1]
+          lines = block.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          Path('/tmp/apply-request-id.sh').write_text(script + '\n')
+          PY
+          bash /tmp/apply-request-id.sh
+      - name: Fix fixture ownership and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/batch/tests/sequential_encoder_decoder.rs')
+          text = path.read_text()
+          text = text.replace(
+              'let first_state = encoder.pop_completed().expect("first state").into_output();',
+              'let first_state = Arc::clone(encoder.pop_completed().expect("first state").output());',
+              1,
+          )
+          text = text.replace(
+              'let second_state = encoder.pop_completed().expect("second state").into_output();',
+              'let second_state = Arc::clone(encoder.pop_completed().expect("second state").output());',
+              1,
+          )
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          python3 tools/check-boundaries.py
+          cargo test --workspace
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo doc --workspace --no-deps --locked
+      - name: Commit validated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add Cargo.lock crates/runtime/src/executor.rs crates/runtime/src/engine.rs crates/runtime/tests/contract.rs crates/runtime/examples/host_overhead.rs crates/qwen/src/cuda.rs crates/qwen/src/execution/tests.rs crates/batch/Cargo.toml crates/batch/tests/sequential_encoder_decoder.rs
+          git commit -m 'Pass request identity through AR admission'
+          git push origin HEAD:main
