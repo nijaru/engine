@@ -117,14 +117,51 @@ impl BertConfig {
         }
 
         let parsed = Self {
-            vocab_size: config_usize(config, "vocab_size")?,
-            hidden_size: config_usize(config, "hidden_size")?,
-            num_hidden_layers: config_usize(config, "num_hidden_layers")?,
-            num_attention_heads: config_usize(config, "num_attention_heads")?,
-            intermediate_size: config_usize(config, "intermediate_size")?,
-            max_position_embeddings: config_usize(config, "max_position_embeddings")?,
-            type_vocab_size: config_usize(config, "type_vocab_size")?,
-            layer_norm_eps: config_f32(config, "layer_norm_eps", 1.0e-12)?,
+            vocab_size: config_usize(
+                config.get("vocab_size").and_then(|value| value.as_u64()),
+                "vocab_size",
+            )?,
+            hidden_size: config_usize(
+                config.get("hidden_size").and_then(|value| value.as_u64()),
+                "hidden_size",
+            )?,
+            num_hidden_layers: config_usize(
+                config
+                    .get("num_hidden_layers")
+                    .and_then(|value| value.as_u64()),
+                "num_hidden_layers",
+            )?,
+            num_attention_heads: config_usize(
+                config
+                    .get("num_attention_heads")
+                    .and_then(|value| value.as_u64()),
+                "num_attention_heads",
+            )?,
+            intermediate_size: config_usize(
+                config
+                    .get("intermediate_size")
+                    .and_then(|value| value.as_u64()),
+                "intermediate_size",
+            )?,
+            max_position_embeddings: config_usize(
+                config
+                    .get("max_position_embeddings")
+                    .and_then(|value| value.as_u64()),
+                "max_position_embeddings",
+            )?,
+            type_vocab_size: config_usize(
+                config
+                    .get("type_vocab_size")
+                    .and_then(|value| value.as_u64()),
+                "type_vocab_size",
+            )?,
+            layer_norm_eps: config_f32(
+                config
+                    .get("layer_norm_eps")
+                    .and_then(|value| value.as_f64()),
+                "layer_norm_eps",
+                1.0e-12,
+            )?,
         };
         parsed.validate()?;
         Ok(parsed)
@@ -152,27 +189,18 @@ impl BertConfig {
     }
 }
 
-fn config_usize(config: &serde_json::Value, key: &'static str) -> Result<usize, ModelError> {
-    let value = config
-        .get(key)
-        .and_then(|value| value.as_u64())
+fn config_usize(value: Option<u64>, key: &'static str) -> Result<usize, ModelError> {
+    let value = value
         .ok_or_else(|| ModelError::InvalidConfig(format!("missing integer field {key}")))?;
     usize::try_from(value)
         .map_err(|_| ModelError::InvalidConfig(format!("field {key} does not fit usize")))
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn config_f32(
-    config: &serde_json::Value,
-    key: &'static str,
-    default: f32,
-) -> Result<f32, ModelError> {
-    let Some(value) = config.get(key) else {
+fn config_f32(value: Option<f64>, key: &'static str, default: f32) -> Result<f32, ModelError> {
+    let Some(value) = value else {
         return Ok(default);
     };
-    let value = value
-        .as_f64()
-        .ok_or_else(|| ModelError::InvalidConfig(format!("field {key} must be numeric")))?;
     if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
         return Err(ModelError::InvalidConfig(format!(
             "field {key} is outside the supported f32 range"
@@ -808,9 +836,9 @@ fn bert_fixture_tensors() -> Vec<TensorFixture> {
             "bert.embeddings.word_embeddings.weight",
             &[3, hidden],
             vec![
-                1.0, 0.0, 0.0, 0.0, // token 0
-                0.0, 1.0, 0.0, 0.0, // token 1
-                0.0, 0.0, 1.0, 0.0, // token 2
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
             ],
         ),
         tensor(
