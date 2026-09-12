@@ -2,6 +2,12 @@
 
 A Rust-first model inference runtime and serving engine.
 
+The goal is state-of-the-art inference performance, model support, and
+reliability in Rust, with familiar CLI, HTTP, and library interfaces. Sensible
+defaults should reduce setup, not remove useful configuration or advanced access.
+This is the product direction, not a claim that the current implementation has
+reached those goals. See the [interface plan](docs/ground-up-design.md#public-interface-direction).
+
 The model-neutral runtime is the `ribn` crate in `crates/runtime`. Its
 `GenerationExecutor` boundary keeps model state, artifact formats, and device execution
 out of the common request scheduler. The first real adapter is Qwen GGUF on CUDA.
@@ -13,8 +19,8 @@ The existing Qwen path has correctness and performance evidence recorded in
 adapter have host contract tests and CUDA-feature compilation checks; their
 integration is **experimental pending GPU qualification**. New model families,
 HTTP serving, multimodal input, and automatic model selection are not implemented.
-The generation contract is task-specific; it does not claim every inference task
-has a prefill/decode lifecycle.
+The generation contract is an internal execution boundary, not a requirement for
+users to choose a task or executor before running a model.
 
 The binary is `ribn`; the package is `ribn-cli`. Metadata inspection needs no GPU:
 
@@ -46,7 +52,7 @@ model loader yet.
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/runtime` (`ribn`) | Model-neutral request ownership, scheduling, output, and prepared-model contract |
+| `crates/runtime` (`ribn`) | Model-neutral request ownership, scheduling, output, and generation-executor contract |
 | `crates/qwen` | Qwen definition, GGUF mapping, and CUDA generation executor |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
 | `crates/gguf` | Generic GGUF reader/tokenizer; model interpretation belongs to the model package |

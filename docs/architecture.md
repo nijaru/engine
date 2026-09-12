@@ -4,7 +4,24 @@ Ribn is a Rust-first inference runtime. The ground-up target is defined in
 [ground-up design](ground-up-design.md); this document describes the implemented
 boundaries. [Roadmap](roadmap.md) lists the remaining proof and retirement gates.
 
-## Task runtime, not a universal model graph
+## Public interfaces and internal execution
+
+The product target is familiar inference-engine CLI, HTTP, and idiomatic Rust
+library interfaces, with sensible defaults and explicit tuning controls. Loading,
+generation, batching, and streaming should be ordinary operations, not require
+users to understand prepared tasks or executor selection. Task selection is
+explicit only when the requested operation and model leave a real ambiguity.
+
+The current `GenerationExecutor`, `BatchItem`, and mailbox APIs support runtime
+and model integration. They are not a requirement for the eventual high-level
+API to expose the same workflow. Internal backpressure should appear as normal
+streaming and capacity/error behavior. Keep useful lower-level access for advanced
+integrations, including device/resource control where supported; hiding that
+control is not an architectural goal. The
+[public-interface direction](ground-up-design.md#public-interface-direction)
+defines the plan; it does not add capabilities to the current CLI or library.
+
+## Generation runtime, not a universal model graph
 
 `crates/runtime` exports `ribn`. The current task is token generation. Its
 `GenerationExecutor` contract is explicit about that scope: admit a sequence,

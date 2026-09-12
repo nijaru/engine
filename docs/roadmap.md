@@ -5,6 +5,13 @@ New runtime work targets `crates/runtime` (`ribn`), not the legacy request layer
 in `crates/core`. [Architecture](architecture.md) defines ownership;
 [the ground-up target](ground-up-design.md) records the research and tradeoffs.
 
+The goal is a state-of-the-art inference engine in Rust. Public UX/DX should
+follow familiar inference-engine conventions, with sensible defaults and useful
+explicit controls. Internal execution contracts do not mandate a new public
+workflow. The [interface direction](ground-up-design.md#public-interface-direction)
+and milestone 4 define this plan; the existing qualification and kernel gates
+remain in place.
+
 ## Status
 
 | Area | Current evidence | Remaining gate |
@@ -84,33 +91,86 @@ supported path for the existing target.
 
 Then remove the duplicate `local` serving path and the old request/scheduler
 runtime. Remove Qwen's temporary batch/lease translation as its backend adopts
-the new boundary directly. NVIDIA submission glue is already relocated; move remaining model-specific helpers
-out of neutral core as their actual owners are established; delete region/phase metadata with no execution role.
+the new boundary directly. NVIDIA submission glue is already relocated; move
+remaining model-specific helpers out of neutral core as their actual owners are
+established; delete region/phase metadata with no execution role.
 
 Qwen configuration and GGUF interpretation are now separate. Normalize remaining
-weight roles and backend shape assumptions before implementing a second artifact format. Serialized GGUF identifiers stay unchanged. Keep tests
-and numerical references independent of optimized implementations. Do not add
-new model features to both old and new runtimes while waiting for cutover.
+weight roles and backend shape assumptions before implementing a second artifact
+format. Serialized GGUF identifiers stay unchanged. Keep tests and numerical
+references independent of optimized implementations. Do not add new model
+features to both old and new runtimes while waiting for cutover.
 
-## 4. Preparation identity, observability, and usable surfaces
+## 4. Familiar interfaces, configuration, and loading diagnostics
+
+Implement the public surfaces around conventional inference operations, not
+around the internal executor lifecycle. Use vLLM/SGLang as serving and offline
+workflow references and llama.cpp as a local CLI reference. Check their actual
+interfaces when selecting flag names and semantics; document a concrete benefit
+for any deliberate difference. This is not a requirement to copy every flag or
+support every feature before delivering a usable interface.
+
+### CLI and library
+
+Target `ribn serve <model>` for serving and `ribn run <model>` for local inference.
+Add prompt, file/stdin, and interactive input with conventional generation options
+as supported. Keep help, exit status, interruption, stdout output, and stderr
+logging predictable. Model source/revision support follows real loader support;
+metadata detection alone is not execution support. Preserve the existing
+`run --model ...` form or provide a documented migration when syntax changes.
+
+Provide an idiomatic Rust model-loading and generation API with batching,
+streaming, typed options, cancellation, and errors. Ordinary callers should not
+construct `BatchItem` records or manage mailbox credits. Retain lower-level
+`GenerationExecutor` and resource access for advanced integrations. Infer the
+operation from the command/API and model; require task selection only to resolve
+real ambiguity. A general task registry is not a prerequisite.
+
+### Explicit configuration and compatible serving
+
+Expose useful supported controls for context length, devices, memory budgets,
+cache policy/precision, batching, parallelism, quantization, and sampling. Document
+names, units, defaults, supported combinations, and precedence for whichever CLI,
+configuration-file, or environment inputs are implemented. Respect explicit
+choices, show the effective configuration, and reject unsupported options rather
+than silently ignoring them. Distinguish live scheduling changes from settings
+that require draining, reload, or preparation.
+
+For HTTP serving, implement and document an OpenAI-compatible subset for supported
+operations. Test existing clients without a Ribn-specific adapter. Include ordinary
+streaming and non-streaming behavior, errors, stop/finish reasons, and usage
+reporting where part of the supported API. Use per-request output limits and add
+disconnect cancellation, wakeups, and bounded input preparation. Compatibility
+must include behavior, not just similar endpoint names. Reuse the same engine;
+keep protocol code outside model execution.
+
+### Evidence and acceptance
+
+- CLI tests cover supported input modes, help/errors, configuration overrides,
+  output/log separation, interruption, and any syntax migration.
+- Rust examples load a supported model and perform ordinary generation, batch,
+  and streaming operations without manually wiring scheduler internals; a separate
+  example demonstrates supported advanced control.
+- Integration tests run selected unmodified HTTP clients against streaming and
+  non-streaming operations. Publish the tested subset and reject unsupported
+  features explicitly; do not claim blanket compatibility.
+- Loading reports effective settings, readiness, unsupported geometry/options,
+  and estimated versus actual memory. Performance/qualification claims remain
+  tied to measured execution, not the existence of the new interface.
 
 Build a canonical, versioned compatibility manifest before automatic execution
 variant selection or persistent reuse. It must cover exact artifact and model
 implementation, physical state representation, backend/runtime/device capability,
 kernels, graph mode, speculation, and distributed layout where applicable.
 Qualification status without matching evidence does not authorize selection.
+Keep this internal to loading/selection; ordinary users should not need to assemble
+manifests to serve an explicitly supported model.
 
-Make readiness, preparation failures, selected variant, memory estimates versus
-actual usage, queue delay, prefill/decode cost, cancellation, and retained fault
-resources visible. Split live scheduling changes from settings that require
-quiescence or re-preparation. Unsupported settings must fail explicitly.
-
-The `ribn` CLI and CPU-only artifact inspection now exist. Complete a small
-application API, model/backend resolution, and hardware diagnostics before an
-extensive flag surface. A network
-surface must use the implemented per-request output limits and add disconnect
-cancellation, wakeups, structured errors, and bounded input preparation. Reuse the same
-Engine; keep HTTP/chat protocols outside model execution. A network service, model auto-resolution, and hardware diagnostics are not shipped.
+The current `ribn` CLI and CPU-only artifact inspection exist. A network service,
+model auto-resolution, hardware diagnostics, the broader input modes, and the
+high-level library API described here are not shipped by this plan update.
+This clarification does not replace the GPU qualification or kernel work above
+with a public-API framework project.
 
 ## 5. Optimize measured execution and state costs
 

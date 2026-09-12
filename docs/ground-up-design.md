@@ -6,33 +6,76 @@ Baseline reviewed: `4787885949c4f89f6ed62a9757e3daef88fdf667`
 
 ## What I would build without the existing code
 
-Ribn should be a small, stateful execution runtime with reusable model and device
-implementations, not a universal model compiler and not a separate bespoke engine
-for every model. Stable application behavior comes from keeping changing model
-mechanisms below explicit task, preparation, resource, and completion contracts.
+Ribn's goal is a state-of-the-art inference engine in Rust. Judge progress by
+correctness, model support, latency, throughput, memory use, reliability, and
+usability on real workloads. The architecture should support those goals with
+reusable model and device implementations, not become a separate product or a
+universal model compiler.
 
-The public entry point should do the ordinary work automatically: resolve an
-artifact, identify its architecture, validate the requested task/options, choose
-an eligible execution implementation, prepare it, and return an observable ready
-handle. Experts can override those decisions without assembling queues, layer
-catalogues, state shapes, and CUDA streams in application code.
+Keep changing model mechanisms below the request and scheduling interfaces.
+Loading should validate model/backend support and prepare execution, but those
+internal steps do not define the public workflow. Ordinary users load or serve
+a model and submit requests; advanced users can configure and integrate the
+supported execution mechanisms directly where useful.
 
-The execution interface should operate on a prepared task. Generation is the
-first task, not the definition of inference. Embedding, transcription, and
-iterative image generation may share loading, memory, readiness, cancellation,
-and diagnostics without pretending they share a prefill/decode state machine.
-A new attention mechanism should not change the generation API; a genuinely new
-task may require an additive task interface.
+Internally, generation has a prefill/decode lifecycle. Other inference operations
+may need different execution contracts when implemented. This is not a mandate
+for a user-visible task system or a generic framework before useful model
+execution. A new attention mechanism should not change the generation API.
+
+## Public interface direction
+
+Ribn should provide familiar inference-server, command-line, and library
+interfaces, with sensible defaults and explicit configuration. Follow established
+conventions unless a concrete usability, performance, or correctness benefit
+justifies a difference. Rust changes the implementation, not the workflow users
+must learn to run a model.
+
+The following are interface targets, not a list of shipped capabilities:
+
+| Surface | Planned experience |
+| --- | --- |
+| Serving | `ribn serve <model>` with conventional server options and OpenAI-compatible HTTP operations for the supported subset; existing clients should not need a Ribn-specific protocol |
+| Local inference | `ribn run <model>` with prompt, file/stdin input, interactive use, and familiar generation options as implemented |
+| Rust library | Idiomatic model loading, generation, batching, and streaming, with typed configuration and errors; retain lower-level executor/device integration where useful |
+| Configuration | Explicit model source/revision, context, device, memory, cache, batching, quantization/precision, parallelism, and sampling controls as those capabilities are implemented |
+
+Use vLLM and SGLang as references for serving/offline workflows and llama.cpp for
+local execution conventions. Review their actual interfaces before choosing exact
+flags or signatures. Choose consistent semantics for each surface rather than
+combining every option or preserving incompatible quirks. Record a concrete
+reason for deliberate deviations; a new internal abstraction is not such a reason.
+
+Normally infer the operation from the requested API/command and model metadata.
+Ask for an explicit task selection only when there is a real ambiguity. Model
+loading may select a compatible backend by default, but must respect explicit
+choices, show the effective configuration, and reject unsupported combinations.
+Do not silently change numerical policy or ignore a user override.
+
+Ordinary callers should not need to assemble cache allocations, scheduler queues,
+execution plans, or streams. This does not prohibit advanced control over cache
+policy, memory placement, batching, device resources, or execution. Keep useful
+low-level access with clear ownership and safety contracts. Likewise, expose
+ordinary streaming responses or an idiomatic Rust stream rather than requiring
+application callers to manage internal mailbox credits.
+
+Document CLI/configuration precedence, option units, defaults, errors, and supported
+HTTP behavior. Test compatibility with selected unmodified clients before claiming
+it. Show unsupported features explicitly instead of accepting ineffective options.
+Existing `run --model ...` examples remain valid until an intentional syntax
+migration is implemented and documented. `serve`, positional model syntax for
+`run`, interactive input, and the high-level library surface are plans, not new
+features introduced by this document.
 
 ## Boundaries and the data they own
 
 | Boundary | Owned information and responsibility | Kept out |
 | --- | --- | --- |
-| Application/task API | Inputs, output semantics, cancellation, bounded result streams | Model layer geometry and device allocations |
+| High-level API | Inputs, output semantics, cancellation, and streaming responses | Required assembly of model geometry or device allocations; optional lower-level access remains separate |
 | Artifact reader | Container metadata, tensor directory, encoded bytes, exact source identity | Request scheduling and architecture execution |
 | Model definition | Validated model dimensions, layer semantics, parameter roles, input preparation rules | GGUF field names, CUDA pointers, serving queues |
 | Preparation | Resolve definition + artifact + device + options into a supported execution; report identity, limits, costs, readiness | Per-token expensive search or compilation |
-| Task runtime | Sequence identity, committed progress, admission, scheduling, output, failure ownership | KV/GDN/MoE families and physical state formats |
+| Generation runtime | Sequence identity, committed progress, admission, scheduling, output, failure ownership | KV/GDN/MoE families and physical state formats |
 | Model executor | Concrete forward/speculation algorithms, typed continuation bundle, execution-local resource decisions | Fleet allocation and application protocols |
 | Device implementation | Allocations, transfers, streams, completion, kernels, vendor primitives | Application request semantics |
 
@@ -80,7 +123,8 @@ Preparation reports why it selected an implementation, whether it is experimenta
 or qualified for the exact scope, required and optional work, estimated versus
 actual memory, and readiness. Failure should identify the unsupported geometry,
 option, artifact, or resource budget before a long load wherever possible.
-Ordinary users should not need a manual compile ceremony.
+Present this as normal loading progress and diagnostics; expose explicit compile
+or preparation controls only where they serve a concrete supported use case.
 
 A process-local resource owner can share device/model allocations across task
 instances later. Executors must expose actual reservations, capacity pressure,

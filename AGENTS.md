@@ -16,6 +16,23 @@ If maintainer-local companion context is available, use it for private planning 
 4. Check repository status before editing.
 5. Keep implementation and performance claims evidence-backed.
 
+## Product and interface direction
+
+The goal is a state-of-the-art inference engine in Rust, not a new interaction
+model for inference. Follow familiar inference-engine CLI, HTTP, and library
+conventions unless a concrete usability, performance, or correctness benefit
+justifies a difference. See the public-interface direction in
+`docs/ground-up-design.md` and its acceptance criteria in `docs/roadmap.md`.
+
+Use sensible defaults while preserving explicit, supported model, context,
+device, memory, cache, batching, parallelism, and generation controls. Internal
+executor/preparation contracts must not require ordinary users to select tasks,
+construct execution plans, or manage output credits. Keep lower-level access for
+advanced integrations when useful, with explicit ownership and safety contracts.
+New commands and options are plans until implemented and tested; describe the
+supported surface accurately. Architectural cleanup does not establish model
+support or performance gains.
+
 ## Runtime migration
 
 New request/runtime work belongs in `crates/runtime`, through `GenerationExecutor`.
