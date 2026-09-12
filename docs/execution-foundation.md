@@ -81,9 +81,11 @@ state while an inference plan owns quantized or otherwise transformed serving
 materializations. Sharing logical identity does not require sharing physical layout.
 
 The SafeTensors/HF package pressure tests reinforce this split: an artifact exposes
-`embeddings.weight` as bytes plus format metadata, the model integration decides
-that name's semantic role and logical parameter identity, and execution preparation
-would later decide the backend-specific materialization.
+parameter names as bytes plus format metadata, the model integration decides each
+name's semantic role and logical parameter identity, and execution preparation later
+decides the backend-specific materialization. The test-only BERT integration now
+exercises this with an actual encoder architecture rather than only a toy embedding
+fixture.
 
 ## Parameter versioning
 
@@ -109,14 +111,14 @@ intentionally strict validation behavior, not yet the final hot-update protocol.
 A production design may drain, version-partition, double-buffer, or otherwise
 coordinate transitions.
 
-Derived state must carry equivalent compatibility. The sequential encoder->decoder
-pressure test currently proves in-process handoff identity, but a production
+Derived state must carry equivalent compatibility. Sequential encoder->decoder tests
+prove in-process handoff identity and cancellation ownership, but a production
 encoder-state cache must also reject reuse across incompatible model/parameter/
 adapter or processor versions.
 
 ## Artifact and package boundaries
 
-Two additional validation layers now exist below model execution:
+Two validation layers exist below model execution:
 
 - `ribn-safetensors` validates SafeTensors bytes and exposes tensor names, shape,
   dtype, and borrowed payload bytes. It does not create `ParameterMaterialization`
@@ -126,11 +128,21 @@ Two additional validation layers now exist below model execution:
   config metadata and maps parameter names to shard files without choosing a model
   architecture, runtime, processor, backend, or serving operation.
 
-A reference encoder test loads an HF-style package and executes through `ribn-batch`.
-This is evidence that package/format code can remain separate from model semantics;
-it is not yet a general model-package/architecture registry. Remote repository IDs,
-revisions, tokenizer/processor metadata, actual model integrations, and prepared
-backend storage remain future work.
+The BERT pressure test now loads a small actual BERT architecture from this boundary
+and executes embeddings, multi-head self-attention, residual/LayerNorm, feed-forward
+and pooler semantics through `ribn-batch`. That is stronger evidence that format and
+package code can stay below model meaning. It is still a reference implementation,
+not production BERT support or a general model registry.
+
+It also exposed a concrete loading concern that toy fixtures could hide: repeatedly
+calling a per-parameter helper that reopens a SafeTensors shard would reread the same
+checkpoint bytes many times. The BERT loader therefore keeps a private artifact cache
+and opens each unique shard once. A reusable package/weight-set owner should preserve
+that property for real integrations, while model-specific tensor names, expected
+shapes and semantic mapping remain above it.
+
+Remote repository IDs/revisions, tokenizer/processor metadata, prepared backend
+storage and the general architecture resolver remain future work.
 
 SafeTensors also exposed one useful future-proofing detail: its dtype enum is
 non-exhaustive. The adapter therefore preserves unknown future dtypes by name rather
@@ -177,21 +189,23 @@ The first two runtime families are deliberately different:
   shorten the oldest FIFO candidate set when concrete shape/memory/compute
   constraints make the entire candidate batch unsuitable.
 
-The reference encoder test uses variable-length token inputs, embedding lookup plus
-mean pooling, vector outputs, and a model-specific total-token batch limit. This
-immediately showed that request count alone is not enough to form a safe encoder
-batch. The resulting `select_batch` hook deliberately exposes no universal cost
-unit: the executor sees its own inputs and returns a shorter FIFO prefix. Reordering,
-length bucketing, heterogeneous batching, and shared cost metadata remain unresolved
-until a real workload demonstrates that they belong in the common runtime.
+The early variable-length reference encoder showed that request count alone is not
+enough to form a safe batch. The resulting `select_batch` hook deliberately exposes
+no universal cost unit: the executor sees its own inputs and returns a shorter FIFO
+prefix. Reordering, length bucketing, heterogeneous batching, and shared cost
+metadata remain unresolved until real workloads demonstrate that they belong in the
+common runtime.
 
-The artifact-backed encoder fixtures then proved that this runtime can remain
-independent of checkpoint/package semantics. They are still reference fixtures, not
-optimized encoder implementations.
+The BERT architecture pressure test is the first substantially real model-semantic
+use of this path. It preserves the same executor-defined request/result boundary and
+uses sequence length to constrain batching while running actual BERT attention and
+feed-forward structure. No new universal batching abstraction was required. The
+next useful pressure comes from attention masks, padding/ragged layouts and real
+device memory/compute admission rather than another synthetic cost type.
 
 `ribn-batch` is not yet an embedding API or the final encoder scheduler. In
 particular, cancellation, asynchronous device execution, resource admission,
-per-request failures, and optimal batching for real model shapes are intentionally
+per-request failures, padding/mask policy, and optimized device batching remain
 unfinished.
 
 Further runtime families should be introduced only when real execution regimes
@@ -201,8 +215,8 @@ pressure tests, not fixed enum variants.
 ## Cross-runtime request and state identity
 
 Sequential encoder->decoder validation found one useful AR seam without introducing
-a universal pipeline payload: `GenerationExecutor::admit` now receives both
-`RequestId` and `SequenceId`.
+a universal pipeline payload: `GenerationExecutor::admit` receives both `RequestId`
+and `SequenceId`.
 
 They have different roles:
 
@@ -211,17 +225,32 @@ They have different roles:
 - `SequenceId` is the executor continuation identity used for physical/state
   ownership after admission.
 
-A test runs a batch encoder, keeps its output in an `Arc`, installs prepared states
-for two AR requests in reverse order, and proves each decoder request consumes the
+Tests run a batch encoder, keep its output in an `Arc`, install prepared states for
+two AR requests in reverse order, and prove each decoder request consumes the
 correct allocation without serialization or data copying. A missing prepared state
 fails only that request.
 
+Cancellation establishes the ownership transition without another generic cleanup
+interface. Before AR admission the producer/orchestrator still owns prepared state;
+after successful admission the executor's sequence state owns it and the ordinary
+`release` path reclaims it after cancellation/completion is established.
+
 This proves a useful **sequential handoff** mechanism. It does not mean every
 multimodal model should put an opaque prepared-input handle into `TokenRequest`, nor
-that AR `RequestId` is a universal top-level pipeline identity. VLM-style
-prompt-positioned feature items still need a separate coupled-scheduling pressure
-test. Top-level application/orchestrator identity may remain distinct from each
-specialized runtime's internal request identity.
+that AR `RequestId` is a universal top-level pipeline identity. Top-level
+application/orchestrator identity may remain distinct from each specialized runtime's
+internal request identity.
+
+A separate VLM pressure test now covers the coupled case at the scheduling boundary.
+It models model-prepared feature identity, prompt span, cache readiness, encoder
+compute cost and encoder-cache cost. The tests show that prompt progress can cross a
+cached feature with no encoder compute, can schedule an encoder item in the same
+iteration that consumes its prompt span, must stop before an uncached item when
+compute is unavailable, and can fail independently under encoder-cache pressure.
+This is evidence that coupled generation needs scheduler/resource cooperation and
+that encoder compute and cache are distinct concerns. It is **not** evidence for an
+arbitrary resource vector or a finalized production dependency descriptor. A real
+VLM integration should determine that seam.
 
 ## Operators, kernels, and future training
 
@@ -254,19 +283,23 @@ Implemented as provisional scaffolding:
 - test-only preparation-time semantic RMSNorm implementation selection;
 - `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
 - coherent parameter-version checks for queued non-AR work;
-- a variable-length reference encoder/pooling path with executor-informed FIFO
-  batch sizing;
+- executor-informed variable-length batch sizing without a universal work unit;
 - SafeTensors format-level validation/borrowed tensor access;
 - local HF-style config plus single/sharded SafeTensors package resolution;
-- an artifact/package-backed reference encoder proving model semantics remain above
-  format/package parsing;
+- an actual BERT architecture reference path over that package boundary, including
+  embeddings, self-attention, residual/LayerNorm, FFN and pooler execution;
+- evidence that real model loading needs each SafeTensors shard owned/opened once
+  for repeated tensor access rather than reread per parameter;
 - stable AR `RequestId` passed separately from `SequenceId` into executor admission;
-- a sequential encoder->AR handoff test that preserves prepared-state allocation
-  identity and is independent of handoff order.
+- sequential encoder->AR handoff, out-of-order correlation, request-local failure,
+  and cancellation ownership before/after admission;
+- VLM prompt-position dependency scheduling with separate encoder compute/cache
+  pressure as a test-only model of the coupled case.
 
-This validates that the broad boundary is implementable and has already forced
-several interface changes. It does **not** validate that these exact types are
-sufficient or optimal. The next high-value pressure tests are an actual small
-encoder architecture/checkpoint, VLM prompt-positioned encoder dependencies,
-prepared-state cancellation/version lifecycle, an iterative non-AR runtime, more
-real semantic-op/backend implementations, and a second hardware backend.
+This validates that the broad boundary is implementable and has forced several
+interface changes. It does **not** validate that these exact types are sufficient or
+optimal. The next high-value pressure tests are masked/padded/ragged encoder/device
+execution, ordinary architecture resolution using the concrete Qwen+BERT evidence,
+a genuine encoder-decoder model, a real VLM/processor integration, an iterative
+non-AR runtime, more real semantic-op/backend implementations, and a second hardware
+backend.
