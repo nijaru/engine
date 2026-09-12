@@ -511,7 +511,7 @@ mod tests {
         .expect("index");
         assert!(matches!(
             LocalModelPackage::open(dir.path()),
-            Err(PackageError::UnsafeShardPath(path)) if path == PathBuf::from("../outside.safetensors")
+            Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new("../outside.safetensors")
         ));
     }
 }
