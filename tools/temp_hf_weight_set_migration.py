@@ -3,11 +3,21 @@ from pathlib import Path
 
 hf = Path("crates/hf/src/lib.rs")
 text = hf.read_text()
+text = text.replace(
+    "/// Lazy reusable view over the SafeTensors files resolved by one local package.",
+    "/// Lazy reusable view over the `SafeTensors` files resolved by one local package.",
+    1,
+)
+text = text.replace(
+    "    /// Number of unique SafeTensors shards opened so far.",
+    "    /// Number of unique `SafeTensors` shards opened so far.",
+    1,
+)
 start_marker = "    /// Resolve and borrow one parameter tensor, lazily opening its shard once.\n"
 end_marker = "\n}\n\nfn open_artifact"
 start = text.index(start_marker)
 end = text.index(end_marker, start)
-new = '''    /// Resolve and borrow the SafeTensors artifact containing one parameter.
+new = '''    /// Resolve and borrow the `SafeTensors` artifact containing one parameter.
     ///
     /// This exposes format-level access for model integrations that need to try
     /// architecture-specific parameter aliases while keeping shard ownership and
@@ -21,15 +31,12 @@ new = '''    /// Resolve and borrow the SafeTensors artifact containing one para
             .weight_path(parameter)
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
             .to_owned();
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            self.artifacts.entry(path.clone())
-        {
-            entry.insert(open_artifact(&path)?);
+        match self.artifacts.entry(path.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                Ok(entry.insert(open_artifact(&path)?))
+            }
         }
-        Ok(self
-            .artifacts
-            .get(&path)
-            .expect("opened artifact remains owned by the weight set"))
     }
 
     /// Resolve and borrow one parameter tensor, lazily opening its shard once.
