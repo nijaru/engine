@@ -1,0 +1,388 @@
+name: Temporary request identity admission refactor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/request-id-admit-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Apply request identity admission refactor
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f'{path}: expected {count} matches, found {actual}: {old!r}')
+              p.write_text(text.replace(old, new, count))
+
+          replace(
+              'crates/runtime/src/executor.rs',
+              'use crate::TokenRequest;',
+              'use crate::{RequestId, TokenRequest};',
+          )
+          replace(
+              'crates/runtime/src/executor.rs',
+              '    fn admit(\n        &mut self,\n        sequence: SequenceId,\n        request: &TokenRequest,\n    ) -> Result<Admission, ExecutionError>;',
+              '    fn admit(\n        &mut self,\n        request_id: RequestId,\n        sequence: SequenceId,\n        request: &TokenRequest,\n    ) -> Result<Admission, ExecutionError>;',
+          )
+          replace(
+              'crates/runtime/src/executor.rs',
+              '    /// Validate request semantics and reserve the complete continuation bundle\n',
+              '    /// Validate request semantics and reserve the complete continuation bundle.\n    /// `request_id` is the stable runtime request identity for correlating model-\n    /// prepared inputs, tracing, or other request-scoped state; `sequence` is the\n    /// executor-owned continuation identity.\n',
+          )
+          replace(
+              'crates/runtime/src/engine.rs',
+              '.admit(sequence.id, input);',
+              '.admit(sequence.request, sequence.id, input);',
+          )
+          replace(
+              'crates/runtime/tests/contract.rs',
+              '    FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, SchedulePolicy,\n    SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,\n',
+              '    FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, RequestId,\n    SchedulePolicy, SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,\n',
+          )
+          replace(
+              'crates/runtime/tests/contract.rs',
+              '    fn admit(\n        &mut self,\n        sequence: SequenceId,\n        _request: &TokenRequest,\n',
+              '    fn admit(\n        &mut self,\n        _request_id: RequestId,\n        sequence: SequenceId,\n        _request: &TokenRequest,\n',
+          )
+          replace(
+              'crates/runtime/examples/host_overhead.rs',
+              '    GenerationLimits, GenerationOptions, SchedulePolicy, SequenceId, StepCompletion, SubmissionId,\n    TokenRequest,\n',
+              '    GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId, StepCompletion,\n    SubmissionId, TokenRequest,\n',
+          )
+          replace(
+              'crates/runtime/examples/host_overhead.rs',
+              '    fn admit(&mut self, id: SequenceId, _: &TokenRequest) -> Result<Admission, ExecutionError> {',
+              '    fn admit(\n        &mut self,\n        _: RequestId,\n        id: SequenceId,\n        _: &TokenRequest,\n    ) -> Result<Admission, ExecutionError> {',
+          )
+          replace(
+              'crates/qwen/src/cuda.rs',
+              '    Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, SequenceId,\n    StepCompletion, SubmissionId, TokenRequest,\n',
+              '    Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, RequestId, SequenceId,\n    StepCompletion, SubmissionId, TokenRequest,\n',
+          )
+          replace(
+              'crates/qwen/src/cuda.rs',
+              '    fn admit(\n        &mut self,\n        id: SequenceId,\n        request: &TokenRequest,\n',
+              '    fn admit(\n        &mut self,\n        _request_id: RequestId,\n        id: SequenceId,\n        request: &TokenRequest,\n',
+          )
+          replace(
+              'crates/qwen/src/execution/tests.rs',
+              '    Engine, EngineConfig, Event, GenerationExecutor, GenerationLimits, GenerationOptions,\n    SchedulePolicy,\n',
+              '    Engine, EngineConfig, Event, GenerationExecutor, GenerationLimits, GenerationOptions,\n    RequestId, SchedulePolicy,\n',
+          )
+          replace(
+              'crates/qwen/src/execution/tests.rs',
+              '    fn admit(\n        &mut self,\n        id: SequenceId,\n        request: &TokenRequest,\n',
+              '    fn admit(\n        &mut self,\n        _request_id: RequestId,\n        id: SequenceId,\n        request: &TokenRequest,\n',
+          )
+
+          p = Path('crates/batch/Cargo.toml')
+          text = p.read_text()
+          old = '[dev-dependencies]\nribn-hf = { path = "../hf" }\n'
+          new = '[dev-dependencies]\nribn = { path = "../runtime" }\nribn-hf = { path = "../hf" }\n'
+          if old not in text:
+              raise SystemExit('batch Cargo dev-dependency anchor not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+          cat > crates/batch/tests/sequential_encoder_decoder.rs <<'RS'
+          use std::collections::HashMap;
+          use std::convert::Infallible;
+          use std::sync::{Arc, Mutex};
+
+          use ribn::{
+              Admission, BatchItem, Engine, EngineConfig, Event, ExecutionError, ExecutorInfo,
+              FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, RequestId,
+              SchedulePolicy, SequenceId, StepCompletion, SubmissionId, TokenRequest,
+          };
+          use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
+          use ribn_foundation::ParameterVersion;
+
+          type EncoderState = Arc<[f32]>;
+
+          struct Encoder;
+
+          impl BatchExecutor for Encoder {
+              type Input = Vec<f32>;
+              type Output = EncoderState;
+              type Error = Infallible;
+
+              fn parameter_version(&self) -> ParameterVersion {
+                  ParameterVersion::new(3)
+              }
+
+              fn max_batch_items(&self) -> usize {
+                  4
+              }
+
+              fn execute(
+                  &mut self,
+                  batch: Vec<Job<Self::Input>>,
+              ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+                  Ok(batch
+                      .into_iter()
+                      .map(|job| {
+                          let request = job.request();
+                          JobOutput::new(request, Arc::<[f32]>::from(job.into_input()))
+                      })
+                      .collect())
+              }
+          }
+
+          #[derive(Default)]
+          struct Shared {
+              prepared: HashMap<RequestId, EncoderState>,
+              admitted: HashMap<RequestId, usize>,
+          }
+
+          struct Decoder {
+              info: ExecutorInfo,
+              shared: Arc<Mutex<Shared>>,
+              states: HashMap<SequenceId, EncoderState>,
+              pending: Option<Vec<StepCompletion>>,
+              next_submission: u64,
+          }
+
+          impl Decoder {
+              fn new(shared: Arc<Mutex<Shared>>) -> Self {
+                  Self {
+                      info: ExecutorInfo {
+                          name: "conditioned-decoder-fixture".to_owned(),
+                          limits: GenerationLimits {
+                              context_tokens: 32,
+                              max_sequences: 4,
+                              max_batch_tokens: 16,
+                              max_decode_tokens: 1,
+                          },
+                      },
+                      shared,
+                      states: HashMap::new(),
+                      pending: None,
+                      next_submission: 0,
+                  }
+              }
+          }
+
+          impl GenerationExecutor for Decoder {
+              fn info(&self) -> &ExecutorInfo {
+                  &self.info
+              }
+
+              fn admit(
+                  &mut self,
+                  request_id: RequestId,
+                  sequence: SequenceId,
+                  _: &TokenRequest,
+              ) -> Result<Admission, ExecutionError> {
+                  let state = self
+                      .shared
+                      .lock()
+                      .expect("shared conditioning")
+                      .prepared
+                      .remove(&request_id)
+                      .ok_or_else(|| ExecutionError::new("missing prepared encoder state"))?;
+                  let pointer = state.as_ptr() as usize;
+                  self.shared
+                      .lock()
+                      .expect("shared conditioning")
+                      .admitted
+                      .insert(request_id, pointer);
+                  self.states.insert(sequence, state);
+                  Ok(Admission::Ready)
+              }
+
+              fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
+                  if self.pending.is_some() {
+                      return Err(ExecutionError::new("decoder fixture already has pending work"));
+                  }
+                  self.next_submission += 1;
+                  let rows = batch
+                      .iter()
+                      .map(|item| {
+                          let state = self
+                              .states
+                              .get(&item.sequence)
+                              .ok_or_else(|| ExecutionError::new("decoder state is missing"))?;
+                          let token = 100_u32
+                              .checked_add(state.first().copied().unwrap_or_default() as u32)
+                              .ok_or_else(|| ExecutionError::new("fixture token overflow"))?;
+                          Ok(StepCompletion {
+                              sequence: item.sequence,
+                              prefix: item.prefix + item.token_budget,
+                              tokens: vec![token; item.output_budget as usize],
+                          })
+                      })
+                      .collect::<Result<Vec<_>, ExecutionError>>()?;
+                  self.pending = Some(rows);
+                  Ok(SubmissionId::new(self.next_submission))
+              }
+
+              fn poll(
+                  &mut self,
+                  _: SubmissionId,
+              ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+                  Ok(self.pending.take())
+              }
+
+              fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {
+                  self.states.remove(&sequence);
+                  Ok(())
+              }
+
+              fn synchronize(&mut self) -> Result<(), ExecutionError> {
+                  self.pending = None;
+                  Ok(())
+              }
+          }
+
+          fn engine(shared: Arc<Mutex<Shared>>) -> Engine {
+              Engine::new(
+                  Decoder::new(shared),
+                  EngineConfig {
+                      max_active_requests: 2,
+                      max_queued_requests: 2,
+                      max_queued_input_tokens: 64,
+                      max_buffered_events: 16,
+                      max_events_per_request: 8,
+                  },
+                  SchedulePolicy {
+                      max_batch_tokens: 8,
+                      prefill_chunk_tokens: 8,
+                      max_decode_steps_before_prefill: 1,
+                  },
+              )
+              .expect("decoder engine")
+          }
+
+          fn run_until_finished(engine: &mut Engine, request: RequestId) -> (u32, FinishReason) {
+              let mut token = None;
+              for _ in 0..8 {
+                  engine.step().expect("decoder step");
+                  while let Some(event) = engine.pop_event_for(request) {
+                      match event {
+                          Event::Token { token: value, .. } => token = Some(value),
+                          Event::Finished { reason, .. } => {
+                              return (token.expect("generated token"), reason);
+                          }
+                      }
+                  }
+              }
+              panic!("decoder request did not finish")
+          }
+
+          #[test]
+          fn sequential_encoder_state_is_correlated_by_request_identity_without_serialization() {
+              let mut encoder = BatchRuntime::new(
+                  Encoder,
+                  BatchConfig {
+                      max_queued_requests: 4,
+                  },
+              )
+              .expect("encoder runtime");
+              encoder.submit(vec![3.0, 30.0]).expect("first encode");
+              encoder.submit(vec![7.0, 70.0]).expect("second encode");
+              assert!(encoder.step().expect("encoder step"));
+              let first_state = encoder.pop_completed().expect("first state").into_output();
+              let second_state = encoder.pop_completed().expect("second state").into_output();
+
+              let first_pointer = first_state.as_ptr() as usize;
+              let second_pointer = second_state.as_ptr() as usize;
+              let shared = Arc::new(Mutex::new(Shared::default()));
+              let mut decoder = engine(Arc::clone(&shared));
+              let options = GenerationOptions {
+                  max_output_tokens: 1,
+                  ..GenerationOptions::default()
+              };
+              let first_request = decoder
+                  .enqueue(TokenRequest::new([1_u32], options.clone()))
+                  .expect("first decode request");
+              let second_request = decoder
+                  .enqueue(TokenRequest::new([1_u32], options))
+                  .expect("second decode request");
+
+              // Install in reverse order to prove correlation is by stable request
+              // identity rather than by an incidental FIFO between runtimes.
+              {
+                  let mut state = shared.lock().expect("shared conditioning");
+                  state
+                      .prepared
+                      .insert(second_request, Arc::clone(&second_state));
+                  state
+                      .prepared
+                      .insert(first_request, Arc::clone(&first_state));
+              }
+
+              let (first_token, first_reason) = run_until_finished(&mut decoder, first_request);
+              let (second_token, second_reason) = run_until_finished(&mut decoder, second_request);
+              assert_eq!(first_token, 103);
+              assert_eq!(second_token, 107);
+              assert_eq!(first_reason, FinishReason::Length);
+              assert_eq!(second_reason, FinishReason::Length);
+
+              let state = shared.lock().expect("shared conditioning");
+              assert_eq!(state.admitted[&first_request], first_pointer);
+              assert_eq!(state.admitted[&second_request], second_pointer);
+              assert!(state.prepared.is_empty());
+          }
+
+          #[test]
+          fn decoder_rejects_missing_prepared_encoder_state() {
+              let shared = Arc::new(Mutex::new(Shared::default()));
+              let mut decoder = engine(shared);
+              let request = decoder
+                  .enqueue(TokenRequest::new(
+                      [1_u32],
+                      GenerationOptions {
+                          max_output_tokens: 1,
+                          ..GenerationOptions::default()
+                      },
+                  ))
+                  .expect("decode request");
+              decoder.step().expect("admission failure is request-local");
+              let event = decoder.pop_event_for(request).expect("terminal event");
+              assert!(matches!(
+                  event,
+                  Event::Finished {
+                      reason: FinishReason::Failed(error),
+                      ..
+                  } if error.to_string() == "missing prepared encoder state"
+              ));
+          }
+          RS
+      - name: Validate candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          python3 tools/check-boundaries.py
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo doc --workspace --no-deps --locked
+      - name: Commit validated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/runtime/src/executor.rs crates/runtime/src/engine.rs crates/runtime/tests/contract.rs crates/runtime/examples/host_overhead.rs crates/qwen/src/cuda.rs crates/qwen/src/execution/tests.rs crates/batch/Cargo.toml crates/batch/tests/sequential_encoder_decoder.rs
+          git commit -m 'Pass request identity through AR admission'
+          git push origin HEAD:main
