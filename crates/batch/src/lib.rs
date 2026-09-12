@@ -96,6 +96,22 @@ pub trait BatchExecutor {
     fn parameter_version(&self) -> ParameterVersion;
     fn max_batch_items(&self) -> usize;
 
+    /// Choose how many of the oldest compatible candidates can execute together.
+    ///
+    /// `candidates` contains at most [`Self::max_batch_items`] requests, all pinned
+    /// to the executor's current parameter version. Returning the full slice is
+    /// the default. A model can return a shorter nonzero prefix when shapes,
+    /// padding, memory, or another concrete execution constraint makes the whole
+    /// candidate set unsuitable.
+    ///
+    /// This provisional contract preserves FIFO order. Reordering/bucketing is
+    /// intentionally deferred until a real workload demonstrates that the
+    /// additional scheduling complexity belongs in this runtime.
+    #[must_use]
+    fn select_batch(&self, candidates: &[&Self::Input]) -> usize {
+        candidates.len()
+    }
+
     /// # Errors
     /// Returns the concrete executor error when the selected batch cannot execute.
     fn execute(
@@ -180,7 +196,8 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     ///
     /// # Errors
     /// Rejects a parameter-version change while queued work still targets the
-    /// previous version, malformed executor output, or an executor failure.
+    /// previous version, invalid executor batch selection, malformed executor
+    /// output, or an executor failure.
     pub fn step(&mut self) -> Result<bool, RuntimeError<E::Error>> {
         let Some(front) = self.queue.front() else {
             return Ok(false);
@@ -193,20 +210,25 @@ impl<E: BatchExecutor> BatchRuntime<E> {
             });
         }
 
-        let mut queued = Vec::new();
-        while queued.len() < self.executor.max_batch_items() {
-            let Some(next) = self.queue.front() else {
-                break;
-            };
-            if next.parameter_version != version {
-                break;
-            }
-            if let Some(next) = self.queue.pop_front() {
-                queued.push(next);
-            } else {
-                break;
-            }
+        let candidates = self
+            .queue
+            .iter()
+            .take(self.executor.max_batch_items())
+            .take_while(|queued| queued.parameter_version == version)
+            .map(|queued| &queued.input)
+            .collect::<Vec<_>>();
+        let selected = self.executor.select_batch(&candidates);
+        if selected == 0 || selected > candidates.len() {
+            return Err(RuntimeError::InvalidBatchSelection {
+                selected,
+                candidates: candidates.len(),
+            });
         }
+        drop(candidates);
+
+        let queued = (0..selected)
+            .map(|_| self.queue.pop_front().expect("selected queue item exists"))
+            .collect::<Vec<_>>();
         let expected = queued.iter().map(|item| item.request).collect::<Vec<_>>();
         let jobs = queued
             .into_iter()
@@ -271,6 +293,10 @@ pub enum RuntimeError<E> {
         queued: ParameterVersion,
         current: ParameterVersion,
     },
+    InvalidBatchSelection {
+        selected: usize,
+        candidates: usize,
+    },
     MalformedCompletion {
         requests: Vec<RequestId>,
     },
@@ -293,6 +319,13 @@ impl<E: fmt::Display> fmt::Display for RuntimeError<E> {
                 "queued request targets parameter version {}, but executor now exposes version {}",
                 queued.get(),
                 current.get()
+            ),
+            Self::InvalidBatchSelection {
+                selected,
+                candidates,
+            } => write!(
+                f,
+                "batch executor selected {selected} requests from {candidates} candidates"
             ),
             Self::MalformedCompletion { requests } => write!(
                 f,
