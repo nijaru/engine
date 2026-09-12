@@ -30,7 +30,10 @@ impl fmt::Display for EncoderError {
             Self::InputTooLong => f.write_str("encoder input is too long for the reference path"),
             Self::TokenOutOfRange(token) => write!(f, "encoder token {token} is out of range"),
             Self::BatchTooLarge { tokens, limit } => {
-                write!(f, "encoder batch has {tokens} tokens but its limit is {limit}")
+                write!(
+                    f,
+                    "encoder batch has {tokens} tokens but its limit is {limit}"
+                )
             }
         }
     }
@@ -64,14 +67,18 @@ impl ArtifactEncoder {
         }
         let vocab = tensor.shape()[0];
         let width = tensor.shape()[1];
-        let elements = vocab.checked_mul(width).ok_or(EncoderError::ShapeOverflow)?;
+        let elements = vocab
+            .checked_mul(width)
+            .ok_or(EncoderError::ShapeOverflow)?;
         let expected_bytes = elements.checked_mul(4).ok_or(EncoderError::ShapeOverflow)?;
         if tensor.data().len() != expected_bytes {
             return Err(EncoderError::InvalidPayload);
         }
         let mut embeddings = Vec::with_capacity(elements);
         for encoded in tensor.data().chunks_exact(4) {
-            let bytes: [u8; 4] = encoded.try_into().map_err(|_| EncoderError::InvalidPayload)?;
+            let bytes: [u8; 4] = encoded
+                .try_into()
+                .map_err(|_| EncoderError::InvalidPayload)?;
             embeddings.push(f32::from_le_bytes(bytes));
         }
         Ok(Self {
@@ -89,15 +96,18 @@ impl ArtifactEncoder {
             return Err(EncoderError::EmptyInput);
         }
         let mut output = vec![0.0_f32; self.width];
-        for &token in tokens {
-            let token = usize::try_from(token).map_err(|_| EncoderError::TokenOutOfRange(token))?;
+        for &token_id in tokens {
+            let token = usize::try_from(token_id)
+                .map_err(|_| EncoderError::TokenOutOfRange(token_id))?;
             if token >= self.vocab {
-                return Err(EncoderError::TokenOutOfRange(
-                    u32::try_from(token).unwrap_or(u32::MAX),
-                ));
+                return Err(EncoderError::TokenOutOfRange(token_id));
             }
-            let start = token.checked_mul(self.width).ok_or(EncoderError::ShapeOverflow)?;
-            let end = start.checked_add(self.width).ok_or(EncoderError::ShapeOverflow)?;
+            let start = token
+                .checked_mul(self.width)
+                .ok_or(EncoderError::ShapeOverflow)?;
+            let end = start
+                .checked_add(self.width)
+                .ok_or(EncoderError::ShapeOverflow)?;
             for (destination, source) in output.iter_mut().zip(&self.embeddings[start..end]) {
                 *destination += source;
             }
