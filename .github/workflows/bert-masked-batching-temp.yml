@@ -1,0 +1,39 @@
+name: Temporary masked BERT batching validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bert-masked-batching-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Apply masked and padded BERT pressure test
+        run: |
+          python3 tools/temp_bert_masked_batching.py
+          cargo fmt --all
+      - name: Validate BERT pressure test
+        run: |
+          set -euo pipefail
+          cargo test -p ribn-batch --test bert_architecture --locked
+          cargo clippy -p ribn-batch --test bert_architecture --locked -- -D warnings
+      - name: Commit validated test changes
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/batch/tests/bert_architecture.rs
+          git commit -m 'Pressure-test masked and padded BERT batching'
+          git push origin HEAD:main
