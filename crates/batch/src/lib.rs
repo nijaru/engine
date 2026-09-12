@@ -318,8 +318,8 @@ mod tests {
     }
 
     impl BatchExecutor for Encoder {
-        type Input = Vec<f32>;
-        type Output = f32;
+        type Input = Vec<u32>;
+        type Output = u32;
         type Error = Infallible;
 
         fn parameter_version(&self) -> ParameterVersion {
@@ -363,19 +363,19 @@ mod tests {
     #[test]
     fn encoder_batches_without_token_or_sequence_semantics() {
         let mut runtime = runtime();
-        let first = runtime.submit(vec![1.0, 2.0]).expect("first");
-        let second = runtime.submit(vec![3.0, 4.0, 5.0]).expect("second");
-        let third = runtime.submit(vec![6.0, 7.0]).expect("third");
+        let first = runtime.submit(vec![1, 2]).expect("first");
+        let second = runtime.submit(vec![3, 4, 5]).expect("second");
+        let third = runtime.submit(vec![6, 7]).expect("third");
         assert!(runtime.step().expect("step"));
         assert_eq!(runtime.queued(), 1);
         assert_eq!(runtime.executor().batches, vec![vec![2, 3]]);
         let first_output = runtime.pop_completed().expect("first output");
         let second_output = runtime.pop_completed().expect("second output");
         assert_eq!(first_output.request(), first);
-        assert_eq!(*first_output.output(), 3.0);
+        assert_eq!(*first_output.output(), 3);
         assert_eq!(first_output.parameter_version(), ParameterVersion::new(7));
         assert_eq!(second_output.request(), second);
-        assert_eq!(*second_output.output(), 12.0);
+        assert_eq!(*second_output.output(), 12);
         assert!(runtime.step().expect("second step"));
         assert_eq!(
             runtime.pop_completed().expect("third output").request(),
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn queued_work_is_pinned_to_a_parameter_version() {
         let mut runtime = runtime();
-        runtime.submit(vec![1.0]).expect("request");
+        runtime.submit(vec![1]).expect("request");
         runtime.executor_mut().version = ParameterVersion::new(8);
         assert!(matches!(
             runtime.step(),
