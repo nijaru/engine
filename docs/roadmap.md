@@ -1,232 +1,130 @@
 # Roadmap
 
-This is an ordered engineering plan, not release dates or a performance claim.
-New runtime work targets `crates/runtime` (`ribn`), not the legacy request layer
-in `crates/core`. [Architecture](architecture.md) defines ownership;
-[the ground-up target](ground-up-design.md) records the research and tradeoffs.
+This is an ordered engineering plan, not release dates. Items below are evidence
+gates and implementation targets; they are not architectural requirements when a
+better measured design emerges.
 
-The goal is a state-of-the-art inference engine in Rust. Public UX/DX should
-follow familiar inference-engine conventions, with sensible defaults and useful
-explicit controls. Internal execution contracts do not mandate a new public
-workflow. The [interface direction](ground-up-design.md#public-interface-direction)
-and milestone 4 define this plan; the existing qualification and kernel gates
-remain in place.
+## Current status
 
-## Status
-
-| Area | Current evidence | Remaining gate |
+| Area | Current evidence | Main remaining work |
 | --- | --- | --- |
-| Qwen GGUF/CUDA baseline | Native execution, same-artifact parity, async cancellation, batched kernel measurements | Preserve as comparison oracle |
-| CUDA Rust migration | Resource/kernel-authoring smoke proof, gate 1 | Representative kernels, integration, coverage, retirement |
-| Model-neutral runtime | Host contract tests; bounded queue/output; multi-token completion; live scheduling policy | Workload and hardware validation |
-| Qwen prepared adapter | CUDA-feature compilation and host-tested lease protocol | GPU reference replay and lifecycle tests |
-| Streaming CLI | Experimental `run`; legacy `local` retained | Hardware qualification, packaging, broader UX |
-| New model/hardware families | Design pressure tests only | Concrete implementations and evidence |
+| Existing Qwen GGUF/CUDA path | Same-artifact correctness/performance references and legacy serving path | Keep as oracle through cutover |
+| New generation runtime | Host lifecycle/backpressure tests, persistent slots, bounded per-request output, multi-token completion | GPU workload qualification; concurrent driver |
+| Shared text frontend | Raw prompt/chat/token input, tokenizer/template reuse, incremental decode, synchronous stream, offline batch, token usage | Concurrent handle, broader generation features, HTTP integration |
+| Qwen integration | Artifact-independent config + GGUF adapter + host-tested executor bridge | GPU replay/lifecycle proof; remove legacy bridge after cutover |
+| CUDA Rust migration | Resource/toolchain proof gate complete | Representative quantized + recurrent kernels, integration, coverage |
+| State/cache | Fixed full-context reservations | Dynamic hybrid state, prefix reuse, pressure/preemption experiments |
 
-Historical kernel/serving numbers remain in
-[execution history](../benchmarks/execution-history.md), not as claims about the
-new runtime. [CUDA migration](cuda-rust-migration.md) remains authoritative for
-kernel proof gates.
+## 1. Qualify the new runtime with the existing Qwen kernels
 
-## Ground-up alignment completed
+Before deleting the reference serving path, run exact-artifact GPU replay and
+lifecycle tests through the new runtime. Cover concurrency 1/2/8/9, long outputs,
+mixed prompt lengths, final prefill tails, cancellation in prefill/decode, stop
+limits, repeated admission, constrained memory, and fallback batch shapes.
 
-- The runtime-facing contract is `GenerationExecutor`, not a universal model API.
-- Qwen configuration/layer semantics are artifact-independent; `QwenGguf` mapping
-  moved out of the generic format reader. Source-format-free tests run in CI.
-- NVIDIA submission glue and its integration tests moved out of neutral core.
-- Per-request mailboxes isolate stalled consumers within aggregate/model capacity;
-  execution uses stable mailbox slots and preserves completion credits.
-- Runtime configuration, selection, commitment, and output are separate modules
-  with one owner. Compatible defaults and the `ribn` CLI reduce manual setup.
-- `ribn inspect` reads generic GGUF metadata without GPU initialization.
+Measure old versus new TTFT, inter-token latency, throughput, CPU scheduling time,
+allocations, host/device memory, and preparation. Do not call host compilation or
+mock-runtime tests GPU qualification.
 
-This closes concrete structural gaps, not the full target. The highest remaining
-code-design issue is the fixed-shape Qwen body: validate backend support at
-preparation, normalize parameter roles, and make shape-dependent plans explicit
-before adding another geometry or checkpoint format. Do not expose arbitrary
-configurations while silently running kernels specialized to the first artifact.
+## 2. Continue CUDA Rust gate 2 and target the new runtime for integration
 
-## 1. Qualify the new runtime boundary
+Prove representative Q8_1 packing -> quantized integer-dot projection and batched
+GDN/recurrent state updates with numerical references, tails, repeated updates,
+generated-code inspection, and matched timings. Keep kernel migration separate
+from request-runtime retirement.
 
-The host implementation is in place. Complete the existing-kernel Qwen comparison
-before retiring the old serving path or integrating migrated CUDA Rust kernels
-through a different request interface again.
+Once representative kernels are proven, integrate them through the current Qwen
+executor/runtime path rather than building another serving stack.
 
-- Replay independently recorded, exact-artifact token fixtures through the new
-  adapter at concurrency 1, 2, 8, and 9. Include diverse prompts and 256/1024-token
-  generations; reference data must not be generated by the candidate itself.
-- Verify final one-token prefill tails, mixed prompt lengths, stop/output limits,
-  cancellation during prefill and decode, full batched peer progress, and fallback
-  batch sizes. Add soak/repeated admission and constrained-memory cases.
-- Verify broken-output/shutdown handling, deferred release, malformed completion,
-  partial enqueue failure, and uncertain-device failure ownership. Host fault
-  injection is not destructive GPU-fault evidence.
-- Compare old/new CPU overhead, allocations, TTFT, inter-token latency, throughput,
-  host/device memory, and preparation under matched settings. Explain regressions
-  instead of assigning a speedup to the redesign by assumption.
+## 3. Finish the reusable application layer and serving driver
 
-An ignored GPU reference/cancellation harness and host benchmark are provided in
-[verification instructions](../benchmarks/runtime-contract.md). Their presence
-is not a passing hardware gate.
+The first shared text layer is implemented. Continue from that concrete surface:
 
-## 2. Continue CUDA Rust gate 2; integrate through the new boundary
+- provide a concurrent model handle/driver so independent Rust and server callers
+  can submit, stream, and cancel without manually calling `Engine::step()`;
+- preserve bounded per-request backpressure when designing channels/wakeups;
+- expose raw prompt, chat-message, and token-ID inputs consistently across CLI,
+  Rust, and HTTP;
+- add request settings incrementally: stop strings, penalties/logit bias,
+  logprobs, structured/constrained output, and reasoning/tool formatting only when
+  their full execution semantics are implemented;
+- keep public request overrides distinct from fully resolved executor settings;
+- implement a documented compatibility subset for serving and test unmodified
+  clients, including streaming, errors, finish reasons, usage, and disconnect
+  cancellation.
 
-Representative quantized and recurrent kernel work can proceed independently
-of request scheduling. Prove Q8_1 packing → quantized integer-dot projection and
-batched GDN state updates, with layout, arithmetic, tails, repeated updates,
-generated-code inspection, and matched timings.
+`ribn run` now accepts a positional or `--model` path, chat-formatted input by
+default, `--raw` for raw completion, prompt/file/piped stdin, context capacity,
+and generation length. Interactive terminal chat and `ribn serve` remain future
+features.
 
-Gate 3's asynchronous serving integration should target `GenerationExecutor` after
-the boundary qualification above. Preserve exact output/prefix commitment,
-completion, cancellation, and one deallocation owner. Complete remaining kernel
-families, then rerun full-model/serving gates before retiring CUDA C++ authoring.
-Do not confuse retiring the old request runtime with retiring the old kernels:
-these are separate gates and separate changes.
+## 4. Replace fixed per-sequence state reservation with a measured hybrid resource layer
 
-## 3. Cut over and delete transitional architecture
+The current Qwen path reserves full configured context state per sequence, which
+will limit concurrency. Implement a real dynamic state manager before inventing a
+final cache API.
 
-Exit criteria: hardware reference replay and lifecycle gates pass; old/new
-performance and memory regressions are understood; the new path is the default
-supported path for the existing target.
+For full-attention state, evaluate paged allocation and compact page-table metadata.
+For recurrent state, evaluate checkpoints/materialization appropriate to the actual
+Qwen recurrence. A reusable hybrid prefix is valid only when all required state
+components correspond to the same semantic prefix. Track their ownership and
+completion together even if they use different physical allocators.
 
-Then remove the duplicate `local` serving path and the old request/scheduler
-runtime. Remove Qwen's temporary batch/lease translation as its backend adopts
-the new boundary directly. NVIDIA submission glue is already relocated; move
-remaining model-specific helpers out of neutral core as their actual owners are
-established; delete region/phase metadata with no execution role.
+Add capacity pressure and resource telemetry. Then test preemption/recompute,
+eviction, prefix reuse, and optional host tiers against realistic long-context and
+multi-turn workloads. Do not force recurrent state into a KV page abstraction.
 
-Qwen configuration and GGUF interpretation are now separate. Normalize remaining
-weight roles and backend shape assumptions before implementing a second artifact
-format. Serialized GGUF identifiers stay unchanged. Keep tests and numerical
-references independent of optimized implementations. Do not add new model
-features to both old and new runtimes while waiting for cutover.
+## 5. Revisit scheduling with real paging/reuse data
 
-## 4. Familiar interfaces, configuration, and loading diagnostics
+Once dynamic resources exist, compare the current decode-priority/prefill-fairness
+policy against alternatives such as a unified scheduled-token budget, cache-aware
+priority, and preemption/recompute. Measure TTFT, ITL, throughput, cache hit rate,
+GPU utilization, and tail latency across short/long and shared-prefix workloads.
 
-Implement the public surfaces around conventional inference operations, not
-around the internal executor lifecycle. Use vLLM/SGLang as serving and offline
-workflow references and llama.cpp as a local CLI reference. Check their actual
-interfaces when selecting flag names and semantics; document a concrete benefit
-for any deliberate difference. This is not a requirement to copy every flag or
-support every feature before delivering a usable interface.
+The scheduler should receive enough resource/cost information to make decisions
+without owning model tensor layouts. Evolve `Admission::Ready/Deferred` only when
+real resource operations demonstrate what additional contract is needed.
 
-### CLI and library
+## 6. Optimize the host/device pipeline
 
-Target `ribn serve <model>` for serving and `ribn run <model>` for local inference.
-Add prompt, file/stdin, and interactive input with conventional generation options
-as supported. Keep help, exit status, interruption, stdout output, and stderr
-logging predictable. Model source/revision support follows real loader support;
-metadata detection alone is not execution support. Preserve the existing
-`run --model ...` form or provide a documented migration when syntax changes.
+Profile before choosing work. Candidate optimizations include persistent device
+request rows, incremental metadata writes, packed/ragged prefill, mixed
+prefill/decode kernels, device-side sampling, fused/vendor kernels, CPU/GPU
+scheduler overlap, and multiple in-flight batches.
 
-Provide an idiomatic Rust model-loading and generation API with batching,
-streaming, typed options, cancellation, and errors. Ordinary callers should not
-construct `BatchItem` records or manage mailbox credits. Retain lower-level
-`GenerationExecutor` and resource access for advanced integrations. Infer the
-operation from the command/API and model; require task selection only to resolve
-real ambiguity. A general task registry is not a prerequisite.
+CUDA graphs should be treated as qualified execution variants with explicit
+shape/cache/workspace compatibility and a correct fallback. Do not make graph mode
+or an overlap scheme a global assumption.
 
-### Explicit configuration and compatible serving
+## 7. Cut over and retire transitional runtime code
 
-Expose useful supported controls for context length, devices, memory budgets,
-cache policy/precision, batching, parallelism, quantization, and sampling. Document
-names, units, defaults, supported combinations, and precedence for whichever CLI,
-configuration-file, or environment inputs are implemented. Respect explicit
-choices, show the effective configuration, and reject unsupported options rather
-than silently ignoring them. Distinguish live scheduling changes from settings
-that require draining, reload, or preparation.
+After GPU correctness/lifecycle and performance gates pass, make the new path the
+supported default, remove the duplicate `local` serving runtime, and remove Qwen's
+legacy segment/state translation as its backend adopts the new contracts directly.
+Retain independent numerical fixtures and benchmark history.
 
-For HTTP serving, implement and document an OpenAI-compatible subset for supported
-operations. Test existing clients without a Ribn-specific adapter. Include ordinary
-streaming and non-streaming behavior, errors, stop/finish reasons, and usage
-reporting where part of the supported API. Use per-request output limits and add
-disconnect cancellation, wakeups, and bounded input preparation. Compatibility
-must include behavior, not just similar endpoint names. Reuse the same engine;
-keep protocol code outside model execution.
+Normalize remaining parameter roles and shape support before adding a second
+checkpoint format. A valid `QwenConfig` is not proof that a backend supports that
+geometry.
 
-### Evidence and acceptance
+## 8. Add another architecture/backend as a pressure test
 
-- CLI tests cover supported input modes, help/errors, configuration overrides,
-  output/log separation, interruption, and any syntax migration.
-- Rust examples load a supported model and perform ordinary generation, batch,
-  and streaming operations without manually wiring scheduler internals; a separate
-  example demonstrates supported advanced control.
-- Integration tests run selected unmodified HTTP clients against streaming and
-  non-streaming operations. Publish the tested subset and reject unsupported
-  features explicitly; do not claim blanket compatibility.
-- Loading reports effective settings, readiness, unsupported geometry/options,
-  and estimated versus actual memory. Performance/qualification claims remain
-  tied to measured execution, not the existence of the new interface.
+Use a materially different model architecture and, later, another hardware backend
+to test what actually belongs in shared code. New attention/state/MoE mechanisms
+should reuse request/serving infrastructure where sensible, while shared interfaces
+may change when the new implementation exposes a genuine common requirement.
 
-Build a canonical, versioned compatibility manifest before automatic execution
-variant selection or persistent reuse. It must cover exact artifact and model
-implementation, physical state representation, backend/runtime/device capability,
-kernels, graph mode, speculation, and distributed layout where applicable.
-Qualification status without matching evidence does not authorize selection.
-Keep this internal to loading/selection; ordinary users should not need to assemble
-manifests to serve an explicitly supported model.
+Add speculative decoding only with draft/verify/rollback correctness, stop
+semantics, acceptance metrics, resource accounting, and joint variant
+qualification. The current multi-token completion contract is necessary but not
+sufficient proof.
 
-The current `ribn` CLI and CPU-only artifact inspection exist. A network service,
-model auto-resolution, hardware diagnostics, the broader input modes, and the
-high-level library API described here are not shipped by this plan update.
-This clarification does not replace the GPU qualification or kernel work above
-with a public-API framework project.
+## 9. Distributed inference when local execution and resource semantics are solid
 
-## 5. Optimize measured execution and state costs
+Ribn may eventually own inference-local tensor/expert/pipeline/sequence parallelism,
+communication, and prefill/decode disaggregation inside externally allocated
+resources. Fleet placement and datacenter policy remain outside the engine.
 
-Use the host benchmark to track CPU regressions, not to rank inference engines.
-Profile real timelines before choosing the next optimization. Likely candidates
-include fewer adapter allocations/copies, persistent backend request rows,
-incremental device metadata, batched prefill, fused/vendor kernels, device-side
-sampling, and CUDA graph variants. Add multi-batch overlap or async wakeups only
-with dependency, cancellation, and lifetime tests.
-
-For state growth/reuse, build model-owned physical allocation mechanisms rather
-than another core KV-only abstraction. Exact prefix reuse must include every
-required recurrent/attention component at the correct boundary. Transfer,
-restore, reconstruction, fork, and preemption require content/compatibility
-identity, capacity accounting, explicit completion, and fault-safe rollback.
-Never claim valid nonzero history from an empty allocation.
-
-## 6. Add the second native architecture and speculation
-
-Qwen3.8-Flash-Next remains the selected next architecture pressure test after the
-foundation and cutover are stable. Pin its real artifact/config/reference first.
-Implement its actual sparse/recurrent state, model-owned host lookup resources,
-and MoE execution inside the model/backend layer. Distinguish persistent state
-from derived indexing scratch. Do not invent a generic framework first.
-
-Implement ordinary text execution before model-native speculation and long-context
-optimization. The runtime already accepts bounded multi-token completions;
-real speculation still needs draft/verify/rollback and numerical correctness
-proof, stop handling, acceptance telemetry, and joint variant qualification.
-
-Use [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
-as a design/implementation spike for phase asymmetry, shared compact state,
-reconstruction, and model-native speculation. Full large-model deployment is
-not a prerequisite: small reference-backed component proofs should expose a
-wrong boundary earlier. Do not claim full support from fixture tests.
-
-## 7. Validate input, artifact, and hardware portability
-
-Before a stable public API, prove an owned prepared-input boundary for a concrete
-multimodal task. Keep input resources and preprocessing lifetimes explicit; do
-not encode images/audio as fictional text tokens. Different output tasks may
-need additive task interfaces rather than expanding one generation-options bag.
-
-Use a second checkpoint format and a materially different backend (Metal or AMD
-when a concrete target is available) to test separation. Generic request/runtime
-code should not change for different attention kernels or storage formats.
-Factor shared backend components only after actual duplication appears.
-
-## 8. Distributed inference only with a measured use case
-
-Ribn may own tensor/expert/pipeline/sequence parallelism, distributed model/state
-resources, inference-local routing, and prefill/decode disaggregation. Plans must
-fit externally allocated resources and expose costs/readiness. Topology and
-communication choices stay hardware-specific. Archon, Kubernetes, Slurm, or bare
-metal can supply the allocation; none is a required Ribn dependency.
-
-The strategic benchmark remains useful, correct execution on real workloads:
-latency, throughput, memory, preparation, reliability, and ease of adding models.
-A cleaner type system or a longer feature checklist alone is not that result.
+The strategic benchmark stays simple: useful model coverage with strong latency,
+throughput, memory efficiency, reliability, and integration ergonomics. Cleaner
+abstractions matter only insofar as they help achieve those results.

@@ -151,7 +151,9 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
                 Event::Token { request, token } => {
                     outputs.get_mut(&request).unwrap().push(token);
                 }
-                Event::Finished { request, reason } => {
+                Event::Finished {
+                    request, reason, ..
+                } => {
                     assert!(finished.insert(request, reason).is_none());
                 }
             }

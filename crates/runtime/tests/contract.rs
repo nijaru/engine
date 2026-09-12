@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
     FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, SchedulePolicy,
-    SequenceId, StepCompletion, SubmissionId, TokenRequest,
+    SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,
 };
 
 #[allow(
@@ -305,7 +305,11 @@ fn prefixes_and_output_wait_for_completion_and_cancelled_peers_do_not_escape() {
     );
     assert!(events.contains(&Event::Finished {
         request: cancelled,
-        reason: FinishReason::Cancelled
+        reason: FinishReason::Cancelled,
+        usage: Usage {
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        },
     }));
     assert_eq!(control.lock().unwrap().released.len(), 2);
 }
@@ -431,7 +435,11 @@ fn output_backpressure_preserves_reserved_completion_credits() {
     );
     assert!(events.contains(&Event::Finished {
         request: waiting,
-        reason: FinishReason::Cancelled
+        reason: FinishReason::Cancelled,
+        usage: Usage {
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        },
     }));
 }
 
@@ -688,6 +696,10 @@ fn stalled_consumer_does_not_block_a_peer_with_output_capacity() {
         Some(Event::Finished {
             request: slow,
             reason: FinishReason::Cancelled,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
         })
     );
     assert!(runtime.pop_event().is_none());
@@ -736,7 +748,11 @@ fn request_mailboxes_survive_slot_reuse_without_cross_delivery() {
             runtime.pop_event_for(id),
             Some(Event::Finished {
                 request: id,
-                reason: FinishReason::Length
+                reason: FinishReason::Length,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
             })
         );
         assert!(runtime.pop_event_for(id).is_none());

@@ -1,136 +1,118 @@
 # Architecture
 
-Ribn is a Rust-first inference runtime. The ground-up target is defined in
-[ground-up design](ground-up-design.md); this document describes the implemented
-boundaries. [Roadmap](roadmap.md) lists the remaining proof and retirement gates.
+Ribn is a Rust-first inference runtime and serving engine. The design is intentionally
+provisional where real model, workload, or hardware evidence is still missing.
+[Ground-up design](ground-up-design.md) records the current target and external
+reference points; [roadmap](roadmap.md) records the next proof gates.
 
-## Public interfaces and internal execution
+## Current stack
 
-The product target is familiar inference-engine CLI, HTTP, and idiomatic Rust
-library interfaces, with sensible defaults and explicit tuning controls. Loading,
-generation, batching, and streaming should be ordinary operations, not require
-users to understand prepared tasks or executor selection. Task selection is
-explicit only when the requested operation and model leave a real ambiguity.
+```text
+CLI / future HTTP / application
+              |
+        ribn-text frontend
+  raw prompt / chat / token IDs
+  tokenizer / template / text decode
+              |
+          ribn runtime
+ request slots / batching / output
+              |
+      GenerationExecutor
+              |
+    Qwen execution + NVIDIA
+```
 
-The current `GenerationExecutor`, `BatchItem`, and mailbox APIs support runtime
-and model integration. They are not a requirement for the eventual high-level
-API to expose the same workflow. Internal backpressure should appear as normal
-streaming and capacity/error behavior. Keep useful lower-level access for advanced
-integrations, including device/resource control where supported; hiding that
-control is not an architectural goal. The
-[public-interface direction](ground-up-design.md#public-interface-direction)
-defines the plan; it does not add capabilities to the current CLI or library.
+These are practical ownership boundaries, not a requirement that every future model
+or feature fit a fixed number of crates or traits.
 
-## Generation runtime, not a universal model graph
-
-`crates/runtime` exports `ribn`. The current task is token generation. Its
-`GenerationExecutor` contract is explicit about that scope: admit a sequence,
-submit prefill/decode work, observe accepted completion, release resources, and
-synchronize shutdown. Other tasks may share infrastructure without using this
-exact state machine. No arbitrary tensor graph, model-family enum, or device
-allocation appears in the common request interface.
-
-`Engine` owns persistent request slots and lifecycle. Internal configuration,
-scheduling, completion validation, and output modules share that one owner.
-`ExecutorInfo` describes the prepared executor's display identity and
-`GenerationLimits`; it is not a persistent compatibility fingerprint.
-
-## Dependency and ownership direction
-
-| Package | Responsibility |
+| Package | Current responsibility |
 | --- | --- |
-| `ribn` (`crates/runtime`) | Generation requests, admission, scheduling, committed results, output, cleanup ownership |
-| `engine-qwen` | Artifact-independent `QwenConfig`, `QwenGguf` mapping, prepared `QwenCuda` executor |
-| `engine-gguf` | Generic GGUF metadata, tensor reading, and tokenizer adapter; no Qwen model provider |
-| `engine-nvidia` | CUDA mechanisms, kernels, current specialized Qwen execution, and NVIDIA submission adapter |
-| `engine-core` | Legacy execution/state contracts and old runtime retained for comparison/cutover |
-| `ribn-cli` (`crates/cli`) | `ribn inspect`, experimental `ribn run`, and legacy `ribn local` |
+| `ribn` (`crates/runtime`) | Token-generation lifecycle, admission, scheduling, completion, bounded output, cancellation, cleanup ownership |
+| `ribn-text` (`crates/text`) | Shared text input/output behavior: raw prompts, chat formatting, token IDs, tokenization, incremental decoding, generation/batch results |
+| `engine-qwen` | Qwen configuration, GGUF mapping, and the current CUDA generation executor |
+| `engine-gguf` | Generic GGUF metadata/tensor reader and embedded tokenizer support |
+| `engine-nvidia` | NVIDIA resources, kernels, physical state, and submission mechanics |
+| `engine-core` | Legacy execution/state/runtime contracts retained temporarily for comparison and migration |
+| `ribn-cli` | `inspect`, experimental `run`, and the legacy `local` correctness path |
 
-The model definition can build with no GGUF/CUDA features and no normal
-third-party dependency. Serialized `qwen35.*` keys remain unchanged inside the
-Qwen GGUF adapter. Backend specialization is legitimate; model geometry and
-checkpoint container identity are not the same concept.
+Production dependency direction is checked by `tools/check-boundaries.py`. The goal
+is to prevent accidental reverse coupling, not to forbid shared code when a real
+implementation demonstrates that it belongs at a lower layer.
 
-NVIDIA glue no longer lives in core. Development-only reference tests may depend
-on higher-level adapters; production dependencies must retain the direction
-checked by `tools/check-boundaries.py`. The legacy core is not the API to extend
-when adding another generation model.
+## Application-facing behavior
 
-## Request, state, and completion invariants
+The public workflow should look like an inference engine, not like its scheduler.
+The shared text frontend currently establishes three distinct inputs:
 
-`RequestId` is the user-visible identity; `SequenceId` identifies executor-owned
-continuation state. Both are engine-issued and process-unique, not allocation
-pointers or cache identities. Concrete model implementations retain strongly
-typed state and model-owned resources separately. Neither recurrent state nor
-host lookup resources must masquerade as KV pages.
+- **raw prompt** -> tokenize without a chat template;
+- **chat messages** -> apply the artifact's supported chat template, then tokenize;
+- **token IDs** -> submit directly without text preprocessing.
 
-The committed prefix counts consumed model inputs. Generated output is separate:
-final prefill can emit output without consuming that token, and decode can return
-bounded multi-token accepted progress. Draft/rejected work never appears as a
-committed result. Fresh admission creates prefix-zero state only; restore, fork,
-transfer, and reconstruction need actual compatible contents and completion proof.
+`TextModel` provides synchronous `generate`, `chat`, `generate_tokens`, `stream`,
+and offline `generate_batch` operations over the same runtime. The CLI now uses
+this frontend instead of reimplementing Qwen loading and streaming itself. The
+current stream borrows the model mutably, so it is not yet the concurrent public
+handle needed by an HTTP server or multiple independent Rust callers.
 
-Submission may enqueue device work. The entire completion batch is validated
-against saved sequence identities, prefixes, and budgets before any logical state
-or output is changed. Scheduling-policy updates do not invalidate earlier work.
-In-flight cancellation suppresses uncommitted results after completion; it does
-not release live buffers or cancel peers.
+Generation completion carries prompt/completion token accounting with explicitly
+documented semantics. Protocol-specific usage, finish-reason, tool, logprob, and
+structured-output behavior should be mapped and tested above the scheduler rather
+than inferred from similarly named HTTP fields.
 
-An execution/completion fault fences new submissions. An unsuccessful physical
-release retains its cleanup owner. Explicit shutdown reports barrier/release
-errors; defensive Drop retains the executor when completion cannot be established
-instead of freeing device-visible memory. This is conservative fault containment,
-not a guarantee of successful resource reclamation.
+The intended CLI remains conventional: local model execution (`ribn run`), model
+inspection, and later serving/benchmark/device commands where implemented. Useful
+execution controls should be exposed when supported. Internal queues, output-credit
+bookkeeping, and model-specific state shapes should not become mandatory application
+concepts, but lower-level execution APIs can remain available for integrations that
+need them.
 
-## Bounded output and scheduling
+## Runtime invariants
 
-Waiting requests consume bounded request/input capacity but allocate executor
-state only on successful admission. Rejected/deferred admission retains no
-sequence resources. Physical memory budgeting remains the executor's responsibility.
+`RequestId` is user-visible request identity. `SequenceId` identifies executor-owned
+continuation state. Neither is a cache key or proof that continuation contents exist.
 
-Output has aggregate and per-request event limits. Work reserves credits before
-submission, including terminal-event capacity. Completed results go to stable
-mailboxes that outlive execution-slot reclamation. `pop_event_for(request)` drains
-one client directly; `pop_event()` visits ready clients round-robin. Per-request
-ordering is guaranteed; cross-request arrival ordering is not a public semantic.
+The committed prefix counts model inputs consumed. Output progress is separate:
+final prefill may produce the first output without consuming it, and speculative
+execution may compute more work than it commits. Completion is validated for the
+whole submitted batch before any public prefix/output mutation.
 
-Scheduling skips a blocked mailbox so peers with available model/output capacity
-can progress. Aggregate saturation still backpressures work, and clients retaining
-all available sequence capacity can prevent new admission. The current runtime
-has no network-disconnect policy or state preemption.
+Cancellation records intent. In-flight device state is not freed until completion
+or a proven synchronization barrier. Failed release retains an owner for retry;
+uncertain teardown prefers retaining device-visible resources over premature free.
+Those are correctness constraints, not performance-policy choices.
 
-Ready queues use stable internal slots and reused batch buffers. One batch is in
-flight at a time. Decode receives priority with bounded admitted-prefill progress.
-The scheduler does not know individual expert identities or attention algorithms.
-Profiling, compilation, and expensive policy search remain outside this loop.
+Output has aggregate and per-request bounds. Ready mailboxes use stable internal
+slots, and a stalled consumer can be skipped while peers with output/model capacity
+continue. The runtime currently keeps one scheduler batch in flight and is driven
+by polling. Wakeups, CPU/GPU scheduler overlap, and multiple in-flight batches are
+future performance work that needs lifetime and cancellation tests.
 
-## Preparation and current limits
+## Model, artifact, and backend boundaries
 
-`Engine::with_defaults` derives compatible limits from a prepared executor;
-`Engine::new` checks explicit limits strictly. The ordinary default constructor
-must not reject a one-sequence executor merely because a generic default said eight.
+Model geometry and artifact representation are different concerns. `QwenConfig`
+does not require GGUF; `QwenGguf` maps GGUF metadata/tensors into Qwen-specific
+semantics. The current Qwen CUDA implementation is still specialized and must
+reject unsupported geometry rather than treating a parsed config as proof that the
+kernels support it.
 
-`QwenCuda::load_gguf` prepares the existing CUDA text implementation, checks free
-memory against weight/state/headroom budgets, and completes preparation before
-returning. `ribn run` streams output through it; `ribn local` is the old numerical
-comparison frontend. `ribn inspect` reads generic GGUF metadata without allocating
-weights or initializing CUDA, and does not claim execution support from metadata.
+The scheduler should know enough about resource availability to make good choices,
+but it should not own physical KV/GDN/MoE layouts. The current `Ready`/`Deferred`
+admission contract is enough for the fixed-reservation path, not a final paging or
+preemption API. When dynamic state allocation lands, scheduling and the resource
+manager should cooperate around real capacity, reuse, and materialization costs.
 
-The Qwen path remains experimental on the new runtime. Its kernel geometry,
-state representation, full-context reservation, and greedy sampling remain those
-of the existing implementation. Artifact-independent metadata does not establish
-arbitrary-shape execution or support for another checkpoint format.
+Qwen3.8's hybrid continuation state makes a KV-only cache abstraction insufficient.
+Any future prefix reuse must establish that *all* required continuation components
+match the same prefix boundary. How those components are physically paged or
+checkpointed is an implementation decision to validate against the real model.
 
-The new runtime still lacks a canonical compatibility/qualification manifest,
-automatic variant selection, state paging/reuse, asynchronous wakeup integration,
-multimodal task input, and an HTTP server. See the gap map rather than treating a
-small trait as proof these capabilities exist.
+## Current limitations
 
-## Project boundaries
+The new Qwen/runtime integration remains experimental pending GPU qualification.
+The CUDA executor still has fixed-shape assumptions, full-context state reservation,
+and limited sampling. There is no HTTP server, concurrent high-level application
+handle, prefix cache, dynamic paging/preemption, automatic execution-variant
+selection, or second production model/backend path yet.
 
-CUDA Rust remains the NVIDIA kernel direction; target-specific vendor libraries
-are allowed. The migration must preserve numerical and resource-ownership proof.
-Future Metal/AMD implementations need real backend tests, not generic kernel
-claims. Distributed inference may eventually coordinate tensor/expert/pipeline
-execution within allocated resources. Fleet allocation and datacenter policy
-remain external; Archon is not a required dependency.
+CUDA Rust remains the NVIDIA kernel direction, but kernel migration and runtime
+migration are separate proof gates. See [CUDA Rust migration](cuda-rust-migration.md).

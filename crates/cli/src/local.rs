@@ -39,6 +39,13 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let options = crate::cli::parse(arguments, USAGE)?;
+    if options.raw || options.file.is_some() {
+        return Err("legacy local accepts only --prompt chat input; use `ribn run` for raw, file, or stdin input".to_owned());
+    }
+    let prompt = options
+        .prompt
+        .clone()
+        .ok_or_else(|| "legacy local requires --prompt".to_owned())?;
     let tokenizer_file =
         GgufFile::open(options.model.clone()).map_err(|error| error.to_string())?;
     let tokenizer = tokenizer_file
@@ -46,7 +53,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let prompt_tokens = tokenizer
         .encode_chat(
-            &[ChatMessage::new("user", options.prompt)],
+            &[ChatMessage::new("user", prompt)],
             ChatTemplateOptions::new(true, false),
         )
         .map_err(|error| error.to_string())?;

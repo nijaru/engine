@@ -188,7 +188,7 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FinishReason;
+    use crate::{FinishReason, Usage};
 
     fn token(id: RequestId, token: u32) -> Event {
         Event::Token { request: id, token }
@@ -197,6 +197,7 @@ mod tests {
         Event::Finished {
             request: id,
             reason: FinishReason::Length,
+            usage: Usage::default(),
         }
     }
 

@@ -2,69 +2,79 @@
 
 A Rust-first model inference runtime and serving engine.
 
-The goal is state-of-the-art inference performance, model support, and
-reliability in Rust, with familiar CLI, HTTP, and library interfaces. Sensible
-defaults should reduce setup, not remove useful configuration or advanced access.
-This is the product direction, not a claim that the current implementation has
-reached those goals. See the [interface plan](docs/ground-up-design.md#public-interface-direction).
+The goal is state-of-the-art inference performance, model support, reliability,
+and familiar CLI/library/server workflows. The current implementation is still an
+experimental Qwen GGUF/CUDA path under qualification; the documentation separates
+implemented behavior from planned interfaces and performance work.
 
-The model-neutral runtime is the `ribn` crate in `crates/runtime`. Its
-`GenerationExecutor` boundary keeps model state, artifact formats, and device execution
-out of the common request scheduler. The first real adapter is Qwen GGUF on CUDA.
+## Current interfaces
 
-## Status
-
-The existing Qwen path has correctness and performance evidence recorded in
-[execution history](benchmarks/execution-history.md). The new runtime and Qwen
-adapter have host contract tests and CUDA-feature compilation checks; their
-integration is **experimental pending GPU qualification**. New model families,
-HTTP serving, multimodal input, and automatic model selection are not implemented.
-The generation contract is an internal execution boundary, not a requirement for
-users to choose a task or executor before running a model.
-
-The binary is `ribn`; the package is `ribn-cli`. Metadata inspection needs no GPU:
+Metadata inspection requires no GPU:
 
 ```sh
 cargo run -p ribn-cli -- inspect /path/model.gguf
 ```
+
+The experimental CUDA path supports one-shot text generation. Text is treated as
+a user chat message by default; `--raw` performs raw completion instead. The model
+can be positional or supplied by the existing `--model` form.
+
+```sh
+cargo run -p ribn-cli --features cuda -- run /path/model.gguf \
+  --prompt 'Explain a mutex.' --max-tokens 128
+
+cargo run -p ribn-cli --features cuda -- run /path/model.gguf \
+  --raw --prompt 'The answer is'
+```
+
+File input and piped stdin are supported. Interactive terminal chat and an HTTP
+`serve` command are not implemented yet. `ribn local` remains the legacy numerical
+comparison frontend during migration.
+
+## Library layers
+
+`crates/runtime` (`ribn`) is the low-level generation runtime. `crates/text`
+(`ribn-text`) is the shared text frontend used by the CLI: it provides raw prompt,
+chat-message, and token-ID input, tokenization/chat-template handling, incremental
+UTF-8 decoding, synchronous streaming, offline batching, and terminal token usage.
+The current high-level stream borrows the model mutably; a concurrent application
+handle/server driver is planned rather than implied.
+
+The first real model implementation is Qwen on CUDA. Qwen configuration is
+separate from GGUF parsing, while NVIDIA resources and kernels remain backend-owned.
 
 ## Development
 
 Use the Rust toolchain pinned in `rust-toolchain.toml`:
 
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+python3 tools/check-boundaries.py
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-NVIDIA execution requires compatible hardware and runtime libraries:
-
-```sh
-cargo run -p ribn-cli --features cuda -- run \
-  --model /path/model.gguf --prompt 'Explain a mutex.' --max-tokens 128
-```
-
-`run` streams through the new runtime. `local` remains the legacy correctness
-frontend during migration. Neither command is a general multi-architecture
-model loader yet.
+CUDA-feature compile/tests run in CPU CI, but numerical/lifecycle qualification
+requires an actual compatible NVIDIA GPU.
 
 ## Code map
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/runtime` (`ribn`) | Model-neutral request ownership, scheduling, output, and generation-executor contract |
-| `crates/qwen` | Qwen definition, GGUF mapping, and CUDA generation executor |
+| `crates/runtime` (`ribn`) | Token-generation request lifecycle, scheduling, output, and executor contract |
+| `crates/text` (`ribn-text`) | Shared text/chat/token input and generation-result frontend |
+| `crates/qwen` | Qwen definition, GGUF mapping, and current CUDA executor |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
-| `crates/gguf` | Generic GGUF reader/tokenizer; model interpretation belongs to the model package |
-| `crates/core` | Legacy execution/state/runtime contracts retained for cutover and reference tests |
-| `crates/cli` | Experimental streaming CLI and legacy local frontend |
+| `crates/gguf` | Generic GGUF metadata/tensor reader and tokenizer support |
+| `crates/core` | Legacy execution/state contracts retained for cutover/reference tests |
+| `crates/cli` | `ribn` command-line frontend |
 
 ## Documentation
 
-- [Ground-up target and implementation gaps](docs/ground-up-design.md)
 - [Architecture](docs/architecture.md)
-- [Runtime redesign and research](docs/runtime-redesign.md)
-- [Roadmap and retirement gates](docs/roadmap.md)
+- [Ground-up design and external lessons](docs/ground-up-design.md)
+- [Roadmap](docs/roadmap.md)
+- [Runtime redesign history](docs/runtime-redesign.md)
 - [Runtime verification](benchmarks/runtime-contract.md)
 - [Benchmarks](benchmarks/README.md)
 - [CUDA Rust migration](docs/cuda-rust-migration.md)

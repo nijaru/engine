@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{
     Admission, BatchItem, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
     FinishReason, GenerationExecutor, RequestId, SchedulePolicy, SequenceId, SubmissionId,
-    TokenRequest,
+    TokenRequest, Usage,
 };
 
 use crate::config::validate_policy;
@@ -75,7 +75,7 @@ pub struct Engine {
     decode: VecDeque<usize>,
     terminal: VecDeque<usize>,
     active: usize,
-    queued_input_tokens: u64,
+    queued_prompt_tokens: u64,
     output: Output,
     batch: Vec<BatchItem>,
     batch_slots: Vec<usize>,
@@ -122,7 +122,7 @@ impl Engine {
             decode: VecDeque::with_capacity(config.max_active_requests),
             terminal: VecDeque::with_capacity(capacity),
             active: 0,
-            queued_input_tokens: 0,
+            queued_prompt_tokens: 0,
             output: Output::new(
                 config.max_buffered_events,
                 config.max_events_per_request,
@@ -214,7 +214,7 @@ impl Engine {
             return Err(EngineError::InvalidRequest);
         }
         let queued = self
-            .queued_input_tokens
+            .queued_prompt_tokens
             .checked_add(u64::from(prompt_tokens))
             .ok_or(EngineError::QueueFull)?;
         if self.requests.len() >= self.config.max_active_requests + self.config.max_queued_requests
@@ -243,7 +243,7 @@ impl Engine {
             terminal: None,
             notified: false,
         });
-        self.queued_input_tokens = queued;
+        self.queued_prompt_tokens = queued;
         self.requests.insert(request, index);
         self.waiting.push_back(index);
         Ok(request)
@@ -403,7 +403,7 @@ impl Engine {
                     let sequence = self.slots[index].as_mut().expect("waiting slot exists");
                     sequence.admitted = true;
                     sequence.input = None;
-                    self.queued_input_tokens -= u64::from(sequence.prompt_tokens);
+                    self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
                     self.active += 1;
                     self.prefill.push_back(index);
                 }
@@ -419,7 +419,7 @@ impl Engine {
             return;
         }
         if sequence.input.take().is_some() {
-            self.queued_input_tokens -= u64::from(sequence.prompt_tokens);
+            self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
         }
         sequence.terminal = Some(reason);
         sequence.work = WorkState::Idle;
@@ -456,6 +456,10 @@ impl Engine {
                             .as_ref()
                             .expect("terminal reason exists")
                             .clone(),
+                        usage: Usage {
+                            prompt_tokens: sequence.prompt_tokens,
+                            completion_tokens: sequence.generated,
+                        },
                     },
                 );
                 sequence.notified = true;

@@ -231,6 +231,15 @@ dependencies = [
  "engine-gguf",
  "engine-nvidia",
  "engine-qwen",
+ "ribn-text",
+]
+
+[[package]]
+name = "ribn-text"
+version = "0.0.0"
+dependencies = [
+ "engine-gguf",
+ "engine-qwen",
  "ribn",
 ]
 

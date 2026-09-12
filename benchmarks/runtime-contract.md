@@ -32,6 +32,19 @@ shutdown retries, and conservative retention after uncertain teardown. New tests
 per-request mailbox isolation, draining after execution-slot reuse, bounded ready
 list membership, source-format-independent model geometry, and small-executor defaults.
 
+## Shared text frontend
+
+`ribn-text` reuses the low-level runtime for raw prompt, chat-message, and token-ID
+input. Its synchronous streaming and offline batch paths are covered by workspace
+and CUDA-feature compilation/tests. Terminal events include explicit prompt and
+completion token accounting. The high-level stream currently borrows one model
+mutably; it is not evidence of a concurrent server driver or HTTP compatibility.
+
+CLI behavior uses the same frontend: default text input is one user chat message,
+`--raw` bypasses the chat template, and prompt/file/piped-stdin input share the
+same generation implementation. GPU numerical qualification remains the separate
+hardware gate below.
+
 ## Synthetic CPU benchmark
 
 ```sh

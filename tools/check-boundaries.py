@@ -6,9 +6,10 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FORBIDDEN = {
-    "runtime": {"engine-core", "engine-gguf", "engine-nvidia", "engine-qwen", "ribn-cli"},
-    "core": {"engine-gguf", "engine-nvidia", "engine-qwen", "ribn", "ribn-cli"},
-    "gguf": {"engine-nvidia", "engine-qwen", "ribn", "ribn-cli"},
+    "runtime": {"engine-core", "engine-gguf", "engine-nvidia", "engine-qwen", "ribn-text", "ribn-cli"},
+    "core": {"engine-gguf", "engine-nvidia", "engine-qwen", "ribn", "ribn-text", "ribn-cli"},
+    "gguf": {"engine-nvidia", "engine-qwen", "ribn", "ribn-text", "ribn-cli"},
+    "qwen": {"ribn-text", "ribn-cli"},
 }
 
 

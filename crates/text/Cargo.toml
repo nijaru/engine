@@ -1,0 +1,20 @@
+[package]
+name = "ribn-text"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["dep:engine-qwen", "engine-qwen/cuda"]
+
+[dependencies]
+ribn = { path = "../runtime" }
+engine-gguf = { path = "../gguf" }
+engine-qwen = { path = "../qwen", optional = true }
+
+[lints]
+workspace = true

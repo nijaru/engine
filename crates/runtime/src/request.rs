@@ -83,17 +83,20 @@ impl TokenRequest {
     }
 }
 
-/// Exact committed token accounting for a terminal request.
+/// Token accounting for a terminal generation request.
+/// `prompt_tokens` is the encoded input length. `completion_tokens` counts
+/// committed generated tokens, including a generated stop token even when the
+/// stop token itself is suppressed from streamed output.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 impl Usage {
     #[must_use]
     pub const fn total_tokens(self) -> u32 {
-        self.input_tokens.saturating_add(self.output_tokens)
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 }
 
