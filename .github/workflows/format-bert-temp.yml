@@ -1,0 +1,35 @@
+name: Temporary BERT formatter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/format-bert-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Format BERT pressure test
+        run: cargo fmt --all
+      - name: Commit formatted test
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- crates/batch/tests/bert_architecture.rs; then
+            exit 0
+          fi
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/batch/tests/bert_architecture.rs
+          git commit -m 'Format BERT architecture pressure test'
+          git push origin HEAD:main
