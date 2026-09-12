@@ -83,6 +83,20 @@ impl TokenRequest {
     }
 }
 
+/// Exact committed token accounting for a terminal request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+impl Usage {
+    #[must_use]
+    pub const fn total_tokens(self) -> u32 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FinishReason {
     Length,
@@ -102,6 +116,7 @@ pub enum Event {
     Finished {
         request: RequestId,
         reason: FinishReason,
+        usage: Usage,
     },
 }
 
