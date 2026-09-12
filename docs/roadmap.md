@@ -17,12 +17,12 @@ cross-component scheduling.
 | --- | --- | --- |
 | Shared execution foundation | Dependency-free parameter/version/materialization metadata; node/device/link topology; same logical model placed locally or across nodes; preparation-time semantic-op dispatch experiment | Physical storage/device primitives, broader operator/backend evidence, second hardware backend |
 | Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation | New-path GPU qualification; fixed-shape/model assumptions |
-| AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is now passed into executor admission separately from `SequenceId` | Static full-sequence resources, separate prefill/decode queues, one in-flight batch, richer coupled encoder/resource scheduling |
-| Non-AR runtime validation | Generic bounded batch runtime; parameter-version pinning; executor-informed FIFO batch sizing; SafeTensors/HF-style artifact-backed reference encoder | Actual encoder architecture/model integration, async/cancellation/resource admission, shape bucketing/reordering if evidence supports it |
+| AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation |
+| Non-AR runtime validation | Generic bounded batch runtime; parameter-version pinning; executor-informed FIFO batch sizing; an actual BERT encoder reference path loads HF/SafeTensors weights and executes embeddings, self-attention, residual/LayerNorm, FFN and pooler semantics | Attention masks/padding/ragged batching, async/cancellation/resource admission, device execution and optimized kernels |
 | Text facade | Raw/chat/token inputs, tokenizer/template reuse, streaming/offline batch | Hardwired Qwen GGUF/CUDA loading; mutable single-caller handle |
-| Model/artifact separation | `QwenConfig` independent of GGUF; thin SafeTensors artifact adapter; local HF-style config + unsharded/sharded weight-package resolver | Remote HF repository/revision resolution, processor/tokenizer package integration, architecture registry/model package |
-| Cross-runtime composition | Sequential batch-encoder -> AR handoff passes prepared state in-process and correlates it by stable AR `RequestId` even when handoffs arrive out of order | Cancellation/cleanup ownership around prepared state; VLM-style prompt-positioned encoder dependencies; real encoder-decoder model |
-| Multimodal/iterative | Staged-vs-coupled design distinction documented | No typed media processor path, VLM coupled scheduling/cache, iterative/diffusion runtime or realtime session path |
+| Model/artifact separation | `QwenConfig` independent of GGUF; thin SafeTensors artifact adapter; local HF-style config + unsharded/sharded weight-package resolver; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution/model package, reusable shard opening/materialization path |
+| Cross-runtime composition | Sequential batch-encoder -> AR handoff passes prepared state in-process; stable request identity survives out-of-order handoff; cancellation ownership is validated before and after AR admission | Genuine encoder-decoder model, cross-attention/device-state lifetime, async failure propagation and version compatibility |
+| Multimodal/iterative | VLM pressure test models prompt-positioned encoder items with independent encoder-compute and encoder-cache pressure; staged-vs-coupled distinction is validated | Typed media processor path, real VLM integration and production coupled scheduler/resource seam; iterative/diffusion runtime; realtime session path |
 | CUDA Rust | Resource/toolchain gate complete | Representative quantized/recurrent kernels and full execution integration |
 | Other hardware/distributed | Resource-topology/placement representation only | No second backend, collectives, remote execution or state transfer |
 
@@ -50,32 +50,45 @@ Executable validation scaffolds now establish several useful boundaries:
   tensor views without assigning model semantics or allocating execution tensors;
 - `ribn-hf` resolves a local HF-style `config.json` plus single or sharded
   SafeTensors weights without choosing model architecture, runtime or backend;
-- an HF-style/SafeTensors reference encoder flows through the non-AR runtime while
-  model integration, not the artifact layer, interprets `embeddings.weight`;
-- the AR executor admission seam now receives stable `RequestId` separately from
-  internal `SequenceId`, and a sequential encoder->decoder test proves prepared
-  state can remain in-process and be correlated correctly independent of handoff
-  order.
+- a test-only BERT architecture loads that HF/SafeTensors package and executes real
+  encoder structure—embeddings, multi-head self-attention, residual/LayerNorm, FFN
+  and pooler—through `ribn-batch`, while sequence length remains an executor-owned
+  batching constraint;
+- that BERT loading path also exposed a concrete model-loader requirement: one
+  SafeTensors shard should be opened once and serve many parameter views rather than
+  being reread independently for every tensor;
+- the AR executor admission seam receives stable `RequestId` separately from
+  internal `SequenceId`; sequential encoder->decoder tests prove prepared state can
+  remain in-process, correlate correctly independent of handoff order, and transfer
+  cleanup ownership at admission;
+- a VLM scheduler pressure test proves prompt-positioned encoder items can constrain
+  AR prefill and that encoder compute pressure and encoder-cache pressure are
+  independent scheduling facts. This is evidence for scheduler/resource-planner
+  cooperation, not for a universal resource-cost vector or raw media in the AR
+  request.
 
 These tests prove that the separation is implementable, **not** that the exact type
 shapes are finished. `StageId`, `RuntimeClass`, materialized storage IDs, current
-topology fields, `BatchExecutor::select_batch`, and the request-admission seam are
-still pressure-test interfaces.
+topology fields, `BatchExecutor::select_batch`, the request-admission seam, and the
+VLM test's dependency representation remain pressure-test interfaces.
 
 Remaining work in this architecture-validation stage:
 
-- integrate one actual small encoder/pooling architecture and checkpoint, not only
-  the current reference fixture, and let real tensor shapes/padding/resource costs
-  refine the non-AR contracts;
+- pressure-test attention masks, padding/ragged shapes and real device resource
+  costs on the encoder path; let that evidence refine non-AR batching/admission
+  rather than inventing a universal cost unit;
 - establish the general loaded-model/model-package and architecture-resolution
-  boundary on top of the now-separated HF/SafeTensors artifact layer;
+  boundary using the concrete Qwen and BERT integrations. An ordinary central Rust
+  enum/registry/factory is acceptable if it is the simplest fit; extensibility does
+  not require a plugin ABI or a scheduler that never changes;
 - add tokenizer/processor/package metadata and model capability/operation
   introspection without a user-visible task-default workflow;
-- pressure-test VLM-style **prompt-positioned** encoder dependencies where encoder
-  work/cache can interleave with AR prefill; do not assume the validated sequential
-  stage handoff is sufficient for multimodal generation;
-- validate prepared-state cancellation/cleanup and version invalidation around a
-  genuine encoder-decoder model;
+- integrate a genuine encoder-decoder model to validate cross-attention state,
+  device-resident handoff, cancellation/failure propagation and version
+  compatibility;
+- integrate a real VLM/processor path and use it to turn the test-only
+  prompt-position dependency model into the minimum production scheduler/resource
+  seam actually required;
 - introduce typed application inputs/outputs sufficient for text plus media and
   non-token results without putting raw media in the AR scheduler;
 - build a concurrent/cloneable Rust `Model` handle or equivalent whose driver owns
@@ -101,9 +114,9 @@ expose a wrong boundary.
 | --- | --- | --- |
 | Current Qwen hybrid AR | Existing prototype | KV + recurrent state, quantization, chunked generation, cancellation |
 | Dense decoder-only | Not started | New AR architecture without Qwen-specific changes |
-| Encoder/pooling | HF-style/SafeTensors artifact-backed reference encoder passes; executor-informed variable-length batch sizing passes | Embeddings/scoring without fake AR sequences; next: actual encoder model/architecture and real tensor/resource behavior |
-| Sequential encoder-decoder | Cross-runtime prepared-state handoff passes in-process using stable AR `RequestId` | Next: real encoder-decoder model, cancellation/cleanup and cross-attention/state lifetime |
-| VLM | Staged-vs-coupled boundary researched; implementation not started | Prompt-positioned media-feature dependencies, encoder compute/cache budgets, model-specific processor semantics |
+| Encoder/pooling | Actual BERT architecture reference path passes through HF/SafeTensors + `ribn-batch`; sequence-length batch selection passes | Non-AR model semantics do not need AR contracts; next: masks/padding/ragged/device resource behavior |
+| Sequential encoder-decoder | Cross-runtime state handoff and cancellation ownership pass in-process using stable AR `RequestId` | Next: genuine encoder-decoder model, cross-attention/device state, async failure/version lifetime |
+| VLM | Prompt-positioned encoder-dependency pressure test passes with separate encoder compute/cache constraints | Next: actual processor/model integration and minimum production scheduler/resource interface |
 | Diffusion image/video | Not started | Non-token iterative scheduling and media output |
 | Realtime/full-duplex | Design only | Long-lived session identity, concurrent media input/output, interruption/backpressure |
 | Non-AR text if practical | Not started | Text output does not imply autoregressive execution |
@@ -149,10 +162,12 @@ fairness queues with a unified scheduled-token budget. The scheduler should be a
 to express chunked prefill, cached progress, speculative multi-token work,
 encoder-conditioned prompts and preemption without special-case queue proliferation.
 
-For tightly coupled VLM-style generation, evaluate a separate encoder compute/cache
-budget or equivalent resource-manager cooperation rather than forcing all encoder
-work into a completed upstream stage. Scheduler-visible metadata should describe
-prepared dependency identity/readiness/cost, not raw media or preprocessing details.
+The VLM pressure test already shows that a coupled generation path sometimes needs
+per-item prompt-span readiness plus independent encoder-compute and encoder-cache
+capacity. Do not turn those two demonstrated resources into an arbitrary generic
+resource vector. Let an actual VLM integration determine whether the production
+boundary is explicit dependency descriptors, a model/resource planner queried by
+the scheduler, or another small cooperative interface.
 
 Measure FCFS/priority policy, token budgets, prefix locality, preemption/recompute
 and admission watermarks against short/long/shared-prefix workloads. Preserve
@@ -192,18 +207,27 @@ Kernel-language migration and top-level runtime migration are separate proof gat
 ## 7. Implement general model loading and model-support workflow
 
 Local HF-style package and SafeTensors artifact boundaries now exist as validation
-code. Extend them deliberately rather than making the artifact layer responsible for
-model semantics.
+code. Qwen and BERT provide two concrete model-family integrations against which to
+pressure-test architecture resolution. Extend these layers deliberately rather than
+making the artifact parser responsible for model semantics.
+
+First make repeated tensor access practical for real checkpoints: one resolved
+SafeTensors shard should be opened/owned once and provide many borrowed parameter
+views or prepared materializations. The BERT reference path currently proves this
+need with a private per-loader artifact cache; promote only the reusable artifact
+ownership mechanism, not BERT-specific semantics.
 
 Add Hugging Face repository IDs/revisions, tokenizer/chat-template and processor
 metadata as first-class sources alongside local directories. GGUF remains supported
 for quantized/local use.
 
-Define the model-package/architecture registry from actual integrations: config,
+Define the model-package/architecture resolver from actual integrations: config,
 logical parameter identity, weight adapters/materializations, processor, supported
 operations, logical stage topology, continuation semantics and backend variants.
 New checkpoints of an existing architecture should not require new scheduler/server
-code.
+code. A central enum or registry changing when genuinely new architectures are
+added is acceptable; the failure mode to avoid is model-specific branching scattered
+through unrelated runtime policy.
 
 Research a compatibility/reference backend for day-zero bring-up. Compare an
 optional Transformers/PyTorch bridge, portable graph import and Rust-framework
@@ -244,7 +268,9 @@ machinery.
 Do not assume every encoder is a separate top-level stage. Sequential
 encoder-decoder models can use a shallow staged handoff, while VLM/omni models may
 need a coupled runtime where encoder readiness/cache and AR prompt progress are
-scheduled together. See `docs/pipeline-composition.md`.
+scheduled together. The synthetic VLM pressure test has validated that distinction;
+an actual VLM must now determine the concrete production seam. See
+`docs/pipeline-composition.md`.
 
 For genuinely staged omni/diffusion models, compose logical stages where the model
 has different execution loops. Allow co-located stages to pass device-resident
