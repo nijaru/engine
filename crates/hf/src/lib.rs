@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use ribn_safetensors::SafeTensorArtifact;
+use ribn_safetensors::{ArtifactTensor, SafeTensorArtifact};
 use serde_json::Value;
 
 const CONFIG_FILE: &str = "config.json";
@@ -45,6 +45,16 @@ enum Weights {
         weight_map: BTreeMap<String, PathBuf>,
         shards: Vec<PathBuf>,
     },
+}
+
+/// Lazy reusable view over the SafeTensors files resolved by one local package.
+///
+/// The first tensor requested from a shard opens and validates that artifact; later
+/// tensors from the same shard reuse the owned bytes. The set still does not assign
+/// model semantics to parameter names or materialize tensors for a backend.
+pub struct LocalWeightSet<'a> {
+    weights: &'a Weights,
+    artifacts: BTreeMap<PathBuf, SafeTensorArtifact>,
 }
 
 impl LocalModelPackage {
@@ -145,7 +155,24 @@ impl LocalModelPackage {
         }
     }
 
-    /// Open the `SafeTensors` shard associated with `parameter`.
+    /// Create a lazy reusable weight-set view.
+    ///
+    /// Prefer this for loading multiple parameters. Each unique shard is opened at
+    /// most once for the lifetime of the returned set, while unused shards stay
+    /// unopened.
+    #[must_use]
+    pub fn weight_set(&self) -> LocalWeightSet<'_> {
+        LocalWeightSet {
+            weights: &self.weights,
+            artifacts: BTreeMap::new(),
+        }
+    }
+
+    /// Open the `SafeTensors` shard associated with one `parameter`.
+    ///
+    /// This one-shot helper is useful for inspection. Model loaders reading many
+    /// tensors should use [`Self::weight_set`] so repeated parameters in one shard
+    /// do not reread the whole artifact.
     ///
     /// # Errors
     /// Returns [`PackageError::UnknownParameter`] for a name absent from a
@@ -154,10 +181,7 @@ impl LocalModelPackage {
         let path = self
             .weight_file(parameter)
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?;
-        SafeTensorArtifact::open(path).map_err(|error| PackageError::Artifact {
-            path: path.to_owned(),
-            message: error.to_string(),
-        })
+        open_artifact(path)
     }
 
     /// Resolve another file within the package root without assigning semantics
@@ -169,6 +193,56 @@ impl LocalModelPackage {
     pub fn package_file(&self, relative: impl AsRef<Path>) -> Result<PathBuf, PackageError> {
         resolve_member(&self.root, relative.as_ref(), false)
     }
+}
+
+impl LocalWeightSet<'_> {
+    /// Number of unique SafeTensors shards opened so far.
+    #[must_use]
+    pub fn opened_shard_count(&self) -> usize {
+        self.artifacts.len()
+    }
+
+    /// Resolve and borrow one parameter tensor, lazily opening its shard once.
+    ///
+    /// Model integrations remain responsible for interpreting the parameter name,
+    /// validating model-specific shape requirements, and preparing backend storage.
+    ///
+    /// # Errors
+    /// Returns [`PackageError::UnknownParameter`] for a name absent from a sharded
+    /// index, or an artifact error when the shard/tensor is invalid.
+    pub fn tensor(&mut self, parameter: &str) -> Result<ArtifactTensor<'_>, PackageError> {
+        let path = self
+            .weight_path(parameter)
+            .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
+            .to_owned();
+        if !self.artifacts.contains_key(&path) {
+            self.artifacts.insert(path.clone(), open_artifact(&path)?);
+        }
+        self.artifacts
+            .get(&path)
+            .expect("opened artifact remains owned by the weight set")
+            .tensor(parameter)
+            .map_err(|error| PackageError::Artifact {
+                path,
+                message: error.to_string(),
+            })
+    }
+
+    fn weight_path(&self, parameter: &str) -> Option<&Path> {
+        match self.weights {
+            Weights::Single(path) => Some(path),
+            Weights::Sharded { weight_map, .. } => {
+                weight_map.get(parameter).map(PathBuf::as_path)
+            }
+        }
+    }
+}
+
+fn open_artifact(path: &Path) -> Result<SafeTensorArtifact, PackageError> {
+    SafeTensorArtifact::open(path).map_err(|error| PackageError::Artifact {
+        path: path.to_owned(),
+        message: error.to_string(),
+    })
 }
 
 impl Weights {
@@ -440,6 +514,18 @@ mod tests {
                 .shape(),
             [1, 3]
         );
+        let mut weights = package.weight_set();
+        assert_eq!(weights.opened_shard_count(), 0);
+        assert_eq!(
+            weights
+                .tensor("embeddings.weight")
+                .expect("cached tensor")
+                .shape(),
+            [1, 3]
+        );
+        assert_eq!(weights.opened_shard_count(), 1);
+        assert!(weights.tensor("embeddings.weight").is_ok());
+        assert_eq!(weights.opened_shard_count(), 1);
         assert!(
             package
                 .package_file("tokenizer.json")
@@ -496,6 +582,19 @@ mod tests {
         assert!(artifact.tensor("projection.weight").is_ok());
         assert!(matches!(
             package.open_weights_for("missing.weight"),
+            Err(PackageError::UnknownParameter(name)) if name == "missing.weight"
+        ));
+
+        let mut weights = package.weight_set();
+        assert_eq!(weights.opened_shard_count(), 0);
+        assert!(weights.tensor("projection.weight").is_ok());
+        assert_eq!(weights.opened_shard_count(), 1);
+        assert!(weights.tensor("projection.weight").is_ok());
+        assert_eq!(weights.opened_shard_count(), 1);
+        assert!(weights.tensor("embeddings.weight").is_ok());
+        assert_eq!(weights.opened_shard_count(), 2);
+        assert!(matches!(
+            weights.tensor("missing.weight"),
             Err(PackageError::UnknownParameter(name)) if name == "missing.weight"
         ));
     }
