@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/apply-ribn-final.yml
-      - .github/ribn-final.patch.xz
+      - .github/patchparts/**
 
 permissions:
   contents: write
@@ -22,11 +22,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          xz -dc .github/ribn-final.patch.xz > /tmp/ribn-final.patch
+          echo '672daf54f578796e5f6b06b00b7cb09b62f7893c61419b01df2ca1b04e3ff894  .github/patchparts/p0' | sha256sum -c -
+          echo 'd0f2a4caa8d8042664e2ec00a5e533ad02faf3bc54e69fb79f1c193e6508fecb  .github/patchparts/p1' | sha256sum -c -
+          echo 'a507a95cfadc80f1127865f8bd086b6eda19dbf1269995e8003bc34446854e79  .github/patchparts/p2' | sha256sum -c -
+          echo 'c7f25f7b260ef482eb1c0825032f59011f18d6944998674bde086cb88b474ac0  .github/patchparts/p3' | sha256sum -c -
+          echo '1369f6bd746b842dbc99cde14be68d074cbc2f26b6cd1264128807664a13f3fb  .github/patchparts/p4' | sha256sum -c -
+          cat .github/patchparts/p{0,1,2,3,4} | base64 -d > /tmp/ribn-final.patch.xz
+          echo '255b5a89bb9152f41a7a16eaf860027091f94d30fd4b5d19a6a9fd5f192efe7e  /tmp/ribn-final.patch.xz' | sha256sum -c -
+          xz -dc /tmp/ribn-final.patch.xz > /tmp/ribn-final.patch
           echo '31445bb1441c1aaacb737d778240889219545e171fe1f7ec1d7639d948d2e35b  /tmp/ribn-final.patch' | sha256sum -c -
           git apply --index --check /tmp/ribn-final.patch
           git apply --index /tmp/ribn-final.patch
-          git rm .github/ribn-final.patch.xz .github/workflows/apply-ribn-final.yml
+          git rm -r .github/patchparts .github/ribn-final.patch.xz .github/workflows/apply-ribn-final.yml
           git diff --cached --check
       - uses: dtolnay/rust-toolchain@master
         with:
