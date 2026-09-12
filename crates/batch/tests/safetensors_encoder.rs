@@ -97,8 +97,8 @@ impl ArtifactEncoder {
         }
         let mut output = vec![0.0_f32; self.width];
         for &token_id in tokens {
-            let token = usize::try_from(token_id)
-                .map_err(|_| EncoderError::TokenOutOfRange(token_id))?;
+            let token =
+                usize::try_from(token_id).map_err(|_| EncoderError::TokenOutOfRange(token_id))?;
             if token >= self.vocab {
                 return Err(EncoderError::TokenOutOfRange(token_id));
             }
