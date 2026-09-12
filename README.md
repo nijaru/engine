@@ -16,10 +16,15 @@ encoder-decoder speech, diffusion/media, and other execution regimes without
 forcing them through token-generation contracts.
 
 A provisional [shared execution foundation](docs/execution-foundation.md) now
-pressure-tests two additional boundaries: logical parameter/version identity is
-separate from physical materialization, and model semantics are separate from
-resource/deployment topology. These validation types are intentionally not stable
-public APIs yet.
+pressure-tests additional boundaries: logical parameter/version identity is
+separate from physical materialization, model semantics are separate from
+resource/deployment topology, and backend/operator compatibility can be resolved at
+preparation rather than rediscovered in the hot path. These validation types are
+intentionally not stable public APIs yet.
+
+[Pipeline composition](docs/pipeline-composition.md) records another important
+result: genuinely sequential encoder->decoder models and tightly coupled VLM/omni
+execution do not necessarily want the same composition mechanism.
 
 ## Current interfaces
 
@@ -56,15 +61,29 @@ without committing Ribn to a general operator IR.
 
 `crates/runtime` (`ribn`) is currently the low-level **AR generation runtime**. It
 owns token-generation request lifecycle, scheduling, cancellation, bounded output,
-and the current `GenerationExecutor` contract. Those are not intended as universal
-contracts for every inference workload.
+and the current `GenerationExecutor` contract. Stable `RequestId` is now passed to
+executor admission separately from internal `SequenceId`, which lets model-owned
+request-scoped prepared state be correlated without turning `TokenRequest` into a
+generic multimodal payload container. Those AR contracts are still not intended as
+universal interfaces for every inference workload.
 
 `crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
 encoder/pooling-style batching. Its inputs and outputs are executor-defined and it
-contains no token/prefix/KV concepts. A variable-length reference encoder already
-showed that request count alone is not enough to form safe batches, so the executor
-can shorten the oldest FIFO candidate set using its own concrete constraints. There
-is deliberately no universal work/cost unit or length-bucketing policy yet.
+contains no token/prefix/KV concepts. A variable-length reference encoder showed
+that request count alone is not enough to form safe batches, so the executor can
+shorten the oldest FIFO candidate set using its concrete constraints. SafeTensors
+and local HF-style package fixtures now exercise this path from artifact metadata
+through model-owned parameter interpretation. There is deliberately no universal
+work/cost unit or length-bucketing policy yet.
+
+`crates/safetensors` (`ribn-safetensors`) is a thin artifact adapter. It validates
+SafeTensors bytes and exposes names, shapes, dtypes, and borrowed payload bytes; it
+does not assign parameter semantics or allocate execution tensors.
+
+`crates/hf` (`ribn-hf`) is a local Hugging Face-style package resolver for
+`config.json` and unsharded/sharded SafeTensors weights. It intentionally preserves
+raw model metadata and resolves files/parameter ownership without choosing a model
+architecture, runtime, backend, or processor implementation.
 
 `crates/text` (`ribn-text`) is the current shared text frontend used by the CLI: raw
 prompt, chat-message and token-ID input, tokenization/chat-template handling,
@@ -72,12 +91,18 @@ incremental UTF-8 decoding, synchronous streaming, offline batching, and termina
 token usage. `TextModel::load` is still Qwen/GGUF/CUDA-specific and the high-level
 stream borrows the model mutably; both are transitional.
 
-The broader design will add a loaded-model/model-package boundary, Hugging Face +
-safetensors/tokenizer/processor loading, typed multimodal inputs/results, a
-concurrent model handle, and specialized runtimes for execution regimes that are
-not AR token generation. Native optimized execution remains the production target;
-a compatibility/reference model path is being evaluated separately for faster
-model bring-up and correctness comparison.
+A sequential encoder->AR pressure test now passes prepared state in-process and
+correlates it with the correct AR request even when handoffs are installed out of
+order. This validates one staged-execution seam, not a general multimodal solution.
+VLM-style prompt-positioned encoder dependencies remain a separate coupled-runtime
+pressure test.
+
+The broader design still needs the real loaded-model/model-package boundary, remote
+Hugging Face repository/revision resolution, tokenizer/processor package metadata,
+typed multimodal inputs/results, a concurrent model handle, and specialized
+runtimes for execution regimes that are not AR token generation. Native optimized
+execution remains the production target; a compatibility/reference model path is
+being evaluated separately for faster model bring-up and correctness comparison.
 
 ## Intended use
 
@@ -117,7 +142,9 @@ requires an actual compatible NVIDIA GPU.
 | --- | --- |
 | `crates/foundation` (`ribn-foundation`) | Provisional parameter/version/materialization, resource-topology, prepared-placement, and test-only semantic-op validation |
 | `crates/runtime` (`ribn`) | AR token-generation lifecycle/scheduling/output/executor contract |
-| `crates/batch` (`ribn-batch`) | Provisional non-AR batch/encoder runtime with executor-informed FIFO batch sizing |
+| `crates/batch` (`ribn-batch`) | Provisional non-AR batch/encoder runtime with executor-informed FIFO batch sizing and cross-runtime pressure tests |
+| `crates/safetensors` (`ribn-safetensors`) | Generic validated SafeTensors artifact/tensor views |
+| `crates/hf` (`ribn-hf`) | Local HF-style config/weight package resolution without model semantics |
 | `crates/text` (`ribn-text`) | Current shared text/chat/token input and generation-result frontend |
 | `crates/qwen` | Qwen definition, GGUF mapping, and current CUDA AR executor |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
@@ -129,6 +156,7 @@ requires an actual compatible NVIDIA GPU.
 
 - [Inference engine design](docs/inference-engine-design.md)
 - [Shared execution foundation](docs/execution-foundation.md)
+- [Pipeline composition](docs/pipeline-composition.md)
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
 - [Research agenda](docs/research-agenda.md)
