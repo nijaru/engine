@@ -19,7 +19,9 @@ enum OpError {
 impl fmt::Display for OpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoImplementation => f.write_str("no RMSNorm implementation supports this preparation"),
+            Self::NoImplementation => {
+                f.write_str("no RMSNorm implementation supports this preparation")
+            }
             Self::InvalidShape => f.write_str("RMSNorm input/weight shape does not match its spec"),
             Self::WidthTooLarge => f.write_str("RMSNorm reference fixture width is too large"),
         }
@@ -152,8 +154,14 @@ fn preparation_selects_backend_implementation_once() {
     let input = [1.0, -2.0, 0.5, 3.0];
     let weight = [1.0, 0.5, 2.0, 1.5];
     let expected = reference_kernel(&spec, &input, &weight).expect("reference output");
-    assert_close(&gpu_op.execute(&input, &weight).expect("gpu output"), &expected);
-    assert_close(&cpu_op.execute(&input, &weight).expect("cpu output"), &expected);
+    assert_close(
+        &gpu_op.execute(&input, &weight).expect("gpu output"),
+        &expected,
+    );
+    assert_close(
+        &cpu_op.execute(&input, &weight).expect("cpu output"),
+        &expected,
+    );
 }
 
 #[test]
