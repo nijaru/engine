@@ -1,5 +1,4 @@
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
@@ -20,20 +19,11 @@ use engine_nvidia::{
     StagedTensorSource, wrap_f32_stream,
 };
 
-const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_PREFILL_CHUNK_TOKENS: u32 = 16;
 const WEIGHT_BUDGET_BYTES: u64 = 20_u64 << 30;
 const EPSILON: f32 = 1.0e-6;
 
 pub const USAGE: &str = "engine-server local --model <model.gguf> --prompt <text> [--max-tokens <n>] [--device <ordinal>]";
-
-#[derive(Debug)]
-struct LocalOptions {
-    model: PathBuf,
-    prompt: String,
-    max_tokens: u32,
-    device: u16,
-}
 
 #[allow(
     clippy::too_many_lines,
@@ -47,7 +37,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    let options = parse_options(arguments)?;
+    let options = crate::cli::parse(arguments, USAGE)?;
     let tokenizer_file =
         GgufFile::open(options.model.clone()).map_err(|error| error.to_string())?;
     let tokenizer = tokenizer_file
@@ -184,45 +174,6 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let text = String::from_utf8_lossy(&bytes);
     println!("{text}");
     Ok(())
-}
-
-fn parse_options(arguments: &[String]) -> Result<LocalOptions, String> {
-    let mut model = None;
-    let mut prompt = None;
-    let mut max_tokens = DEFAULT_MAX_TOKENS;
-    let mut device = 0_u16;
-    let mut index = 0;
-    while index < arguments.len() {
-        let name = &arguments[index];
-        let value = arguments
-            .get(index + 1)
-            .ok_or_else(|| format!("missing value for {name}; usage: {USAGE}"))?;
-        match name.as_str() {
-            "--model" => model = Some(PathBuf::from(value)),
-            "--prompt" => prompt = Some(value.clone()),
-            "--max-tokens" => {
-                max_tokens = value
-                    .parse::<u32>()
-                    .map_err(|_| "--max-tokens expects a positive integer".to_owned())?;
-                if max_tokens == 0 {
-                    return Err("--max-tokens must be greater than zero".to_owned());
-                }
-            }
-            "--device" => {
-                device = value
-                    .parse::<u16>()
-                    .map_err(|_| "--device expects a non-negative device ordinal".to_owned())?;
-            }
-            other => return Err(format!("unknown local option {other:?}; usage: {USAGE}")),
-        }
-        index += 2;
-    }
-    Ok(LocalOptions {
-        model: model.ok_or_else(|| format!("--model is required; usage: {USAGE}"))?,
-        prompt: prompt.ok_or_else(|| format!("--prompt is required; usage: {USAGE}"))?,
-        max_tokens,
-        device,
-    })
 }
 
 fn stage_weights(

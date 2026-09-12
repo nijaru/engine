@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-qwen"
+version = "0.0.0"
+dependencies = [
+ "cudarc",
+ "engine-core",
+ "engine-gguf",
+ "engine-nvidia",
+ "ribn",
+]
+
+[[package]]
 name = "engine-server"
 version = "0.0.0"
 dependencies = [
@@ -103,6 +114,8 @@ dependencies = [
  "engine-core",
  "engine-gguf",
  "engine-nvidia",
+ "engine-qwen",
+ "ribn",
 ]
 
 [[package]]

@@ -30,3 +30,6 @@ jobs:
           components: clippy, rustfmt
       - run: cargo clippy -p engine-nvidia --features cuda --all-targets -- -D warnings
       - run: cargo clippy -p engine-server --features cuda --all-targets -- -D warnings
+      - run: cargo clippy -p engine-qwen --features cuda --all-targets -- -D warnings
+      - run: cargo test -p engine-qwen --features cuda
+      - run: cargo test -p engine-server --features cuda

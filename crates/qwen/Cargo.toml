@@ -1,5 +1,5 @@
 [package]
-name = "engine-server"
+name = "engine-qwen"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,10 @@ publish = false
 
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:engine-gguf", "dep:engine-nvidia", "engine-nvidia/cuda", "dep:engine-qwen", "engine-qwen/cuda"]
+cuda = ["dep:cudarc", "dep:engine-gguf", "dep:engine-nvidia", "engine-nvidia/cuda"]
 
 [dependencies]
 ribn = { path = "../runtime" }
-engine-qwen = { path = "../qwen", optional = true }
 engine-core = { path = "../core" }
 engine-gguf = { path = "../gguf", optional = true }
 engine-nvidia = { path = "../nvidia", optional = true }
