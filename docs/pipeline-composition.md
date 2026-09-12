@@ -33,10 +33,10 @@ begins. In that case the shallow orchestrator can own the dependency between the
 runtimes. If both stages are co-located, the prepared encoder state should remain in
 device memory; a logical stage boundary must not imply host serialization or RPC.
 
-The current pressure test validates a narrow version of this boundary. A batch
+The current pressure tests validate a narrow version of this boundary. A batch
 encoder produces `Arc`-owned prepared state. AR executor admission receives stable
 `RequestId` separately from internal `SequenceId`, takes ownership of the state for
-that request, and the test proves handoff order does not determine which request
+that request, and the tests prove handoff order does not determine which request
 receives which state.
 
 Cancellation also establishes a useful ownership rule without a new generic cleanup
@@ -94,24 +94,56 @@ those facts affect whether a prompt range can execute.
 The current AR `Engine` deliberately hides prompt-prefix progress from an external
 orchestrator. That is desirable for ordinary staged execution, but it means a simple
 wrapper around the existing engine cannot efficiently decide when a prompt-positioned
-encoder item becomes relevant. The coupled VLM pressure test therefore needs to run
-at the AR scheduler/resource boundary rather than pretending the validated sequential
-handoff solves this case.
+encoder item becomes relevant. Coupled VLM decisions therefore belong at a
+scheduler/resource boundary rather than in an external stage wrapper.
+
+## What the VLM pressure test proved
+
+`crates/runtime/tests/multimodal_dependencies.rs` models only scheduler-visible facts,
+not images or processor implementation details. Each prepared encoder dependency has
+an item identity, prompt span, encoder-compute cost, encoder-cache cost, and cached
+or uncached state. Token progress and encoder resources are budgeted independently.
+
+The test establishes several behaviors:
+
+- a future encoder item is not eagerly scheduled before the prompt range that needs
+  it;
+- an encoder item can be computed in the same scheduling iteration whose prompt
+  chunk reaches and consumes it;
+- cached encoder output can cross its placeholder span without spending encoder
+  compute budget;
+- insufficient encoder compute truncates prompt progress before the uncached item;
+- insufficient encoder cache capacity is a distinct failure/pressure mode from
+  insufficient encoder compute;
+- multiple prompt-positioned items can progressively truncate an otherwise valid AR
+  prefill chunk;
+- starting directly at an unready dependency stalls token progress until the
+  required encoder resource is available.
+
+This is enough to reject two premature designs:
+
+1. every encoder must finish as a top-level stage before AR prefill starts;
+2. one opaque whole-request multimodal handle is necessarily sufficient for
+   efficient scheduling.
+
+It is **not** enough to stabilize a production dependency descriptor. In particular,
+the test's compute/cache integer units are fixtures, not a proposed arbitrary
+resource vector. An actual VLM integration should determine whether the production
+seam is explicit per-item descriptors, a model/resource planner queried by the AR
+scheduler, or another small cooperative interface.
 
 ## Do not choose an opaque request handle too early
 
 A single opaque "prepared multimodal input" handle would be easy to add to the
-current `TokenRequest`, but it may be too coarse. Efficient VLM execution can need
-per-item readiness and cache lifetime because different encoder items become relevant
-at different prompt positions.
+current `TokenRequest`, but it is too early to make that the common contract.
+Efficient VLM execution can require per-item readiness and cache lifetime because
+different encoder items become relevant at different prompt positions.
 
-Do not stabilize that handle yet. The whole-input sequential case has now passed;
-the remaining pressure test is prompt-positioned multimodal encoder items interleaved
-with AR prefill.
-
-The resulting AR request/resource contract should expose only the minimum dependency
-information scheduling actually needs. Raw media stays above the runtime in the
-model processor/application layer.
+The whole-input sequential and prompt-positioned coupled cases have now both been
+pressure-tested. The next step is not another synthetic abstraction: integrate an
+actual VLM processor/model path and expose only the minimum scheduler/resource
+information that implementation demonstrably needs. Raw media stays above the
+runtime in the model processor/application layer.
 
 ## Identity and cache validity
 
@@ -139,7 +171,7 @@ Omni and media-generation models may therefore mix both approaches. A model can 
 several logical stages while one stage internally coordinates multiple tightly
 coupled components.
 
-## Validation targets
+## Validation status and next targets
 
 Completed sequential pressure tests:
 
@@ -151,14 +183,23 @@ Completed sequential pressure tests:
 - cancellation after admission reclaims executor-owned state through `release`;
 - missing prepared state fails only the affected AR request.
 
+Completed coupled pressure tests:
+
+- prompt-positioned encoder dependencies participate in AR prefill progress;
+- encoder computation can occur just in time for the prompt span that consumes it;
+- cached items bypass encoder compute but still represent cache residency;
+- encoder compute and cache are independent scheduling constraints;
+- later dependencies can shorten a chunk after earlier dependencies were satisfied.
+
 Remaining before stabilizing composition contracts:
 
 - use an actual encoder-decoder architecture/checkpoint to validate real prepared
   device-state and cross-attention semantics;
-- pressure-test VLM-style prompt-positioned encoder dependencies with separate
-  encoder compute/cache pressure;
-- let that evidence determine whether AR scheduling needs explicit per-item
-  dependency descriptors, a resource-manager interface, or another representation.
+- integrate an actual VLM processor/model and let its real feature tensors, prompt
+  positions, cache lifetime and device costs determine the production coupled
+  scheduler/resource seam;
+- validate version compatibility and async failure propagation for both staged and
+  coupled derived state.
 
 The goal is not a universal pipeline graph. The goal is to preserve direct fast
 paths while giving genuinely heterogeneous models the coordination they require.
