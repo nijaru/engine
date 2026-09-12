@@ -95,6 +95,9 @@ pub trait BatchExecutor {
 
     fn parameter_version(&self) -> ParameterVersion;
     fn max_batch_items(&self) -> usize;
+
+    /// # Errors
+    /// Returns the concrete executor error when the selected batch cannot execute.
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
