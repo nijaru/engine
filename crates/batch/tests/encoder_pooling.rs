@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput, RuntimeError};
+use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
 use ribn_foundation::ParameterVersion;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +94,20 @@ impl BatchExecutor for ReferenceEncoder {
         self.max_items
     }
 
+    fn select_batch(&self, candidates: &[&Self::Input]) -> usize {
+        let mut selected = 0;
+        let mut tokens = 0_usize;
+        for candidate in candidates {
+            let next = tokens.saturating_add(candidate.len());
+            if selected > 0 && next > self.max_batch_tokens {
+                break;
+            }
+            tokens = next;
+            selected += 1;
+        }
+        selected
+    }
+
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
@@ -147,7 +161,7 @@ fn variable_length_encoder_inputs_batch_without_ar_semantics() {
 }
 
 #[test]
-fn item_count_only_selection_is_not_enough_for_real_encoder_costs() {
+fn executor_informed_selection_respects_encoder_batch_cost() {
     let mut runtime = BatchRuntime::new(
         ReferenceEncoder::fixture(4),
         BatchConfig {
@@ -156,17 +170,14 @@ fn item_count_only_selection_is_not_enough_for_real_encoder_costs() {
     )
     .expect("runtime");
 
-    runtime.submit(vec![0, 1, 2]).expect("first request");
-    runtime.submit(vec![3, 2, 1]).expect("second request");
+    let first = runtime.submit(vec![0, 1, 2]).expect("first request");
+    let second = runtime.submit(vec![3, 2, 1]).expect("second request");
 
-    assert!(matches!(
-        runtime.step(),
-        Err(RuntimeError::Executor {
-            source: EncoderError::BatchTooLarge {
-                tokens: 6,
-                limit: 4
-            },
-            ..
-        })
-    ));
+    assert!(runtime.step().expect("first encoder batch"));
+    assert_eq!(runtime.queued(), 1);
+    assert_eq!(runtime.pop_completed().expect("first output").request(), first);
+
+    assert!(runtime.step().expect("second encoder batch"));
+    assert_eq!(runtime.queued(), 0);
+    assert_eq!(runtime.pop_completed().expect("second output").request(), second);
 }
