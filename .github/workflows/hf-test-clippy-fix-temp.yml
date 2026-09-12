@@ -1,0 +1,45 @@
+name: Temporary HF test Clippy fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/hf-test-clippy-fix-temp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fix borrowed path comparison
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/hf/src/lib.rs')
+          text = path.read_text()
+          old = 'Err(PackageError::UnsafeShardPath(path)) if path == PathBuf::from("../outside.safetensors")'
+          new = 'Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new("../outside.safetensors")'
+          if old not in text:
+              raise SystemExit('target comparison not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Commit fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nick'
+          git config user.email 'nijaru7@gmail.com'
+          git add crates/hf/src/lib.rs
+          git commit -m 'Fix HF path comparison lint'
+          git push origin HEAD:main
