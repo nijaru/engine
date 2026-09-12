@@ -11,9 +11,9 @@ Keep commits focused and leave the tree green. Public architecture/roadmap decis
 belong in `docs/`; do not make repository behavior depend on private context files.
 
 At session start, read `README.md`, `docs/inference-engine-design.md`,
-`docs/execution-foundation.md`, `docs/architecture.md`, and `docs/roadmap.md`, then
-inspect the actual code/tests relevant to the change. Keep correctness and
-performance claims tied to evidence.
+`docs/execution-foundation.md`, `docs/pipeline-composition.md`,
+`docs/architecture.md`, and `docs/roadmap.md`, then inspect the actual code/tests
+relevant to the change. Keep correctness and performance claims tied to evidence.
 
 ## Product direction
 
@@ -45,19 +45,24 @@ wrong top-level substrate.
 Target decomposition:
 
 - a loaded-model/model-package boundary resolves architecture, artifact, processor,
-  supported operations, logical stage topology, model state semantics, and backend
+  supported operations, logical topology, model state semantics, and backend
   variants;
-- a shallow orchestrator owns request identity, cross-stage routing, cancellation,
-  bounded queues, failure propagation, and output ordering;
+- a shallow orchestrator owns genuine cross-runtime dependencies, cancellation,
+  bounded queues, failure propagation, placement and output ordering;
 - specialized runtimes own execution-specific scheduling (AR token generation,
-  batch/encoder/pooling, iterative diffusion/media, or additional regimes justified
-  by actual models);
+  batch/encoder/pooling, iterative diffusion/media, session/realtime, or additional
+  regimes justified by actual models);
 - backend/model code owns physical resources, kernels, layouts and collectives;
 - CLI/HTTP/Python/Rust frontends reuse model/application behavior rather than
   reimplementing model execution.
 
 Logical stages are not mandatory processes. Single-stage models should take a
 short direct path. Avoid pass-through Worker/Executor/Engine layer stacks.
+
+Do not force every encoder behind a top-level stage boundary. Sequential
+encoder-decoder models can use a staged handoff; VLM/omni models may need a coupled
+runtime where encoder readiness/cache and AR prompt progress participate in the same
+resource decision. See `docs/pipeline-composition.md`.
 
 ## Shared execution foundation
 
@@ -88,12 +93,12 @@ core contracts can be removed as replacement paths qualify.
 
 `crates/batch` (`ribn-batch`) is likewise a design-validation runtime, not a final
 embedding scheduler. It proves non-AR work need not inherit token/prefix/KV
-semantics. A variable-length reference encoder already showed that request count
-alone cannot safely form all batches, so the concrete executor can shorten the
-oldest FIFO candidate set using its own shape/memory/compute constraints. Do not
-replace that with a universal cost or work-unit abstraction without evidence.
-Reordering, bucketing, heterogeneous batching, async execution and resource-aware
-admission remain open until real models justify their shared contracts.
+semantics. A variable-length reference encoder showed that request count alone
+cannot safely form all batches, so the concrete executor can shorten the oldest
+FIFO candidate set using its own shape/memory/compute constraints. Do not replace
+that with a universal cost or work-unit abstraction without evidence. Reordering,
+bucketing, heterogeneous batching, async execution and resource-aware admission
+remain open until real models justify their shared contracts.
 
 A future trainer may reuse lower-level parameter/device/operator/collective
 infrastructure, but it remains a separate execution system. Shared infrastructure
@@ -110,7 +115,14 @@ that it reduces duplication without adding hot-path dispatch or compiler machine
 Model configuration and artifact representation are separate concerns. The current
 `QwenConfig` / `QwenGguf` split is directionally correct.
 
-Hugging Face repository IDs/local directories, config JSON, safetensors, tokenizer
+`crates/safetensors` now provides a thin format adapter that validates artifacts and
+exposes format-level tensor views without assigning model semantics or allocating
+execution tensors. `crates/hf` resolves local HF-style `config.json` plus single or
+sharded SafeTensors weights without choosing architecture/runtime/backend. Preserve
+that separation as remote repository/revision, tokenizer and processor support are
+added.
+
+Hugging Face repository IDs/local directories, config JSON, SafeTensors, tokenizer
 and processor metadata should become first-class. GGUF remains important for
 quantized/local use but is one loader path, not a universal representation.
 
@@ -132,6 +144,13 @@ request/device rows, incremental metadata updates, asynchronous host/device
 execution, packed/ragged batches, reusable workspaces, and backend-specific optimized
 paths where measurements support them.
 
+`RequestId` and `SequenceId` are deliberately different identities. `RequestId` is
+the stable AR runtime request identity; `SequenceId` identifies executor
+continuation ownership. `GenerationExecutor::admit` receives both so model-owned
+prepared request state or tracing can correlate with the logical request without
+making `TokenRequest` a generic payload container. Do not put raw media or a vague
+universal multimodal object into `TokenRequest` merely because this seam exists.
+
 Do not assume continuation state is KV. Full/SWA/MLA/sparse attention, recurrent or
 SSM state, speculative/draft state and other components can coexist. Future dynamic
 resource management must cooperate with scheduling around allocation, prefix reuse,
@@ -145,6 +164,11 @@ The current separate prefill/decode queues, one in-flight batch, static
 `Ready/Deferred` admission, and full-context-per-sequence reservation are prototype
 mechanics, not architectural commitments. Revisit them once the real resource model
 exists; unified token-budget scheduling is one strong candidate.
+
+For VLM-style coupled generation, be prepared for scheduler/resource cooperation
+around model-prepared encoder-item identity, token-span dependency, readiness,
+encoder-compute cost and encoder-cache capacity. Raw media and processor
+implementation details remain above that boundary.
 
 Optimized variants need correctness qualification for the scope in which they are
 automatically selected. Compilation or host tests are not GPU evidence.
@@ -171,10 +195,17 @@ optimized support is not required for every pressure test.
 
 Current validation evidence includes: the same logical model can be placed against
 local or multi-node resource topologies; non-AR work can execute without token/KV
-semantics while remaining pinned to a parameter version; and a variable-length
-reference encoder forced executor-informed FIFO batch selection. The next useful
-pressure test is an artifact-backed small encoder/pooling path using the modern
-model-loading direction rather than more synthetic scheduling abstractions.
+semantics while remaining pinned to a parameter version; a variable-length encoder
+forced executor-informed FIFO batch selection; SafeTensors + local HF-style package
+fixtures keep artifact semantics separate from model semantics; and a sequential
+batch-encoder -> AR test passes prepared state in-process and correlates it by AR
+`RequestId` independent of handoff order.
+
+Next composition pressure tests are an actual encoder architecture/checkpoint and a
+VLM-style prompt-positioned encoder dependency path. The latter should determine
+whether the AR scheduler needs explicit per-item dependency descriptors,
+resource-manager cooperation, or another representation; do not assume the
+sequential staged handoff solves multimodal scheduling.
 
 ## Verification
 
