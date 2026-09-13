@@ -1,7 +1,14 @@
 # Qwen multi-token prefill qualification
 
 Date: 2026-09-12
-Status: hardware gate pending; no GPU correctness or performance claim yet
+Status: hardware-qualified at `0496f79` on the pinned artifact; production serving still
+runs serial prefill, and the candidate is not selected by serving.
+
+Result: both parity gates pass and chunked prefill is 1.71x-1.79x serial at the
+8-member cap with no decode regression, so the candidate is eligible for
+backend-local serving integration. The measurement is the intermediate path only; it
+is not a chunked GDN or multi-token attention implementation. See the qualification
+result section at the end of this document.
 
 This gate decides whether Ribn's experimental same-sequence Qwen prefill path is
 safe and useful enough to consider for serving. It is deliberately separate from
@@ -137,3 +144,71 @@ Full-attention prefill should likewise move toward an actual multi-token attenti
 implementation rather than repeatedly invoking the decode attention kernel. These
 are model/backend execution changes; they do not require inventing a new top-level
 scheduler contract.
+
+## Qualification result, 2026-09-12 (head `0496f79`)
+
+Session preconditions, recorded before the run:
+
+```text
+git rev-parse HEAD      0496f792d22ae93c3db465bb781fe19afbf4f5e0
+artifact sha256         322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482
+rustc / cargo           1.98.0 / 1.98.0
+driver / CUDA UMD       615.71.09 / 13.4
+GPU                     RTX 4090, 24564 MiB, idle (only gnome-shell/Xwayland resident)
+```
+
+Across the 72 timing runs the GPU stayed at 45-57 C and 241-361 W with no reported
+HW or thermal slowdown. Raw output is kept at
+`/home/nick/ribn-prefill-gate-2026-09-12/`; benchmark output is gitignored by the
+`benchmarks/results/` policy, so the summary below is the committed record.
+
+### Correctness
+
+Both ignored gates passed on the pinned artifact:
+
+```text
+same_sequence_prefill_chunk_matches_batch1_hybrid_prefix  ok  164.78 s
+same_sequence_prefill_chunk_matches_batch1_full_model    ok  173.74 s
+```
+
+The hybrid gate compares every prompt row of a four-token chunk through three
+recurrent layers plus one full-attention layer against serial batch-1 execution, then
+runs a continuation token through both persisted states. The full gate does the same
+across all 64 layers with an eight-token prompt. Passing qualifies this implementation
+at this artifact and tolerance (5.0e-3), and nothing else.
+
+### Prefill timing
+
+Three prompt lengths, four modes, six runs each with rep 0 discarded as warmup, one
+unchanged release build, `--tokens=64`. Mode order rotates per repetition so no mode
+is confounded with thermal drift. Values are medians of the five measured runs in
+seconds; the parenthesized number is speedup against that prompt length's serial
+median.
+
+| prompt tokens | serial | chunk 2 | chunk 4 | chunk 8 |
+| --- | --- | --- | --- | --- |
+| 65 | 2.786 | 2.772 (1.01x) | 1.900 (1.47x) | 1.556 (1.79x) |
+| 257 | 11.573 | 11.460 (1.01x) | 7.931 (1.46x) | 6.549 (1.77x) |
+| 447 | 21.134 | 20.844 (1.01x) | 14.681 (1.44x) | 12.350 (1.71x) |
+
+Per-cell spread was 0.006-0.029 s, so every speedup above is two orders of magnitude
+outside run-to-run noise. Decode medians were 2.921/3.215/3.505 s at 65/257/447 prompt
+tokens and within 0.002 s of that in every chunked mode at the same prompt length, so
+no decode regression appears. Chunk 2 is indistinguishable from serial; the win grows
+with chunk size up to the 8-member cap, which is consistent with amortizing weight
+reads across prompt rows.
+
+Device memory during a chunk-8 447-token run peaked at 16221 MiB used of 24564 MiB
+(7940 MiB free) including the full staged model, so the candidate does not create
+memory pressure at this workload size.
+
+### Decision
+
+This is promotion case C: parity passes and the prefill win is substantial and
+repeatable across all three prompt lengths, so the candidate is eligible for
+backend-local serving integration with the scheduler contract unchanged. Independent
+same-sequence lane sizing, backend subchunking, keeping the logits-producing prompt
+token on the existing output path, and conservative asynchronous fault handling are
+the integration conditions. Production serving was not changed in this session, so
+serving still executes prompt tokens serially and this path stays opt-in through the
+benchmark flag until that integration is qualified in turn.

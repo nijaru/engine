@@ -207,13 +207,21 @@ model topology stays separate from deployment topology.
 
 ## Current limitations
 
-Ribn currently has only the Qwen GGUF/CUDA AR path. `TextModel::load` rejects
-non-Qwen GGUFs; the AR executor accepts only token-generation requests; state is
-reserved for full configured context per active sequence; the scheduler has one
-batch in flight; sampling support is limited; there is no HF/safetensors loader,
-general processor/model registry, multimodal prepared-input path, encoder/pooling
-runtime, diffusion runtime, cross-stage orchestrator, concurrent public model
-handle, HTTP server, second hardware backend or distributed execution.
+Ribn currently has only the Qwen GGUF/CUDA AR path in production use. `TextModel::load`
+rejects non-Qwen GGUFs; the AR executor accepts only token-generation requests; state
+is reserved for full configured context per active sequence; the scheduler has one
+batch in flight; sampling support is limited.
+
+Provisional pressure-test scaffolding exists beyond that path for format-level
+SafeTensors validation, local HF-style package resolution, and a non-AR batch runtime
+with a BERT reference path, but none of it is production model support. There is no
+general model/architecture registry, production processor or multimodal prepared-input
+path, encoder/pooling runtime, diffusion runtime, cross-stage orchestrator, concurrent
+public model handle, HTTP server, second hardware backend or distributed execution.
+
+`docs/execution-foundation.md` records what has actually been validated and is the
+single place to update when that changes. This section states the shape of the gap
+rather than restating evidence, so the two cannot drift.
 
 Those limitations are reasons to redesign now while the codebase is small, not
 reasons to expand Qwen-specific abstractions until they become harder to remove.

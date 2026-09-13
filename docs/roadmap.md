@@ -113,9 +113,13 @@ expose a wrong boundary.
 
 | Path | Current state | What it validates |
 | --- | --- | --- |
+
+The `Current state` column records which pressure test ran, not what it proved.
+`docs/execution-foundation.md` holds the validated behavior and its limits, and is the
+single owner of evidence; this table links to that rather than restating it.
 | Current Qwen hybrid AR | Existing prototype | KV + recurrent state, quantization, chunked generation, cancellation |
 | Dense decoder-only | Not started | New AR architecture without Qwen-specific changes |
-| Encoder/pooling | Actual BERT architecture reference path passes through HF/SafeTensors + `ribn-batch`; sequence-length batch selection passes | Non-AR model semantics do not need AR contracts; next: masks/padding/ragged/device resource behavior |
+| Encoder/pooling | Actual BERT architecture reference path passes through HF/SafeTensors + `ribn-batch`; sequence-length batch selection, attention masks, and padded-versus-ragged cost pass | Non-AR model semantics do not need AR contracts; next: real device resource admission and asynchronous execution |
 | Sequential encoder-decoder | Cross-runtime state handoff and cancellation ownership pass in-process using stable AR `RequestId` | Next: genuine encoder-decoder model, cross-attention/device state, async failure/version lifetime |
 | VLM | Prompt-positioned encoder-dependency pressure test passes with separate encoder compute/cache constraints | Next: actual processor/model integration and minimum production scheduler/resource interface |
 | Diffusion image/video | Not started | Non-token iterative scheduling and media output |
