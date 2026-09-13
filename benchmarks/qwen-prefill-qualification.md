@@ -163,7 +163,9 @@ target/release/examples/qwen_serving_bench \
 
 The prompt is the same five tokens cycled to length, which makes this a prefill-cost
 fixture rather than a realistic prompt distribution; the token streams it prints are
-the parity check for the same run.
+the parity check for the same run. *The sweep section at the end of this document
+repeats the measurement with a real prompt's content at three lengths, and the
+`--prompt-fixture` flag added there is the way to do it.*
 
 ## 6. Where prefill time goes
 
@@ -455,7 +457,7 @@ unchanged. Still open in this area: true chunked GDN and multi-token attention (
 lane batches projections and feed-forward work per position while recurrence still
 advances token by token), the long-prompt fidelity item above, and a serving-relevant
 prompt-length sweep with a realistic prompt distribution rather than the repeated
-timing fixture.
+timing fixture (measured in the sweep section at the end of this document).
 
 ## Batched GEMV result, 2026-09-13 (head `f68e345`)
 
@@ -896,3 +898,45 @@ gate now carries the switch that measures it either way.
 Landed unwired and opt-in, with its device gates green and its adoption blocker recorded
 rather than argued away. The default path is untouched: serial prefill, decode, the
 default chunked lane, and every other gate behave exactly as at `765f565`.
+
+## Serving prompt-length sweep, 2026-09-13 (head `ed367d9`)
+
+Every serving number recorded above used the same five tokens cycled to the requested
+length, which is a prefill-cost fixture rather than prompt content, and the missing
+work list has carried "a serving-relevant prompt-length sweep with a realistic prompt
+distribution" since the integration result. `qwen_serving_bench` now takes
+`--prompt-fixture=<path>`, which uses a reference fixture's real prompt tokens at the
+requested length (no cycling, and a length beyond the fixture is an error), and prints
+which source it used. This sweep is the fixture prompt's real content at three lengths,
+32 output tokens, one unchanged release build:
+
+| prompt tokens | concurrency | mode | TTFT | elapsed | ITL |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 1 | serial | 1.708 s | 2.606 s | 28.95 ms |
+| 64 | 1 | chunk 8 | 0.603 s | 1.500 s | 28.94 ms |
+| 64 | 4 | serial | 6.814 s | 8.261 s | 46.67 ms |
+| 64 | 4 | chunk 8 | 2.377 s | 3.825 s | 46.70 ms |
+| 128 | 1 | serial | 3.509 s | 4.453 s | 30.47 ms |
+| 128 | 1 | chunk 8 | 1.054 s | 2.000 s | 30.51 ms |
+| 128 | 4 | serial | 14.032 s | 15.670 s | 52.83 ms |
+| 128 | 4 | chunk 8 | 4.188 s | 5.826 s | 52.84 ms |
+| 257 | 1 | serial | 7.426 s | 8.466 s | 33.55 ms |
+| 257 | 1 | chunk 8 | 1.821 s | 2.861 s | 33.53 ms |
+| 257 | 4 | serial | 29.723 s | 31.742 s | 65.11 ms |
+| 257 | 4 | chunk 8 | 7.264 s | 9.280 s | 65.04 ms |
+
+Three things follow. First, prompt **content** is not a confound: at 257 tokens the real
+prompt gives 1.821 s and 7.264 s against the repeated-cycle prompt's 1.828 s and
+7.264 s, so the earlier timings stand as prefill-cost measurements rather than as
+artifacts of the fixture. Second, the chunking win **grows with prompt length** — 2.83x
+at 64 tokens, 3.33x at 128, 4.08x at 257 at concurrency 1, and 2.87x/3.35x/4.09x at
+concurrency 4 — which is the shape the lane predicts: weights are read once per chunk
+and the per-chunk overhead is fixed, so longer prompts amortize better. The chunked
+cost per prompt token falls from 9.4 ms at 64 tokens to 8.2 at 128 and 7.1 at 257, while
+serial prefill sits at 26.7-28.9 ms per token across the same range. Third, inter-token
+latency is unchanged by the mode and grows with concurrency exactly as before, so the
+lane remains a prefill-only change.
+
+Serial and chunked prefill also print identical token streams at both 128 and 257 prompt
+tokens, which is the same parity check the 257-token run has carried since the
+integration result.

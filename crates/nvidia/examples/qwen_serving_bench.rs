@@ -70,7 +70,30 @@ fn run() -> Result<(), String> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let concurrency = parse_usize(&arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
     let output_tokens = parse_u32(&arguments, "--tokens=", DEFAULT_OUTPUT_TOKENS)?;
-    let prompt_tokens = parse_usize(&arguments, "--prompt-tokens=", PROMPT.len())?;
+    // `--prompt-fixture=<path>` swaps the repeated timing prompt for a real
+    // prompt's content, taken as the fixture prompt's first `--prompt-tokens`
+    // tokens (default: the whole fixture prompt). Real content at several
+    // lengths is what makes a prompt-length sweep evidence about prompts rather
+    // than about one repeated token cycle.
+    let fixture_tokens = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prompt-fixture="))
+        .map(read_fixture_prompt)
+        .transpose()?;
+    let prompt_tokens = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prompt-tokens="))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("--prompt-tokens expects a number: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            fixture_tokens
+                .as_ref()
+                .map_or(PROMPT.len(), std::vec::Vec::len)
+        });
     if prompt_tokens == 0 {
         return Err("prompt token count must be greater than zero".to_owned());
     }
@@ -116,20 +139,28 @@ fn run() -> Result<(), String> {
     } else {
         prompt_tokens
     };
-    // The fixed prompt is repeated to reach `--prompt-tokens`, so prefill cost
-    // and chunking can be exercised without a workload driver; the repetition
-    // makes this a timing fixture, not a realistic prompt distribution.
-    let prompt: Arc<[u32]> = if prompt_tokens == PROMPT.len() {
-        Arc::from(PROMPT)
-    } else {
-        Arc::from(
+    // Without a fixture the fixed prompt is repeated to reach
+    // `--prompt-tokens`, which exercises prefill cost and chunking without a
+    // workload driver but is a timing fixture rather than real prompt content.
+    let prompt: Arc<[u32]> = match &fixture_tokens {
+        Some(tokens) => {
+            if tokens.len() < prompt_tokens {
+                return Err(format!(
+                    "prompt fixture holds {} tokens, fewer than the requested {prompt_tokens}",
+                    tokens.len()
+                ));
+            }
+            Arc::from(tokens[..prompt_tokens].to_vec())
+        }
+        None if prompt_tokens == PROMPT.len() => Arc::from(PROMPT),
+        None => Arc::from(
             PROMPT
                 .iter()
                 .copied()
                 .cycle()
                 .take(prompt_tokens)
                 .collect::<Vec<_>>(),
-        )
+        ),
     };
     let state_tokens = u32::try_from(longest_prompt)
         .map_err(|_| "prompt length does not fit the runtime".to_owned())?
@@ -339,6 +370,12 @@ fn run() -> Result<(), String> {
     println!("  concurrency: {concurrency}");
     println!("  output tokens/request: {output_tokens}");
     println!("  prompt tokens/request: {prompt_tokens}");
+    let prompt_source = if fixture_tokens.is_some() {
+        "reference fixture prompt"
+    } else {
+        "repeated fixed prompt (timing fixture)"
+    };
+    println!("  prompt source: {prompt_source}");
     println!(
         "  same-sequence prefill chunking: {}",
         match prefill_chunk {
@@ -393,6 +430,27 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Read a reference fixture's prompt token IDs: an artifact identity line, the
+/// prompt, and the expected continuation, as `crates/qwen/tests/fixtures` uses.
+fn read_fixture_prompt(path: &str) -> Result<Vec<u32>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("read prompt fixture {path}: {error}"))?;
+    let mut lines = text.lines();
+    lines
+        .next()
+        .ok_or_else(|| format!("prompt fixture {path} has no identity line"))?;
+    lines
+        .next()
+        .ok_or_else(|| format!("prompt fixture {path} has no prompt line"))?
+        .split_whitespace()
+        .map(|token| {
+            token
+                .parse::<u32>()
+                .map_err(|error| format!("prompt fixture {path} token: {error}"))
+        })
+        .collect()
 }
 
 fn parse_usize(arguments: &[String], prefix: &str, default: usize) -> Result<usize, String> {
