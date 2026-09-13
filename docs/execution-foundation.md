@@ -344,7 +344,9 @@ Implemented as provisional scaffolding:
 - sequential encoder->AR handoff, out-of-order correlation, request-local failure,
   and cancellation ownership before/after admission;
 - VLM prompt-position dependency scheduling with separate encoder compute/cache
-  pressure as a test-only model of the coupled case.
+  pressure as a test-only model of the coupled case, plus the same dependencies
+  driven through the real admission loop to establish which of those decisions the
+  request contract carries and which it does not.
 
 This validates that the broad boundary is implementable and has forced several
 interface changes. It does **not** validate that these exact types are sufficient or

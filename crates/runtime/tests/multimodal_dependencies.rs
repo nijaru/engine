@@ -4,6 +4,14 @@
 //! narrower question: what information must a generation scheduler/resource layer
 //! know in order to advance a prompt without either eagerly encoding every media
 //! item or entering a placeholder span whose encoder output is unavailable?
+//!
+//! Everything here is a pure function over a proposed decision, so passing these
+//! tests shows the decision is *expressible*, not that the engine can carry it.
+//! `multimodal_admission.rs` asks that second question through the real admission,
+//! submission, and completion loop, and records where the two answers differ: a
+//! prefill step must advance exactly the chunk the engine chose, so the range that
+//! stops before an unavailable placeholder can only be produced by choosing a
+//! policy chunk whose granularity matches the prompt's encoder items.
 
 use std::collections::HashSet;
 

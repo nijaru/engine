@@ -132,6 +132,36 @@ resource vector. An actual VLM integration should determine whether the producti
 seam is explicit per-item descriptors, a model/resource planner queried by the AR
 scheduler, or another small cooperative interface.
 
+### What the request contract can carry
+
+`crates/runtime/tests/multimodal_admission.rs` asks the same questions through the
+real `Engine` instead of a pure function, and the answers divide the list above.
+
+Carried today:
+
+- `Admission::Deferred` is a working per-request encoder gate: the engine retries the
+  request on later steps and commits no prompt token while it waits, so "do not start
+  before the encoder output exists" is expressible without a new interface;
+- a backend can perform encoder work inside its own step, and encoder output published
+  by anyone is reused rather than recomputed, across requests as well as across steps.
+
+Not carried today:
+
+- a prefill completion must advance *exactly* the chunk the engine chose, so a backend
+  cannot return a shorter range and stop before an unavailable placeholder. Decode may
+  advance partially; prefill may not. The remaining options are to do the work anyway,
+  exceeding an internal encoder budget, or to fail the submission, which faults every
+  request in that batch rather than only the one whose encoder is missing;
+- encoder budgets therefore hold only when `SchedulePolicy::prefill_chunk_tokens`
+  aligns with the prompt's encoder-item granularity. Two of the three admission tests
+  pin this: one shows aligned chunking staying inside budget, the other shows an
+  eight-token chunk spanning both items and overspending in a single step because the
+  model had no way to refuse.
+
+That is the concrete reason the incremental `prepare`-then-`enqueue` contract in
+[the resource protocol](resource-protocol.md) exists: negotiation before a step is
+fixed, rather than a policy chunk the backend must honor or fail on.
+
 ## Do not choose an opaque request handle too early
 
 A single opaque "prepared multimodal input" handle would be easy to add to the
