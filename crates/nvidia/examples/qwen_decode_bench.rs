@@ -2,10 +2,16 @@
 //! Qwen3.8-27B GGUF text path.
 //!
 //! Stages the full text path onto the device, prefills a raw token prompt, then
-//! greedily decodes `N` tokens while timing prefill and decode separately. The
-//! default remains the serial batch-1 correctness path. `--prefill-chunk=N`
-//! opts only this benchmark into the experimental same-sequence chunk executor;
-//! it does not change serving behavior or constitute performance qualification.
+//! greedily decodes `N` tokens while timing prefill and decode separately.
+//! `--prefill-chunk=N` selects the same-sequence chunk executor that serving also
+//! uses by default, so the two modes can be compared on one build; `--tokens` and
+//! `--prompt-tokens` build a repeated prompt for timing.
+//!
+//! `--prompt-fixture=<path>` reads a reference fixture's prompt tokens instead, and
+//! `--logit-margins=N` prints the first `N` steps' top-five log-probabilities and
+//! top-1/top-2 margin, which is what a comparison against another engine's recorded
+//! log-probabilities needs: agreeing on the winning token says nothing about how
+//! close the runners-up were.
 //!
 //! ```text
 //! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
@@ -63,16 +69,49 @@ fn main() {
                 .parse::<usize>()
                 .expect("--prefill-chunk expects a number")
         });
-    let prompt = if prompt_token_count == BASE_PROMPT.len() {
-        BASE_PROMPT.to_vec()
-    } else {
-        BASE_PROMPT
-            .iter()
-            .copied()
-            .cycle()
-            .take(prompt_token_count)
-            .collect::<Vec<_>>()
-    };
+    // Number of generation steps whose top-k log-probabilities are printed. Used
+    // with `--prompt-fixture` to compare greedy margins against a reference
+    // engine that recorded the same prompt, which token agreement alone cannot do.
+    let margin_steps = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--logit-margins="))
+        .map_or(0, |value| {
+            value
+                .parse::<usize>()
+                .expect("--logit-margins expects a number")
+        });
+    let prompt = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prompt-fixture="))
+        .map_or_else(
+            || {
+                if prompt_token_count == BASE_PROMPT.len() {
+                    BASE_PROMPT.to_vec()
+                } else {
+                    BASE_PROMPT
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(prompt_token_count)
+                        .collect::<Vec<_>>()
+                }
+            },
+            |path| {
+                let text = std::fs::read_to_string(path).expect("read prompt fixture");
+                let mut lines = text.lines();
+                lines.next().expect("fixture identity line");
+                lines
+                    .next()
+                    .expect("fixture prompt line")
+                    .split_whitespace()
+                    .map(|token| token.parse::<u32>().expect("fixture token"))
+                    .collect::<Vec<_>>()
+            },
+        );
+    assert!(
+        prompt.len() + decode_token_count <= KV_CAPACITY,
+        "fixture prompt plus --tokens must fit the {KV_CAPACITY}-token benchmark KV cache"
+    );
     let model_path = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--model=").map(str::to_owned))
@@ -200,10 +239,13 @@ fn main() {
         .decode_step(&mut state, prompt[last_prompt_index], final_position)
         .expect("final prefill step");
     stream.synchronize().expect("sync after prefill");
+    if margin_steps > 0 {
+        print_logit_margins(0, chosen, &executor.copy_logits().expect("logits readback"));
+    }
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
     let prefill_mode = prefill_chunk.map_or_else(
         || "serial batch-1 AR loop".to_owned(),
-        |members| format!("experimental same-sequence chunks of {members}"),
+        |members| format!("same-sequence chunks of {members}"),
     );
     println!(
         "prefill {} tokens in {prefill_seconds:.3} s ({:.3} s/token, {prefill_mode})",
@@ -221,6 +263,14 @@ fn main() {
         chosen = executor
             .decode_step(&mut state, chosen, decode_position)
             .expect("decode step");
+        let generation_step = usize::try_from(step).expect("step fits usize");
+        if generation_step + 1 < margin_steps {
+            print_logit_margins(
+                generation_step + 1,
+                chosen,
+                &executor.copy_logits().expect("logits readback"),
+            );
+        }
     }
     stream.synchronize().expect("sync after decode");
     let decode_seconds = decode_start.elapsed().as_secs_f64();
@@ -231,9 +281,31 @@ fn main() {
         tokens_f64 / decode_seconds
     );
     println!(
-        "caveat: prefill chunking is experimental and unqualified; decode still has per-step argmax synchronization and ~{} kernel launches per step. This is a local measurement, not a serving-throughput claim",
+        "caveat: decode still synchronizes per step for the argmax and issues ~{} kernel launches per step, so this is a local measurement, not a serving-throughput claim",
         per_step_launches()
     );
+}
+
+/// Print the top five log-probabilities and the top-1/top-2 margin for one
+/// generation step, in the same shape as a reference engine's `n_probs` output
+/// so the two can be compared directly.
+fn print_logit_margins(index: usize, chosen: u32, logits: &[f32]) {
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum = logits
+        .iter()
+        .map(|value| (value - maximum).exp())
+        .sum::<f32>();
+    let log_normalizer = maximum + sum.ln();
+    let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let top = ranked
+        .iter()
+        .take(5)
+        .map(|(token, logit)| format!("{token}:{:.4}", logit - log_normalizer))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let margin = ranked[0].1 - ranked[1].1;
+    println!("margins[{index}] chosen={chosen} gap={margin:.4} {top}");
 }
 
 fn per_step_launches() -> usize {

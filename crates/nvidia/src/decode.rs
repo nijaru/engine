@@ -5,11 +5,11 @@
 //! sequencing across [`CudaHybridState`], FFN, and the greedy output head.
 //! Layer sequencing mirrors `host_gdn_ar_step`/`host_full_attn_ar_step`,
 //! which are llama.cpp-verified at `cc83d7b48`; each launch is the
-//! corresponding parity-tested CUDA kernel. The default serving prefill still uses
-//! the state-advancing model body autoregressively, one token at a time. An
-//! experimental same-sequence chunk path batches token-independent work while
-//! keeping recurrent/KV updates causal; it remains unwired pending device parity
-//! and performance qualification.
+//! corresponding parity-tested CUDA kernel. Serving prefills a prompt with the
+//! same-sequence chunk path below, which batches token-independent work while
+//! keeping recurrent and KV updates causal, and leaves the final sampling token
+//! on the batch-1 step; `benchmarks/qwen-prefill-qualification.md` records the
+//! parity and serving gates behind that selection.
 //!
 //! The executor defines its own [`QwenLayerKind`] so `engine-gguf` remains
 //! optional; model providers translate their layer catalogs into this
@@ -745,6 +745,22 @@ impl CudaQwen35Decode {
     pub fn copy_hidden(&self) -> Result<Vec<f32>, CudaDecodeError> {
         self.stream
             .clone_dtoh(&self.hidden)
+            .map_err(|error| CudaDecodeError::Driver(error.to_string()))
+    }
+
+    /// Copy the vocabulary logits of the most recent output head to the host.
+    ///
+    /// The copy is stream-ordered and synchronized. It exists so parity work can
+    /// compare greedy margins with a reference engine's log-probabilities, which
+    /// an argmax alone cannot distinguish from a different distribution that
+    /// happens to agree on the winner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaDecodeError::Driver`] when the device copy fails.
+    pub fn copy_logits(&self) -> Result<Vec<f32>, CudaDecodeError> {
+        self.stream
+            .clone_dtoh(&self.logits)
             .map_err(|error| CudaDecodeError::Driver(error.to_string()))
     }
 
@@ -1872,9 +1888,11 @@ impl CudaQwen35BatchDecode {
     /// The fixed batch rows represent consecutive tokens of the **same** sequence,
     /// not independent requests. Token-independent projections, norms, and FFNs run
     /// batch-major; convolution, recurrent-state updates, KV append, and causal
-    /// attention remain ordered by token inside each layer. This is an experimental
-    /// prefill path for qualification against the batch-1 oracle and is not selected
-    /// by serving automatically.
+    /// attention remain ordered by token inside each layer. This is the
+    /// serving-selected prefill path, qualified against the batch-1 oracle by
+    /// `benchmarks/qwen-prefill-qualification.md`; the dispatcher sizes the lane
+    /// independently of request concurrency and keeps the final sampling token
+    /// on the batch-1 step.
     ///
     /// Physical state buffers are updated, but the mirrored prefix in
     /// [`CudaHybridState`] is not committed here, matching [`CudaQwen35Decode::prefill_step`].
@@ -2080,7 +2098,7 @@ impl CudaQwen35BatchDecode {
     /// weight-heavy operations across prompt-token rows.
     #[allow(
         clippy::too_many_lines,
-        reason = "the experimental prefill path mirrors the layer sequence while keeping causal state updates explicit"
+        reason = "the serving prefill path mirrors the layer sequence while keeping causal state updates explicit"
     )]
     fn run_prefill_chunk(
         &mut self,
