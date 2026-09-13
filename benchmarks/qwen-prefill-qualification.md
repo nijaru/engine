@@ -165,6 +165,63 @@ The prompt is the same five tokens cycled to length, which makes this a prefill-
 fixture rather than a realistic prompt distribution; the token streams it prints are
 the parity check for the same run.
 
+## 6. Where prefill time goes
+
+Before optimizing further, measure. `nsys` over one 257-token prefill with one decode
+step, release build, pinned artifact:
+
+```sh
+ENGINE_QWEN_GGUF=/path/Qwen3.8-27B-UD-Q4_K_M.gguf \
+nsys profile --trace=cuda --sample=none --cpuctxsw=none --cuda-memory-usage=false \
+  -o /tmp/prefill target/release/examples/qwen_decode_bench \
+  --prompt-fixture=crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens \
+  --tokens=1 --prefill-chunk=8
+nsys stats --report cuda_gpu_kern_sum /tmp/prefill.nsys-rep
+```
+
+| mode | prefill wall | GPU kernel time | kernel launches |
+| --- | --- | --- | --- |
+| chunk 8 | 6.582 s | 6.55 s | 69,512 |
+| serial | 11.629 s | 11.44 s | 309,864 |
+
+Both modes are GPU-bound; wall time is within 2% of kernel time, so launch overhead is
+not the limiter and neither is host code. Composition of the chunk-8 prefill:
+
+| family | GPU time | share |
+| --- | --- | --- |
+| quantized GEMV (`*_gemv_warp_batch`) | 5.41 s | 83% |
+| attention (`attn_score_gqa`) | 0.68 s | 10% |
+| recurrent/GDN kernels | 0.34 s | 5% |
+| norms, rope, elementwise | ~0.12 s | 2% |
+
+The GEMV share is the finding, and one kernel pair shows why it is larger than it
+should be. `iq4_xs_gemv_warp_batch` decodes each weight element once per launch and
+reuses it across all eight members, so a chunk-8 launch reads exactly the bytes a
+batch-1 launch reads:
+
+| kernel | launches | time per launch | weight bandwidth |
+| --- | --- | --- | --- |
+| `iq4_xs_gemv_warp` (batch 1) | 30,186 | 83 us | ~447 GB/s |
+| `iq4_xs_gemv_warp_batch` (batch 8) | 3,744 | 479 us | ~95 GB/s |
+
+Same bytes, 5.8x the time. Per member the batch kernel is therefore only 1.38x cheaper
+(60 us against 83 us) although it reads one eighth of the weights per member, and its
+throughput is about a tenth of the card's HBM peak. Switching kernel family does not fix
+it: `--gemv=int-dot` completes the same chunked prefill in 5.346 s (1.23x) and the same
+serial prefill in 10.851 s (1.07x).
+
+The consequence for sequencing is that the two named next steps are worth about 15% of
+prefill between them - attention 10% and the recurrent scan 5% - while a batched GEMV
+that reached the batch-1 kernel's own bandwidth would cut roughly 2.8x off the whole
+prefill (5.41 s to about 1.9 s) with no numerical change and no new kernels. Optimize
+the batch GEMV's memory behavior first; the multi-token attention and chunked GDN work
+remains worth doing, and is now second.
+
+Not measured here: achieved occupancy and stall reasons, which need `ncu`. Profiling
+counters are unavailable on this host (`ERR_NVGPUCTRPERM` without root), so the cause
+inside the batch kernel is inferred from bandwidth and launch geometry rather than
+observed.
+
 ## Promotion rule
 
 Do not wire the candidate into serving unless all of the following are true:
@@ -184,12 +241,15 @@ weak result.
 
 ## After the intermediate gate
 
-The next performance step should be evidence-driven. The host test
-`gdn_chunk_reference.rs` already validates the unit-lower-triangular chunk transform
-against token recurrence for nonzero initial state and multiple chunk sizes. If the
-intermediate path demonstrates that multi-token prompt execution is valuable, use
-that oracle to qualify a backend-specific chunked GDN kernel that scans recurrent
-state across chunks rather than across every token.
+The next performance step should be evidence-driven, and section 6 is that evidence.
+The host test `gdn_chunk_reference.rs` already validates the unit-lower-triangular chunk
+transform against token recurrence for nonzero initial state and multiple chunk sizes,
+so a backend-specific chunked GDN kernel that scans recurrent state across chunks rather
+than across every token remains well supported and worth building. It is also worth
+about 5% of prefill, while the batched quantized GEMV kernels hold 83% and run at a
+fraction of the bandwidth the batch-1 kernels achieve on identical weight bytes. Fix the
+GEMV memory behavior first; the GDN and attention kernels remain the next qualified
+targets after it.
 
 Full-attention prefill should likewise move toward an actual multi-token attention
 implementation rather than repeatedly invoking the decode attention kernel. These
