@@ -68,6 +68,11 @@ pub struct TextModel {
     tokenizer: GgufTokenizer,
     engine: Engine,
     memory: MemoryReport,
+    /// Requests whose streams were dropped. Cancellation is intent rather than
+    /// completion, so an in-flight request may have no terminal event yet; the
+    /// next call that drives the runtime reclaims these instead of leaving a
+    /// mailbox that still holds output capacity.
+    discarded: Vec<RequestId>,
 }
 
 impl TextModel {
@@ -98,6 +103,7 @@ impl TextModel {
             tokenizer,
             engine,
             memory,
+            discarded: Vec::new(),
         })
     }
 
@@ -133,6 +139,7 @@ impl TextModel {
         input: TextInput,
         mut options: GenerationOptions,
     ) -> Result<TextStream<'_>, TextError> {
+        self.reclaim_discarded();
         let tokens = encode_input(&self.tokenizer, input)?;
         if !options.stop_tokens.contains(&self.tokenizer.eos_token_id()) {
             options.stop_tokens.push(self.tokenizer.eos_token_id());
@@ -199,14 +206,22 @@ impl TextModel {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let mut responses = Vec::with_capacity(requests.len());
-        let mut positions = HashMap::with_capacity(requests.len());
+        // Tokenize every input before submitting anything: an input that fails
+        // to prepare must not strand requests that are already executing.
+        let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
             let tokens = encode_input(&self.tokenizer, request.input)?;
             let mut options = request.options;
             if !options.stop_tokens.contains(&self.tokenizer.eos_token_id()) {
                 options.stop_tokens.push(self.tokenizer.eos_token_id());
             }
+            prepared.push((tokens, options));
+        }
+        self.reclaim_discarded();
+
+        let mut responses = Vec::with_capacity(prepared.len());
+        let mut positions = HashMap::with_capacity(prepared.len());
+        for (tokens, options) in prepared {
             let id = match self.engine.enqueue(TokenRequest::new(tokens, options)) {
                 Ok(id) => id,
                 Err(error) => {
@@ -221,22 +236,26 @@ impl TextModel {
         let mut remaining = responses.len();
         while remaining > 0 {
             let status = self.engine.step().map_err(TextError::from_display)?;
-            while let Some(event) = self.engine.pop_event() {
-                let index = positions[&event.request()];
+            // Drain only this batch's requests: the engine's global drain also
+            // returns events other callers own, and a batch must never
+            // interpret another request's output.
+            for (&id, &index) in &positions {
                 let response = &mut responses[index];
-                match event {
-                    Event::Token { token, .. } => {
-                        let bytes = self
-                            .tokenizer
-                            .decode_bytes(&[token])
-                            .map_err(TextError::from_display)?;
-                        response.text.push_str(&response.decoder.push(&bytes)?);
-                        response.tokens.push(token);
-                    }
-                    Event::Finished { reason, usage, .. } => {
-                        response.text.push_str(&response.decoder.finish());
-                        response.finish = Some((reason, usage));
-                        remaining -= 1;
+                while let Some(event) = self.engine.pop_event_for(id) {
+                    match event {
+                        Event::Token { token, .. } => {
+                            let bytes = self
+                                .tokenizer
+                                .decode_bytes(&[token])
+                                .map_err(TextError::from_display)?;
+                            response.text.push_str(&response.decoder.push(&bytes)?);
+                            response.tokens.push(token);
+                        }
+                        Event::Finished { reason, usage, .. } => {
+                            response.text.push_str(&response.decoder.finish());
+                            response.finish = Some((reason, usage));
+                            remaining -= 1;
+                        }
                     }
                 }
             }
@@ -249,6 +268,47 @@ impl TextModel {
             .into_iter()
             .map(BatchResponse::finish)
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Discard this request's buffered events, reporting whether its terminal
+    /// event was delivered.
+    fn drain_events(&mut self, request: RequestId) -> bool {
+        let mut terminal = false;
+        while let Some(event) = self.engine.pop_event_for(request) {
+            terminal |= matches!(event, Event::Finished { .. });
+        }
+        terminal
+    }
+
+    /// Cancel a request and take responsibility for its undrained mailbox.
+    /// Cancellation is intent rather than completion, so an in-flight request is
+    /// remembered until a later step delivers its terminal event. Leaving it
+    /// unowned instead would keep output capacity reserved and prevent
+    /// `flush_terminals` from reclaiming the request slot.
+    fn discard(&mut self, request: RequestId) {
+        if let Err(EngineError::UnknownRequest(_)) = self.engine.cancel(request) {
+            return;
+        }
+        if !self.drain_events(request) {
+            self.discarded.push(request);
+        }
+    }
+
+    /// Reclaim dropped streams whose terminal event has now been delivered.
+    fn reclaim_discarded(&mut self) {
+        if self.discarded.is_empty() {
+            return;
+        }
+        // Cancellation completes when the runtime observes it. A step error is
+        // irrelevant here: the discarded request's outcome is already abandoned,
+        // and a sticky fault still surfaces through the caller's own request.
+        let _ = self.engine.step();
+        let pending = std::mem::take(&mut self.discarded);
+        for request in pending {
+            if !self.drain_events(request) {
+                self.discarded.push(request);
+            }
+        }
     }
 
     fn cancel_batch(&mut self, requests: impl IntoIterator<Item = RequestId>) {
@@ -400,7 +460,7 @@ impl Iterator for TextStream<'_> {
 impl Drop for TextStream<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.model.engine.cancel(self.request);
+            self.model.discard(self.request);
         }
     }
 }

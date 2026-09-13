@@ -314,7 +314,6 @@ pub struct BatchRuntime<E: BatchExecutor> {
     config: BatchConfig,
     queue: VecDeque<Queued<E::Input>>,
     terminal: VecDeque<Completed<E::Output, E::Constraint>>,
-    retained_outputs: usize,
     retained_output_bytes: u64,
 }
 
@@ -333,7 +332,6 @@ impl<E: BatchExecutor> BatchRuntime<E> {
             config,
             queue: VecDeque::with_capacity(config.max_waiting_requests),
             terminal: VecDeque::new(),
-            retained_outputs: 0,
             retained_output_bytes: 0,
         })
     }
@@ -397,7 +395,6 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         let version = self.executor.parameter_version();
         let outputs = self.execute_selected(items)?;
         let results = outputs.len();
-        self.retained_outputs += results;
         self.retained_output_bytes = self.retained_output_bytes.saturating_add(reservation);
         self.terminal
             .extend(
@@ -419,7 +416,9 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         let mut fits = 0_usize;
         let mut bytes = 0_u64;
         for reservation in reservations {
-            if self.retained_outputs.saturating_add(fits) >= self.config.max_retained_results {
+            // Rejections and outputs are both terminal entries the caller has not
+            // consumed, so both occupy the retained-result budget.
+            if self.retained_results().saturating_add(fits) >= self.config.max_retained_results {
                 break;
             }
             let next = bytes.saturating_add(*reservation);
@@ -436,7 +435,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
 
     /// Which retained bound stops even the head request from running.
     fn exhausted_reason(&self, head_reservation: u64) -> BlockReason<E::Constraint> {
-        if self.retained_outputs >= self.config.max_retained_results {
+        if self.retained_results() >= self.config.max_retained_results {
             BlockReason::RetainedResults
         } else if self.retained_output_bytes.saturating_add(head_reservation)
             > self.config.max_retained_output_bytes
@@ -552,7 +551,6 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     pub fn pop_completed(&mut self) -> Option<Completed<E::Output, E::Constraint>> {
         let entry = self.terminal.pop_front()?;
         if entry.output().is_some() {
-            self.retained_outputs -= 1;
             self.retained_output_bytes = self
                 .retained_output_bytes
                 .saturating_sub(entry.retained_bytes);
@@ -565,7 +563,9 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         self.queue.len()
     }
 
-    /// Terminal entries the caller has not consumed.
+    /// Terminal entries the caller has not consumed, which is what
+    /// `max_retained_results` bounds: a rejection occupies the budget until it is
+    /// consumed exactly like an output does.
     #[must_use]
     pub fn retained_results(&self) -> usize {
         self.terminal.len()
@@ -1009,6 +1009,51 @@ mod tests {
             runtime.pop_completed().expect("rejection entry").outcome(),
             Terminal::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn retained_rejections_count_toward_the_retained_bound() {
+        // A rejection is a terminal entry the caller has not consumed, so it
+        // occupies the retained-result budget exactly like an output. Counting
+        // only outputs lets a rejection and a later output sit in `terminal`
+        // together under `max_retained_results = 1`.
+        let mut executor = Encoder::new();
+        executor.token_budget = Some(2);
+        let mut runtime = BatchRuntime::new(
+            executor,
+            BatchConfig {
+                max_retained_results: 1,
+                ..config()
+            },
+        )
+        .expect("runtime");
+        let oversized = runtime.submit(vec![1, 2, 3]).expect("oversized request");
+        assert_eq!(
+            runtime.step().expect("rejecting step"),
+            StepOutcome::Rejected { request: oversized }
+        );
+        assert_eq!(runtime.retained_results(), 1);
+
+        runtime.submit(vec![4]).expect("later request");
+        assert!(
+            matches!(
+                runtime.step().expect("step under a full retained budget"),
+                StepOutcome::Blocked(BlockReason::RetainedResults)
+            ),
+            "an unconsumed rejection must block execution, not share the bound"
+        );
+        assert_eq!(runtime.retained_results(), 1);
+
+        // Consuming the rejection releases the budget for the queued request.
+        assert!(matches!(
+            runtime.pop_completed().expect("rejection entry").outcome(),
+            Terminal::Rejected(_)
+        ));
+        assert_eq!(
+            runtime.step().expect("step after consuming the rejection"),
+            StepOutcome::Executed { results: 1 }
+        );
+        assert_eq!(runtime.retained_results(), 1);
     }
 
     #[test]

@@ -84,14 +84,14 @@ metadata parsing, a successful load, or test-only architecture coverage.
 
 ## Open review gates (2026-09-13)
 
-These findings come from source/design review at `46a5340`, not newly executed
-regression tests. Keep them open until the acceptance evidence exists; do not treat
-this list as implemented behavior.
+These findings come from source/design review at `46a5340`. The two lifecycle items
+are fixed at `d919db9`+; the rest stay open until their acceptance evidence exists.
+Do not treat this list as implemented behavior.
 
 | Priority / owner | Finding and required exit evidence |
 | --- | --- |
-| First: text lifecycle | `TextStream::drop` cancels without consuming/discarding eventual events, while `generate_batch` drains all events through its own request map; batch encoding can return early after prior submissions. Reproduce and fix dropped-stream → batch, invalid later input → retry, and repeated abandonment without orphan events or premature device release. See `crates/text/src/model.rs`. |
-| First: batch bounds | Successful-output admission counts `retained_outputs`, while rejection admission counts all terminal entries. Prove mixed retained rejection/success cannot exceed `max_retained_results`, including a stalled consumer. See `crates/batch/src/lib.rs::fitting_prefix` and `resolve_head`. |
+| **Fixed:** text lifecycle | `TextStream::drop` cancelled without taking ownership of the eventual events, while `generate_batch` drained the engine globally and routed by its own request map, so an abandoned mailbox could both panic that map and hold output capacity that `flush_terminals` needs to reclaim a request slot. Now `generate_batch` tokenizes every input before submitting any, drains per request (`pop_event_for`), and `TextStream::drop` cancels and owns the mailbox (`TextModel::discard`/`reclaim_discarded`). Engine-level regression tests: `crates/runtime/tests/abandoned_requests.rs`. Still unrun: the facade-level dropped-stream → batch path on a real model, which needs a device. |
+| **Fixed:** batch bounds | `fitting_prefix` and `exhausted_reason` compared successful outputs against `max_retained_results` while a rejection also occupies `terminal`, so an unconsumed rejection let a later output exceed the bound (the public `retained_results()` accessor already reported the correct count). Both checks now use the terminal count, and `retained_outputs` is gone. Regression test: `retained_rejections_count_toward_the_retained_bound`. |
 | Before resource implementation | Resolve the ambiguities in `docs/resource-protocol.md`: already-held claims versus later reservation, ready/blocked/rejected preparation, accepted per-request ranges, abandonment and partial-enqueue ownership. A fallible `prepare` wrapper around the unchanged exact-prefill contract is insufficient. |
 | Before asynchronous composition | Reservations follow live allocations beyond dequeue; producer completion and consumer access lifetime govern reuse. Test constrained shared pools, delayed completion, consumer stalls, cancellation and failed handoffs with a real device encoder. |
 | Before optimized-variant promotion | Add explicit finite/shape checks, actual bit equality where promised, and justified numerical bounds for reordered algorithms. Compare persisted hybrid components and continuation, not only hidden outputs. Keep the GDN scan opt-in while its full-model gate fails; diagnose captured real inputs against an independent higher-precision recurrence before setting acceptance criteria. |
