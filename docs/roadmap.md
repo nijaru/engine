@@ -18,7 +18,7 @@ cross-component scheduling.
 | Area | Current evidence | Main gap |
 | --- | --- | --- |
 | Shared execution foundation | Dependency-free parameter/version/materialization metadata; node/device/link topology; same logical model placed locally or across nodes; preparation-time semantic-op dispatch experiment | Physical storage/device primitives, broader operator/backend evidence, second hardware backend |
-| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; same-sequence multi-token prefill is hardware-qualified at `4c22e11` (single-chunk, three-chunk, serving-seam, and end-to-end runtime gates) and is selected by default through `QwenLoadOptions`; the batched GEMV activation access is fixed at `f68e345` (coalesced `float4` runs; 3.9x off those kernels), the chunk lane attends all eight rows in one launch at `b0d2c4e` (attention 683 -> 109 ms), and each batched-GEMV warp resolves two weight rows at `f372a60` (prefill 2.01 s -> 1.82 s, TTFT 2.004 -> 1.828 s and 8.015 -> 7.264 s, serial and decode unchanged, parity test now asserting bit equality), for 6.55 s -> 1.82 s chunked prefill, 7.43 s serial, 0.667 s decode, and 1.83 s / 7.26 s serving TTFT at concurrency 1/4 against 7.43 s / 29.69 s serial; chunked and serial log-probability tables are identical at every head | The batched GEMV families are still 68% of chunked prefill kernel time, but no single resource there is saturated at two rows per warp (about 30% of issue at boost clock, 18% of FP32) and four rows measures worse, so the next gain needs occupancy/stall counters this host refuses (`ncu` needs root) or cheaper per-element arithmetic rather than more amortization; `Q8_0` regresses at two rows and needs a per-family row count if it grows in importance; the recurrent scan at 16% now has an opt-in chunk-parallel form at `d1fb55d` (prefill 1.82 s -> 1.62 s when selected, 3.7x off that family), but adopting it needs a tolerance decision because it is a different summation order and the three-chunk gate reports 1.10e-2 against its 5.0e-3 tolerance, so the lane keeps the per-token path by default; then long-prompt numerical fidelity, where ribn's log-probabilities sit 0.08-0.26 nats from llama.cpp's at a 257-token prompt and flip one near-tie of 0.2242 nats with chunking both on and off, so neither mode matches the reference to within its smallest margins; fixed-shape/model assumptions |
+| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; same-sequence multi-token prefill is hardware-qualified at `4c22e11` (single-chunk, three-chunk, serving-seam, and end-to-end runtime gates) and is selected by default through `QwenLoadOptions`; the batched GEMV activation access is fixed at `f68e345` (coalesced `float4` runs; 3.9x off those kernels), the chunk lane attends all eight rows in one launch at `b0d2c4e` (attention 683 -> 109 ms), and each batched-GEMV warp resolves two weight rows at `f372a60` (prefill 2.01 s -> 1.82 s, TTFT 2.004 -> 1.828 s and 8.015 -> 7.264 s, serial and decode unchanged, parity test now asserting bit equality), for 6.55 s -> 1.82 s chunked prefill, 7.43 s serial, 0.667 s decode, and 1.83 s / 7.26 s serving TTFT at concurrency 1/4 against 7.43 s / 29.69 s serial; chunked and serial log-probability tables are identical at every head | The batched GEMV families are still 68% of chunked prefill kernel time, but no single resource there is saturated at two rows per warp (about 30% of issue at boost clock, 18% of FP32) and four rows measures worse, so the next gain needs occupancy/stall counters this host refuses (`ncu` needs root) or cheaper per-element arithmetic rather than more amortization; `Q8_0` regresses at two rows and needs a per-family row count if it grows in importance; the recurrent scan at 16% now has an opt-in chunk-parallel form at `d1fb55d` (prefill 1.82 s -> 1.62 s when selected, 3.7x off that family), but adoption remains blocked: the three-chunk gate reports 1.10e-2 against its 5.0e-3 tolerance; summation-order drift is a hypothesis requiring diagnosis, not grounds to widen the gate, so the lane keeps the per-token path by default; then long-prompt numerical fidelity, where ribn's log-probabilities sit 0.08-0.26 nats from llama.cpp's at a 257-token prompt and flip one near-tie of 0.2242 nats with chunking both on and off, so neither mode matches the reference to within its smallest margins; fixed-shape/model assumptions |
 | AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Physical demand is invisible to admission, static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation ([resource protocol](resource-protocol.md)) |
 | Non-AR runtime validation | Generic batch runtime bounding waiting work and retained results separately, with ready/blocked/rejected admission and a rejection path that survives an exhausted byte budget; parameter-version pinning; actual BERT encoder semantics checked against an independently generated nondegenerate reference (Hugging Face `transformers`, worst deviation 3.6e-7) with a mask-inertness property that fails if the fixture loses sensitivity; attention masks and padded-versus-ragged batch-cost tests | Async/cancellation/resource admission, shared-pool accounting, device execution and optimized kernels |
 | Text facade | Raw/chat/token inputs, tokenizer/template reuse, streaming/offline batch | Hardwired Qwen GGUF/CUDA loading; mutable single-caller handle |
@@ -38,10 +38,10 @@ allocation. Resolve the lifecycle first and the later counterexamples become sma
 
 | Milestone | Required exit evidence |
 | --- | --- |
-| 1. Bounded, concurrent execution lifecycle | A minimal cloneable model handle with explicit request ownership; bounded retained output; admission that distinguishes ready, temporarily blocked, and rejected; an owning snapshot. Exercised with multiple callers and a stalled consumer. |
-| 2. One real asynchronous non-AR integration | Encoder work against real device resources producing owned results, surviving cancellation and handoff failure without premature reclamation. |
+| 1. Bounded, concurrent execution lifecycle | Close the request-cleanup and retained-count review findings below with regression tests; a minimal cloneable model handle with explicit request ownership, bounded retained output, ready/blocked/rejected admission and an owning snapshot. Exercised with multiple callers, abandoned requests and a stalled consumer. |
+| 2. One real asynchronous non-AR integration | Negotiated prepared submissions with one reservation authority and accepted work ranges; encoder work against real device resources producing owned results whose reservations and completion dependencies survive dequeue, cancellation and handoff failure. |
 | 3. Dynamic hybrid AR resources | KV and recurrent state cooperating with reservations, cache reuse, eviction and preemption. Non-speculative correctness first, then qualified speculative reconciliation. |
-| 4. Real composition counterexamples | A genuine VLM processor/model path and a small iterative non-AR path, changing shared contracts only where those integrations demonstrate the need. |
+| 4. Real composition counterexamples | A second real decoder and a genuine VLM processor/model path satisfy the model-local integration gate below; a small iterative non-AR path changes shared contracts only where the execution regime demonstrates the need. |
 | 5. Qualification and broader exposure | Matched numerical and workload benchmarks, a tested serving subset, and a materially different backend before calling the shared device boundary general. |
 
 Milestone 1 has partially started: the non-AR runtime now bounds retained results and
@@ -57,6 +57,58 @@ Two tracks stay independent of this order instead of becoming prerequisites:
 - Distributed placement types stay provisional until real sharding, replication or
   cross-device execution constrains them. Metadata accepting several device IDs is
   not yet a distributed execution abstraction.
+
+## Model-local integration acceptance gate
+
+The contribution goal is localized architecture support, not automatic arbitrary
+checkpoint compatibility or a frozen core. The expected scope is:
+
+| Contribution | Normal change boundary |
+| --- | --- |
+| Checkpoint of a supported architecture | Validated configuration/artifact mapping; no code when already supported |
+| New architecture using existing execution mechanisms | Model implementation, processor, backend components, registration and qualification tests |
+| New attention, continuation or resource mechanism | Model/backend implementation and a focused shared-contract extension where necessary |
+| Genuinely new execution regime | Specialized runtime and only the cross-runtime coordination it requires |
+
+A second real decoder and a real VLM must demonstrate that ordinary model additions
+need no model-family branches in cancellation, output routing, protocol adapters or
+unrelated scheduling policy. Record any core changes and why the existing mechanism
+could not represent the model. One central enum/factory/registration edit is acceptable;
+a dynamic plugin ABI and a universal operator graph are not prerequisites.
+
+Contribution readiness also needs reusable execution components and a reproducible
+qualification procedure, not merely traits. Use
+[the model-integration skill](../.agents/skills/model-integration/SKILL.md) for the
+recurring implementation/review checks. Do not advertise arbitrary model support from
+metadata parsing, a successful load, or test-only architecture coverage.
+
+## Open review gates (2026-09-13)
+
+These findings come from source/design review at `46a5340`, not newly executed
+regression tests. Keep them open until the acceptance evidence exists; do not treat
+this list as implemented behavior.
+
+| Priority / owner | Finding and required exit evidence |
+| --- | --- |
+| First: text lifecycle | `TextStream::drop` cancels without consuming/discarding eventual events, while `generate_batch` drains all events through its own request map; batch encoding can return early after prior submissions. Reproduce and fix dropped-stream → batch, invalid later input → retry, and repeated abandonment without orphan events or premature device release. See `crates/text/src/model.rs`. |
+| First: batch bounds | Successful-output admission counts `retained_outputs`, while rejection admission counts all terminal entries. Prove mixed retained rejection/success cannot exceed `max_retained_results`, including a stalled consumer. See `crates/batch/src/lib.rs::fitting_prefix` and `resolve_head`. |
+| Before resource implementation | Resolve the ambiguities in `docs/resource-protocol.md`: already-held claims versus later reservation, ready/blocked/rejected preparation, accepted per-request ranges, abandonment and partial-enqueue ownership. A fallible `prepare` wrapper around the unchanged exact-prefill contract is insufficient. |
+| Before asynchronous composition | Reservations follow live allocations beyond dequeue; producer completion and consumer access lifetime govern reuse. Test constrained shared pools, delayed completion, consumer stalls, cancellation and failed handoffs with a real device encoder. |
+| Before optimized-variant promotion | Add explicit finite/shape checks, actual bit equality where promised, and justified numerical bounds for reordered algorithms. Compare persisted hybrid components and continuation, not only hidden outputs. Keep the GDN scan opt-in while its full-model gate fails; diagnose captured real inputs against an independent higher-precision recurrence before setting acceptance criteria. |
+| Before large HF loading | A one-shard cache is not a one-shard peak-memory guarantee: a miss opens the incoming shard before eviction and clones may keep old storage alive. Measure live/peak bytes and qualify byte-aware or streaming loading before claiming a hard memory bound. |
+
+The latest margin comparison does not establish harmless scan drift: the reference
+and Ribn diverge in chosen token at step 18, so step 19 no longer compares the same
+history. Existing error against another engine is not an error budget for a new
+variant. See the corrected evidence in `benchmarks/qwen-prefill-qualification.md`.
+
+For the independent performance track, retain the qualified small-M GEMV path but
+evaluate larger-M tiled quantized GEMM, packed cross-request execution and tiled
+attention instead of assuming larger compile-time accumulators will scale. Kernel
+selection should follow qualified shape/encoding/device regimes. The current global
+row-blocking choice already trades a Q8_0 regression for this artifact's aggregate win.
+Long-context and mixed-arrival benchmarks must precede general performance claims;
+one prompt's prefixes at concurrency 1/4 are not a representative serving workload.
 
 ## 0. Reset and validate the top-level architecture before deeper model-specific work
 

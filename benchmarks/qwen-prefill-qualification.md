@@ -868,30 +868,37 @@ lower triangle dense, `beta = 0` must leave the state decayed but unchanged, and
 gate must zero every interval spanning it - which a ratio-based implementation turns
 into a NaN, and which the finite-output assertion catches.
 
-**Fidelity does not distinguish the two lanes.** Measured against llama.cpp's recorded
-margins for this same 257-token prompt (`benchmarks/llama_reference_margins.py`; the
-reference table is in the previous session's evidence directory), the serial lane sits
-0.1348 nats of mean top-1/top-2 gap error from the reference with a maximum of 0.5937 at
-step 2, and the scan lane sits 0.1349 with a maximum of 0.5934. The mean worst shared
-top-5 error is 0.2181 for both, and both pick the reference's token at 19 of 20 steps,
-missing the same known near-tie at step 18. The scan's 1.7e-3 nat drift against the
-serial path is therefore two orders of magnitude below ribn's own distance from an
-independent engine: adopting it moves nothing that the reference can see. That reframes
-the blocker - the gate that fails is an internal-oracle tolerance calibrated at
-bit-identity, not a fidelity boundary - but it does not decide it, because raising that
-tolerance also weakens the structural checking it does for stale state, chunk-boundary
-ordering, and continuation handoff.
+**The reference comparison is narrow evidence, not an adoption gate.** The recorded
+20-step comparison against llama.cpp gave mean absolute top-1/top-2 gap errors of
+0.1348 nats for serial and 0.1349 for the scan, with maxima of 0.5937 and 0.5934.
+Both selected the reference token at 19 of 20 positions. However, the first different
+chosen token is at step 18: step 19 compares different histories and must not count
+as same-input numerical evidence, even though its selected token agrees again.
+Recomputing over same-history steps 0–18 gives mean gap errors of approximately
+0.11221 and 0.11224 nats. Source logs are `29-margins-serial-rows2.log`,
+`41-margins-chunk8-gdn-scan.log`, and `46-llama-reference-margins.log` under
+`desktop:~/ribn-prefill-kernels-2026-09-13/`; the reference was originally recorded
+under `~/ribn-prefill-serving-gate-2026-09-12/11-margins-reference.log`.
 
-The last row is the finding that matters for adoption, and it is not a defect: 1.10e-2
-is the same order as the 6.2e-3 that a GEMV summation reordering produced at this same
-gate, so it is compound drift through 64 layers and a recurrent state that accumulates
-across tokens, not a wrong result. The kernel is right to 7e-7 per element and the
-token stream is unchanged; what changes is that the chunked lane's hidden states no
-longer sit inside a tolerance that was calibrated when chunked prefill was bit-identical
-to serial prefill. Selecting the scan therefore needs a decision this change does not
-make: re-derive that gate's tolerance with the measured drift as its evidence, qualify
-the lane against something other than the serial oracle, or leave the scan unwired. The
-gate now carries the switch that measures it either way.
+These similar aggregates on one prompt do not establish distributional or
+long-context equivalence. An existing discrepancy against llama.cpp is not an error
+budget for a new optimization. Future comparisons should teacher-force a common
+continuation or stop numerical aggregation at the first history divergence.
+
+The full-model failure remains unexplained. Summation-order drift through 64 layers
+is a plausible cause, not proof that there is no defect. The kernel tests' relative
+metric is maximum absolute error divided by maximum absolute reference magnitude,
+not a per-element relative guarantee. Their passing fixtures do not qualify the
+later chunks or continuation skipped when the full-model test fails early.
+
+Keep the scan opt-in. Before adoption, capture real inputs and carried state around
+the first failure, replay both algorithms against a higher-precision recurrence,
+and check finite outputs and persisted recurrent/convolution/KV components across
+chunk boundaries and continued decoding. Set numerical acceptance criteria from
+that analysis and broader fixtures, not merely above the observed failing maximum.
+Keep exact arithmetic-preserving checks separate from qualification of reordered
+algorithms. This corrects the earlier unsupported claim that the failure was known
+to be harmless.
 
 ### Decision
 
@@ -925,15 +932,14 @@ which source it used. This sweep is the fixture prompt's real content at three l
 | 257 | 4 | serial | 29.723 s | 31.742 s | 65.11 ms |
 | 257 | 4 | chunk 8 | 7.264 s | 9.280 s | 65.04 ms |
 
-Three things follow. First, prompt **content** is not a confound: at 257 tokens the real
+Within this sweep, the two tested prompt contents give similar timings: at 257 tokens the real
 prompt gives 1.821 s and 7.264 s against the repeated-cycle prompt's 1.828 s and
-7.264 s, so the earlier timings stand as prefill-cost measurements rather than as
-artifacts of the fixture. Second, the chunking win **grows with prompt length** — 2.83x
+7.264 s. This does not establish content independence across workloads. The chunking
+win **grows over the tested prompt lengths** — 2.83x
 at 64 tokens, 3.33x at 128, 4.08x at 257 at concurrency 1, and 2.87x/3.35x/4.09x at
-concurrency 4 — which is the shape the lane predicts: weights are read once per chunk
-and the per-chunk overhead is fixed, so longer prompts amortize better. The chunked
+concurrency 4. These end-to-end timings do not isolate the cause of the changing ratio. The chunked
 cost per prompt token falls from 9.4 ms at 64 tokens to 8.2 at 128 and 7.1 at 257, while
-serial prefill sits at 26.7-28.9 ms per token across the same range. Third, inter-token
+serial prefill sits at 26.7-28.9 ms per token across the same range. Inter-token
 latency is unchanged by the mode and grows with concurrency exactly as before, so the
 lane remains a prefill-only change.
 

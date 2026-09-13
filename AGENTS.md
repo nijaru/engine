@@ -70,6 +70,27 @@ the simplest representation of actual supported architectures. Avoid scattered
 model-family branches through unrelated scheduling/server code; do not invent a
 plugin ABI or generic framework merely so adding a model never changes central code.
 
+## Long-term integration and qualification
+
+Optimize for model-local contributions, not a promise that arbitrary checkpoints run
+or that the core never changes. A new architecture using supported execution mechanisms
+should normally change model/processor/backend code, registration and tests—not
+cancellation, output routing, protocol adapters or unrelated scheduler policy. A new
+execution mechanism may justify a focused shared-contract change. Prove this boundary
+with a second real decoder and a real VLM before calling model integration routine.
+
+Follow the milestone order and open review gates in `docs/roadmap.md`. Lifecycle,
+resource negotiation and asynchronous ownership come before additional synthetic model
+classes. Kernel tuning is a separate qualification track, not a substitute for that
+work. Keep small-batch optimized paths without treating their fixed shapes or hardware
+as the general execution design.
+
+For model integration, model-support PR review, or promotion of an optimized execution
+variant, read `.agents/skills/model-integration/SKILL.md`. Numerical acceptance must
+not be inferred from an existing reference discrepancy or adjusted merely to pass an
+observed failure. Bit equality applies where arithmetic preservation is intended;
+reordered algorithms require independently justified numerical qualification.
+
 ## Shared execution foundation
 
 `crates/foundation` (`ribn-foundation`) is a provisional pressure-test of the

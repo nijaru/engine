@@ -285,6 +285,21 @@ maintenance cost.
 Model qualification should compare against an independent reference artifact and
 implementation. A parsed config or successful load is not execution support.
 
+The contribution boundary is model-local for architectures using existing execution
+mechanisms: model/processor/backend code, registration and tests. Cancellation,
+output routing, protocol adapters and unrelated scheduler policy should not acquire
+model-family branches. Genuinely new state mechanisms or execution regimes can require
+focused core changes; a frozen core is not the goal. The roadmap's model-local
+integration gate requires a second real decoder and a real VLM to demonstrate this
+boundary before it is advertised as routine.
+
+Optimized execution variants may use different arithmetic and physical layouts.
+Keep exact checks for transformations intended to preserve arithmetic, and separately
+qualify reordered algorithms against justified numerical criteria. Existing baseline
+error is not a budget for another optimization, and token agreement on one prompt is
+not sufficient qualification. The recurring procedure lives in
+[the model-integration skill](../.agents/skills/model-integration/SKILL.md).
+
 ## Hardware and distributed execution
 
 The development RTX 4090 is a qualification device, not an architecture boundary.

@@ -5,9 +5,34 @@ contract the runtime needs before dynamic continuation resources, speculation, o
 second non-AR runtime are built on top of the current seams, so that work does not
 have to invent it piecemeal later.
 
-This is not a universal framework. Every type below exists because a concrete
-failure mode is already visible in the current code or in a pressure test, and each
-one is sized to the smallest shape that fixes it.
+This is not a universal framework. The responsibilities below address concrete
+failure modes, but the illustrative signatures are not ready to implement unchanged.
+
+## Unresolved contract details
+
+The 2026-09-13 design review identified four requirements the sketches below do not
+yet express consistently. Resolve them before implementation, with the acceptance
+tests at the end of this document:
+
+- **One reservation authority.** Section 1 describes claims as already reserved,
+  while section 2 reserves them later. Choose one ownership transition; an estimate
+  is not an owning reservation, and one allocation must not be charged twice.
+- **Negotiated work.** Preparation must distinguish ready, temporarily blocked and
+  request-local rejection, and expose the accepted per-request work ranges before
+  submission. Returning only `Prepared` or an execution error cannot resolve an
+  unavailable encoder item in the middle of a scheduler-selected prefill chunk.
+- **Abandonment and partial enqueue.** Distinguish pre-existing continuation from
+  newly reserved persistent growth. Abandoning unsubmitted work must not strand new
+  reservations; any partial device submission keeps an owner through completion or
+  quarantine, including driver-error paths.
+- **Pool boundedness and progress.** Reservations must follow allocations through
+  dequeue and handoff until safe reuse. One accounting authority prevents aggregate
+  overspend but does not by itself prevent upstream results from consuming the
+  workspace needed downstream. Prove progress under consumer stalls and constrained
+  pools, with reserved downstream headroom or another concrete admission policy.
+
+These are open design obligations, not implemented guarantees. The roadmap owns
+priority and completion status.
 
 ## What the runtime does today
 
