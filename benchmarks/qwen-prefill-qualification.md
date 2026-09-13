@@ -220,7 +220,9 @@ remains worth doing, and is now second.
 Not measured here: achieved occupancy and stall reasons, which need `ncu`. Profiling
 counters are unavailable on this host (`ERR_NVGPUCTRPERM` without root), so the cause
 inside the batch kernel is inferred from bandwidth and launch geometry rather than
-observed.
+observed. *Resolved: the batched-GEMV result section below names the cause (strided
+scalar activation loads) and measures the fix; the ordering above is now satisfied, and
+multi-token attention leads the remaining work at 27% of prefill kernel time.*
 
 ## Promotion rule
 
@@ -249,7 +251,9 @@ than across every token remains well supported and worth building. It is also wo
 about 5% of prefill, while the batched quantized GEMV kernels hold 83% and run at a
 fraction of the bandwidth the batch-1 kernels achieve on identical weight bytes. Fix the
 GEMV memory behavior first; the GDN and attention kernels remain the next qualified
-targets after it.
+targets after it. *The GEMV fix landed in the batched-GEMV result section below, which
+re-measures this composition: multi-token attention is now the largest single item and
+the batch GEMV families the next.*
 
 Full-attention prefill should likewise move toward an actual multi-token attention
 implementation rather than repeatedly invoking the decode attention kernel. These
@@ -423,7 +427,12 @@ That pass also produced a stronger statement about the integration than token eq
 **chunked and serial prefill emitted identical log-probability tables for all 20 steps**
 (`diff` of the two runs is empty), so chunking changes which kernels execute, not what
 they compute. The 20-step tables are in the session evidence directory as
-`11-margins-reference.log` and `12-margins-ribn-{serial,chunk8}.log`.
+`11-margins-reference.log` and `12-margins-ribn-{serial,chunk8}.log`. That property is
+load-bearing, not incidental: it is why the chunked prefill gates below can compare
+against the serial oracle at all. The batched-GEMV result section re-verifies it at a
+later head with a different kernel-internal accumulation order; the tables recorded here
+shifted by at most 2e-4 nats as a result, and the reference comparison and step-18 flip
+above are unchanged.
 
 ### Margin probe procedure
 
@@ -447,3 +456,149 @@ lane batches projections and feed-forward work per position while recurrence sti
 advances token by token), the long-prompt fidelity item above, and a serving-relevant
 prompt-length sweep with a realistic prompt distribution rather than the repeated
 timing fixture.
+
+## Batched GEMV result, 2026-09-13 (head `f68e345`)
+
+Section 6 put 83% of chunked prefill GPU time in the batched quantized-GEMV kernels
+and left the reason inferred from bandwidth and launch geometry. The reason was the
+activation access, not the weight read. The kernels already decoded each weight
+element once per launch and reused it across all eight members, but each lane read
+its eight activations one scalar at a time: a warp load spanned 32 different 32-byte
+sectors and used 4 bytes of each, so a 1 KiB activation block cost eight L1
+wavefronts where one suffices. The weight decode does not scale with the member
+count while the per-member activation loads and FMAs do, which is why the batched
+kernel landed at about a tenth of HBM peak and only 1.38x cheaper per member than
+eight batch-1 launches.
+
+### The change
+
+Each lane now owns four consecutive activations in the low half of a quantization
+block (elements `4*lane`) and four in the high half (elements `128 + 4*lane`). Both
+runs are 16-byte aligned, so one member's activations are two `float4` loads per lane
+and a warp load covers 512 contiguous bytes. The same lane mapping turns the packed
+nibbles of those four elements into one word load per half, so the decode-once
+property survives: the K-quant families whose block stride is not a multiple of four
+(110 and 210 bytes) read that word as two aligned halfwords, because a 32-bit load
+inside such a block faults on the odd rows.
+
+The batch-1 warp kernels take the same mapping and the same decode expressions. They
+had the same activation access pattern, and sharing the accumulation order - rather
+than only the layout - is what keeps chunked prefill bit-identical to serial prefill
+instead of merely within a tolerance. The first attempt changed only the batched
+kernels, and the three-chunk gate then measured 6.2e-3 against its 5.0e-3 tolerance:
+a valid but different summation order through 64 layers. Restoring one shared order
+removed the question instead of widening the gate.
+
+`decode_f16` is now `cvt.f32.f16`. Every binary16 value is exactly representable in
+binary32, so it is bit-identical to the sign/exponent expansion it replaces while
+costing one instruction instead of a per-block shift loop. The 32-element block
+families notice it most: one scale covers 32 elements there against 256 in the
+K-quants, so the same decode is amortized over eight times fewer elements.
+
+### Kernel-level effect
+
+`crates/nvidia/examples/int_dot_bench --iters=50`, synthetic weights at representative
+Qwen shapes, weight bytes counted once per launch:
+
+| family | shape | batch 8 before | batch 8 after | batch 1 before | batch 1 after |
+| --- | --- | --- | --- | --- | --- |
+| IQ4_XS | 5120x5120 | 82.0 | 379.5 | 419.6 | 719.1 |
+| IQ4_XS | 5120x17408 | 85.3 | 363.1 | 494.7 | 965.4 |
+| IQ4_XS | 17408x5120 | 83.6 | 427.3 | 469.8 | 864.3 |
+| Q4_K | 5120x5120 | 88.5 | 276.1 | 423.3 | 1027.4 |
+| Q4_K | 5120x17408 | 87.2 | 433.3 | 517.3 | 1454.1 |
+| Q4_K | 17408x5120 | 88.7 | 296.2 | 474.5 | 1353.8 |
+| Q5_K | 5120x5120 | 105.6 | 323.3 | 477.5 | 975.0 |
+| Q5_K | 5120x17408 | 107.8 | 504.1 | 574.0 | 1303.2 |
+| Q5_K | 17408x5120 | 105.6 | 351.7 | 529.1 | 1178.5 |
+| Q6_K | 5120x5120 | 117.3 | 403.9 | 578.5 | 1157.6 |
+| Q6_K | 5120x17408 | 123.0 | 597.1 | 678.1 | 1537.7 |
+| Q6_K | 17408x5120 | 67.2 | 418.4 | 639.1 | 1417.0 |
+| Q8_0 | 5120x5120 | 25.2 | 63.1 | 44.7 | 224.4 |
+| Q8_0 | 5120x17408 | 28.0 | 87.4 | 34.7 | 104.7 |
+| Q8_0 | 17408x5120 | 20.8 | 49.0 | 26.6 | 83.4 |
+
+Values are weight GB/s. The batch-1 rows show the same activation fix on the path
+that decode and serial prefill use; the batch-8 rows are the ones the chunked lane
+runs. Both columns include the `cvt.f32.f16` change, whose largest single effect is
+in the 32-element block families (Q8_0 batch 1, 5120x5120, 5.0x); the K-quant gains
+in both columns come from the activation remapping.
+
+### Prefill, decode, and serving effect
+
+`qwen_decode_bench` and `qwen_serving_bench`, pinned artifact, 257-token fixture, one
+release build. Before values are the head `b5475b0` measurements recorded above.
+
+| measurement | before | after | speedup |
+| --- | --- | --- | --- |
+| chunk-8 prefill (5 runs) | 6.553-6.567 s | 2.576-2.588 s | 2.54x |
+| serial prefill (3 runs) | 11.587 s | 7.417-7.427 s | 1.56x |
+| decode 20 tokens (same runs) | 1.054-1.133 s | 0.667-0.668 s | 1.60x |
+| `--gemv=int-dot` chunk-8 prefill | 5.346 s | 4.478 s | 1.19x |
+
+The integer-dot variant is no longer the faster family: the float warp path is now
+1.7x faster than it on the same prefill, so the earlier 1.23x advantage in its favor
+is inverted and nothing needs the quantize-then-dot round trip on this workload. Its
+own 1.19x improvement is the float fallback path it uses for `Q3_K`/`IQ4_NL`/`IQ3_S`
+plus the serial tail and sampling token, not its integer kernels, which do not call
+`decode_f16`.
+
+Through the serving scheduler and runtime at a 257-token prompt and 32 output tokens:
+
+| concurrency | mode | prefill | TTFT | elapsed | ITL |
+| --- | --- | --- | --- | --- | --- |
+| 1 | serial | 7.430 s | 7.430 s | 8.470 s | 33.54 ms |
+| 1 | chunk 8 | 2.581 s | 2.588 s | 3.627 s | 33.52 ms |
+| 4 | serial | 29.653 s | 29.654 s | 31.715 s | 66.49 ms |
+| 4 | chunk 8 | 10.301 s | 10.302 s | 12.363 s | 66.47 ms |
+
+Chunking is now worth 2.87x of TTFT at concurrency 1 and 2.88x at concurrency 4,
+against 1.75x and 1.76x before this change, and inter-token latency improves rather
+than merely holding: 49.8 ms to 33.5 ms at concurrency 1 and 141.7 ms to 66.5 ms at
+concurrency 4. The printed token streams at concurrency 2 are identical between serial
+and chunked prefill (`diff` of the `tokens[...]` lines is empty), which is the
+serving-seam check that this path still computes what it computed before.
+
+### Where prefill time goes now
+
+`nsys` over the same chunk-8 prefill. GPU kernel time is 2.56 s of a 2.605 s wall, so
+the workload is still GPU-bound. Shares are of kernel time.
+
+| kernel | before | after | speedup |
+| --- | --- | --- | --- |
+| `attn_score_gqa` | 682.5 ms | 683.2 ms | 1.00x |
+| `iq4_xs_gemv_warp_batch` | 1794.5 ms | 433.1 ms | 4.14x |
+| `q5_k_gemv_warp_batch` | 1476.7 ms | 410.6 ms | 3.60x |
+| `q4_k_gemv_warp_batch` | 1287.4 ms | 300.2 ms | 4.29x |
+| `gdn_state_update` | 276.2 ms | 277.8 ms | 1.00x |
+| `q8_0_gemv_warp_batch` | 291.1 ms | 91.5 ms | 3.18x |
+| `q6_k_gemv_warp_batch` | 132.1 ms | 38.9 ms | 3.40x |
+| `q3_k_gemv_warp_batch` | 127.4 ms | 30.1 ms | 4.23x |
+| `iq3_s_gemv_warp_batch` | 123.4 ms | 23.6 ms | 5.23x |
+| `iq4_nl_gemv_warp_batch` | 100.3 ms | 40.3 ms | 2.49x |
+
+The eight batched GEMV families fall from 5.33 s to 1.37 s together (3.9x). Multi-token
+attention is now the largest single item at 26.7%, then the three large GEMV families
+at 44.7%, then the recurrent scan at 10.9%. That ordering is the new short list:
+`attn_score_gqa` is still the decode-shaped kernel invoked per token, and the remaining
+GEMV time is activation traffic that more rows per warp would amortize.
+
+### Numerics
+
+Serial and chunked prefill emitted identical 20-step log-probability tables at this
+head (`diff` of the two runs is empty), so the bit-identical property recorded in the
+serving integration result survived the kernel rewrite. Both tables shifted by at most
+2e-4 nats against the tables recorded at `0496f79` - for example step 14 moves from
+0.2044 to 0.2040 nats and step 18 from 0.0088 to 0.0087 - with the same chosen tokens
+and the same top-5 ranking at every step. The reference comparison above is unaffected:
+ribn still sits 0.08-0.26 nats from llama.cpp and still flips the same near-tie of
+0.2242 nats at step 18.
+
+### Decision
+
+The fix is a kernel-internal change: the scheduler contract, state ownership,
+cancellation semantics, backend lane sizing, and the output path are untouched, and
+the logits are unchanged in every way the gates can see. Chunked prefill stays the
+default prefill strategy for this path. Next in this area are true multi-token
+attention (now the largest single item), a chunked GDN scan, and the long-prompt
+fidelity item and serving prompt-length sweep that remain open above.
