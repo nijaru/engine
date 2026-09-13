@@ -854,8 +854,17 @@ would idle lanes or shrink the grid.
 | --- | --- | --- |
 | `gdn_chunk_scan_matches_the_per_token_recurrence` | pinned geometry, chunk 1/5/8 | worst relative 7e-7 output, 3e-7 state; asserted at 1e-5 |
 | `gdn_chunk_scan_matches_a_double_precision_recurrence` | small geometry, two carried chunk launches | 7e-8 output, 8.4e-8 state against an f64 host recurrence |
+| `gdn_chunk_scan_matches_the_per_token_recurrence_on_gate_extremes` | pinned geometry, aligned keys, `beta` of exactly 0 and 1, decay of exactly 0 and 1 | 5.5e-7 output, 3.8e-7 state, all finite |
 | serial prefill's 20-step log-probability table | 257-token prompt, scan selected | at most 8e-4 nats in the top-1/2 gap, 1.7e-3 nats in shared log-probs, all 20 chosen tokens identical |
 | `same_sequence_multi_chunk_prefill_matches_batch1_full_model` | 24 tokens, 64 layers, scan selected | **fails: 1.10e-2 against its 5.0e-3 tolerance** (chunk 1, row 6) |
+
+The gate-extremes fixture exists because a design review of the first draft listed the
+failure modes that still produce *plausible* output: `beta` multiplying in the wrong
+place, the intra diagonal carrying a decay it should not, and interval factors computed
+as ratios of cumulative sums rather than products of the gate. Aligned keys make the
+lower triangle dense, `beta = 0` must leave the state decayed but unchanged, and a zero
+gate must zero every interval spanning it - which a ratio-based implementation turns
+into a NaN, and which the finite-output assertion catches.
 
 The last row is the finding that matters for adoption, and it is not a defect: 1.10e-2
 is the same order as the 6.2e-3 that a GEMV summation reordering produced at this same

@@ -2662,6 +2662,181 @@ fn gdn_chunk_scan_matches_the_per_token_recurrence() {
     }
 }
 
+/// The chunk scan against the per-token recurrence on gate extremes: aligned
+/// keys, `beta` of exactly zero and one, and a decay of exactly zero and one.
+///
+/// The reference-comparison test above uses a random fixture, which is a weak
+/// probe for the parts of the algebra a design review flagged as failure modes
+/// that still produce plausible output: where `beta` multiplies, whether the
+/// intra diagonal carries a decay, and whether interval factors are products
+/// of the gate rather than ratios of cumulative sums. Aligned keys make the
+/// lower triangle dense and maximal, `beta = 0` must leave the state decayed
+/// but unchanged by the update, and a zero gate zeroes every interval that
+/// spans it - which a ratio-based implementation would turn into a NaN.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture, two device paths, one printout"
+)]
+fn gdn_chunk_scan_matches_the_per_token_recurrence_on_gate_extremes() {
+    const V_HEADS: usize = 48;
+    const K_HEADS: usize = 16;
+    const HEAD_DIM: usize = 128;
+    const V_OFFSET: usize = 4096;
+    const CONV_ROW: usize = V_OFFSET + V_HEADS * HEAD_DIM;
+    const CHUNK: usize = 8;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut seed = 0x600D_F00D_u32;
+    let mut fixture = || fixture_quantized_f32(&mut seed) * 0.05;
+    // One key vector per k head, shared by every token: the chunk's keys are
+    // mutually aligned, so every off-diagonal product is nonzero.
+    let mut k_normed = vec![0.0_f32; CHUNK * K_HEADS * HEAD_DIM];
+    let shared_keys: Vec<f32> = (0..K_HEADS * HEAD_DIM).map(|_| fixture()).collect();
+    for token in 0..CHUNK {
+        k_normed[token * K_HEADS * HEAD_DIM..(token + 1) * K_HEADS * HEAD_DIM]
+            .copy_from_slice(&shared_keys);
+    }
+    for head in k_normed.chunks_mut(HEAD_DIM) {
+        let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+        for value in head.iter_mut() {
+            *value /= norm;
+        }
+    }
+    let mut q_normed: Vec<f32> = (0..CHUNK * K_HEADS * HEAD_DIM).map(|_| fixture()).collect();
+    for head in q_normed.chunks_mut(HEAD_DIM) {
+        let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+        for value in head.iter_mut() {
+            *value /= norm;
+        }
+    }
+    let conv_activated: Vec<f32> = (0..CHUNK * CONV_ROW).map(|_| fixture() * 4.0).collect();
+    // Gates span the exact ends of the range: a zero decay must zero every
+    // interval that spans it, a unit decay must leave one, and beta of zero
+    // must stop the update without stopping the decay.
+    let decay: Vec<f32> = (0..CHUNK * V_HEADS)
+        .map(|index| match index % 4 {
+            0 => 1.0,
+            1 => 0.0,
+            2 => 0.5,
+            _ => 0.999,
+        })
+        .collect();
+    let beta: Vec<f32> = (0..CHUNK * V_HEADS)
+        .map(|index| match index % 4 {
+            0 => 0.0,
+            1 => 1.0,
+            2 => 0.5,
+            _ => 0.25,
+        })
+        .collect();
+    let initial: Vec<f32> = (0..V_HEADS * HEAD_DIM * HEAD_DIM)
+        .map(|_| fixture() * 4.0)
+        .collect();
+
+    let q_device = stream.clone_htod(&q_normed).expect("upload q");
+    let k_device = stream.clone_htod(&k_normed).expect("upload k");
+    let conv_device = stream.clone_htod(&conv_activated).expect("upload conv");
+    let decay_device = stream.clone_htod(&decay).expect("upload decay");
+    let beta_device = stream.clone_htod(&beta).expect("upload beta");
+    let mut chunk_matrix = stream.clone_htod(&initial).expect("upload chunk state");
+    let mut chunk_output = stream
+        .alloc_zeros::<f32>(CHUNK * V_HEADS * HEAD_DIM)
+        .expect("allocate chunk output");
+    ops.gdn_chunk_scan(
+        &mut chunk_matrix,
+        &q_device,
+        &k_device,
+        &conv_device,
+        &decay_device,
+        &beta_device,
+        &mut chunk_output,
+        CHUNK,
+        V_HEADS,
+        K_HEADS,
+        HEAD_DIM,
+        V_OFFSET,
+    )
+    .expect("execute chunk scan");
+
+    let mut token_matrix = stream.clone_htod(&initial).expect("upload token state");
+    let mut token_output = Vec::with_capacity(CHUNK * V_HEADS * HEAD_DIM);
+    for token in 0..CHUNK {
+        let q_row = stream
+            .clone_htod(&q_normed[token * K_HEADS * HEAD_DIM..(token + 1) * K_HEADS * HEAD_DIM])
+            .expect("upload q row");
+        let k_row = stream
+            .clone_htod(&k_normed[token * K_HEADS * HEAD_DIM..(token + 1) * K_HEADS * HEAD_DIM])
+            .expect("upload k row");
+        let conv_row = stream
+            .clone_htod(&conv_activated[token * CONV_ROW..(token + 1) * CONV_ROW])
+            .expect("upload conv row");
+        let decay_row = stream
+            .clone_htod(&decay[token * V_HEADS..(token + 1) * V_HEADS])
+            .expect("upload decay row");
+        let beta_row = stream
+            .clone_htod(&beta[token * V_HEADS..(token + 1) * V_HEADS])
+            .expect("upload beta row");
+        let mut out_row = stream
+            .alloc_zeros::<f32>(V_HEADS * HEAD_DIM)
+            .expect("allocate token output");
+        ops.gdn_state_update(
+            &mut token_matrix,
+            &q_row,
+            &k_row,
+            &conv_row,
+            &decay_row,
+            &beta_row,
+            &mut out_row,
+            V_HEADS,
+            K_HEADS,
+            HEAD_DIM,
+            V_OFFSET,
+        )
+        .expect("execute per-token state update");
+        token_output.extend(stream.clone_dtoh(&out_row).expect("download token output"));
+    }
+
+    let chunk_values = stream
+        .clone_dtoh(&chunk_output)
+        .expect("download chunk output");
+    let chunk_state = stream
+        .clone_dtoh(&chunk_matrix)
+        .expect("download chunk state");
+    let token_state = stream
+        .clone_dtoh(&token_matrix)
+        .expect("download token state");
+    assert!(
+        chunk_values.iter().all(|value| value.is_finite())
+            && chunk_state.iter().all(|value| value.is_finite()),
+        "gate extremes must not produce non-finite output"
+    );
+    let relative = |actual: &[f32], expected: &[f32]| -> f32 {
+        let max_abs = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        let scale = expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        max_abs / scale.max(1.0e-30)
+    };
+    let output_relative = relative(&chunk_values, &token_output);
+    let state_relative = relative(&chunk_state, &token_state);
+    println!(
+        "gate extremes: output relative {output_relative:e}, state relative {state_relative:e}"
+    );
+    assert!(
+        output_relative < 1.0e-5 && state_relative < 1.0e-5,
+        "chunk scan diverged from the per-token recurrence on gate extremes: output {output_relative:e}, state {state_relative:e}"
+    );
+}
+
 /// The chunk scan against an independent f64 host recurrence at a small
 /// geometry, over two consecutive chunk launches.
 ///
