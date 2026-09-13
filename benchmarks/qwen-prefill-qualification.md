@@ -263,3 +263,84 @@ token on the existing output path, and conservative asynchronous fault handling 
 the integration conditions. Production serving was not changed in this session, so
 serving still executes prompt tokens serially and this path stays opt-in through the
 benchmark flag until that integration is qualified in turn.
+
+## Serving integration result, 2026-09-12 (heads `150bb62`..`4c22e11`)
+
+Case C was carried out. Chunked prefill is now the backend's default prefill strategy
+for this path, and nothing above the backend changed: a prefill segment is still one
+segment with one outcome, the scheduler still asks for its 16-token prefill chunks,
+and the lane is a private copy of the batch-1 executor's bindings that adds only
+per-lane scratch. Whole leading chunks leave the serial path; the tail, and on a
+sampling segment the final logits-producing token, stay serial. Lane size is
+independent of `max_pending_rows` and of the decode lanes, so one long prompt chunks
+even in a dispatcher prepared for two concurrent decodes - the serving-seam gate
+asserts exactly that, because a regression silently tying the lane to request
+concurrency would otherwise leave a differential test green while measuring nothing.
+
+Session preconditions: the same artifact (sha256
+`322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`), driver 615.71.09
+on an idle RTX 4090 (241 MiB used, 0% utilization, 43 C between stages), rustc/cargo
+1.98.0. Raw logs and per-stage `nvidia-smi` records are in the session evidence
+directory.
+
+### Gates
+
+| gate | test | head | result |
+| --- | --- | --- | --- |
+| single chunk, 4 layers | `same_sequence_prefill_chunk_matches_batch1_hybrid_prefix` | `0496f79` | ok, 164.78 s |
+| single chunk, 64 layers | `same_sequence_prefill_chunk_matches_batch1_full_model` | `3183d44` | ok, 173.89 s |
+| three consecutive chunks | `same_sequence_multi_chunk_prefill_matches_batch1_full_model` | `3183d44` | ok, 174.81 s |
+| serving seam | `serves_chunked_prefill_matching_the_serial_path` | `4c22e11` | ok, 174.18 s |
+| end-to-end runtime | `prepared_qwen_matches_reference_and_preserves_cancelled_peers` | `4c22e11` | ok, 1256.57 s |
+
+The end-to-end gate is the only one that exercises the production loader, `Engine`,
+scheduler, and live cancellation together: a 257-token prompt at concurrency 1/2/8/9
+plus in-flight decode cancellation with peer progress at 2 and 8, against the
+llama.cpp fixture in `crates/qwen/tests/fixtures`. Chunking was enabled by default for
+that run, and the same fixture is what exposed the long-prompt item below. Two
+construction faults in the new gates are part of the record only as fixes: the
+three-chunk gate first used a KV capacity its own prompt outgrew, and the first
+attempt at that fix raised the layer count instead of the token block.
+
+### Serving effect
+
+`qwen_serving_bench` driving the real scheduler and runtime, 257-token prompt, 32
+output tokens, one unchanged release build (`754ab23`, whose serving code is identical
+to `150bb62`):
+
+| concurrency | prefill | TTFT | elapsed | ITL |
+| --- | --- | --- | --- | --- |
+| 1 | serial | 11.569 s | 13.113 s | 49.82 ms |
+| 1 | chunk 8 | 6.595 s | 8.140 s | 49.83 ms |
+| 4 | serial | 46.316 s | 50.716 s | 141.92 ms |
+| 4 | chunk 8 | 26.369 s | 30.756 s | 141.52 ms |
+
+Time to first token improves 1.75x at concurrency 1 and 1.76x at concurrency 4, with
+inter-token latency unchanged, and the printed token streams are identical between
+modes. TTFT at concurrency 4 is four times the concurrency-1 value in both modes,
+because queued requests' prefills run one after another; chunking shortens each of
+them rather than overlapping them. The serial TTFT of 11.569 s also reproduces the
+decoder-level benchmark's 11.573 s serial prefill of the same prompt length through a
+completely different seam, which is a useful cross-check on both benches.
+
+### Long-prompt finding, and why it is not a chunking effect
+
+The 257-token fixture diverges from llama.cpp at generated step 18, where llama.cpp's
+own top-2 margin was 0.2242 nats and ribn prefers the runner-up token; the later
+disagreements are that changed context, not additional flips. The item is pre-existing
+and independent of this work: with chunking disabled the token stream is byte-identical
+to the chunked stream, and both diverge at the same step. The earlier harness could not
+see it because its five-token prompt gave drift far less room, which is why "200 greedy
+tokens match" was never evidence about long prompts. It is recorded in the fixture's
+provenance with the full reference continuation, and it is a numerical-fidelity item for
+the long-prompt path, not a scheduling or ownership defect.
+
+### Decision
+
+Chunked same-sequence prefill is selected by default through `QwenLoadOptions`, with
+the scheduler contract, state ownership, cancellation semantics, and output path
+unchanged. Still open in this area: true chunked GDN and multi-token attention (the
+lane batches projections and feed-forward work per position while recurrence still
+advances token by token), the long-prompt fidelity item above, and a serving-relevant
+prompt-length sweep with a realistic prompt distribution rather than the repeated
+timing fixture.
