@@ -274,6 +274,9 @@ pub struct CudaQwen35Decode {
     scores: Option<CudaSlice<f32>>,
     scores_stride: usize,
     gemv_mode: GemvMode,
+    /// See [`CudaQwen35BatchDecode`]: the chunk-parallel recurrent scan is
+    /// opt-in because it changes the lane's summation order.
+    gdn_chunk_scan: bool,
     /// Lazily built integer-dot state for [`GemvMode::IntegerDot`]; `None`
     /// until the first integer-dot step so float modes pay no staging cost.
     int_dot: Option<CudaIntDotProjector>,
@@ -440,6 +443,7 @@ impl CudaQwen35Decode {
             scores: None,
             scores_stride: 0,
             gemv_mode: GemvMode::default(),
+            gdn_chunk_scan: false,
             int_dot: None,
             hidden: scratch.hidden,
             normed: scratch.normed,
@@ -733,6 +737,21 @@ impl CudaQwen35Decode {
     /// Set the `GEMV` kernel variant used by subsequent steps.
     pub fn set_gemv_mode(&mut self, mode: GemvMode) {
         self.gemv_mode = mode;
+    }
+
+    /// Whether the prefill lane routes recurrent layers through the
+    /// chunk-parallel scan.
+    #[must_use]
+    pub const fn gdn_chunk_scan(&self) -> bool {
+        self.gdn_chunk_scan
+    }
+
+    /// Route (or stop routing) the prefill lane's recurrent layers through the
+    /// chunk-parallel scan. Off by default; see the field comment on
+    /// [`CudaQwen35BatchDecode`] for why selecting it is a qualification
+    /// decision rather than a kernel detail.
+    pub fn set_gdn_chunk_scan(&mut self, enabled: bool) {
+        self.gdn_chunk_scan = enabled;
     }
 
     /// Copy the current residual stream to the host. The copy is
@@ -1617,6 +1636,13 @@ pub struct CudaQwen35BatchDecode {
     layer_kinds: Vec<QwenLayerKind>,
     scratch: BatchScratch,
     gemv_mode: GemvMode,
+    /// Route the prefill lane's recurrent layers through the chunk-parallel
+    /// scan. Off by default: the chunked form is a *different summation order*
+    /// than the per-token recurrence, so selecting it turns the lane's
+    /// chunked-versus-serial agreement from bit-identical into a tolerance and
+    /// is a qualification decision, not a kernel detail. Device gates:
+    /// `gdn_chunk_scan_matches_*` in `crates/nvidia/tests/cuda_reference.rs`.
+    gdn_chunk_scan: bool,
     /// Lazily built integer-dot state for [`GemvMode::IntegerDot`], shared
     /// shape with the batch-1 projector but holding batch-major scratch:
     /// one packed `[members][K/32*9]` buffer per distinct projection width.
@@ -1652,6 +1678,7 @@ impl CudaQwen35BatchDecode {
             ops,
             embedding,
             GemvMode::default(),
+            false,
         )
     }
 
@@ -1669,6 +1696,7 @@ impl CudaQwen35BatchDecode {
             vocab: single.logits.len(),
         };
         let gemv_mode = single.gemv_mode;
+        let gdn_chunk_scan = single.gdn_chunk_scan;
         Self::prepare(
             Arc::clone(single.stream()),
             Arc::clone(&single.weights),
@@ -1678,6 +1706,7 @@ impl CudaQwen35BatchDecode {
             Arc::clone(&single.ops),
             Arc::clone(&single.embedding),
             gemv_mode,
+            gdn_chunk_scan,
         )
     }
 
@@ -1694,6 +1723,7 @@ impl CudaQwen35BatchDecode {
         ops: Arc<CudaQwen35Ops>,
         embedding: Arc<CudaQ4KEmbedding>,
         gemv_mode: GemvMode,
+        gdn_chunk_scan: bool,
     ) -> Result<Self, CudaDecodeError> {
         let ValidatedModelPlan {
             tensor_names,
@@ -1768,6 +1798,7 @@ impl CudaQwen35BatchDecode {
                 .collect(),
             scratch,
             gemv_mode,
+            gdn_chunk_scan,
             int_dot: None,
         })
     }
@@ -1780,6 +1811,20 @@ impl CudaQwen35BatchDecode {
     /// step and never mutate in-flight launches.
     pub fn set_gemv_mode(&mut self, mode: GemvMode) {
         self.gemv_mode = mode;
+    }
+
+    /// Whether this lane routes its recurrent layers through the
+    /// chunk-parallel scan.
+    #[must_use]
+    pub const fn gdn_chunk_scan(&self) -> bool {
+        self.gdn_chunk_scan
+    }
+
+    /// Route (or stop routing) this lane's recurrent layers through the
+    /// chunk-parallel scan. Off by default; see the field comment for why
+    /// selecting it is a qualification decision rather than a kernel detail.
+    pub fn set_gdn_chunk_scan(&mut self, enabled: bool) {
+        self.gdn_chunk_scan = enabled;
     }
 
     /// Number of batch rows this executor was built for.
@@ -2367,34 +2412,65 @@ impl CudaQwen35BatchDecode {
             let matrix = matrix_buffer.as_f32_mut().ok_or_else(|| {
                 CudaDecodeError::InvalidPlan("recurrent matrix must be F32".to_owned())
             })?;
-            for member in 0..m {
-                let q = member_row(&self.scratch.gdn_q, member, GDN_K_OFFSET)
-                    .ok_or_else(|| CudaDecodeError::Driver("gdn_q row out of range".to_owned()))?;
-                let k = member_row(&self.scratch.gdn_k, member, GDN_K_OFFSET)
-                    .ok_or_else(|| CudaDecodeError::Driver("gdn_k row out of range".to_owned()))?;
-                let conv = member_row(&self.scratch.conv_out, member, GDN_QKV_DIM)
-                    .ok_or_else(|| CudaDecodeError::Driver("conv row out of range".to_owned()))?;
-                let decay = member_row(&self.scratch.decay, member, GDN_V_HEADS)
-                    .ok_or_else(|| CudaDecodeError::Driver("decay row out of range".to_owned()))?;
-                let beta = member_row(&self.scratch.beta, member, GDN_V_HEADS)
-                    .ok_or_else(|| CudaDecodeError::Driver("beta row out of range".to_owned()))?;
-                let mut output = member_row_mut(&mut self.scratch.state_out, member, GDN_INNER)
-                    .ok_or_else(|| {
-                        CudaDecodeError::Driver("state output row out of range".to_owned())
-                    })?;
-                self.ops.gdn_state_update_views(
+            if self.gdn_chunk_scan {
+                // One launch for the whole chunk. Its rows share this
+                // sequence's matrix, so the intra-chunk triangular solve
+                // replaces the per-token chain; the summation order differs
+                // from the per-token path, which is why this is opt-in and
+                // numerically, not bit-for-bit, qualified.
+                self.ops.gdn_chunk_scan(
                     matrix,
-                    &q,
-                    &k,
-                    &conv,
-                    &decay,
-                    &beta,
-                    &mut output,
+                    &self.scratch.gdn_q,
+                    &self.scratch.gdn_k,
+                    &self.scratch.conv_out,
+                    &self.scratch.decay,
+                    &self.scratch.beta,
+                    &mut self.scratch.state_out,
+                    m,
                     GDN_V_HEADS,
                     GDN_K_HEADS,
                     GDN_HEAD_DIM,
                     GDN_V_OFFSET,
                 )?;
+            } else {
+                for member in 0..m {
+                    let q =
+                        member_row(&self.scratch.gdn_q, member, GDN_K_OFFSET).ok_or_else(|| {
+                            CudaDecodeError::Driver("gdn_q row out of range".to_owned())
+                        })?;
+                    let k =
+                        member_row(&self.scratch.gdn_k, member, GDN_K_OFFSET).ok_or_else(|| {
+                            CudaDecodeError::Driver("gdn_k row out of range".to_owned())
+                        })?;
+                    let conv = member_row(&self.scratch.conv_out, member, GDN_QKV_DIM).ok_or_else(
+                        || CudaDecodeError::Driver("conv row out of range".to_owned()),
+                    )?;
+                    let decay =
+                        member_row(&self.scratch.decay, member, GDN_V_HEADS).ok_or_else(|| {
+                            CudaDecodeError::Driver("decay row out of range".to_owned())
+                        })?;
+                    let beta =
+                        member_row(&self.scratch.beta, member, GDN_V_HEADS).ok_or_else(|| {
+                            CudaDecodeError::Driver("beta row out of range".to_owned())
+                        })?;
+                    let mut output = member_row_mut(&mut self.scratch.state_out, member, GDN_INNER)
+                        .ok_or_else(|| {
+                            CudaDecodeError::Driver("state output row out of range".to_owned())
+                        })?;
+                    self.ops.gdn_state_update_views(
+                        matrix,
+                        &q,
+                        &k,
+                        &conv,
+                        &decay,
+                        &beta,
+                        &mut output,
+                        GDN_V_HEADS,
+                        GDN_K_HEADS,
+                        GDN_HEAD_DIM,
+                        GDN_V_OFFSET,
+                    )?;
+                }
             }
         }
 

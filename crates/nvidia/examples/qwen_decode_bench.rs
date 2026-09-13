@@ -73,6 +73,11 @@ fn main() {
                 .parse::<usize>()
                 .expect("--prefill-chunk expects a number")
         });
+    // Opt-in: routes the chunk lane's recurrent layers through the
+    // chunk-parallel scan, which is a different summation order from the
+    // per-token path and therefore changes chunked-versus-serial agreement from
+    // bit-identical to a tolerance.
+    let gdn_chunk_scan = args.iter().any(|argument| argument == "--gdn-chunk-scan");
     // Number of generation steps whose top-k log-probabilities are printed. Used
     // with `--prompt-fixture` to compare greedy margins against a reference
     // engine that recorded the same prompt, which token agreement alone cannot do.
@@ -221,8 +226,10 @@ fn main() {
         .expect("build decode executor");
     executor.set_gemv_mode(gemv_mode);
     let mut chunk_executor = prefill_chunk.map(|members| {
-        CudaQwen35BatchDecode::from_decode(&executor, members)
-            .unwrap_or_else(|error| panic!("invalid --prefill-chunk={members}: {error}"))
+        let mut chunk = CudaQwen35BatchDecode::from_decode(&executor, members)
+            .unwrap_or_else(|error| panic!("invalid --prefill-chunk={members}: {error}"));
+        chunk.set_gdn_chunk_scan(gdn_chunk_scan);
+        chunk
     });
 
     let prefill_start = Instant::now();

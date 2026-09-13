@@ -2500,6 +2500,348 @@ fn executes_gdn_state_update_against_host_equations() {
     }
 }
 
+/// The chunk-parallel recurrent scan against the shipped per-token kernel, at
+/// the pinned geometry and at chunk lengths that exercise the degenerate and
+/// tail cases.
+///
+/// `crates/nvidia/tests/gdn_chunk_reference.rs` proves the chunk algebra
+/// against the token recurrence on the host. This is the device gate: the
+/// chunked form is a *different summation order*, so the two device paths are
+/// compared numerically, with the achieved error printed, rather than
+/// bit-for-bit. That difference is why the lane does not select this kernel
+/// until the qualification decision recorded in
+/// `benchmarks/qwen-prefill-qualification.md` is made.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture, three chunk lengths, two device paths, one printout"
+)]
+fn gdn_chunk_scan_matches_the_per_token_recurrence() {
+    const V_HEADS: usize = 48;
+    const K_HEADS: usize = 16;
+    const HEAD_DIM: usize = 128;
+    const V_OFFSET: usize = 4096;
+    const CONV_ROW: usize = V_OFFSET + V_HEADS * HEAD_DIM;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    for chunk in [1_usize, 5, 8] {
+        let mut seed = 0x51ED_2026_u32;
+        let mut fixture = || fixture_quantized_f32(&mut seed) * 0.05;
+        // Normalized q/k, as the lane produces them before this kernel runs.
+        let normalize = |values: &mut [f32]| {
+            for head in values.chunks_mut(HEAD_DIM) {
+                let norm = head
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1.0e-6);
+                for value in head.iter_mut() {
+                    *value /= norm;
+                }
+            }
+        };
+        let mut q_normed: Vec<f32> = (0..chunk * K_HEADS * HEAD_DIM).map(|_| fixture()).collect();
+        let mut k_normed: Vec<f32> = (0..chunk * K_HEADS * HEAD_DIM).map(|_| fixture()).collect();
+        normalize(&mut q_normed);
+        normalize(&mut k_normed);
+        let conv_activated: Vec<f32> = (0..chunk * CONV_ROW).map(|_| fixture() * 4.0).collect();
+        let decay: Vec<f32> = (0..chunk * V_HEADS)
+            .map(|index| 0.55 + f32::from(u16::try_from(index % 5).expect("fits")) * 0.07)
+            .collect();
+        let beta: Vec<f32> = (0..chunk * V_HEADS)
+            .map(|index| 0.1 + f32::from(u16::try_from(index % 7).expect("fits")) * 0.03)
+            .collect();
+        let initial: Vec<f32> = (0..V_HEADS * HEAD_DIM * HEAD_DIM)
+            .map(|_| fixture() * 4.0)
+            .collect();
+
+        let q_device = stream.clone_htod(&q_normed).expect("upload q");
+        let k_device = stream.clone_htod(&k_normed).expect("upload k");
+        let conv_device = stream.clone_htod(&conv_activated).expect("upload conv");
+        let decay_device = stream.clone_htod(&decay).expect("upload decay");
+        let beta_device = stream.clone_htod(&beta).expect("upload beta");
+        let mut chunk_matrix = stream.clone_htod(&initial).expect("upload chunk state");
+        let mut chunk_output = stream
+            .alloc_zeros::<f32>(chunk * V_HEADS * HEAD_DIM)
+            .expect("allocate chunk output");
+        ops.gdn_chunk_scan(
+            &mut chunk_matrix,
+            &q_device,
+            &k_device,
+            &conv_device,
+            &decay_device,
+            &beta_device,
+            &mut chunk_output,
+            chunk,
+            V_HEADS,
+            K_HEADS,
+            HEAD_DIM,
+            V_OFFSET,
+        )
+        .expect("execute chunk scan");
+
+        // Oracle: the same tokens through the per-token kernel, one member at a
+        // time, carrying the matrix exactly as the serial lane does.
+        let mut token_matrix = stream.clone_htod(&initial).expect("upload token state");
+        let mut token_output = Vec::with_capacity(chunk * V_HEADS * HEAD_DIM);
+        for token in 0..chunk {
+            let q_row = stream
+                .clone_htod(&q_normed[token * K_HEADS * HEAD_DIM..(token + 1) * K_HEADS * HEAD_DIM])
+                .expect("upload q row");
+            let k_row = stream
+                .clone_htod(&k_normed[token * K_HEADS * HEAD_DIM..(token + 1) * K_HEADS * HEAD_DIM])
+                .expect("upload k row");
+            let conv_row = stream
+                .clone_htod(&conv_activated[token * CONV_ROW..(token + 1) * CONV_ROW])
+                .expect("upload conv row");
+            let decay_row = stream
+                .clone_htod(&decay[token * V_HEADS..(token + 1) * V_HEADS])
+                .expect("upload decay row");
+            let beta_row = stream
+                .clone_htod(&beta[token * V_HEADS..(token + 1) * V_HEADS])
+                .expect("upload beta row");
+            let mut out_row = stream
+                .alloc_zeros::<f32>(V_HEADS * HEAD_DIM)
+                .expect("allocate token output");
+            ops.gdn_state_update(
+                &mut token_matrix,
+                &q_row,
+                &k_row,
+                &conv_row,
+                &decay_row,
+                &beta_row,
+                &mut out_row,
+                V_HEADS,
+                K_HEADS,
+                HEAD_DIM,
+                V_OFFSET,
+            )
+            .expect("execute per-token state update");
+            token_output.extend(stream.clone_dtoh(&out_row).expect("download token output"));
+        }
+
+        let chunk_values = stream
+            .clone_dtoh(&chunk_output)
+            .expect("download chunk output");
+        let chunk_state = stream
+            .clone_dtoh(&chunk_matrix)
+            .expect("download chunk state");
+        let token_state = stream
+            .clone_dtoh(&token_matrix)
+            .expect("download token state");
+        let reported = |name: &str, actual: &[f32], expected: &[f32]| -> f32 {
+            let max_abs = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            let scale = expected
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f32, f32::max);
+            println!(
+                "chunk {chunk} {name}: max abs {max_abs:e}, max value {scale:e}, relative {:e}",
+                max_abs / scale.max(1.0e-30)
+            );
+            max_abs / scale.max(1.0e-30)
+        };
+        let output_relative = reported("output", &chunk_values, &token_output);
+        let state_relative = reported("state", &chunk_state, &token_state);
+        // Measured worst case over these chunk lengths is 7e-7 relative, so
+        // 1e-5 leaves an order of magnitude of headroom while still catching a
+        // real regression (the pre-elimination decayed-keys solve, for
+        // instance, is a different order and does not reach it).
+        assert!(
+            output_relative < 1.0e-5 && state_relative < 1.0e-5,
+            "chunk {chunk} diverged from the per-token recurrence: output {output_relative:e}, state {state_relative:e}"
+        );
+    }
+}
+
+/// The chunk scan against an independent f64 host recurrence at a small
+/// geometry, over two consecutive chunk launches.
+///
+/// The reference-comparison test above compares two device paths that share my
+/// reading of the equations; this one checks the equations themselves, in
+/// double precision, and covers the carried matrix a second chunk inherits.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one small fixture, two launches, one double-precision replay"
+)]
+fn gdn_chunk_scan_matches_a_double_precision_recurrence() {
+    const V_HEADS: usize = 4;
+    const K_HEADS: usize = 2;
+    const HEAD_DIM: usize = 32;
+    const V_OFFSET: usize = 8;
+    const CHUNK: usize = 5;
+    const CHUNKS: usize = 2;
+    const TOKENS: usize = CHUNK * CHUNKS;
+    const CONV_ROW: usize = V_OFFSET + V_HEADS * HEAD_DIM;
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let ops = CudaQwen35Ops::from_context(&context, stream.clone()).expect("compile Qwen ops");
+
+    let mut seed = 0x00DD_BA11_u32;
+    let mut fixture = || fixture_quantized_f32(&mut seed) * 0.125;
+    let mut q_normed: Vec<f32> = (0..TOKENS * K_HEADS * HEAD_DIM)
+        .map(|_| fixture())
+        .collect();
+    let mut k_normed: Vec<f32> = (0..TOKENS * K_HEADS * HEAD_DIM)
+        .map(|_| fixture())
+        .collect();
+    for head in q_normed.chunks_mut(HEAD_DIM) {
+        let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+        for value in head.iter_mut() {
+            *value /= norm;
+        }
+    }
+    for head in k_normed.chunks_mut(HEAD_DIM) {
+        let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+        for value in head.iter_mut() {
+            *value /= norm;
+        }
+    }
+    let conv_activated: Vec<f32> = (0..TOKENS * CONV_ROW).map(|_| fixture() * 2.0).collect();
+    let decay: Vec<f32> = (0..TOKENS * V_HEADS)
+        .map(|index| 0.6 + f32::from(u16::try_from(index % 4).expect("fits")) * 0.1)
+        .collect();
+    let beta: Vec<f32> = (0..TOKENS * V_HEADS)
+        .map(|index| 0.2 + f32::from(u16::try_from(index % 3).expect("fits")) * 0.15)
+        .collect();
+    let initial: Vec<f32> = (0..V_HEADS * HEAD_DIM * HEAD_DIM)
+        .map(|_| fixture() * 2.0)
+        .collect();
+
+    let mut matrix = stream.clone_htod(&initial).expect("upload state");
+    let mut output = stream
+        .alloc_zeros::<f32>(TOKENS * V_HEADS * HEAD_DIM)
+        .expect("allocate output");
+    for chunk in 0..CHUNKS {
+        let token_start = chunk * CHUNK;
+        let q_chunk = stream
+            .clone_htod(
+                &q_normed
+                    [token_start * K_HEADS * HEAD_DIM..(token_start + CHUNK) * K_HEADS * HEAD_DIM],
+            )
+            .expect("upload chunk q");
+        let k_chunk = stream
+            .clone_htod(
+                &k_normed
+                    [token_start * K_HEADS * HEAD_DIM..(token_start + CHUNK) * K_HEADS * HEAD_DIM],
+            )
+            .expect("upload chunk k");
+        let conv_chunk = stream
+            .clone_htod(&conv_activated[token_start * CONV_ROW..(token_start + CHUNK) * CONV_ROW])
+            .expect("upload chunk conv");
+        let decay_chunk = stream
+            .clone_htod(&decay[token_start * V_HEADS..(token_start + CHUNK) * V_HEADS])
+            .expect("upload chunk decay");
+        let beta_chunk = stream
+            .clone_htod(&beta[token_start * V_HEADS..(token_start + CHUNK) * V_HEADS])
+            .expect("upload chunk beta");
+        let mut chunk_output = stream
+            .alloc_zeros::<f32>(CHUNK * V_HEADS * HEAD_DIM)
+            .expect("allocate chunk output");
+        ops.gdn_chunk_scan(
+            &mut matrix,
+            &q_chunk,
+            &k_chunk,
+            &conv_chunk,
+            &decay_chunk,
+            &beta_chunk,
+            &mut chunk_output,
+            CHUNK,
+            V_HEADS,
+            K_HEADS,
+            HEAD_DIM,
+            V_OFFSET,
+        )
+        .expect("execute chunk scan");
+        let values = stream
+            .clone_dtoh(&chunk_output)
+            .expect("download chunk output");
+        let target = token_start * V_HEADS * HEAD_DIM;
+        let mut host_output = stream.clone_dtoh(&output).expect("download output so far");
+        host_output[target..target + CHUNK * V_HEADS * HEAD_DIM].copy_from_slice(&values);
+        output = stream.clone_htod(&host_output).expect("re-upload output");
+    }
+    let actual_output = stream.clone_dtoh(&output).expect("download output");
+    let actual_state = stream.clone_dtoh(&matrix).expect("download state");
+
+    // Double-precision token recurrence, straight from the pinned equations.
+    let scale = 1.0_f64 / f64::from(u16::try_from(HEAD_DIM).expect("dim fits u16")).sqrt();
+    let mut state: Vec<f64> = initial.iter().map(|value| f64::from(*value)).collect();
+    let mut expected_output = vec![0.0_f64; TOKENS * V_HEADS * HEAD_DIM];
+    for token in 0..TOKENS {
+        for v_head in 0..V_HEADS {
+            let k_head = v_head % K_HEADS;
+            let q: Vec<f64> = (0..HEAD_DIM)
+                .map(|dim| {
+                    f64::from(q_normed[token * K_HEADS * HEAD_DIM + k_head * HEAD_DIM + dim])
+                })
+                .collect();
+            let k: Vec<f64> = (0..HEAD_DIM)
+                .map(|dim| {
+                    f64::from(k_normed[token * K_HEADS * HEAD_DIM + k_head * HEAD_DIM + dim])
+                })
+                .collect();
+            let v: Vec<f64> = (0..HEAD_DIM)
+                .map(|dim| {
+                    f64::from(conv_activated[token * CONV_ROW + V_OFFSET + v_head * HEAD_DIM + dim])
+                })
+                .collect();
+            let decay = f64::from(decay[token * V_HEADS + v_head]);
+            let beta = f64::from(beta[token * V_HEADS + v_head]);
+            let base = v_head * HEAD_DIM * HEAD_DIM;
+            for element in &mut state[base..base + HEAD_DIM * HEAD_DIM] {
+                *element *= decay;
+            }
+            let mut prediction = vec![0.0_f64; HEAD_DIM];
+            for key_index in 0..HEAD_DIM {
+                for value_index in 0..HEAD_DIM {
+                    prediction[value_index] +=
+                        state[base + key_index * HEAD_DIM + value_index] * k[key_index];
+                }
+            }
+            for value_index in 0..HEAD_DIM {
+                let correction = (v[value_index] - prediction[value_index]) * beta;
+                for key_index in 0..HEAD_DIM {
+                    state[base + key_index * HEAD_DIM + value_index] += k[key_index] * correction;
+                }
+            }
+            for value_index in 0..HEAD_DIM {
+                let mut out = 0.0_f64;
+                for key_index in 0..HEAD_DIM {
+                    out += state[base + key_index * HEAD_DIM + value_index] * q[key_index];
+                }
+                expected_output[token * V_HEADS * HEAD_DIM + v_head * HEAD_DIM + value_index] =
+                    out * scale;
+            }
+        }
+    }
+    let max_abs = actual_output
+        .iter()
+        .zip(&expected_output)
+        .map(|(actual, expected)| (f64::from(*actual) - *expected).abs())
+        .fold(0.0_f64, f64::max);
+    let max_state_abs = actual_state
+        .iter()
+        .zip(&state)
+        .map(|(actual, expected)| (f64::from(*actual) - *expected).abs())
+        .fold(0.0_f64, f64::max);
+    println!("f64 oracle: output max abs {max_abs:e}, state max abs {max_state_abs:e}");
+    assert!(
+        max_abs < 1.0e-4 && max_state_abs < 1.0e-4,
+        "chunk scan diverged from the double-precision recurrence: output {max_abs:e}, state {max_state_abs:e}"
+    );
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 #[allow(
@@ -3644,6 +3986,14 @@ fn same_sequence_multi_chunk_prefill_matches_batch1_full_model() {
         .expect("candidate single executor");
     let mut chunk =
         CudaQwen35BatchDecode::from_decode(&candidate, MEMBERS).expect("chunk executor");
+    // Optional device-gate switch. The chunk-parallel recurrent scan is a
+    // different summation order from the per-token recurrence, so selecting it
+    // turns this gate from a bit-identity check into the tolerance check that
+    // decides whether the lane may adopt it; `RIBN_GDN_CHUNK_SCAN=1` runs it
+    // that way and prints the achieved divergence.
+    if std::env::var_os("RIBN_GDN_CHUNK_SCAN").is_some() {
+        chunk.set_gdn_chunk_scan(true);
+    }
     let mut chunk_state = fresh_state();
     for chunk_index in 0..CHUNKS {
         let start = u32::try_from(chunk_index * MEMBERS).expect("chunk start fits u32");

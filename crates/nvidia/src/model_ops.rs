@@ -56,6 +56,16 @@ impl fmt::Display for CudaModelKernelError {
 
 impl std::error::Error for CudaModelKernelError {}
 
+/// Compile-time geometry of `gdn_chunk_scan`, mirroring its `MAX_GDN_CHUNK`,
+/// `MAX_GDN_DIM` and `GDN_TILE_V` defines in the source below: the launch sizes
+/// the grid from these, and the kernel sizes its shared tile and warp mapping
+/// from the defines, so the two must agree.
+const MAX_GDN_CHUNK: usize = 8;
+const MAX_GDN_DIM: usize = 256;
+const GDN_TILE_V: usize = 32;
+/// The same tile as a launch dimension.
+const GDN_TILE_V_LAUNCH: u32 = 32;
+
 const MODEL_OPS_SOURCE: &str = r#"
 // F16 -> F32 bit conversion without cuda_fp16.h (NVRTC's default include
 // path does not ship it): zero-extend to F32, rebias the exponent, and
@@ -739,6 +749,171 @@ extern "C" __global__ void gdn_state_update_batch(
         out * rsqrtf((float)head_dim);
 }
 
+#define MAX_GDN_CHUNK 8
+#define MAX_GDN_DIM 256
+#define GDN_TILE_V 32
+
+extern "C" __global__ void gdn_chunk_scan(
+    float* matrix,
+    const float* q_normed,
+    const float* k_normed,
+    const float* conv_activated,
+    const float* decay,
+    const float* beta,
+    float* output,
+    int chunk,
+    int v_heads,
+    int k_heads,
+    int head_dim,
+    int v_offset
+) {
+    // One warp per (v head, GDN_TILE_V value columns). A prefill chunk's tokens
+    // are one sequence sharing one recurrent matrix, so the whole chunk is one
+    // launch: `gdn_state_update` needs eight sequential sweeps of the state
+    // because token i reads the matrix token i-1 produced, and that serializes
+    // 48 blocks with two 128-step dependent chains per thread. The chunked form
+    // replaces the chain with the unit-lower-triangular solve from
+    // `crates/nvidia/tests/gdn_chunk_reference.rs`: the intra-chunk terms are
+    // solved once, the old state is read once per element, and the carry is one
+    // fused sweep.
+    //
+    // Decay algebra: `gdn_scalar_gate` writes the exponentiated per-token
+    // factor the per-token kernel multiplies the state by, so every interval
+    // factor is a product of those same factors - never a ratio of cumulative
+    // sums, which would need a logarithm and could underflow.
+    //
+    // `decayed_keys` is not materialized: both solves share the same unit
+    // lower-triangular system A, so
+    //   A * update = beta * (V - D_i * K^T S)
+    // is algebraically the reference's two solved right-hand sides subtracted.
+    const int tiles = head_dim / GDN_TILE_V;
+    const int v_head = (int)(blockIdx.x) / tiles;
+    const int tile = (int)(blockIdx.x) - v_head * tiles;
+    const int lane = (int)(threadIdx.x);
+    const int column = tile * GDN_TILE_V + lane;
+    if (v_head >= v_heads || column >= head_dim) {
+        return;
+    }
+    const int k_head = v_head % k_heads;
+    const int qk_row = k_heads * head_dim;
+    const int qkv_row = v_offset + v_heads * head_dim;
+
+    __shared__ float s_q[MAX_GDN_CHUNK][MAX_GDN_DIM];
+    __shared__ float s_k[MAX_GDN_CHUNK][MAX_GDN_DIM];
+    __shared__ float s_lower[MAX_GDN_CHUNK][MAX_GDN_CHUNK];
+    __shared__ float s_intra[MAX_GDN_CHUNK][MAX_GDN_CHUNK];
+    __shared__ float s_cumulative[MAX_GDN_CHUNK];
+    __shared__ float s_carry[MAX_GDN_CHUNK];
+    __shared__ float s_beta[MAX_GDN_CHUNK];
+
+    if (lane == 0) {
+        float cumulative = 1.0f;
+        for (int i = 0; i < chunk; ++i) {
+            cumulative *= decay[i * v_heads + v_head];
+            s_cumulative[i] = cumulative;
+        }
+        // Interval product from the token after i through the last token.
+        float trailing = 1.0f;
+        for (int i = chunk - 1; i >= 0; --i) {
+            s_carry[i] = trailing;
+            trailing *= decay[i * v_heads + v_head];
+        }
+        for (int i = 0; i < chunk; ++i) {
+            s_beta[i] = beta[i * v_heads + v_head];
+        }
+    }
+    for (int index = lane; index < chunk * head_dim; index += GDN_TILE_V) {
+        const int token = index / head_dim;
+        const int dim = index - token * head_dim;
+        s_q[token][dim] = q_normed[token * qk_row + k_head * head_dim + dim];
+        s_k[token][dim] = k_normed[token * qk_row + k_head * head_dim + dim];
+    }
+    __syncthreads();
+
+    // A = I + L with L[i][j] = beta_i * <k_i,k_j> * interval(j->i); the output
+    // read uses the same interval with q. The diagonal interval is one because
+    // an interval excludes j and includes i.
+    const float scale = rsqrtf((float)head_dim);
+    for (int index = lane; index < chunk * chunk; index += GDN_TILE_V) {
+        const int row = index / chunk;
+        const int col = index - row * chunk;
+        if (col > row) {
+            s_lower[row][col] = 0.0f;
+            s_intra[row][col] = 0.0f;
+            continue;
+        }
+        float interval = 1.0f;
+        for (int t = col + 1; t <= row; ++t) {
+            interval *= decay[t * v_heads + v_head];
+        }
+        float query_key = 0.0f;
+        float key_key = 0.0f;
+        for (int dim = 0; dim < head_dim; ++dim) {
+            query_key += s_q[row][dim] * s_k[col][dim];
+            key_key += s_k[row][dim] * s_k[col][dim];
+        }
+        s_intra[row][col] = query_key * scale * interval;
+        s_lower[row][col] = col < row ? s_beta[row] * key_key * interval : 0.0f;
+    }
+    __syncthreads();
+
+    // Fused old-state projections: K^T S and Q^T S for this column. Sixteen
+    // accumulators, and every state element is read once and reused across the
+    // chunk's rows.
+    float projection_k[MAX_GDN_CHUNK];
+    float projection_q[MAX_GDN_CHUNK];
+    #pragma unroll
+    for (int i = 0; i < MAX_GDN_CHUNK; ++i) {
+        projection_k[i] = 0.0f;
+        projection_q[i] = 0.0f;
+    }
+    float* state = matrix + (long long)v_head * head_dim * head_dim;
+    for (int row = 0; row < head_dim; ++row) {
+        const float element = state[row * head_dim + column];
+        #pragma unroll
+        for (int i = 0; i < MAX_GDN_CHUNK; ++i) {
+            if (i < chunk) {
+                projection_k[i] += s_k[i][row] * element;
+                projection_q[i] += s_q[i][row] * element;
+            }
+        }
+    }
+
+    float update[MAX_GDN_CHUNK];
+    #pragma unroll
+    for (int i = 0; i < MAX_GDN_CHUNK; ++i) {
+        update[i] = 0.0f;
+    }
+    for (int i = 0; i < chunk; ++i) {
+        const float value =
+            conv_activated[i * qkv_row + v_offset + v_head * head_dim + column];
+        float solved = s_beta[i] * (value - s_cumulative[i] * projection_k[i]);
+        for (int j = 0; j < i; ++j) {
+            solved -= s_lower[i][j] * update[j];
+        }
+        update[i] = solved;
+    }
+    for (int i = 0; i < chunk; ++i) {
+        float result = scale * s_cumulative[i] * projection_q[i];
+        for (int j = 0; j <= i; ++j) {
+            result += s_intra[i][j] * update[j];
+        }
+        output[i * v_heads * head_dim + v_head * head_dim + column] = result;
+    }
+
+    // Carry: one decayed read of the old state plus every row's update. The
+    // old-state reads above happen before this write, and each thread owns its
+    // own column, so no state barrier is needed.
+    const float chunk_decay = s_cumulative[chunk - 1];
+    for (int row = 0; row < head_dim; ++row) {
+        float element = chunk_decay * state[row * head_dim + column];
+        for (int i = 0; i < chunk; ++i) {
+            element += s_k[i][row] * s_carry[i] * update[i];
+        }
+        state[row * head_dim + column] = element;
+    }
+}
+
 extern "C" __global__ void gdn_gated_norm(
     const float* input,
     const float* z_gate,
@@ -1057,6 +1232,7 @@ pub struct CudaQwen35Ops {
     strided_rms_norm: CudaFunction,
     gdn_state_update: CudaFunction,
     gdn_state_update_batch: CudaFunction,
+    gdn_chunk_scan: CudaFunction,
     gdn_gated_norm: CudaFunction,
     q_gate_norm: CudaFunction,
     kv_append_f16: CudaFunction,
@@ -1153,6 +1329,9 @@ impl CudaQwen35Ops {
         let gdn_state_update_batch = module
             .load_function("gdn_state_update_batch")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let gdn_chunk_scan = module
+            .load_function("gdn_chunk_scan")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let gdn_gated_norm = module
             .load_function("gdn_gated_norm")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -1198,6 +1377,7 @@ impl CudaQwen35Ops {
             strided_rms_norm,
             gdn_state_update,
             gdn_state_update_batch,
+            gdn_chunk_scan,
             gdn_gated_norm,
             q_gate_norm,
             kv_append_f16,
@@ -2706,6 +2886,120 @@ impl CudaQwen35Ops {
                 .arg(decay)
                 .arg(beta)
                 .arg(&mut *output)
+                .arg(&v_heads_u32)
+                .arg(&k_heads_u32)
+                .arg(&head_dim_u32)
+                .arg(&v_offset_u32)
+                .launch(config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// One chunk-parallel recurrent scan: a prefill chunk's `chunk` tokens are
+    /// one sequence sharing one matrix, so a single launch replaces `chunk`
+    /// sequential `gdn_state_update` calls. The intra-chunk triangular solve is
+    /// the one `crates/nvidia/tests/gdn_chunk_reference.rs` validates against
+    /// the token recurrence, so this is a different summation order from the
+    /// per-token kernel and is qualified numerically, not bit-for-bit.
+    ///
+    /// `q_normed`/`k_normed` are `[chunk][k_heads][head_dim]`, `conv_activated`
+    /// is `[chunk][v_offset + v_heads * head_dim]`, `decay`/`beta` are
+    /// `[chunk][v_heads]`, and `output` is `[chunk][v_heads][head_dim]`; input
+    /// rows are batch-major slices of the caller's scratch buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, lengths, geometry, or
+    /// launch arguments are invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn gdn_chunk_scan(
+        &self,
+        matrix: &mut CudaSlice<f32>,
+        q_normed: &CudaSlice<f32>,
+        k_normed: &CudaSlice<f32>,
+        conv_activated: &CudaSlice<f32>,
+        decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        chunk: usize,
+        v_heads: usize,
+        k_heads: usize,
+        head_dim: usize,
+        v_offset: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != matrix.context().as_ref()
+            || context.as_ref() != q_normed.context().as_ref()
+            || context.as_ref() != k_normed.context().as_ref()
+            || context.as_ref() != conv_activated.context().as_ref()
+            || context.as_ref() != decay.context().as_ref()
+            || context.as_ref() != beta.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if v_heads == 0 || k_heads == 0 || head_dim == 0 || chunk == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        // The kernel's shared tile and its warp mapping are fixed at compile
+        // time: one chunk row per register accumulator, one value column per
+        // lane, and a key dimension that tiles evenly.
+        if chunk > MAX_GDN_CHUNK || head_dim > MAX_GDN_DIM || !head_dim.is_multiple_of(GDN_TILE_V) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        if !v_heads.is_multiple_of(k_heads) {
+            return Err(CudaModelKernelError::ShapeOverflow);
+        }
+        let state_len = v_heads * head_dim * head_dim;
+        if matrix.len() != state_len
+            || q_normed.len() != chunk * k_heads * head_dim
+            || k_normed.len() != chunk * k_heads * head_dim
+            || decay.len() != chunk * v_heads
+            || beta.len() != chunk * v_heads
+            || output.len() != chunk * v_heads * head_dim
+            || conv_activated.len() < chunk * (v_offset + v_heads * head_dim)
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: state_len,
+                actual: matrix.len(),
+            });
+        }
+        let chunk_u32 = u32::try_from(chunk).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let v_heads_u32 =
+            u32::try_from(v_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let k_heads_u32 =
+            u32::try_from(k_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let head_dim_u32 =
+            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let v_offset_u32 =
+            u32::try_from(v_offset).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let tiles = u32::try_from(head_dim / GDN_TILE_V)
+            .map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let blocks = v_heads_u32
+            .checked_mul(tiles)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (GDN_TILE_V_LAUNCH, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Safety: cudarc allocated all slices, geometry is validated, and the
+        // launch keeps all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.gdn_chunk_scan)
+                .arg(&mut *matrix)
+                .arg(q_normed)
+                .arg(k_normed)
+                .arg(conv_activated)
+                .arg(decay)
+                .arg(beta)
+                .arg(&mut *output)
+                .arg(&chunk_u32)
                 .arg(&v_heads_u32)
                 .arg(&k_heads_u32)
                 .arg(&head_dim_u32)
