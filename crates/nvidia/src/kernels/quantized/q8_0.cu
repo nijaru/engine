@@ -82,15 +82,16 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
     // bytes are reused against every member's input, so the weight matrix
     // is fetched once per launch instead of once per member.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int warp = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row_base = warp * MAX_BATCH_ROWS;
     const int lane = (int)(threadIdx.x & 31u);
-    if (row >= output_size) {
+    if (row_base >= output_size) {
         return;
     }
     // Constant initializer plus fully unrolled predicated member loops keep
     // acc[] in registers; a runtime-bounded member loop spills it to local
     // memory and serializes the member input loads.
-    float acc[MAX_BATCH_MEMBERS] = {0.0f};
+    float acc[MAX_BATCH_ROWS][MAX_BATCH_MEMBERS] = {0.0f};
     const int blocks_per_output = input_size / 32;
     // One lane owns four consecutive activations of its own block: lanes
     // `8k..8k+7` cover block `base + k`. A member's activations are then a
@@ -105,15 +106,25 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
         if (block_index >= blocks_per_output) {
             continue;
         }
-        const unsigned char* block =
-            weights + (row * blocks_per_output + block_index) * 34;
-        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
-        const unsigned short low_half = *(const unsigned short*)(block + 2 + index);
-        const unsigned short high_half = *(const unsigned short*)(block + 4 + index);
-        const float value0 = d * (float)(int)(signed char)(low_half & 0xffu);
-        const float value1 = d * (float)(int)(signed char)(low_half >> 8u);
-        const float value2 = d * (float)(int)(signed char)(high_half & 0xffu);
-        const float value3 = d * (float)(int)(signed char)(high_half >> 8u);
+        float value0[MAX_BATCH_ROWS];
+        float value1[MAX_BATCH_ROWS];
+        float value2[MAX_BATCH_ROWS];
+        float value3[MAX_BATCH_ROWS];
+        #pragma unroll
+        for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+            const int row = row_base + r;
+            if (row < output_size) {
+                const unsigned char* block =
+                    weights + (row * blocks_per_output + block_index) * 34;
+                const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+                const unsigned short low_half = *(const unsigned short*)(block + 2 + index);
+                const unsigned short high_half = *(const unsigned short*)(block + 4 + index);
+                value0[r] = d * (float)(int)(signed char)(low_half & 0xffu);
+                value1[r] = d * (float)(int)(signed char)(low_half >> 8u);
+                value2[r] = d * (float)(int)(signed char)(high_half & 0xffu);
+                value3[r] = d * (float)(int)(signed char)(high_half >> 8u);
+            }
+        }
         const float* member_input = input + block_index * 32 + index;
         #pragma unroll
         for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
@@ -121,19 +132,30 @@ extern "C" __global__ void q8_0_gemv_warp_batch(
                 const float4* row_input =
                     (const float4*)(member_input + (long long)m * input_size);
                 const float4 activations = *row_input;
-                acc[m] += value0 * activations.x + value1 * activations.y
-                    + value2 * activations.z + value3 * activations.w;
+                // One activation load feeds every blocked row: the rows
+                // differ in weights, not in what this member contributes.
+                #pragma unroll
+                for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+                    acc[r][m] += value0[r] * activations.x + value1[r] * activations.y
+                        + value2[r] * activations.z + value3[r] * activations.w;
+                }
             }
         }
     }
     #pragma unroll
-    for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
-        if (m < members) {
-            // Every lane participates in the shuffle reduction; lane 0
-            // holds the full sum and writes it.
-            const float total = warp_sum(acc[m]);
-            if (lane == 0) {
-                output[(long long)m * output_size + row] = total;
+    for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+        const int row = row_base + r;
+        if (row < output_size) {
+            #pragma unroll
+            for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+                if (m < members) {
+                    // Every lane participates in the shuffle reduction; lane 0
+                    // holds the full sum and writes it.
+                    const float total = warp_sum(acc[r][m]);
+                    if (lane == 0) {
+                        output[(long long)m * output_size + row] = total;
+                    }
+                }
             }
         }
     }

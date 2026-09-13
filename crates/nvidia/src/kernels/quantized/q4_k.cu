@@ -169,15 +169,16 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
     // Weights-read-once: one warp per weight row; each decoded element is
     // reused against every member's input.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int row = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int warp = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int row_base = warp * MAX_BATCH_ROWS;
     const int lane = (int)(threadIdx.x & 31u);
-    if (row >= output_size) {
+    if (row_base >= output_size) {
         return;
     }
     // Constant initializer plus fully unrolled predicated member loops keep
     // acc[] in registers; a runtime-bounded member loop spills it to local
     // memory and serializes the member input loads.
-    float acc[MAX_BATCH_MEMBERS] = {0.0f};
+    float acc[MAX_BATCH_ROWS][MAX_BATCH_MEMBERS] = {0.0f};
     const int blocks_per_output = input_size / 256;
     // Each lane owns four consecutive activations in the low half of the
     // block (elements `4*lane`) and four in the high half (elements
@@ -190,26 +191,32 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
     const int data_offset = 16 + (group_low >> 1) * 32 + index;
     const int shift = (group_low & 1) * 4;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
-        const unsigned char* block =
-            weights + (row * blocks_per_output + block_index) * 144;
-        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
-        const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
-        const float scale_low = (float)scale_value(block, group_low);
-        const float minimum_low = (float)minimum_value(block, group_low);
-        const float scale_high = (float)scale_value(block, group_low + 4);
-        const float minimum_high = (float)minimum_value(block, group_low + 4);
-        // Two words of packed nibbles cover every element this lane owns; the
-        // odd group in each pair reads the high nibbles of the same bytes.
-        const unsigned int packed_low = *(const unsigned int*)(block + data_offset);
-        const unsigned int packed_high = *(const unsigned int*)(block + data_offset + 64);
-        float value_low[4];
-        float value_high[4];
+        float value_low[MAX_BATCH_ROWS][4];
+        float value_high[MAX_BATCH_ROWS][4];
         #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const int quantized_low = (int)((packed_low >> (8 * t + shift)) & 0x0fu);
-            const int quantized_high = (int)((packed_high >> (8 * t + shift)) & 0x0fu);
-            value_low[t] = d * scale_low * (float)quantized_low - min * minimum_low;
-            value_high[t] = d * scale_high * (float)quantized_high - min * minimum_high;
+        for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+            const int row = row_base + r;
+            if (row < output_size) {
+                const unsigned char* block =
+                    weights + (row * blocks_per_output + block_index) * 144;
+                const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+                const float min = decode_f16((unsigned short)block[2] | ((unsigned short)block[3] << 8u));
+                const float scale_low = (float)scale_value(block, group_low);
+                const float minimum_low = (float)minimum_value(block, group_low);
+                const float scale_high = (float)scale_value(block, group_low + 4);
+                const float minimum_high = (float)minimum_value(block, group_low + 4);
+                // Two words of packed nibbles cover every element this lane owns; the
+                // odd group in each pair reads the high nibbles of the same bytes.
+                const unsigned int packed_low = *(const unsigned int*)(block + data_offset);
+                const unsigned int packed_high = *(const unsigned int*)(block + data_offset + 64);
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const int quantized_low = (int)((packed_low >> (8 * t + shift)) & 0x0fu);
+                    const int quantized_high = (int)((packed_high >> (8 * t + shift)) & 0x0fu);
+                    value_low[r][t] = d * scale_low * (float)quantized_low - min * minimum_low;
+                    value_high[r][t] = d * scale_high * (float)quantized_high - min * minimum_high;
+                }
+            }
         }
         const float* member_input = input + block_index * 256;
         #pragma unroll
@@ -219,21 +226,32 @@ extern "C" __global__ void q4_k_gemv_warp_batch(
                     (const float4*)(member_input + (long long)m * input_size);
                 const float4 low = row_input[lane];
                 const float4 high = row_input[32 + lane];
-                acc[m] += value_low[0] * low.x + value_low[1] * low.y
-                    + value_low[2] * low.z + value_low[3] * low.w
-                    + value_high[0] * high.x + value_high[1] * high.y
-                    + value_high[2] * high.z + value_high[3] * high.w;
+                // One activation load feeds every blocked row: the rows
+                // differ in weights, not in what this member contributes.
+                #pragma unroll
+                for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+                    acc[r][m] += value_low[r][0] * low.x + value_low[r][1] * low.y
+                        + value_low[r][2] * low.z + value_low[r][3] * low.w
+                        + value_high[r][0] * high.x + value_high[r][1] * high.y
+                        + value_high[r][2] * high.z + value_high[r][3] * high.w;
+                }
             }
         }
     }
     #pragma unroll
-    for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
-        if (m < members) {
-            // Every lane participates in the shuffle reduction; lane 0
-            // holds the full sum and writes it.
-            const float total = warp_sum(acc[m]);
-            if (lane == 0) {
-                output[(long long)m * output_size + row] = total;
+    for (int r = 0; r < MAX_BATCH_ROWS; ++r) {
+        const int row = row_base + r;
+        if (row < output_size) {
+            #pragma unroll
+            for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+                if (m < members) {
+                    // Every lane participates in the shuffle reduction; lane 0
+                    // holds the full sum and writes it.
+                    const float total = warp_sum(acc[r][m]);
+                    if (lane == 0) {
+                        output[(long long)m * output_size + row] = total;
+                    }
+                }
             }
         }
     }

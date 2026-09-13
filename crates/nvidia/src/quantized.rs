@@ -11,6 +11,15 @@ use crate::cuda::CudaQuantizedWeight;
 /// Maximum row count supported by the weights-read-once CUDA kernels.
 pub const MAX_BATCH_MEMBERS: usize = 8;
 
+/// Weight rows each warp resolves at once in the batched kernels.
+///
+/// The rows of a warp differ in weights and share a member's activation load,
+/// so blocking rows is what amortizes the activation traffic that dominates
+/// the batched GEMV profile. The row loop is internal to the kernels: callers
+/// see the same batched entry points, and the grid covers
+/// `output_size / MAX_BATCH_ROWS` warps.
+const MAX_BATCH_ROWS: usize = 2;
+
 const Q8_0_VALUE_TYPE: u32 = 8;
 const Q3_K_VALUE_TYPE: u32 = 11;
 const Q4_K_VALUE_TYPE: u32 = 12;
@@ -160,7 +169,8 @@ impl CudaQuantizedGemv {
         let ptx = PTX
             .get_or_init(|| {
                 compile_ptx(format!(
-                    "#define MAX_BATCH_MEMBERS {MAX_BATCH_MEMBERS}\n{Q_K_GEMV_SOURCE}"
+                    "#define MAX_BATCH_MEMBERS {MAX_BATCH_MEMBERS}\n\
+                     #define MAX_BATCH_ROWS {MAX_BATCH_ROWS}\n{Q_K_GEMV_SOURCE}"
                 ))
                 .map_err(|error| error.to_string())
             })
@@ -213,6 +223,18 @@ impl CudaQuantizedGemv {
                     .map_err(|error| CudaQuantizedKernelError::Driver(error.to_string()))
             })
             .transpose()?;
+        // Driver-JIT register and local-memory counts are the only per-kernel
+        // resource view available on hosts where `ncu` counters are refused;
+        // `RIBN_LOG_KERNEL_ATTRS=1` prints them once per family.
+        if std::env::var_os("RIBN_LOG_KERNEL_ATTRS").is_some()
+            && let Some(batch) = batch_kernel.as_ref()
+        {
+            eprintln!(
+                "kernel {label} rows={MAX_BATCH_ROWS} regs={:?} local={:?}",
+                batch.num_regs(),
+                batch.local_size_bytes()
+            );
+        }
         Ok(Self {
             stream,
             kernel,
@@ -277,10 +299,12 @@ impl CudaQuantizedGemv {
         }
         let members_u32 =
             u32::try_from(members).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
-        // One warp per weight row (not per (row, member)): the kernel
-        // decodes each weight element once and accumulates all members.
-        let total_warps =
-            u32::try_from(output_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
+        // One warp per MAX_BATCH_ROWS weight rows (not per (row, member)):
+        // the kernel decodes each weight element once, accumulates all
+        // members, and reuses each member's activation load across the
+        // blocked rows.
+        let total_warps = u32::try_from(output_size.div_ceil(MAX_BATCH_ROWS))
+            .map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
         let input_size =
             u32::try_from(input_size).map_err(|_| CudaQuantizedKernelError::ShapeOverflow)?;
         let output_size =

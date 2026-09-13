@@ -4838,9 +4838,16 @@ fn executes_warp_gemv_batch_matching_the_batch1_oracle_per_family() {
                 .expect("download member output");
             let actual = &batched[member * rows..(member + 1) * rows];
             assert_eq!(actual.len(), oracle.len());
+            // Bit identity, not a tolerance: the chunked prefill lane is
+            // qualified against the serial batch-1 path, and the model gates
+            // compare the two, so a batched kernel that only approximates the
+            // batch-1 row would silently spend their tolerance. Any kernel
+            // restructuring that keeps the per-row arithmetic - lane mapping,
+            // accumulation order, shuffle tree - must keep this exact.
             for (actual, oracle) in actual.iter().zip(oracle) {
-                assert!(
-                    (actual - oracle).abs() < 1.0e-3,
+                assert_eq!(
+                    actual.to_bits(),
+                    oracle.to_bits(),
                     "{name} batched member {member} diverged from the batch-1 oracle: {actual} vs {oracle}"
                 );
             }
