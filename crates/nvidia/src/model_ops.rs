@@ -419,29 +419,42 @@ extern "C" __global__ void attn_score_gqa(
     float* scores_scratch,
     float* output,
     int tokens,
+    int rows,
     int scores_stride,
     int q_heads,
     int kv_heads,
     int head_dim
 ) {
-    // One warp per q head. Lanes split head_dim (a multiple of 32 by launch
-    // validation), so F16 KV reads coalesce and the dot/softmax reductions
-    // are shuffles. scores_scratch keeps the [q_heads][scores_stride]
-    // layout: lane 0 writes each token's score, then the warp re-reads
-    // them for the weighted V accumulation after the final max is known.
-    // The sigmoid gate matches the scalar reference's semantics.
+    // One warp per (query row, q head). Lanes split head_dim (a multiple of 32
+    // by launch validation), so F16 KV reads coalesce and the dot/softmax
+    // reductions are shuffles. scores_scratch keeps the
+    // [row][q_heads][scores_stride] layout: lane 0 writes each token's score,
+    // then the warp re-reads them for the weighted V accumulation after the
+    // final max is known. The sigmoid gate matches the scalar reference's
+    // semantics.
+    //
+    // A prefill chunk is `rows` consecutive positions of one sequence sharing
+    // the cache, so row `r` attends `tokens - rows + 1 + r` keys: one launch
+    // reads that prefix once for every row instead of once per row. Each row
+    // runs the identical per-row arithmetic a single-row launch runs, so
+    // chunked prefill stays bit-identical to serial prefill. Batch decode
+    // passes `rows` as 1 and one member's view.
     const int warps_per_block = (int)(blockDim.x >> 5);
-    const int q_head = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
+    const int warp = (int)(blockIdx.x * warps_per_block + (threadIdx.x >> 5));
     const int lane = (int)(threadIdx.x & 31u);
-    if (q_head >= q_heads) {
+    const int row = warp / q_heads;
+    const int q_head = warp - row * q_heads;
+    if (row >= rows) {
         return;
     }
+    const int row_tokens = tokens - rows + 1 + row;
     const int q_per_kv = q_heads / kv_heads;
     const int kv_head = q_head / q_per_kv;
     const float scale = rsqrtf((float)head_dim);
+    const long long row_head = (long long)row * q_heads + q_head;
 
-    float* scores = scores_scratch + q_head * scores_stride;
-    const float* q_vec = q + q_head * head_dim;
+    float* scores = scores_scratch + row_head * scores_stride;
+    const float* q_vec = q + row_head * head_dim;
     const int dims_per_lane = head_dim >> 5;
     const int dim_base = lane * dims_per_lane;
     // Per-lane output accumulators over this lane's contiguous dims;
@@ -456,7 +469,7 @@ extern "C" __global__ void attn_score_gqa(
     // by total matches the reference softmax numerics.
     float max_score = -3.402823466e+38f;
     float total = 0.0f;
-    for (int token = 0; token < tokens; ++token) {
+    for (int token = 0; token < row_tokens; ++token) {
         const unsigned short* key =
             keys + ((long long)token * kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
@@ -479,7 +492,7 @@ extern "C" __global__ void attn_score_gqa(
     // Pass two: normalized weights (computed per lane from the shared
     // scores) accumulate the weighted V sum into the lane's dims.
     const float inv_total = 1.0f / total;
-    for (int token = 0; token < tokens; ++token) {
+    for (int token = 0; token < row_tokens; ++token) {
         const float weight = expf(scores[token] - max_score) * inv_total;
         const unsigned short* value =
             values + ((long long)token * kv_heads + kv_head) * head_dim;
@@ -490,8 +503,8 @@ extern "C" __global__ void attn_score_gqa(
 
     // Sigmoid gate from the second half of each 2*head_dim q-head slice,
     // then write this lane's contiguous dims.
-    const float* gate = gate_scratch + q_head * 2 * head_dim + head_dim;
-    float* out = output + q_head * head_dim;
+    const float* gate = gate_scratch + row_head * 2 * head_dim + head_dim;
+    float* out = output + row_head * head_dim;
     for (int d = 0; d < dims_per_lane && d < 16; ++d) {
         const int dim = dim_base + d;
         const float sigmoid = 1.0f / (1.0f + expf(-gate[dim]));
@@ -1750,15 +1763,22 @@ impl CudaQwen35Ops {
         Ok(())
     }
 
-    /// One full-attention decode step over the F16 KV cache with
-    /// block-mapped GQA, softmax, weighted V sum, and sigmoid gate.
+    /// One full-attention step over the F16 KV cache with block-mapped GQA,
+    /// softmax, weighted V sum, and sigmoid gate, for one group of `rows`
+    /// consecutive query positions.
     ///
-    /// `q` is the rope'd `[q_heads * head_dim]` query vector;
-    /// `gate_scratch` holds the raw `[q_heads * 2 * head_dim]` q projection
-    /// whose second half per head gates the output; `keys`/`values` are the
-    /// `[tokens][kv_heads][head_dim]` F16 cache slices for one layer;
-    /// `scores_scratch` is a `[q_heads * scores_stride]` accumulator reset by
-    /// the caller; `output` receives `[q_heads * head_dim]`.
+    /// `q` is the rope'd `[rows][q_heads * head_dim]` query rows;
+    /// `gate_scratch` holds the raw `[rows][q_heads * 2 * head_dim]` q
+    /// projection whose second half per head gates the output; `keys`/`values`
+    /// are the `[tokens][kv_heads][head_dim]` F16 cache slices for one layer,
+    /// shared by every row; `scores_scratch` is a
+    /// `[rows][q_heads * scores_stride]` accumulator reset by the caller;
+    /// `output` receives `[rows][q_heads * head_dim]`.
+    ///
+    /// `tokens` is the token count of the last row, whose position defines
+    /// how much of the cache this step produces; row `r` attends
+    /// `tokens - rows + 1 + r` keys. `rows` of 1 is the single-position decode
+    /// step.
     ///
     /// The launch is asynchronous with respect to the host.
     ///
@@ -1779,6 +1799,7 @@ impl CudaQwen35Ops {
         scores_scratch: &mut CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
         tokens: usize,
+        rows: usize,
         scores_stride: usize,
         q_heads: usize,
         kv_heads: usize,
@@ -1794,8 +1815,13 @@ impl CudaQwen35Ops {
         {
             return Err(CudaModelKernelError::ContextMismatch);
         }
-        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 {
+        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 || rows == 0 {
             return Err(CudaModelKernelError::EmptyInput);
+        }
+        // Row `r` attends `tokens - rows + 1 + r` keys, so every row needs at
+        // least one token and the last row defines the cache extent.
+        if tokens < rows {
+            return Err(CudaModelKernelError::ShapeOverflow);
         }
         if !q_heads.is_multiple_of(kv_heads) {
             return Err(CudaModelKernelError::ShapeOverflow);
@@ -1804,14 +1830,23 @@ impl CudaQwen35Ops {
         if !head_dim.is_multiple_of(32) {
             return Err(CudaModelKernelError::ShapeOverflow);
         }
-        if q.len() != q_heads * head_dim
-            || gate_scratch.len() != q_heads * 2 * head_dim
-            || output.len() != q_heads * head_dim
-            || scores_scratch.len() < q_heads * scores_stride
+        let rows_heads = rows
+            .checked_mul(q_heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let row_elements = rows_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let score_elements = rows_heads
+            .checked_mul(scores_stride)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        if q.len() != row_elements
+            || gate_scratch.len() != 2 * row_elements
+            || output.len() != row_elements
+            || scores_scratch.len() < score_elements
             || scores_stride < tokens
         {
             return Err(CudaModelKernelError::InputLength {
-                expected: q_heads * head_dim,
+                expected: row_elements,
                 actual: q.len(),
             });
         }
@@ -1823,6 +1858,7 @@ impl CudaQwen35Ops {
             });
         }
         let tokens_u32 = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let stride_u32 =
             u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let q_heads_u32 =
@@ -1831,8 +1867,13 @@ impl CudaQwen35Ops {
             u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let head_dim_u32 =
             u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // One warp per (row, q head); rows of a prefill chunk are consecutive
+        // positions of one sequence sharing the cache.
+        let warps = rows_u32
+            .checked_mul(q_heads_u32)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
         let config = LaunchConfig {
-            grid_dim: (q_heads_u32.div_ceil(4), 1, 1),
+            grid_dim: (warps.div_ceil(4), 1, 1),
             block_dim: (4 * 32, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1848,6 +1889,7 @@ impl CudaQwen35Ops {
                 .arg(&mut *scores_scratch)
                 .arg(&mut *output)
                 .arg(&tokens_u32)
+                .arg(&rows_u32)
                 .arg(&stride_u32)
                 .arg(&q_heads_u32)
                 .arg(&kv_heads_u32)
@@ -2927,6 +2969,7 @@ impl CudaQwen35Ops {
 
     /// `attn_score_gqa` with view-typed scratch: keys/values are the caller's
     /// KV cache; q/gate/scores/output may be views into batch-major scratch.
+    /// Row `r` attends `tokens - rows + 1 + r` keys of the shared cache.
     ///
     /// # Errors
     ///
@@ -2945,13 +2988,19 @@ impl CudaQwen35Ops {
         scores_scratch: &mut CudaViewMut<f32>,
         output: &mut CudaViewMut<f32>,
         tokens: usize,
+        rows: usize,
         scores_stride: usize,
         q_heads: usize,
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<(), CudaModelKernelError> {
-        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 {
+        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 || rows == 0 {
             return Err(CudaModelKernelError::EmptyInput);
+        }
+        // Row `r` attends `tokens - rows + 1 + r` keys, so every row needs at
+        // least one token and the last row defines the cache extent.
+        if tokens < rows {
+            return Err(CudaModelKernelError::ShapeOverflow);
         }
         if !q_heads.is_multiple_of(kv_heads) {
             return Err(CudaModelKernelError::ShapeOverflow);
@@ -2959,14 +3008,23 @@ impl CudaQwen35Ops {
         if !head_dim.is_multiple_of(32) {
             return Err(CudaModelKernelError::ShapeOverflow);
         }
-        if q.len() != q_heads * head_dim
-            || gate_scratch.len() != q_heads * 2 * head_dim
-            || output.len() != q_heads * head_dim
-            || scores_scratch.len() < q_heads * scores_stride
+        let rows_heads = rows
+            .checked_mul(q_heads)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let row_elements = rows_heads
+            .checked_mul(head_dim)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        let score_elements = rows_heads
+            .checked_mul(scores_stride)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        if q.len() != row_elements
+            || gate_scratch.len() != 2 * row_elements
+            || output.len() != row_elements
+            || scores_scratch.len() < score_elements
             || scores_stride < tokens
         {
             return Err(CudaModelKernelError::InputLength {
-                expected: q_heads * head_dim,
+                expected: row_elements,
                 actual: q.len(),
             });
         }
@@ -2978,6 +3036,7 @@ impl CudaQwen35Ops {
             });
         }
         let tokens_u32 = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let stride_u32 =
             u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let q_heads_u32 =
@@ -2986,8 +3045,13 @@ impl CudaQwen35Ops {
             u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
         let head_dim_u32 =
             u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // One warp per (row, q head); rows of a prefill chunk are consecutive
+        // positions of one sequence sharing the cache.
+        let warps = rows_u32
+            .checked_mul(q_heads_u32)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
         let config = LaunchConfig {
-            grid_dim: (q_heads_u32.div_ceil(4), 1, 1),
+            grid_dim: (warps.div_ceil(4), 1, 1),
             block_dim: (4 * 32, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3003,6 +3067,7 @@ impl CudaQwen35Ops {
                 .arg(&mut *scores_scratch)
                 .arg(&mut *output)
                 .arg(&tokens_u32)
+                .arg(&rows_u32)
                 .arg(&stride_u32)
                 .arg(&q_heads_u32)
                 .arg(&kv_heads_u32)

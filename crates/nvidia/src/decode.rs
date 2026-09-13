@@ -1014,6 +1014,7 @@ impl CudaQwen35Decode {
             scores,
             &mut self.attn_out,
             tokens,
+            1,
             self.scores_stride,
             ATTN_Q_HEADS,
             ATTN_KV_HEADS,
@@ -2503,13 +2504,15 @@ impl CudaQwen35BatchDecode {
 
         let capacity = state.kv().ok_or(missing_kv())?.spec().block_tokens() as usize;
         let stride = capacity;
+        let slot = self.kv_slot[layer];
+        // Append every row's K/V first. The rows are consecutive positions of
+        // this one sequence, so the cache prefix they read is shared and one
+        // multi-row attention launch below reads it once instead of once per
+        // row; causality is unaffected because row `r` only reads keys at or
+        // before its own position.
         for (member, &position_u32) in positions.iter().enumerate() {
             let position = usize::try_from(position_u32)
                 .map_err(|_| CudaDecodeError::Driver("position overflowed usize".to_owned()))?;
-            let tokens = position.checked_add(1).ok_or_else(|| {
-                CudaDecodeError::Driver("attention token count overflowed".to_owned())
-            })?;
-            let slot = self.kv_slot[layer];
             let kv = state.kv_mut().ok_or(missing_kv())?;
             let (keys_buffer, values_buffer) = kv.layer_mut(slot).ok_or_else(|| {
                 CudaDecodeError::InvalidPlan(format!("KV state lacks slot {slot}"))
@@ -2538,41 +2541,45 @@ impl CudaQwen35BatchDecode {
                 ATTN_KV_HEADS,
                 ATTN_HEAD_DIM,
             )?;
-
-            let q_member = member_row(&self.scratch.q_packed, member, ATTN_Q_HEADS * ATTN_HEAD_DIM)
-                .ok_or_else(|| CudaDecodeError::Driver("q_packed row out of range".to_owned()))?;
-            let gate_member = member_row(
-                &self.scratch.q_raw,
-                member,
-                ATTN_Q_HEADS * 2 * ATTN_HEAD_DIM,
-            )
-            .ok_or_else(|| CudaDecodeError::Driver("q_raw row out of range".to_owned()))?;
-            let scores =
-                self.scratch.scores.as_mut().ok_or_else(|| {
-                    CudaDecodeError::InvalidPlan("score scratch is unset".to_owned())
-                })?;
-            let mut scores_member = member_row_mut(scores, member, ATTN_Q_HEADS * stride)
-                .ok_or_else(|| CudaDecodeError::Driver("scores row out of range".to_owned()))?;
-            let mut out_member = member_row_mut(
-                &mut self.scratch.attn_out,
-                member,
-                ATTN_Q_HEADS * ATTN_HEAD_DIM,
-            )
-            .ok_or_else(|| CudaDecodeError::Driver("attn_out row out of range".to_owned()))?;
-            self.ops.attn_score_gqa_views(
-                &q_member,
-                cache_keys,
-                cache_values,
-                &gate_member,
-                &mut scores_member,
-                &mut out_member,
-                tokens,
-                stride,
-                ATTN_Q_HEADS,
-                ATTN_KV_HEADS,
-                ATTN_HEAD_DIM,
-            )?;
         }
+
+        // The last row's position defines the extent every row reads from.
+        let tokens = positions
+            .last()
+            .and_then(|&position| usize::try_from(position).ok())
+            .and_then(|position| position.checked_add(1))
+            .ok_or_else(|| {
+                CudaDecodeError::Driver("attention token count overflowed".to_owned())
+            })?;
+        let kv = state.kv_mut().ok_or(missing_kv())?;
+        let (keys_buffer, values_buffer) = kv
+            .layer_mut(slot)
+            .ok_or_else(|| CudaDecodeError::InvalidPlan(format!("KV state lacks slot {slot}")))?;
+        let cache_keys = keys_buffer
+            .as_f16_mut()
+            .ok_or_else(|| CudaDecodeError::InvalidPlan("KV cache must be F16".to_owned()))?;
+        let cache_values = values_buffer
+            .as_f16_mut()
+            .ok_or_else(|| CudaDecodeError::InvalidPlan("KV cache must be F16".to_owned()))?;
+        let scores = self
+            .scratch
+            .scores
+            .as_mut()
+            .ok_or_else(|| CudaDecodeError::InvalidPlan("score scratch is unset".to_owned()))?;
+        self.ops.attn_score_gqa(
+            &self.scratch.q_packed,
+            cache_keys,
+            cache_values,
+            &self.scratch.q_raw,
+            scores,
+            &mut self.scratch.attn_out,
+            tokens,
+            m,
+            stride,
+            ATTN_Q_HEADS,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+        )?;
 
         gemv_batch(
             &self.weights,
@@ -2929,6 +2936,7 @@ impl CudaQwen35BatchDecode {
                 &mut scores_member,
                 &mut out_member,
                 tokens,
+                1,
                 stride,
                 ATTN_Q_HEADS,
                 ATTN_KV_HEADS,
