@@ -9,7 +9,7 @@
 //! ```text
 //! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
 //! cargo run --release -p engine-nvidia --features cuda --example qwen_serving_bench -- \
-//!   --concurrency=4 --tokens=32
+//!   --concurrency=4 --tokens=32 [--prompt-tokens=257] [--prefill-chunk=8]
 //! ```
 
 use std::io;
@@ -70,7 +70,20 @@ fn run() -> Result<(), String> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let concurrency = parse_usize(&arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
     let output_tokens = parse_u32(&arguments, "--tokens=", DEFAULT_OUTPUT_TOKENS)?;
+    let prompt_tokens = parse_usize(&arguments, "--prompt-tokens=", PROMPT.len())?;
+    if prompt_tokens == 0 {
+        return Err("prompt token count must be greater than zero".to_owned());
+    }
     let gemv_mode = parse_gemv_mode(&arguments)?;
+    let prefill_chunk = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--prefill-chunk="))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("--prefill-chunk expects a number, got {value}"))
+        })
+        .transpose()?;
     let print_tokens = arguments
         .iter()
         .any(|argument| argument == "--print-tokens");
@@ -99,9 +112,24 @@ fn run() -> Result<(), String> {
             .iter()
             .map(|prompt| prompt.len())
             .max()
-            .unwrap_or(PROMPT.len())
+            .unwrap_or(prompt_tokens)
     } else {
-        PROMPT.len()
+        prompt_tokens
+    };
+    // The fixed prompt is repeated to reach `--prompt-tokens`, so prefill cost
+    // and chunking can be exercised without a workload driver; the repetition
+    // makes this a timing fixture, not a realistic prompt distribution.
+    let prompt: Arc<[u32]> = if prompt_tokens == PROMPT.len() {
+        Arc::from(PROMPT)
+    } else {
+        Arc::from(
+            PROMPT
+                .iter()
+                .copied()
+                .cycle()
+                .take(prompt_tokens)
+                .collect::<Vec<_>>(),
+        )
     };
     let state_tokens = u32::try_from(longest_prompt)
         .map_err(|_| "prompt length does not fit the runtime".to_owned())?
@@ -130,6 +158,12 @@ fn run() -> Result<(), String> {
     let pinned_rows = concurrency.saturating_mul(4).max(8);
     let dispatcher = CudaQwen35ServingDispatcher::new(&context, executor, stream, pinned_rows)
         .map_err(|error| error.to_string())?;
+    let dispatcher = match prefill_chunk {
+        Some(members) => dispatcher
+            .with_prefill_chunk(members)
+            .map_err(|error| error.to_string())?,
+        None => dispatcher,
+    };
 
     let description = provider.description();
     let model = description.id().clone();
@@ -215,7 +249,7 @@ fn run() -> Result<(), String> {
             // same token sequence in both modes because sampling is greedy.
             Arc::from(PROBE_PROMPTS[index % PROBE_PROMPTS.len()])
         } else {
-            Arc::from(PROMPT)
+            Arc::clone(&prompt)
         };
         let request_id = request_id(index)?;
         let semantics = RequestSemantics::new(
@@ -304,6 +338,14 @@ fn run() -> Result<(), String> {
     println!("Qwen3.8 serving-runtime baseline");
     println!("  concurrency: {concurrency}");
     println!("  output tokens/request: {output_tokens}");
+    println!("  prompt tokens/request: {prompt_tokens}");
+    println!(
+        "  same-sequence prefill chunking: {}",
+        match prefill_chunk {
+            Some(members) => format!("chunks of {members} tokens"),
+            None => "off (serial prefill)".to_owned(),
+        }
+    );
     println!("  staged weights: {:.2} s", stage_elapsed.as_secs_f64());
     println!("  request-state bytes: {per_request_state_bytes} each, {state_capacity} aggregate");
     println!("  elapsed: {:.3} s", elapsed.as_secs_f64());

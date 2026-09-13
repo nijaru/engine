@@ -3599,7 +3599,9 @@ fn same_sequence_multi_chunk_prefill_matches_batch1_full_model() {
         )
         .collect::<Vec<_>>();
 
-    let kv_spec = KvStateSpec::new(16, 4, 256, 16, DataType::F16).expect("KV spec");
+    // Long enough for three chunks plus the continuation token below; the
+    // single-chunk gate's 16-token capacity overflows at position 16.
+    let kv_spec = KvStateSpec::new(32, 4, 256, 16, DataType::F16).expect("KV spec");
     let recurrent_spec = RecurrentStateSpec::new(
         48,
         RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
