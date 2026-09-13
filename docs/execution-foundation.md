@@ -323,7 +323,9 @@ Implemented as provisional scaffolding:
 - a prepared execution-plan representation that can place the same logical model
   locally or across nodes, with stage decomposition and device placement tested as
   separate decisions rather than as one combined change;
-- test-only preparation-time semantic RMSNorm implementation selection;
+- test-only preparation-time semantic RMSNorm implementation selection, with runtime
+  shape support queried per execution so a preparation-time choice is never taken as
+  proof that the same implementation serves every step's shape;
 - `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
 - coherent parameter-version checks for queued non-AR work;
 - executor-informed variable-length batch sizing without a universal work unit;

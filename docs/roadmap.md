@@ -74,7 +74,8 @@ Executable validation scaffolds now establish several useful boundaries:
   device or across nodes without changing model identity;
 - a test-only semantic-operator experiment selects specialized/reference
   implementations during preparation rather than walking a registry in the hot
-  execution path;
+  execution path, and asks per execution whether that selection is qualified for
+  the step's row count instead of assuming the prepared choice covers every shape;
 - `ribn-batch` demonstrates non-AR execution with executor-defined inputs/outputs,
   parameter-version pinning, and executor-informed FIFO batch sizing without fake
   token/prefix/KV semantics;
