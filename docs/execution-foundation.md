@@ -321,7 +321,8 @@ Implemented as provisional scaffolding:
 - dependency-free `ribn-foundation` parameter/version/materialization metadata;
 - node/device/link resource topology;
 - a prepared execution-plan representation that can place the same logical model
-  locally or across nodes;
+  locally or across nodes, with stage decomposition and device placement tested as
+  separate decisions rather than as one combined change;
 - test-only preparation-time semantic RMSNorm implementation selection;
 - `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
 - coherent parameter-version checks for queued non-AR work;

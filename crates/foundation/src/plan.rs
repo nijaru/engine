@@ -195,47 +195,204 @@ mod tests {
         )
     }
 
-    #[test]
-    fn same_model_can_be_placed_locally_or_across_nodes() {
-        let first = device(0, 0);
-        let second = device(1, 0);
-        let local_topology =
-            ResourceTopology::new(vec![ComputeDevice::new(first.clone(), None)], vec![])
-                .expect("local topology");
-        let distributed_topology = ResourceTopology::new(
-            vec![
-                ComputeDevice::new(first.clone(), None),
-                ComputeDevice::new(second.clone(), None),
-            ],
+    fn topology(devices: &[DeviceId]) -> ResourceTopology {
+        ResourceTopology::new(
+            devices
+                .iter()
+                .map(|device| ComputeDevice::new(device.clone(), None))
+                .collect(),
             vec![],
         )
-        .expect("distributed topology");
-        let model = ModelIdentity::new("fixture/model@revision").expect("model");
-        let runtime = RuntimeClass::new("fixture-runtime").expect("runtime");
-        let local = ExecutionPlan::new(
-            model.clone(),
+        .expect("topology")
+    }
+
+    fn model() -> ModelIdentity {
+        ModelIdentity::new("fixture/model@revision").expect("model")
+    }
+
+    fn runtime(name: &str) -> RuntimeClass {
+        RuntimeClass::new(name).expect("runtime class")
+    }
+
+    /// The logical decomposition (which stages exist, with which runtimes) and the
+    /// placement (which devices run them) are separate decisions. Holding the
+    /// first fixed and moving only the second must produce the same logical plan.
+    ///
+    /// The earlier version of this test changed both at once - one stage on one
+    /// device versus two stages on two devices - so any difference it observed
+    /// could have come from either.
+    #[test]
+    fn placement_moves_without_changing_the_logical_stages() {
+        let first = device(0, 0);
+        let second = device(0, 1);
+        let topology = topology(&[first.clone(), second.clone()]);
+
+        // One logical decomposition, reused for every placement below.
+        let stages = |decoder_devices: Vec<DeviceId>| {
+            vec![
+                StagePlacement::new(
+                    StageId::new(0),
+                    runtime("fixture-embedding"),
+                    vec![first.clone()],
+                )
+                .expect("placement"),
+                StagePlacement::new(StageId::new(1), runtime("fixture-decoder"), decoder_devices)
+                    .expect("placement"),
+            ]
+        };
+        let logical = |plan: &ExecutionPlan| {
+            plan.stages()
+                .iter()
+                .map(|stage| (stage.stage(), stage.runtime().clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let co_located = ExecutionPlan::new(
+            model(),
+            ParameterVersion::new(7),
+            stages(vec![first.clone()]),
+            &topology,
+        )
+        .expect("co-located plan");
+        let spread = ExecutionPlan::new(
+            model(),
+            ParameterVersion::new(7),
+            stages(vec![second.clone()]),
+            &topology,
+        )
+        .expect("spread plan");
+
+        assert_eq!(co_located.model(), spread.model());
+        assert_eq!(co_located.parameter_version(), spread.parameter_version());
+        assert_eq!(
+            logical(&co_located),
+            logical(&spread),
+            "only placement was supposed to change"
+        );
+        assert_eq!(co_located.stages()[0].devices(), &[first]);
+        assert_eq!(spread.stages()[1].devices(), &[second]);
+        assert_ne!(
+            co_located.stages()[1].devices(),
+            spread.stages()[1].devices()
+        );
+    }
+
+    /// The mirror property: with a fixed set of available devices, the same model
+    /// may be decomposed into one stage or into several, and both remain valid
+    /// plans over the same resources.
+    #[test]
+    fn stage_decomposition_is_independent_of_available_devices() {
+        let first = device(0, 0);
+        let second = device(1, 0);
+        let topology = topology(&[first.clone(), second.clone()]);
+
+        let single = ExecutionPlan::new(
+            model(),
             ParameterVersion::new(7),
             vec![
-                StagePlacement::new(StageId::new(0), runtime.clone(), vec![first.clone()])
-                    .expect("placement"),
+                StagePlacement::new(
+                    StageId::new(0),
+                    runtime("fixture-runtime"),
+                    vec![first.clone()],
+                )
+                .expect("placement"),
             ],
-            &local_topology,
+            &topology,
         )
-        .expect("local plan");
-        let distributed = ExecutionPlan::new(
-            model,
+        .expect("single-stage plan");
+        let staged = ExecutionPlan::new(
+            model(),
             ParameterVersion::new(7),
             vec![
-                StagePlacement::new(StageId::new(0), runtime.clone(), vec![first])
+                StagePlacement::new(StageId::new(0), runtime("fixture-encoder"), vec![first])
                     .expect("placement"),
-                StagePlacement::new(StageId::new(1), runtime, vec![second]).expect("placement"),
+                StagePlacement::new(StageId::new(1), runtime("fixture-decoder"), vec![second])
+                    .expect("placement"),
             ],
-            &distributed_topology,
+            &topology,
         )
-        .expect("distributed plan");
-        assert_eq!(local.model(), distributed.model());
-        assert_eq!(local.parameter_version(), distributed.parameter_version());
-        assert_eq!(local.stages().len(), 1);
-        assert_eq!(distributed.stages().len(), 2);
+        .expect("two-stage plan");
+
+        assert_eq!(single.model(), staged.model());
+        assert_eq!(single.parameter_version(), staged.parameter_version());
+        assert_eq!(single.stages().len(), 1);
+        assert_eq!(staged.stages().len(), 2);
+        assert_eq!(single.stages()[0].stage(), staged.stages()[0].stage());
+        assert_eq!(
+            single.stages()[0].devices(),
+            staged.stages()[0].devices(),
+            "the first stage kept its placement"
+        );
+    }
+
+    /// A stage's device list is an ordered placement, not a set: replication
+    /// across two devices on one node and across nodes must both round-trip.
+    #[test]
+    fn one_stage_records_replication_across_devices_and_nodes() {
+        let local_first = device(0, 0);
+        let local_second = device(0, 1);
+        let remote = device(1, 0);
+        let topology = topology(&[local_first.clone(), local_second.clone(), remote.clone()]);
+
+        let plan = ExecutionPlan::new(
+            model(),
+            ParameterVersion::new(1),
+            vec![
+                StagePlacement::new(
+                    StageId::new(0),
+                    runtime("fixture-runtime"),
+                    vec![local_first.clone(), local_second.clone(), remote.clone()],
+                )
+                .expect("placement"),
+            ],
+            &topology,
+        )
+        .expect("replicated plan");
+        assert_eq!(
+            plan.stages()[0].devices(),
+            &[local_first, local_second, remote]
+        );
+    }
+
+    /// The two rejections a plan performs, which nothing exercised before: a stage
+    /// cannot appear twice, and it cannot name a device the topology does not have.
+    #[test]
+    fn plans_reject_duplicate_stages_and_absent_devices() {
+        let present = device(0, 0);
+        let absent = device(1, 0);
+        let topology = topology(std::slice::from_ref(&present));
+
+        assert_eq!(
+            StagePlacement::new(StageId::new(0), runtime("fixture-runtime"), vec![]),
+            Err(PlanError::EmptyStagePlacement(StageId::new(0)))
+        );
+
+        let duplicate = ExecutionPlan::new(
+            model(),
+            ParameterVersion::new(1),
+            vec![
+                StagePlacement::new(
+                    StageId::new(0),
+                    runtime("fixture-runtime"),
+                    vec![present.clone()],
+                )
+                .expect("placement"),
+                StagePlacement::new(StageId::new(0), runtime("fixture-runtime"), vec![present])
+                    .expect("placement"),
+            ],
+            &topology,
+        );
+        assert_eq!(duplicate, Err(PlanError::DuplicateStage(StageId::new(0))));
+
+        let outside = ExecutionPlan::new(
+            model(),
+            ParameterVersion::new(1),
+            vec![
+                StagePlacement::new(StageId::new(3), runtime("fixture-runtime"), vec![absent])
+                    .expect("placement"),
+            ],
+            &topology,
+        );
+        assert_eq!(outside, Err(PlanError::UnknownDevice(StageId::new(3))));
     }
 }
