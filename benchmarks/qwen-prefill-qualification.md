@@ -866,6 +866,20 @@ lower triangle dense, `beta = 0` must leave the state decayed but unchanged, and
 gate must zero every interval spanning it - which a ratio-based implementation turns
 into a NaN, and which the finite-output assertion catches.
 
+**Fidelity does not distinguish the two lanes.** Measured against llama.cpp's recorded
+margins for this same 257-token prompt (`benchmarks/llama_reference_margins.py`; the
+reference table is in the previous session's evidence directory), the serial lane sits
+0.1348 nats of mean top-1/top-2 gap error from the reference with a maximum of 0.5937 at
+step 2, and the scan lane sits 0.1349 with a maximum of 0.5934. The mean worst shared
+top-5 error is 0.2181 for both, and both pick the reference's token at 19 of 20 steps,
+missing the same known near-tie at step 18. The scan's 1.7e-3 nat drift against the
+serial path is therefore two orders of magnitude below ribn's own distance from an
+independent engine: adopting it moves nothing that the reference can see. That reframes
+the blocker - the gate that fails is an internal-oracle tolerance calibrated at
+bit-identity, not a fidelity boundary - but it does not decide it, because raising that
+tolerance also weakens the structural checking it does for stale state, chunk-boundary
+ordering, and continuation handoff.
+
 The last row is the finding that matters for adoption, and it is not a defect: 1.10e-2
 is the same order as the 6.2e-3 that a GEMV summation reordering produced at this same
 gate, so it is compound drift through 64 layers and a recurrent state that accumulates
