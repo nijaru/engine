@@ -220,8 +220,10 @@ path, encoder/pooling runtime, diffusion runtime, cross-stage orchestrator, conc
 public model handle, HTTP server, second hardware backend or distributed execution.
 
 `docs/execution-foundation.md` records what has actually been validated and is the
-single place to update when that changes. This section states the shape of the gap
-rather than restating evidence, so the two cannot drift.
+single place to update when that changes. [Resource, submission and snapshot
+protocol](resource-protocol.md) records the contracts the runtimes above that
+foundation need next. This section states the shape of the gap rather than restating
+evidence, so the two cannot drift.
 
 Those limitations are reasons to redesign now while the codebase is small, not
 reasons to expand Qwen-specific abstractions until they become harder to remove.

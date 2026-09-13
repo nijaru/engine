@@ -7,7 +7,9 @@ design.
 
 [Inference engine design](inference-engine-design.md) is the target architecture.
 [Shared execution foundation](execution-foundation.md) records the provisional
-boundary beneath inference-specific runtimes. [Pipeline composition](pipeline-composition.md)
+boundary beneath inference-specific runtimes. [Resource, submission and snapshot
+protocol](resource-protocol.md) records the reservation, handoff and snapshot
+contracts those runtimes need next. [Pipeline composition](pipeline-composition.md)
 records the distinction between genuinely staged execution and tightly coupled
 cross-component scheduling.
 
@@ -16,15 +18,45 @@ cross-component scheduling.
 | Area | Current evidence | Main gap |
 | --- | --- | --- |
 | Shared execution foundation | Dependency-free parameter/version/materialization metadata; node/device/link topology; same logical model placed locally or across nodes; preparation-time semantic-op dispatch experiment | Physical storage/device primitives, broader operator/backend evidence, second hardware backend |
-| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; experimental same-sequence multi-token prefill path and parity/benchmark harness compile but are not device-qualified or serving-selected | Run the new prefill parity/timing gates on the 4090; new-path GPU qualification; fixed-shape/model assumptions; true chunked GDN/full-attention prefill after evidence |
-| AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation |
-| Non-AR runtime validation | Generic bounded batch runtime; parameter-version pinning; executor-informed FIFO batch sizing; actual BERT encoder semantics; attention masks and padded-versus-ragged batch-cost tests pass without a common-runtime change | Async/cancellation/resource admission, device execution and optimized kernels |
+| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; same-sequence multi-token prefill is hardware-qualified at `0496f79` (both parity gates, 1.71x-1.79x prefill at the 8-member cap, no decode regression) but still not serving-selected | Backend-local serving integration with an independently sized same-sequence lane; true chunked GDN/full-attention prefill; fixed-shape/model assumptions |
+| AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Physical demand is invisible to admission, static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation ([resource protocol](resource-protocol.md)) |
+| Non-AR runtime validation | Generic batch runtime bounding waiting work and retained results separately, with ready/blocked/rejected admission and a rejection path that survives an exhausted byte budget; parameter-version pinning; actual BERT encoder semantics; attention masks and padded-versus-ragged batch-cost tests | Async/cancellation/resource admission, shared-pool accounting, device execution and optimized kernels |
 | Text facade | Raw/chat/token inputs, tokenizer/template reuse, streaming/offline batch | Hardwired Qwen GGUF/CUDA loading; mutable single-caller handle |
-| Model/artifact separation | `QwenConfig` independent of GGUF; thin SafeTensors artifact adapter; local HF-style config + unsharded/sharded weight-package resolver; `LocalWeightSet` lazily reuses opened shards; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution when a second production model justifies it, backend materialization path |
+| Model/artifact separation | `QwenConfig` independent of GGUF; SafeTensors adapter retaining tensor metadata and offsets once for indexed lookups; local HF-style config + unsharded/sharded weight-package resolver including symlinked cache snapshots; `LocalWeightSet` with a configurable residency bound; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution when a second production model justifies it, backend materialization path |
 | Cross-runtime composition | Sequential batch-encoder -> AR handoff passes prepared state in-process; stable request identity survives out-of-order handoff; cancellation ownership is validated before and after AR admission | Genuine encoder-decoder model, cross-attention/device-state lifetime, async failure propagation and version compatibility |
 | Multimodal/iterative | VLM pressure test models prompt-positioned encoder items with independent encoder-compute and encoder-cache pressure; staged-vs-coupled distinction is validated | Typed media processor path, real VLM integration and production coupled scheduler/resource seam; iterative/diffusion runtime; realtime session path |
 | CUDA Rust | Resource/toolchain gate complete | Representative quantized/recurrent kernels and full execution integration |
 | Other hardware/distributed | Resource-topology/placement representation only | No second backend, collectives, remote execution or state transfer |
+
+## Milestone order and exit evidence
+
+The numbered sections below describe the work in each area. They are not the order
+to do it in. Adding another model-class pressure test is cheap and feels productive,
+but every one of them inherits the same unresolved lifecycle: unbounded retention,
+reservation that cannot fail before execution, and state whose ownership only covers
+allocation. Resolve the lifecycle first and the later counterexamples become small.
+
+| Milestone | Required exit evidence |
+| --- | --- |
+| 1. Bounded, concurrent execution lifecycle | A minimal cloneable model handle with explicit request ownership; bounded retained output; admission that distinguishes ready, temporarily blocked, and rejected; an owning snapshot. Exercised with multiple callers and a stalled consumer. |
+| 2. One real asynchronous non-AR integration | Encoder work against real device resources producing owned results, surviving cancellation and handoff failure without premature reclamation. |
+| 3. Dynamic hybrid AR resources | KV and recurrent state cooperating with reservations, cache reuse, eviction and preemption. Non-speculative correctness first, then qualified speculative reconciliation. |
+| 4. Real composition counterexamples | A genuine VLM processor/model path and a small iterative non-AR path, changing shared contracts only where those integrations demonstrate the need. |
+| 5. Qualification and broader exposure | Matched numerical and workload benchmarks, a tested serving subset, and a materially different backend before calling the shared device boundary general. |
+
+Milestone 1 has partially started: the non-AR runtime now bounds retained results and
+separates blocked from rejected admission, and the resource protocol records the
+reservation, handoff and snapshot contracts the rest of it needs. The public handle,
+explicit request ownership, and snapshot ownership are not implemented.
+
+Two tracks stay independent of this order instead of becoming prerequisites:
+
+- CUDA kernel-language migration keeps its own proof track ([cuda rust migration](cuda-rust-migration.md));
+  existing kernels and vendor libraries stay the qualified implementation while
+  runtime correctness is proven.
+- Distributed placement types stay provisional until real sharding, replication or
+  cross-device execution constrains them. Metadata accepting several device IDs is
+  not yet a distributed execution abstraction.
 
 ## 0. Reset and validate the top-level architecture before deeper model-specific work
 
@@ -110,6 +142,13 @@ current code is preferred to adding a parallel hierarchy.
 Do this early enough that changing shared contracts is cheap. Full optimized model
 support is not necessary for every test; small/reference-backed implementations can
 expose a wrong boundary.
+
+This is not a license to keep adding model classes ahead of the lifecycle. A new
+pressure test is worth building when it exposes a shared-contract problem no existing
+test can, or when its milestone in the table above is reached. Model classes that
+would only inherit the same unbounded retention, unreservable submission, and
+allocation-only ownership wait, because running them proves nothing new about the
+boundary.
 
 | Path | Current state | What it validates |
 | --- | --- | --- |

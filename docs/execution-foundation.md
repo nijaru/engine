@@ -243,6 +243,13 @@ execution and optimized kernels rather than another synthetic cost type.
 particular, cancellation, asynchronous device execution, shared-pool accounting,
 padding/mask policy, and optimized device batching remain unfinished.
 
+The second performance gap is a list of shared contracts rather than a missing model
+class. [Resource, submission and snapshot protocol](resource-protocol.md) records
+them: prepared submissions that reserve before execution, one accounting authority per
+shared pool, completion plus access ownership across runtime handoffs, and an owning
+model snapshot with separate semantic and physical compatibility. Every runtime in
+this document is affected by at least one of them, which is why they come first.
+
 Further runtime families should be introduced only when real execution regimes
 justify them. Iterative diffusion/flow work and full-duplex sessions are known
 pressure tests, not fixed enum variants.
