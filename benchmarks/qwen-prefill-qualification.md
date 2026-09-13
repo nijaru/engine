@@ -772,9 +772,11 @@ negative. Recording them matters more than the 10% above.
   non-zero local count in the set). Eight bank-spread replicas in shared memory,
   mirroring the integer-dot kernels, measured 1.86 s of prefill against 1.82 s and
   `iq4_xs` 407.8 ms against 365.6 ms, so the local table stays.
-- **No single resource is saturated.** At two rows, `iq4_xs` issues about 37% of the
-  warp-instruction rate and 18% of the FP32 FMA rate available, with roughly half the
-  activation traffic it started from. The per-family gains are therefore below what
+- **No single resource is saturated.** At two rows, `iq4_xs` issues about 30% of the
+  warp-instruction rate at the card's boost clock and 18% of the FP32 FMA rate, with
+  roughly half the activation traffic it started from. (The issue share is quoted
+  against 128 SMs at 2.5 GHz; it moves by a few points with the clock and does not
+  change the reading.) The per-family gains are therefore below what
   halving activation requests would give if L1 bandwidth were binding, and the honest
   reading is that the remaining time is latency and per-element work rather than a
   saturated pipe. Going further needs the occupancy and stall counters this host
