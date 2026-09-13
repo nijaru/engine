@@ -472,6 +472,11 @@ eight batch-1 launches.
 
 ### The change
 
+Raw output - the `int_dot_bench` before/after tables, the nsys report and its kernel
+summary, both margin tables, the serving streams, the two gate logs, and per-stage
+preconditions (same artifact sha256 as above, driver 615.71.09, RTX 4090) - is in the
+session evidence directory `/home/nick/ribn-gemv-activation-2026-09-13/`.
+
 Each lane now owns four consecutive activations in the low half of a quantization
 block (elements `4*lane`) and four in the high half (elements `128 + 4*lane`). Both
 runs are 16-byte aligned, so one member's activations are two `float4` loads per lane
