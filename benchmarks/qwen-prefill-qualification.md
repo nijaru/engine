@@ -475,7 +475,7 @@ eight batch-1 launches.
 Raw output - the `int_dot_bench` before/after tables, the nsys report and its kernel
 summary, both margin tables, the serving streams, the two gate logs, and per-stage
 preconditions (same artifact sha256 as above, driver 615.71.09, RTX 4090) - is in the
-session evidence directory `/home/nick/ribn-gemv-activation-2026-09-13/`.
+session evidence directory `/home/nick/ribn-prefill-kernels-2026-09-13/`.
 
 Each lane now owns four consecutive activations in the low half of a quantization
 block (elements `4*lane`) and four in the high half (elements `128 + 4*lane`). Both
@@ -586,7 +586,9 @@ The eight batched GEMV families fall from 5.33 s to 1.37 s together (3.9x). Mult
 attention is now the largest single item at 26.7%, then the three large GEMV families
 at 44.7%, then the recurrent scan at 10.9%. That ordering is the new short list:
 `attn_score_gqa` is still the decode-shaped kernel invoked per token, and the remaining
-GEMV time is activation traffic that more rows per warp would amortize.
+GEMV time is activation traffic that more rows per warp would amortize. *The attention
+item is taken up in the next section, which leaves the GEMV families and the recurrent
+scan as the open ones.*
 
 ### Numerics
 
@@ -606,4 +608,96 @@ cancellation semantics, backend lane sizing, and the output path are untouched, 
 the logits are unchanged in every way the gates can see. Chunked prefill stays the
 default prefill strategy for this path. Next in this area are true multi-token
 attention (now the largest single item), a chunked GDN scan, and the long-prompt
-fidelity item and serving prompt-length sweep that remain open above.
+fidelity item and serving prompt-length sweep that remain open above. *Multi-token
+attention is resolved in the next section; the GDN scan, the long-prompt item, and the
+prompt-length sweep remain open.*
+
+## Multi-row prefill attention, 2026-09-13 (head `b0d2c4e`)
+
+The batched-GEMV section above left multi-token attention as the largest single item
+in the chunked prefill profile at 26.7%, and it was larger than it should be for the
+same reason the GEMV kernels were: the work was not parallel. The chunked lane runs
+eight consecutive positions of one sequence into one shared KV cache, so its rows
+differ only in how much of the prefix they read - but it invoked the decode-shaped
+attention kernel once per row, which re-read that prefix eight times per layer and put
+**eight warps** (one per q head) on the whole GPU. A 257-token prefill issued 4,128
+launches averaging 165 us each.
+
+### The change
+
+`attn_score_gqa` takes a row count. One warp now handles one (row, q head) pair and
+row `r` attends `tokens - rows + 1 + r` keys of the shared cache, where `tokens` is
+the last row's token count; the grid is `rows * q_heads` warps instead of `q_heads`.
+Per-row base offsets are the only arithmetic change: every row runs exactly the loop a
+single-row launch runs, so chunked prefill stays bit-identical to serial prefill and
+the decode paths, which pass a row count of 1, are untouched. Batch decode still
+issues one launch per member, because distinct requests have distinct caches.
+
+The chunk lane now appends every row's K/V before attending. That is safe because row
+`r` only reads keys at or before its own position, so the per-member append/attend
+interleave it replaces was never load-bearing.
+
+### Effect
+
+`nsys` over the same chunk-8 257-token prefill as the batched-GEMV section, one
+release build. Raw output for both kernel changes is in the session evidence directory
+`/home/nick/ribn-prefill-kernels-2026-09-13/`:
+
+| | before | after |
+| --- | --- | --- |
+| `attn_score_gqa` | 683.2 ms, 4,128 launches | 109.5 ms, 544 launches |
+| chunk-8 prefill | 2.576-2.588 s | 2.007-2.015 s |
+| GPU kernel time | 2.56 s | 1.98 s |
+
+Chunked prefill is now 3.26x the serial baseline this track started from (6.55 s), and
+chunking is worth more than it was: serial prefill (7.427 s) and decode (0.667 s for 20
+tokens) are unchanged, because both run the single-row path this change does not touch.
+Through the serving scheduler at a 257-token prompt and 32 output tokens:
+
+| concurrency | mode | prefill | TTFT | elapsed | ITL |
+| --- | --- | --- | --- | --- | --- |
+| 1 | serial | 7.427 s | 7.427 s | 8.466 s | 33.52 ms |
+| 1 | chunk 8 | 1.998 s | 2.004 s | 3.042 s | 33.50 ms |
+| 4 | serial | 29.688 s | 29.689 s | 31.753 s | 66.57 ms |
+| 4 | chunk 8 | 7.991 s | 8.015 s | 10.078 s | 66.56 ms |
+
+Chunking is now worth 3.71x of TTFT at concurrency 1 and 3.70x at concurrency 4,
+against 2.87x and 2.88x before this change. Against the head that opened this track
+(`b5475b0`, chunk-8 TTFT 6.60 s at concurrency 1 and 26.37 s at concurrency 4), the
+two kernel changes together are 3.30x at both concurrencies. Inter-token latency is
+unchanged at 33.5 ms and 66.6 ms, and the concurrency-2 printed token streams are
+identical between serial and chunked prefill.
+
+### Numerics
+
+The serial path's arithmetic is unchanged, and the 20-step log-probability table it
+emits at this head is byte-identical to the table recorded at `f68e345`. Chunked and
+serial tables are again identical to each other (`diff` of the two runs is empty), so
+the multi-row launch preserves the property rather than approximating it.
+
+### Where prefill time goes now
+
+Shares of the 1.98 s kernel time:
+
+| kernel | time | share |
+| --- | --- | --- |
+| `iq4_xs_gemv_warp_batch` | 433.8 ms | 21.9% |
+| `q5_k_gemv_warp_batch` | 410.4 ms | 20.7% |
+| `q4_k_gemv_warp_batch` | 301.0 ms | 15.2% |
+| `gdn_state_update` | 278.0 ms | 14.0% |
+| `attn_score_gqa` | 109.5 ms | 5.5% |
+| `q8_0_gemv_warp_batch` | 91.6 ms | 4.6% |
+| norms, gates, remaining GEMV families | 345.5 ms | 17.5% |
+
+The eight batched GEMV families are 69% of what is left, and their remaining cost is
+activation traffic rather than weight traffic: the next lever there is more weight
+rows per warp so each `float4` activation load feeds more than one output row. The
+recurrent scan (`gdn_state_update`, 14%) is the other qualified target. Attention is
+no longer a first-order item at 5.5% and 201 us per launch, and the launch is now
+latency-bound at 256 warps rather than bandwidth-bound.
+
+### Decision
+
+Kernel-internal, like the batched-GEMV change: no scheduler, ownership, cancellation,
+or output-path behavior changed, and the gates see identical logits. Chunked prefill
+remains the default strategy for this path.
