@@ -16,7 +16,7 @@ mod state;
 #[cfg(feature = "cuda")]
 pub use cuda::QwenCuda;
 #[cfg(feature = "cuda")]
-pub use loading::{MemoryReport, QwenLoadOptions};
+pub use loading::{DEFAULT_PREFILL_CHUNK_MEMBERS, MemoryReport, QwenLoadOptions};
 
 mod config;
 pub use config::{ConfigError, QwenConfig, QwenLayerKind};

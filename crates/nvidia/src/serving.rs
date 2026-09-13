@@ -78,6 +78,77 @@ pub struct CudaQwen35ServingDispatcher {
     /// Supported execution lanes are prepared before accepting submissions.
     /// Compiled kernels and validated model bindings are shared by all lanes.
     batched: HashMap<usize, CudaQwen35BatchDecode>,
+    /// Optional same-sequence prefill lane: prompt tokens of one request run
+    /// through one batched forward, which amortizes weight reads across
+    /// positions the way the decode lanes amortize them across requests.
+    ///
+    /// This is deliberately independent of the decode lanes and of
+    /// `max_pending_rows`: prefill concurrency is not request concurrency, and
+    /// one long prompt benefits even when only one request is live.
+    prefill_lane: Option<CudaQwen35BatchDecode>,
+}
+
+/// How many leading tokens of one prefill segment can run through a
+/// same-sequence lane of `members` tokens.
+///
+/// Only whole chunks qualify: the lane executes exactly `members` tokens and
+/// leaves the remainder to the serial path. A segment that requests sampling
+/// never chunks its final token, because that token is the one the output path
+/// reads logits from — chunking it would compute logits nothing ever reads and
+/// would move the qualified final step off the batch-1 executor.
+fn chunked_prefix_len(token_count: usize, members: usize, requests_sampling: bool) -> usize {
+    let chunkable = if requests_sampling {
+        token_count.saturating_sub(1)
+    } else {
+        token_count
+    };
+    chunkable / members * members
+}
+
+/// Run the leading whole chunks of one prefill segment through the
+/// same-sequence lane and return how many tokens it consumed.
+///
+/// Chunking performs the same computation the serial path performs: the same
+/// physical state advances in the same position order, and recurrent layers
+/// still walk their convolution and GDN state one token at a time. What it
+/// changes is that projections and feed-forward work for `members` positions
+/// run as one batched forward, so weight reads are amortized across prompt
+/// positions. State position advances once per completed chunk, so a chunk
+/// that fails leaves the recorded position at its start rather than claiming
+/// progress the device did not finish.
+fn run_prefill_chunks(
+    lane: &mut CudaQwen35BatchDecode,
+    physical: &mut CudaHybridState,
+    segment: &ExecutionSegment,
+    tokens: &[u32],
+) -> Result<usize, BackendError> {
+    let members = lane.members();
+    let chunked = chunked_prefix_len(tokens.len(), members, segment.requests_sampling());
+    let mut offset = 0;
+    while offset < chunked {
+        let position = segment
+            .state_position()
+            .checked_add(u32::try_from(offset).map_err(|_| {
+                BackendError::ExecutionFailed("prefill offset overflowed".to_owned())
+            })?)
+            .ok_or_else(|| {
+                BackendError::ExecutionFailed("prefill position overflowed".to_owned())
+            })?;
+        lane.prefill_chunk(physical, &tokens[offset..offset + members], position)
+            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+        let next = position
+            .checked_add(u32::try_from(members).map_err(|_| {
+                BackendError::ExecutionFailed("prefill chunk length overflowed".to_owned())
+            })?)
+            .ok_or_else(|| {
+                BackendError::ExecutionFailed("prefill position overflowed".to_owned())
+            })?;
+        physical
+            .advance_to(next)
+            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+        offset += members;
+    }
+    Ok(chunked)
 }
 
 /// Run one scheduler row's model steps.
@@ -92,6 +163,7 @@ pub struct CudaQwen35ServingDispatcher {
 /// wall-clock time spent queueing the row.
 fn run_row(
     executor: &mut CudaQwen35Decode,
+    prefill_lane: Option<&mut CudaQwen35BatchDecode>,
     registry: &mut CudaStateRegistry,
     segment: &ExecutionSegment,
     state: &InferenceStateSet,
@@ -126,7 +198,13 @@ fn run_row(
                         "Qwen prefill segment requires prompt token input".to_owned(),
                     )
                 })?;
-            for (offset, &token) in tokens.iter().enumerate() {
+            // Whole leading chunks run through the same-sequence lane; the
+            // remainder, and the sampling token, stay on the serial path.
+            let chunked = match prefill_lane {
+                Some(lane) => run_prefill_chunks(lane, physical, segment, tokens)?,
+                None => 0,
+            };
+            for (offset, &token) in tokens.iter().enumerate().skip(chunked) {
                 let offset = u32::try_from(offset).map_err(|_| {
                     BackendError::ExecutionFailed("prefill offset overflowed".to_owned())
                 })?;
@@ -235,7 +313,46 @@ impl CudaQwen35ServingDispatcher {
             submissions: crate::submissions::Submissions::default(),
             deferred_releases: Vec::new(),
             batched,
+            prefill_lane: None,
         })
+    }
+
+    /// Enable same-sequence prefill chunking with `members` tokens per chunk.
+    ///
+    /// The lane is a copy of the single-row executor's model bindings: it
+    /// shares compiled kernels and staged weights and adds only the per-lane
+    /// scratch for `members` positions. It does not change the scheduler
+    /// contract, the state registry, or the output path - a prefill segment is
+    /// still one segment with one outcome, and only the leading whole chunks
+    /// leave the serial path.
+    ///
+    /// Chunk sizes above [`crate::quantized::MAX_BATCH_MEMBERS`] are rejected
+    /// because no qualified lane exists for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] for a chunk smaller than two
+    /// tokens, an unsupported member count, or an allocation failure.
+    pub fn with_prefill_chunk(mut self, members: usize) -> Result<Self, BackendError> {
+        if members < 2 {
+            return Err(BackendError::ExecutionFailed(
+                "prefill chunking requires at least two tokens per chunk; leave the lane unset for serial prefill"
+                    .to_owned(),
+            ));
+        }
+        let lane = CudaQwen35BatchDecode::from_decode(&self.executor, members)
+            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))?;
+        self.prefill_lane = Some(lane);
+        Ok(self)
+    }
+
+    /// The configured same-sequence prefill chunk size, if any.
+    #[must_use]
+    pub const fn prefill_chunk_members(&self) -> Option<usize> {
+        match &self.prefill_lane {
+            Some(lane) => Some(lane.members()),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -314,11 +431,13 @@ impl CudaQwen35ServingDispatcher {
     ) -> Result<ExecutionOutcome, BackendError> {
         let Self {
             executor,
+            prefill_lane,
             states: registry,
             ..
         } = self;
         let result = run_row(
             executor,
+            prefill_lane.as_mut(),
             registry,
             segment,
             state,
@@ -553,6 +672,7 @@ impl CudaQwen35ServingDispatcher {
                 // so one row can hold all three at once.
                 let Self {
                     executor,
+                    prefill_lane,
                     states: registry,
                     pinned_outputs,
                     ..
@@ -569,6 +689,7 @@ impl CudaQwen35ServingDispatcher {
                 let (_, row_elapsed) = if let Some(pinned) = pinned {
                     run_row(
                         executor,
+                        prefill_lane.as_mut(),
                         registry,
                         segment,
                         state,
@@ -582,6 +703,7 @@ impl CudaQwen35ServingDispatcher {
                 } else {
                     run_row(
                         executor,
+                        prefill_lane.as_mut(),
                         registry,
                         segment,
                         state,
@@ -834,5 +956,56 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
             self.states.release_key(&key);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunked_prefix_len;
+
+    /// A sampling segment must keep its final token on the batch-1 path: that
+    /// token is the only one whose logits the output path reads.
+    #[test]
+    fn chunked_prefix_keeps_the_sampling_token_serial() {
+        for (token_count, members, expected) in [
+            (1, 8, 0),
+            (7, 8, 0),
+            (8, 8, 0),
+            (9, 8, 8),
+            (15, 8, 8),
+            (16, 8, 8),
+            (17, 8, 16),
+            (32, 8, 24),
+            (16, 4, 12),
+            (3, 4, 0),
+        ] {
+            assert_eq!(
+                chunked_prefix_len(token_count, members, true),
+                expected,
+                "sampling prefill of {token_count} tokens in chunks of {members}"
+            );
+        }
+    }
+
+    /// Without sampling, every token is chunkable, and the result is always a
+    /// whole number of chunks that does not exceed the segment.
+    #[test]
+    fn chunked_prefix_never_exceeds_whole_chunks() {
+        for (token_count, members, expected) in [
+            (0, 8, 0),
+            (7, 8, 0),
+            (8, 8, 8),
+            (16, 8, 16),
+            (20, 8, 16),
+            (16, 4, 16),
+            (3, 4, 0),
+            (48, 8, 48),
+        ] {
+            assert_eq!(
+                chunked_prefix_len(token_count, members, false),
+                expected,
+                "unsampled prefill of {token_count} tokens in chunks of {members}"
+            );
+        }
     }
 }

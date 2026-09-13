@@ -18,12 +18,23 @@ use ribn::{ExecutionError, ExecutorInfo, GenerationLimits};
 use crate::execution::{QwenExecution, model_error};
 use crate::state;
 
+/// Same-sequence prefill chunk size this backend uses when a caller enables
+/// prefill chunking without naming a size.
+///
+/// Eight is the largest qualified lane ([`engine_nvidia::MAX_BATCH_MEMBERS`]
+/// bounds it) and the size the prefill qualification measured, so it is both
+/// the fastest measured choice and the one with parity evidence.
+pub const DEFAULT_PREFILL_CHUNK_MEMBERS: usize = 8;
+
 /// Preparation limits, not live request scheduling policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QwenLoadOptions {
     pub device: u16,
     pub context_tokens: u32,
     pub max_sequences: usize,
+    /// Enable same-sequence prefill chunking at this many tokens per chunk.
+    /// `None` keeps the serial prefill path.
+    pub prefill_chunk_members: Option<usize>,
     /// Optional upper bound for staged weights. Automatic mode uses observed
     /// free device memory minus request-state reservations and headroom.
     pub weight_budget_bytes: Option<u64>,
@@ -38,6 +49,7 @@ impl Default for QwenLoadOptions {
             device: 0,
             context_tokens: 4096,
             max_sequences: 1,
+            prefill_chunk_members: None,
             weight_budget_bytes: None,
             headroom_bytes: 512 << 20,
         }
@@ -117,6 +129,14 @@ pub(crate) fn load(
     let dispatcher =
         CudaQwen35ServingDispatcher::new(&context, executor, stream.clone(), options.max_sequences)
             .map_err(model_error)?;
+    // The chunk lane is part of preparation, so its scratch is allocated
+    // before the post-preparation memory check below accounts for it.
+    let dispatcher = match options.prefill_chunk_members {
+        Some(members) => dispatcher
+            .with_prefill_chunk(members)
+            .map_err(model_error)?,
+        None => dispatcher,
+    };
     // Preparation is outside the scheduler. Publish no ready owner until all
     // uploads and preparation work have completed.
     stream.synchronize().map_err(model_error)?;

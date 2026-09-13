@@ -17,7 +17,7 @@ use engine_nvidia::{
     CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
-use engine_qwen::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
+use engine_qwen::{DEFAULT_PREFILL_CHUNK_MEMBERS, QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 
 const DEFAULT_PREFILL_CHUNK_TOKENS: u32 = 16;
 const WEIGHT_BUDGET_BYTES: u64 = 20_u64 << 30;
@@ -82,8 +82,12 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPSILON)
         .map_err(|error| error.to_string())?;
     // The local single-request path needs one pinned output slot per
-    // potentially in-flight sampling row; keep a small pool.
+    // potentially in-flight sampling row; keep a small pool. The prefill lane
+    // is sized separately, because one long prompt benefits from chunking
+    // whether or not any other request is live.
     let dispatcher = CudaQwen35ServingDispatcher::new(&context, executor, stream, 8)
+        .map_err(|error| error.to_string())?
+        .with_prefill_chunk(DEFAULT_PREFILL_CHUNK_MEMBERS)
         .map_err(|error| error.to_string())?;
 
     let description = provider.description();

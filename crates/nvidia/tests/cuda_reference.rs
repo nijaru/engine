@@ -3552,6 +3552,147 @@ fn same_sequence_prefill_chunk_matches_batch1_full_model() {
     );
 }
 
+/// Multi-chunk qualification: consecutive same-sequence prefill chunks must
+/// match the serial batch-1 hidden states row for row, including the rows of
+/// chunks after the first.
+///
+/// The single-chunk gate proves one chunk against one serial prefix and a
+/// continuation token. Serving drives many chunks in sequence, so this covers
+/// what that gate cannot: KV rows and recurrent state carried *across* a chunk
+/// boundary, where a stale convolution history, a GDN matrix updated out of
+/// prompt order, or a position-dependent full-attention write would only
+/// diverge from the second chunk on.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one staging pass, three chunk boundaries, and one continuation"
+)]
+fn same_sequence_multi_chunk_prefill_matches_batch1_full_model() {
+    use engine_core::{
+        ConvolutionStateShape, DataType, KvStateSpec, RecurrentMatrixShape, RecurrentStateSpec,
+    };
+    use engine_nvidia::{CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, QwenLayerKind};
+    use std::sync::Arc;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const MEMBERS: usize = 8;
+    const CHUNKS: usize = 3;
+    const TOKENS: [u32; MEMBERS * CHUNKS] = [
+        12_675, 1017, 760, 6511, 314, 9338, 369, 42, 12_675, 1017, 760, 6511, 314, 9338, 369, 42,
+        12_675, 1017, 760, 6511, 314, 9338, 369, 42,
+    ];
+    const NEXT_TOKEN: u32 = 17;
+    const TOLERANCE: f32 = 5.0e-3;
+
+    let provider = QwenGguf::open(GGUF).expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let kv_spec = KvStateSpec::new(16, 4, 256, 16, DataType::F16).expect("KV spec");
+    let recurrent_spec = RecurrentStateSpec::new(
+        48,
+        RecurrentMatrixShape::new(48, 128, 128).expect("matrix shape"),
+        ConvolutionStateShape::new(10_240, 3).expect("convolution shape"),
+        DataType::F32,
+        DataType::F32,
+    )
+    .expect("recurrent spec");
+    let fresh_state = || {
+        let mut state =
+            CudaHybridState::from_specs(stream.clone(), Some(kv_spec), Some(recurrent_spec))
+                .expect("physical hybrid state");
+        state.zero().expect("zero state");
+        state
+    };
+
+    let mut oracle = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("batch-1 oracle");
+    let mut oracle_state = fresh_state();
+    let mut oracle_hidden = Vec::with_capacity(TOKENS.len());
+    for (position, &token) in TOKENS.iter().enumerate() {
+        let position = u32::try_from(position).expect("position fits u32");
+        oracle
+            .prefill_step(&mut oracle_state, token, position)
+            .expect("oracle prefill");
+        oracle_state
+            .advance_to(position + 1)
+            .expect("oracle advance");
+        oracle_hidden.push(oracle.copy_hidden().expect("oracle hidden"));
+    }
+
+    let mut candidate = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPS)
+        .expect("candidate single executor");
+    let mut chunk =
+        CudaQwen35BatchDecode::from_decode(&candidate, MEMBERS).expect("chunk executor");
+    let mut chunk_state = fresh_state();
+    for chunk_index in 0..CHUNKS {
+        let start = u32::try_from(chunk_index * MEMBERS).expect("chunk start fits u32");
+        let end = chunk_index * MEMBERS + MEMBERS;
+        chunk
+            .prefill_chunk(&mut chunk_state, &TOKENS[chunk_index * MEMBERS..end], start)
+            .expect("same-sequence prefill chunk");
+        chunk_state
+            .advance_to(u32::try_from(end).expect("chunk end fits u32"))
+            .expect("chunk advance");
+        for member in 0..MEMBERS {
+            let expected = &oracle_hidden[chunk_index * MEMBERS + member];
+            let actual = chunk.copy_hidden_member(member).expect("chunk hidden row");
+            let max_abs = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs < TOLERANCE,
+                "chunk {chunk_index} row {member} diverged from the serial oracle: max abs {max_abs}"
+            );
+        }
+    }
+
+    // The continuation proves the chunked state is a valid handoff into the
+    // batch-1 path, not merely self-consistent.
+    let next_position = u32::try_from(TOKENS.len()).expect("chunk length fits u32");
+    oracle
+        .prefill_step(&mut oracle_state, NEXT_TOKEN, next_position)
+        .expect("oracle continuation");
+    candidate
+        .prefill_step(&mut chunk_state, NEXT_TOKEN, next_position)
+        .expect("candidate continuation");
+    let max_abs = oracle
+        .copy_hidden()
+        .expect("oracle continuation hidden")
+        .iter()
+        .zip(
+            candidate
+                .copy_hidden()
+                .expect("candidate continuation hidden")
+                .iter(),
+        )
+        .map(|(oracle, candidate)| (oracle - candidate).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_abs < TOLERANCE,
+        "multi-chunk continuation state diverged: max abs {max_abs}"
+    );
+}
+
 /// Bisect the batched divergence by real-weight prefix: plans [R], [R,R],
 /// [R,R,R], and [R,R,R,A] over the pinned artifact (attention tensors exist
 /// only at plan index 3, matching the real layer layout), each run through
@@ -6018,6 +6159,306 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     }
     assert_eq!(async_backend.dispatcher().pending_submissions(), 0);
     assert_eq!(async_backend.dispatcher().state_registry().len(), 0);
+}
+
+/// Same-sequence prefill chunking parity through the real serving seam.
+///
+/// One 21-token prefill segment is submitted to two dispatchers that differ
+/// only in the prefill lane: the chunked one runs two eight-token chunks, then
+/// four serial tokens, then the sampling token; the serial one runs all 21
+/// tokens serially. Both must sample the same greedy token, and every
+/// following decode step must agree, because chunking is a backend-local
+/// reformulation of the same computation and not a different computation.
+///
+/// The lane assertion is part of the gate: without it a regression that
+/// silently dropped the chunk lane would leave this test passing while
+/// measuring nothing.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one staging pass plus a two-path serving comparison"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the shared position counter tracks model state, not iteration"
+)]
+fn serves_chunked_prefill_matching_the_serial_path() {
+    use engine_core::{
+        BackendCapabilities, BackendFeatures, BackendKind, ComputeBackend, DataType,
+        ExecutionBatch, ExecutionPhase, ExecutionPlan, ExecutionStage, InferenceState,
+        LogicalStateManager, ModelProvider, PolicyVersion, Quantization, RequestId, SamplingParams,
+        StateLocation, StateManager, StateRequirement,
+    };
+    use engine_nvidia::NvidiaBackend;
+    use engine_nvidia::{CudaQwen35Decode, CudaQwen35ServingDispatcher, QwenLayerKind};
+    use std::time::Duration;
+
+    const GGUF: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
+    const EPS: f32 = 1.0e-6;
+    const MEMBERS: usize = 8;
+    /// Prompt tokens taken from the llama-server continuation below, so the
+    /// prompt is 21 tokens: two whole chunks, a four-token tail, and the
+    /// sampling token.
+    const ANCHOR_TOKENS: usize = 16;
+    const DECODE_STEPS: usize = 8;
+
+    // "The capital of France is" plus the first sixteen tokens llama-server
+    // generated for it greedily. Feeding those sixteen as prompt tokens must
+    // reproduce the rest of the same greedy continuation, so the expected
+    // tokens come from an independent engine rather than from this path.
+    let mut prompt = vec![760, 6511, 314, 9338, 369];
+    prompt.extend_from_slice(&LLAMA_GREEDY_CONTINUATION[..ANCHOR_TOKENS]);
+    assert_eq!(prompt.len(), 21, "the anchored prompt has a fixed length");
+    assert_eq!(
+        prompt.len() % MEMBERS,
+        5,
+        "the prompt must leave a serial tail after whole chunks"
+    );
+
+    let provider = QwenGguf::open_with_kv_block_tokens(
+        GGUF,
+        u32::try_from(prompt.len() + DECODE_STEPS + 4).expect("fits u32"),
+    )
+    .expect("open pinned Qwen GGUF");
+    let context = CudaContext::new(0).expect("CUDA context");
+    let stream = context.default_stream();
+    let staged = stage_full_text_path(&provider, &context, &stream);
+
+    let layer_kinds = (0..64_u32)
+        .map(
+            |layer| match provider.layer_kind(layer).expect("layer kind") {
+                GgufQwenLayerKind::Recurrent => QwenLayerKind::Recurrent,
+                GgufQwenLayerKind::FullAttention => QwenLayerKind::FullAttention,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let device = DeviceId::new(0);
+    let description = provider.description();
+    let state_requirements = description.state_requirements().to_vec();
+    let execution_stages = [ExecutionPhase::Prefill, ExecutionPhase::Decode]
+        .into_iter()
+        .flat_map(|phase| {
+            description
+                .regions()
+                .iter()
+                .map(move |region| ExecutionStage::new(region.id(), phase))
+        })
+        .collect::<Vec<_>>();
+
+    let backend_id = BackendId::new("cuda").expect("backend ID");
+    let state_bytes: u64 = state_requirements
+        .iter()
+        .map(|requirement| requirement.byte_size().expect("state size"))
+        .sum();
+    let capabilities = BackendCapabilities::new(
+        backend_id.clone(),
+        device,
+        BackendKind::Cuda,
+        (20_u64 << 30) + state_bytes * 2,
+        BackendFeatures::new(
+            vec![DataType::F16, DataType::F32],
+            vec![Quantization::GgufQ4Km],
+            false,
+            true,
+        ),
+    );
+
+    let plan = ExecutionPlan::new(
+        description.id().clone(),
+        backend_id.clone(),
+        device,
+        PolicyVersion::new(1).expect("policy version"),
+        execution_stages,
+        state_requirements.clone(),
+        WeightBinding::empty(description.id().clone(), device),
+    )
+    .expect("plan");
+
+    let allocate_state = |manager: &mut LogicalStateManager| {
+        let states = state_requirements
+            .iter()
+            .map(|requirement| match *requirement {
+                StateRequirement::FullAttentionKv(spec) => manager
+                    .allocate_kv(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
+                StateRequirement::Recurrent(spec) => manager
+                    .allocate_recurrent(spec, StateLocation::Device(device))
+                    .map(InferenceState::from),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("allocate state");
+        InferenceStateSet::new(states).expect("state set")
+    };
+
+    let mut serial_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut serial_state = allocate_state(&mut serial_manager);
+    let serial_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds.clone(),
+        EPS,
+    )
+    .expect("serial executor");
+    let serial_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, serial_executor, stream.clone(), 8)
+            .expect("serial dispatcher");
+    let mut serial_backend =
+        NvidiaBackend::new(capabilities.clone(), serial_dispatcher).expect("serial backend");
+
+    let mut chunked_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut chunked_state = allocate_state(&mut chunked_manager);
+    let chunked_executor = CudaQwen35Decode::new(
+        &context,
+        stream.clone(),
+        Arc::clone(&staged),
+        layer_kinds,
+        EPS,
+    )
+    .expect("chunked executor");
+    let chunked_dispatcher =
+        CudaQwen35ServingDispatcher::new(&context, chunked_executor, stream.clone(), 8)
+            .expect("chunked dispatcher")
+            .with_prefill_chunk(MEMBERS)
+            .expect("prefill lane");
+    let mut chunked_backend =
+        NvidiaBackend::new(capabilities, chunked_dispatcher).expect("chunked backend");
+
+    assert_eq!(serial_backend.dispatcher().prefill_chunk_members(), None);
+    assert_eq!(
+        chunked_backend.dispatcher().prefill_chunk_members(),
+        Some(MEMBERS)
+    );
+
+    let request = RequestId::new(1).expect("request ID");
+    let greedy = SamplingParams::greedy(None);
+
+    let run_one_step = |backend: &mut NvidiaBackend<CudaQwen35ServingDispatcher>,
+                        manager: &mut LogicalStateManager,
+                        state: &mut InferenceStateSet,
+                        phase: ExecutionPhase,
+                        tokens: Arc<[u32]>,
+                        position: u32,
+                        token_count: u32|
+     -> u32 {
+        let input = if phase == ExecutionPhase::Prefill {
+            engine_core::ExecutionTokenInput::prompt(tokens, 0, token_count).expect("prompt input")
+        } else {
+            assert_eq!(token_count, 1);
+            engine_core::ExecutionTokenInput::decode(tokens[0])
+        };
+        let segment = ExecutionSegment::new(
+            request,
+            phase,
+            1,
+            token_count,
+            position,
+            state_requirements.clone(),
+        )
+        .expect("segment")
+        .with_token_input(input)
+        .expect("token input")
+        .with_sampling(greedy);
+        let batch = ExecutionBatch::new(vec![segment]).expect("batch");
+        let submission = backend
+            .submit(&plan, &batch, std::slice::from_mut(state))
+            .expect("submit");
+        let deadline = Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        loop {
+            match backend.poll(submission) {
+                Ok(Some(event)) => {
+                    manager
+                        .commit(state, position + token_count)
+                        .expect("commit position");
+                    return event
+                        .events()
+                        .first()
+                        .expect("one event")
+                        .output_token()
+                        .expect("sampled token");
+                }
+                Ok(None) => {
+                    assert!(
+                        started.elapsed() < deadline,
+                        "asynchronous submission did not complete in time"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("poll failed: {error:?}"),
+            }
+        }
+    };
+
+    // One prefill segment carrying the whole prompt, sampling on its final
+    // token: the composition the serving runtime submits.
+    let prompt_len = u32::try_from(prompt.len()).expect("fits u32");
+    let prompt: Arc<[u32]> = Arc::from(prompt);
+    let serial_token = run_one_step(
+        &mut serial_backend,
+        &mut serial_manager,
+        &mut serial_state,
+        ExecutionPhase::Prefill,
+        Arc::clone(&prompt),
+        0,
+        prompt_len,
+    );
+    let chunked_token = run_one_step(
+        &mut chunked_backend,
+        &mut chunked_manager,
+        &mut chunked_state,
+        ExecutionPhase::Prefill,
+        Arc::clone(&prompt),
+        0,
+        prompt_len,
+    );
+    assert_eq!(
+        serial_token, LLAMA_GREEDY_CONTINUATION[ANCHOR_TOKENS],
+        "the serial path must reproduce the llama-server continuation it was fed"
+    );
+    assert_eq!(
+        chunked_token, serial_token,
+        "chunked prefill sampled a different token than the serial path"
+    );
+
+    let mut fed_serial = serial_token;
+    let mut fed_chunked = chunked_token;
+    for step in 0..DECODE_STEPS {
+        let position = prompt_len + u32::try_from(step).expect("fits u32");
+        // The anchored continuation: the prefill sampled index
+        // `ANCHOR_TOKENS`, so decode step `step` produces the next one.
+        let expected = LLAMA_GREEDY_CONTINUATION[ANCHOR_TOKENS + 1 + step];
+        let next_serial = run_one_step(
+            &mut serial_backend,
+            &mut serial_manager,
+            &mut serial_state,
+            ExecutionPhase::Decode,
+            Arc::from([fed_serial]),
+            position,
+            1,
+        );
+        let next_chunked = run_one_step(
+            &mut chunked_backend,
+            &mut chunked_manager,
+            &mut chunked_state,
+            ExecutionPhase::Decode,
+            Arc::from([fed_chunked]),
+            position,
+            1,
+        );
+        assert_eq!(
+            next_serial, expected,
+            "serial decode diverged from llama-server at step {step}"
+        );
+        assert_eq!(
+            next_chunked, next_serial,
+            "decode diverged between chunked and serial prefill at step {step}"
+        );
+        fed_serial = next_serial;
+        fed_chunked = next_chunked;
+    }
 }
 
 /// Exercise real completion ownership, cancellation, and the >8-row fallback.

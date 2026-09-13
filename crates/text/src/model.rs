@@ -14,6 +14,9 @@ pub struct LoadOptions {
     pub device: u16,
     pub context_tokens: u32,
     pub max_sequences: usize,
+    /// Same-sequence prefill chunk size, or `None` for the serial prefill
+    /// path.
+    pub prefill_chunk_members: Option<usize>,
     pub weight_budget_bytes: Option<u64>,
     pub headroom_bytes: u64,
 }
@@ -25,6 +28,7 @@ impl Default for LoadOptions {
             device: qwen.device,
             context_tokens: qwen.context_tokens,
             max_sequences: qwen.max_sequences,
+            prefill_chunk_members: qwen.prefill_chunk_members,
             weight_budget_bytes: qwen.weight_budget_bytes,
             headroom_bytes: qwen.headroom_bytes,
         }
@@ -37,6 +41,7 @@ impl From<LoadOptions> for QwenLoadOptions {
             device: value.device,
             context_tokens: value.context_tokens,
             max_sequences: value.max_sequences,
+            prefill_chunk_members: value.prefill_chunk_members,
             weight_budget_bytes: value.weight_budget_bytes,
             headroom_bytes: value.headroom_bytes,
         }
