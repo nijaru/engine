@@ -335,6 +335,49 @@ tokens match" was never evidence about long prompts. It is recorded in the fixtu
 provenance with the full reference continuation, and it is a numerical-fidelity item for
 the long-prompt path, not a scheduling or ownership defect.
 
+Margins were then measured rather than assumed, because two engines can pick the same
+token for different reasons. `--logit-margins=N` reads the vocabulary logits back
+through `CudaQwen35Decode::copy_logits` and prints each step's top five log-probabilities
+and top-1/top-2 margin; `benchmarks/llama_reference_margins.py` prints the same rows from
+llama.cpp's `n_probs` for the fixture's own prompt, fed as token IDs with `add_special`
+disabled. Same 257-token prompt, serial prefill for the reference comparison:
+
+| step | llama.cpp margin | ribn margin | margin error | worst shared top-5 error |
+| --- | --- | --- | --- | --- |
+| 0 | 0.8779 | 0.7967 | 0.0812 | 0.1064 |
+| 11 | 3.6355 | 3.6820 | 0.0465 | 0.1055 |
+| 12 | 0.1855 | 0.1655 | 0.0200 | 0.0910 |
+| 14 | 0.3488 | 0.2044 | 0.1444 | 0.1245 |
+| 17 | 2.9102 | 2.8642 | 0.0460 | 0.1040 |
+| 18 | 0.2242 | 0.0088 | 0.2154 | 0.1953 |
+
+Two things follow. First, the flip is not a discontinuity: ribn's log-probabilities
+sit 0.08-0.26 nats from llama.cpp's throughout, so a step whose reference margin is
+0.2242 is inside that band and either token is consistent with ribn's own
+distribution. ribn's margin at that step, 0.0088 nats, is what a nearly-tied
+preference looks like. Second, the deviation is slow and roughly flat in step index
+rather than compounding, which is the signature of a systematic kernel-order difference
+in the quantized paths rather than a state or position error.
+
+That pass also produced a stronger statement about the integration than token equality:
+**chunked and serial prefill emitted identical log-probability tables for all 20 steps**
+(`diff` of the two runs is empty), so chunking changes which kernels execute, not what
+they compute. The 20-step tables are in the session evidence directory as
+`11-margins-reference.log` and `12-margins-ribn-{serial,chunk8}.log`.
+
+### Margin probe procedure
+
+```sh
+python3 benchmarks/llama_reference_margins.py 20 > /tmp/llama-margins.txt
+
+ENGINE_QWEN_GGUF=/path/Qwen3.8-27B-UD-Q4_K_M.gguf \
+target/release/examples/qwen_decode_bench \
+  --prompt-fixture=crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens \
+  --tokens=20 --logit-margins=20 [--prefill-chunk=8] > /tmp/ribn-margins.txt
+
+diff <(grep '^margins' /tmp/llama-margins.txt) <(grep '^margins' /tmp/ribn-margins.txt)
+```
+
 ### Decision
 
 Chunked same-sequence prefill is selected by default through `QwenLoadOptions`, with

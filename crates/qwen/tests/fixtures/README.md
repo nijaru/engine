@@ -40,7 +40,10 @@ legitimately diverge because their contexts differ. The step is a genuine near-t
 the reference itself: llama.cpp's top-2 logit gap there was 0.2242 nats
 (`6249` at -0.7045, `592` at -0.9287) and ribn prefers `592`, the runner-up. A
 differently ordered quantized GEMV and attention reduction can move a margin that
-small.
+small, and the measurement says it does: across the steps before the sequences part,
+ribn's log-probabilities sit 0.08-0.26 nats from llama.cpp's while agreeing on the
+winning token, and at the flip step ribn's own margin is 0.0088 nats over the same two
+tokens. The full per-step table is in `benchmarks/qwen-prefill-qualification.md`.
 
 The committed reference is therefore the agreed prefix. The full llama.cpp
 continuation, recorded so the truncation is never mistaken for a complete match:
