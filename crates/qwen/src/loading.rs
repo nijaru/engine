@@ -32,8 +32,10 @@ pub struct QwenLoadOptions {
     pub device: u16,
     pub context_tokens: u32,
     pub max_sequences: usize,
-    /// Enable same-sequence prefill chunking at this many tokens per chunk.
-    /// `None` keeps the serial prefill path.
+    /// Same-sequence prefill chunk size, or `None` for the serial prefill
+    /// path. Enabled by default: the lane is backend-local, and its parity and
+    /// serving-effect gates are recorded in
+    /// `benchmarks/qwen-prefill-qualification.md`.
     pub prefill_chunk_members: Option<usize>,
     /// Optional upper bound for staged weights. Automatic mode uses observed
     /// free device memory minus request-state reservations and headroom.
@@ -49,7 +51,7 @@ impl Default for QwenLoadOptions {
             device: 0,
             context_tokens: 4096,
             max_sequences: 1,
-            prefill_chunk_members: None,
+            prefill_chunk_members: Some(DEFAULT_PREFILL_CHUNK_MEMBERS),
             weight_budget_bytes: None,
             headroom_bytes: 512 << 20,
         }

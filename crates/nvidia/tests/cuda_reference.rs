@@ -6320,8 +6320,11 @@ fn serves_chunked_prefill_matching_the_serial_path() {
         EPS,
     )
     .expect("chunked executor");
+    // Deliberately fewer decode rows than chunk tokens: prefill lane sizing is
+    // independent of request concurrency, so one long prompt chunks even in a
+    // dispatcher prepared for very little concurrent decoding.
     let chunked_dispatcher =
-        CudaQwen35ServingDispatcher::new(&context, chunked_executor, stream.clone(), 8)
+        CudaQwen35ServingDispatcher::new(&context, chunked_executor, stream.clone(), 2)
             .expect("chunked dispatcher")
             .with_prefill_chunk(MEMBERS)
             .expect("prefill lane");

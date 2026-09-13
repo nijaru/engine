@@ -114,6 +114,57 @@ For each cell record median prefill wall time and spread. Also retain decode tim
 a regression check even though the candidate does not intentionally change decode.
 Do not compare staging time as part of the prefill result.
 
+## 4. Correctness: consecutive chunks
+
+The single-chunk gate proves one chunk against one serial prefix. Serving drives chunks
+in sequence, so a second gate runs three consecutive eight-token chunks (24 prompt
+tokens) through all 64 layers, compares every chunk's rows against the serial batch-1
+hidden states for the same positions, then continues one token on both paths:
+
+```sh
+cargo test -p engine-nvidia --features cuda --test cuda_reference \
+  same_sequence_multi_chunk_prefill_matches_batch1_full_model \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+This covers what a single chunk cannot: KV rows and recurrent state carried across a
+chunk boundary. A stale convolution history, a GDN matrix advanced out of prompt order,
+or a position-dependent full-attention write would only diverge from the second chunk
+on, and would leave a one-chunk gate green.
+
+## 5. Correctness and effect through the serving seam
+
+The integration is gated, not only the kernels:
+
+```sh
+cargo test -p engine-nvidia --features cuda --test cuda_reference \
+  serves_chunked_prefill_matching_the_serial_path \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+One 21-token prefill segment goes to two dispatchers that differ only in the prefill
+lane: the chunked one runs two eight-token chunks, four serial tokens, then the sampling
+token, while the serial one runs all 21 tokens serially. Both must sample the same
+token and agree on the following eight decode steps. The prompt is the base prompt plus
+the first sixteen tokens llama-server generated for it, so the expected continuation
+comes from an independent engine. The test also asserts the lane is configured, because
+a regression that silently dropped it would otherwise leave the test green while
+measuring nothing.
+
+Serving-level effect uses the serving benchmark, which drives the real scheduler and
+runtime rather than the decoder directly, at a 257-token prompt and one unchanged
+release build:
+
+```sh
+ENGINE_QWEN_GGUF=/path/Qwen3.8-27B-UD-Q4_K_M.gguf \
+target/release/examples/qwen_serving_bench \
+  --concurrency=4 --tokens=32 --prompt-tokens=257 --print-tokens [--prefill-chunk=8]
+```
+
+The prompt is the same five tokens cycled to length, which makes this a prefill-cost
+fixture rather than a realistic prompt distribution; the token streams it prints are
+the parity check for the same run.
+
 ## Promotion rule
 
 Do not wire the candidate into serving unless all of the following are true:
