@@ -656,6 +656,11 @@ impl BertInput {
         self.attention_mask = Some(attention_mask.into());
         self
     }
+
+    fn with_token_type_ids(mut self, token_type_ids: impl Into<Vec<u32>>) -> Self {
+        self.token_type_ids = Some(token_type_ids.into());
+        self
+    }
 }
 
 struct BertOutput {
@@ -1124,6 +1129,162 @@ fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
 
     let second_output = runtime.pop_completed().expect("second output");
     assert_eq!(second_output.request(), second);
+}
+
+/// Largest absolute difference between two equally shaped vectors.
+fn max_absolute_deviation(actual: &[f32], expected: &[f32]) -> f32 {
+    assert_eq!(actual.len(), expected.len());
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+fn json_u32_vec(value: &serde_json::Value) -> Vec<u32> {
+    value
+        .as_array()
+        .expect("integer array")
+        .iter()
+        .map(|entry| u32::try_from(entry.as_u64().expect("integer entry")).expect("entry fits u32"))
+        .collect()
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the reference fixture stores f32 values widened to f64 by JSON"
+)]
+fn json_f32_vec(value: &serde_json::Value) -> Vec<f32> {
+    value
+        .as_array()
+        .expect("float array")
+        .iter()
+        .map(|entry| entry.as_f64().expect("float entry") as f32)
+        .collect()
+}
+
+fn bert_tiny_fixture() -> (PathBuf, serde_json::Value) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bert-tiny");
+    let reference = fs::read_to_string(root.join("reference.json")).expect("reference fixture");
+    (
+        root,
+        serde_json::from_str(&reference).expect("reference JSON"),
+    )
+}
+
+/// The in-code fixture above uses zero attention projections, zero token-type and
+/// position embeddings, and zero feed-forward weights, so it can only detect
+/// mistakes that survive every one of those collapsing to nothing. This fixture
+/// keeps the same code path under nonzero weights and checks it against Hugging
+/// Face `transformers`, which computes the same equations independently.
+///
+/// Regenerate the fixture with `tests/fixtures/bert-tiny/generate.py`. The
+/// tolerance is stated here rather than inferred from whatever the first run
+/// produced: the measured worst deviation is 3.6e-7 for hidden states and 2.2e-8
+/// for the pooled output, dominated by the A&S `erf` approximation this path uses
+/// for exact-variant GELU, so the bound below is roughly 25x the observed margin.
+#[test]
+fn bert_encoder_matches_an_independently_generated_reference() {
+    const TOLERANCE: f32 = 1.0e-5;
+
+    let (root, reference) = bert_tiny_fixture();
+    let package = LocalModelPackage::open(&root).expect("package");
+    let model = BertReference::load(&package, ParameterVersion::new(7), 4, 16).expect("BERT");
+    let hidden = usize::try_from(reference["config"]["hidden_size"].as_u64().unwrap())
+        .expect("hidden size fits usize");
+
+    let mut worst_hidden = 0.0_f32;
+    let mut worst_pooled = 0.0_f32;
+    for case in reference["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("case name");
+        let token_ids = json_u32_vec(&case["token_ids"]);
+        let input = BertInput::new(token_ids.clone())
+            .with_token_type_ids(json_u32_vec(&case["token_type_ids"]))
+            .with_attention_mask(
+                json_u32_vec(&case["attention_mask"])
+                    .into_iter()
+                    .map(|flag| flag != 0)
+                    .collect::<Vec<_>>(),
+            );
+        let output = model.encode(&input).expect("encode");
+        assert_eq!(output.sequence, token_ids.len());
+        assert_eq!(output.hidden, hidden);
+
+        let expected_hidden = json_f32_vec(&case["last_hidden_state"]);
+        let hidden_deviation = max_absolute_deviation(&output.last_hidden_state, &expected_hidden);
+        assert!(
+            hidden_deviation <= TOLERANCE,
+            "case {name}: last_hidden_state deviates by {hidden_deviation}"
+        );
+        worst_hidden = worst_hidden.max(hidden_deviation);
+
+        let expected_pooled = json_f32_vec(&case["pooled_output"]);
+        let pooled = output.pooled_output.as_deref().expect("pooled output");
+        let pooled_deviation = max_absolute_deviation(pooled, &expected_pooled);
+        assert!(
+            pooled_deviation <= TOLERANCE,
+            "case {name}: pooled_output deviates by {pooled_deviation}"
+        );
+        worst_pooled = worst_pooled.max(pooled_deviation);
+    }
+    println!("worst deviation against transformers: hidden {worst_hidden}, pooled {worst_pooled}");
+}
+
+/// Padding must be semantically inert under the real weights, and real weights
+/// must actually change the answer. Either half alone proves nothing: a fixture
+/// whose every projection is zero is inert for any input, so a mask test written
+/// on it passes whether or not masking works.
+#[test]
+fn bert_attention_mask_is_inert_for_real_tokens_under_real_weights() {
+    let (root, _) = bert_tiny_fixture();
+    let package = LocalModelPackage::open(&root).expect("package");
+    let model = BertReference::load(&package, ParameterVersion::new(7), 4, 16).expect("BERT");
+
+    let padded = |last_token: u32| {
+        model
+            .encode(
+                &BertInput::new(vec![4, 1, 9, last_token])
+                    .with_token_type_ids(vec![0, 0, 1, 1])
+                    .with_attention_mask(vec![true, true, true, false]),
+            )
+            .expect("encode")
+    };
+    let first = padded(3);
+    let second = padded(12);
+
+    // Only the padded row may move, and it may only move because it is padded,
+    // not because padding leaked into the rows that attend.
+    let attended = 3 * first.hidden;
+    assert_eq!(
+        first.last_hidden_state[..attended],
+        second.last_hidden_state[..attended],
+        "changing a masked token changed an attended row"
+    );
+    assert_eq!(
+        first.pooled_output, second.pooled_output,
+        "changing a masked token changed the pooled output"
+    );
+
+    // The same change in an attended slot must move the result, which is what
+    // makes the assertion above meaningful rather than vacuous.
+    let unmasked = |token: u32| {
+        model
+            .encode(
+                &BertInput::new(vec![4, 1, 9, token])
+                    .with_token_type_ids(vec![0, 0, 1, 1])
+                    .with_attention_mask(vec![true, true, true, true]),
+            )
+            .expect("encode")
+    };
+    let attended_first = unmasked(3);
+    let attended_second = unmasked(12);
+    assert!(
+        max_absolute_deviation(
+            &attended_first.last_hidden_state,
+            &attended_second.last_hidden_state
+        ) > 1.0e-3,
+        "the fixture is insensitive to its input, so it cannot qualify attention"
+    );
 }
 
 #[test]

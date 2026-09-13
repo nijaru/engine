@@ -261,6 +261,7 @@ dependencies = [
  "ribn-foundation",
  "ribn-hf",
  "ribn-safetensors",
+ "serde_json",
 ]
 
 [[package]]

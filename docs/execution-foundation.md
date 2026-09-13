@@ -332,7 +332,9 @@ Implemented as provisional scaffolding:
   including Hugging Face cache snapshots whose members are symlinks into that
   repository's immutable `blobs` directory;
 - an actual BERT architecture reference path over that package boundary, including
-  embeddings, self-attention, residual/LayerNorm, FFN and pooler execution;
+  embeddings, self-attention, residual/LayerNorm, FFN and pooler execution, with a
+  nondegenerate weight fixture whose expected values come from an independent
+  implementation rather than from this code;
 - `LocalWeightSet` lazily owns each resolved SafeTensors shard with a configurable
   residency bound, leaving model semantics above the package layer;
 - BERT attention-mask semantics and padded-versus-ragged batch-cost pressure tests
