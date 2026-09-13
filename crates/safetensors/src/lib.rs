@@ -4,9 +4,22 @@
 //! format metadata. It does not allocate execution tensors, choose parameter
 //! semantics, decide placement, or create [`ribn_foundation::ParameterMaterialization`]
 //! values. Those responsibilities belong to model integration and preparation.
+//!
+//! Validation and metadata extraction happen once, when the artifact is
+//! constructed. Tensor lookups afterwards are index lookups into retained
+//! metadata, so reading every tensor in a shard does not reparse the header or
+//! rescan the tensor names.
+//!
+//! Artifact bytes are owned in host memory. Mapping an immutable local file
+//! instead would avoid that copy, but mapping needs an `unsafe` call that this
+//! workspace forbids, so owned bytes remain the only storage here. Callers that
+//! cannot afford whole-artifact residency should bound how many artifacts stay
+//! open rather than expecting this layer to stream.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +30,15 @@ use safetensors::tensor::{Dtype, SafeTensors};
 #[derive(Clone)]
 pub struct SafeTensorArtifact {
     bytes: Arc<[u8]>,
+    index: Arc<BTreeMap<String, TensorEntry>>,
     source: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct TensorEntry {
+    scalar_type: ScalarType,
+    shape: Vec<usize>,
+    range: Range<usize>,
 }
 
 impl SafeTensorArtifact {
@@ -28,14 +49,19 @@ impl SafeTensorArtifact {
     /// `SafeTensors` artifact.
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, ArtifactError> {
         let bytes = bytes.into();
-        SafeTensors::deserialize(bytes.as_ref()).map_err(ArtifactError::format)?;
+        let parsed = SafeTensors::deserialize(bytes.as_ref()).map_err(ArtifactError::format)?;
+        let index = index_tensors(bytes.as_ref(), &parsed)?;
         Ok(Self {
             bytes,
+            index: Arc::new(index),
             source: None,
         })
     }
 
     /// Read and validate a `SafeTensors` artifact from a local file.
+    ///
+    /// The whole file is read into owned host memory and stays resident for the
+    /// lifetime of the artifact.
     ///
     /// # Errors
     /// Returns an I/O error when the file cannot be read, or a format error when
@@ -56,36 +82,83 @@ impl SafeTensorArtifact {
         self.source.as_deref()
     }
 
-    /// Return tensor names without copying tensor payloads.
-    ///
-    /// # Errors
-    /// Returns a format error if validated bytes somehow fail to deserialize.
-    pub fn names(&self) -> Result<Vec<String>, ArtifactError> {
-        let tensors = self.parse()?;
-        Ok(tensors.names().into_iter().map(str::to_owned).collect())
+    /// Tensor names in the artifact, read from retained metadata.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.index.keys().cloned().collect()
     }
 
     /// Borrow one tensor payload from the owned artifact bytes.
     ///
     /// # Errors
-    /// Returns [`ArtifactError::MissingTensor`] when `name` is absent, or a
-    /// format error if validated bytes somehow fail to deserialize.
+    /// Returns [`ArtifactError::MissingTensor`] when `name` is absent.
     pub fn tensor(&self, name: &str) -> Result<ArtifactTensor<'_>, ArtifactError> {
-        let tensors = self.parse()?;
-        if !tensors.names().contains(&name) {
-            return Err(ArtifactError::MissingTensor(name.to_owned()));
-        }
-        let view = tensors.tensor(name).map_err(ArtifactError::format)?;
+        let entry = self
+            .index
+            .get(name)
+            .ok_or_else(|| ArtifactError::MissingTensor(name.to_owned()))?;
+        let data = self
+            .bytes
+            .get(entry.range.clone())
+            .ok_or_else(|| ArtifactError::format("retained tensor payload is out of range"))?;
         Ok(ArtifactTensor {
-            scalar_type: scalar_type(view.dtype()),
-            shape: view.shape().to_vec(),
-            data: view.data(),
+            scalar_type: entry.scalar_type.clone(),
+            shape: entry.shape.clone(),
+            data,
         })
     }
 
-    fn parse(&self) -> Result<SafeTensors<'_>, ArtifactError> {
-        SafeTensors::deserialize(self.bytes.as_ref()).map_err(ArtifactError::format)
+    /// Payload bytes this artifact keeps in host memory.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.len()
     }
+
+    /// Payload bytes the artifact exposes, regardless of storage.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Number of tensors described by the retained metadata.
+    #[must_use]
+    pub fn tensor_count(&self) -> usize {
+        self.index.len()
+    }
+}
+
+/// Retain validated metadata and payload offsets for every tensor once.
+fn index_tensors(
+    bytes: &[u8],
+    parsed: &SafeTensors<'_>,
+) -> Result<BTreeMap<String, TensorEntry>, ArtifactError> {
+    let base = bytes.as_ptr() as usize;
+    let mut index = BTreeMap::new();
+    for name in parsed.names() {
+        let view = parsed.tensor(name).map_err(ArtifactError::format)?;
+        let data = view.data();
+        let start = (data.as_ptr() as usize)
+            .checked_sub(base)
+            .ok_or_else(|| ArtifactError::format("tensor payload precedes the artifact"))?;
+        let end = start
+            .checked_add(data.len())
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| ArtifactError::format("tensor payload exceeds the artifact"))?;
+        index.insert(
+            name.to_owned(),
+            TensorEntry {
+                scalar_type: scalar_type(view.dtype()),
+                shape: view.shape().to_vec(),
+                range: start..end,
+            },
+        );
+    }
+    Ok(index)
 }
 
 /// Format-level tensor view. Shape and bytes describe the artifact representation,
@@ -165,6 +238,8 @@ impl std::error::Error for ArtifactError {}
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     fn fixture() -> Vec<u8> {
@@ -192,10 +267,55 @@ mod tests {
         artifact
     }
 
+    /// Several tensors with different shapes, so index offsets are exercised
+    /// beyond a single leading payload.
+    fn multi_tensor_fixture() -> Vec<u8> {
+        let payloads: [(&str, &[usize], Vec<f32>); 3] = [
+            ("first.weight", &[2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+            ("second.weight", &[3], vec![5.0, 6.0, 7.0]),
+            ("third.weight", &[1, 1], vec![8.0]),
+        ];
+        let mut data = Vec::new();
+        let mut header = String::from("{");
+        for (position, (name, shape, values)) in payloads.iter().enumerate() {
+            let start = data.len();
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            if position > 0 {
+                header.push(',');
+            }
+            let shape = shape
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = write!(
+                header,
+                r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{}]}}"#,
+                data.len()
+            );
+        }
+        header.push('}');
+        let mut header = header.into_bytes();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut artifact = Vec::new();
+        artifact.extend_from_slice(
+            &u64::try_from(header.len())
+                .expect("fixture header length")
+                .to_le_bytes(),
+        );
+        artifact.extend_from_slice(&header);
+        artifact.extend_from_slice(&data);
+        artifact
+    }
+
     #[test]
     fn exposes_format_metadata_and_borrowed_payload() {
         let artifact = SafeTensorArtifact::from_bytes(fixture()).expect("artifact");
-        assert_eq!(artifact.names().expect("names"), vec!["weight"]);
+        assert_eq!(artifact.names(), vec!["weight"]);
         let tensor = artifact.tensor("weight").expect("weight");
         assert_eq!(tensor.scalar_type(), &ScalarType::F32);
         assert_eq!(tensor.shape(), [2, 2]);
@@ -203,6 +323,52 @@ mod tests {
         assert!(matches!(
             artifact.tensor("missing"),
             Err(ArtifactError::MissingTensor(name)) if name == "missing"
+        ));
+    }
+
+    /// Every tensor keeps its own payload after the metadata is indexed once, so a
+    /// wrong retained offset cannot pass as a lookup miss.
+    #[test]
+    fn retained_offsets_address_each_tensor_payload() {
+        let artifact = SafeTensorArtifact::from_bytes(multi_tensor_fixture()).expect("artifact");
+        assert_eq!(
+            artifact.names(),
+            vec!["first.weight", "second.weight", "third.weight"]
+        );
+        assert_eq!(artifact.tensor_count(), 3);
+        assert_eq!(artifact.heap_bytes(), artifact.len());
+
+        let read = |name: &str| {
+            artifact
+                .tensor(name)
+                .expect("tensor")
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read("first.weight"), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read("second.weight"), vec![5.0, 6.0, 7.0]);
+        assert_eq!(read("third.weight"), vec![8.0]);
+        assert_eq!(
+            artifact.tensor("second.weight").expect("shape").shape(),
+            [3]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_and_malformed_artifacts() {
+        let mut truncated = fixture();
+        truncated.truncate(truncated.len() - 4);
+        assert!(matches!(
+            SafeTensorArtifact::from_bytes(truncated),
+            Err(ArtifactError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            SafeTensorArtifact::from_bytes(vec![0_u8; 8]),
+            Err(ArtifactError::InvalidFormat(_))
         ));
     }
 }

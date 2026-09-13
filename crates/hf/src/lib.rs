@@ -5,7 +5,7 @@
 //! implementation, or processor behavior. Network download/cache/auth are also
 //! intentionally outside this first local-directory pressure test.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -117,9 +117,30 @@ enum Weights {
 /// The first tensor requested from a shard opens and validates that artifact; later
 /// tensors from the same shard reuse the owned bytes. The set still does not assign
 /// model semantics to parameter names or materialize tensors for a backend.
+///
+/// A resident artifact owns its whole file, so the set's residency policy decides
+/// how much host memory a multi-shard model costs. See [`ResidencyPolicy`].
 pub struct LocalWeightSet<'a> {
     weights: &'a Weights,
     artifacts: BTreeMap<PathBuf, SafeTensorArtifact>,
+    recent: VecDeque<PathBuf>,
+    residency: ResidencyPolicy,
+}
+
+/// How many opened `SafeTensors` shards a [`LocalWeightSet`] keeps resident.
+///
+/// Bounding residency is how a loader over many large shards avoids holding every
+/// host artifact at once, because each resident artifact owns its complete file.
+/// Eviction happens only on a call that mutably borrows the set, so an artifact a
+/// caller currently borrows is never dropped underneath it; a caller that needs a
+/// shard to outlive that borrow should keep the returned artifact (it is cheap to
+/// clone and shares the same bytes).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyPolicy {
+    /// Keep every shard opened so far for the set's lifetime.
+    Retain,
+    /// Keep at most `max_open_shards` artifacts, evicting the least recently used.
+    Resident { max_open_shards: usize },
 }
 
 impl LocalModelPackage {
@@ -219,7 +240,7 @@ impl LocalModelPackage {
         }
     }
 
-    /// Create a lazy reusable weight-set view.
+    /// Create a lazy reusable weight-set view that retains every opened shard.
     ///
     /// Prefer this for loading multiple parameters. Each unique shard is opened at
     /// most once for the lifetime of the returned set, while unused shards stay
@@ -229,7 +250,36 @@ impl LocalModelPackage {
         LocalWeightSet {
             weights: &self.weights,
             artifacts: BTreeMap::new(),
+            recent: VecDeque::new(),
+            residency: ResidencyPolicy::Retain,
         }
+    }
+
+    /// Create a lazy reusable weight-set view that keeps at most
+    /// `max_open_shards` shard files resident.
+    ///
+    /// Use this for models whose shards are individually large: a resident artifact
+    /// owns its whole file, so retaining every shard a multi-shard model touches
+    /// costs the sum of the model's shard sizes in host memory. A shard evicted by
+    /// residency is reread from disk if a later parameter needs it again.
+    ///
+    /// # Errors
+    /// Returns [`PackageError::InvalidConfig`] when `max_open_shards` is zero.
+    pub fn weight_set_resident(
+        &self,
+        max_open_shards: usize,
+    ) -> Result<LocalWeightSet<'_>, PackageError> {
+        if max_open_shards == 0 {
+            return Err(PackageError::InvalidConfig(
+                "a resident weight set must keep at least one shard open",
+            ));
+        }
+        Ok(LocalWeightSet {
+            weights: &self.weights,
+            artifacts: BTreeMap::new(),
+            recent: VecDeque::new(),
+            residency: ResidencyPolicy::Resident { max_open_shards },
+        })
     }
 
     /// Open the `SafeTensors` shard associated with one `parameter`.
@@ -260,10 +310,24 @@ impl LocalModelPackage {
 }
 
 impl LocalWeightSet<'_> {
-    /// Number of unique `SafeTensors` shards opened so far.
+    /// Number of `SafeTensors` shards currently resident.
     #[must_use]
     pub fn opened_shard_count(&self) -> usize {
         self.artifacts.len()
+    }
+
+    /// Payload bytes currently held by resident artifacts.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.artifacts
+            .values()
+            .map(SafeTensorArtifact::heap_bytes)
+            .sum()
+    }
+
+    #[must_use]
+    pub const fn residency(&self) -> ResidencyPolicy {
+        self.residency
     }
 
     /// Resolve and borrow the `SafeTensors` artifact containing one parameter.
@@ -280,12 +344,15 @@ impl LocalWeightSet<'_> {
             .weight_path(parameter)
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
             .to_owned();
-        match self.artifacts.entry(path.clone()) {
-            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                Ok(entry.insert(open_artifact(&path)?))
-            }
+        if !self.artifacts.contains_key(&path) {
+            let artifact = open_artifact(&path)?;
+            self.evict_before_insert();
+            self.artifacts.insert(path.clone(), artifact);
         }
+        self.touch(&path);
+        self.artifacts
+            .get(&path)
+            .ok_or(PackageError::UnknownParameter(parameter.to_owned()))
     }
 
     /// Resolve and borrow one parameter tensor, lazily opening its shard once.
@@ -313,6 +380,27 @@ impl LocalWeightSet<'_> {
         match self.weights {
             Weights::Single(path) => Some(path),
             Weights::Sharded { weight_map, .. } => weight_map.get(parameter).map(PathBuf::as_path),
+        }
+    }
+
+    /// Mark one shard as most recently used.
+    fn touch(&mut self, path: &Path) {
+        if let Some(position) = self.recent.iter().position(|recent| recent == path) {
+            self.recent.remove(position);
+        }
+        self.recent.push_back(path.to_owned());
+    }
+
+    /// Free residency for one incoming shard under the configured policy.
+    fn evict_before_insert(&mut self) {
+        let ResidencyPolicy::Resident { max_open_shards } = self.residency else {
+            return;
+        };
+        while self.artifacts.len() >= max_open_shards {
+            let Some(oldest) = self.recent.pop_front() else {
+                return;
+            };
+            self.artifacts.remove(&oldest);
         }
     }
 }
@@ -518,6 +606,7 @@ impl std::error::Error for PackageError {}
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::fmt::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::process;
@@ -896,6 +985,73 @@ mod tests {
         assert!(matches!(
             LocalModelPackage::open(&snapshot),
             Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new(SINGLE_WEIGHTS)
+        ));
+    }
+
+    /// A resident artifact owns its whole file, so residency policy decides how
+    /// much host memory a multi-shard model costs. Reading across three shards
+    /// under a bound of one must not accumulate three artifacts.
+    #[test]
+    fn bounded_residency_keeps_one_shard_open_across_a_sharded_model() {
+        let dir = TestDir::new();
+        write_config(dir.path());
+        let shards = [
+            ("model-00001-of-00003.safetensors", "first.weight"),
+            ("model-00002-of-00003.safetensors", "second.weight"),
+            ("model-00003-of-00003.safetensors", "third.weight"),
+        ];
+        let mut map = String::new();
+        for (position, (file, parameter)) in shards.iter().enumerate() {
+            fs::write(
+                dir.path().join(file),
+                safetensors_fixture(parameter, &[1.0, 2.0, 3.0], &[1, 3]),
+            )
+            .expect("shard");
+            if position > 0 {
+                map.push(',');
+            }
+            let _ = write!(map, r#""{parameter}":"{file}""#);
+        }
+        fs::write(
+            dir.path().join(WEIGHT_INDEX),
+            format!(r#"{{"weight_map":{{{map}}}}}"#),
+        )
+        .expect("index");
+
+        let package = LocalModelPackage::open(dir.path()).expect("package");
+        let shard_bytes = usize::try_from(
+            fs::metadata(dir.path().join(shards[0].0))
+                .expect("shard metadata")
+                .len(),
+        )
+        .expect("shard size fits usize");
+
+        let mut retained = package.weight_set();
+        for (_, parameter) in shards {
+            assert!(retained.tensor(parameter).is_ok());
+        }
+        assert_eq!(retained.residency(), ResidencyPolicy::Retain);
+        assert_eq!(retained.opened_shard_count(), 3);
+        assert_eq!(retained.resident_bytes(), shard_bytes * 3);
+
+        let mut bounded = package.weight_set_resident(1).expect("bounded set");
+        assert_eq!(
+            bounded.residency(),
+            ResidencyPolicy::Resident { max_open_shards: 1 }
+        );
+        for (_, parameter) in shards {
+            assert!(bounded.tensor(parameter).is_ok());
+            assert_eq!(bounded.opened_shard_count(), 1, "residency stays bounded");
+        }
+        assert_eq!(bounded.resident_bytes(), shard_bytes);
+        // Revisiting the evicted shard rereads it instead of growing residency.
+        assert!(bounded.tensor("first.weight").is_ok());
+        assert_eq!(bounded.opened_shard_count(), 1);
+        assert_eq!(bounded.resident_bytes(), shard_bytes);
+
+        assert!(matches!(
+            package.weight_set_resident(0),
+            Err(PackageError::InvalidConfig(_))
         ));
     }
 }

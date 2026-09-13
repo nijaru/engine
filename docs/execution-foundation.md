@@ -134,12 +134,26 @@ and pooler semantics through `ribn-batch`. That is stronger evidence that format
 package code can stay below model meaning. It is still a reference implementation,
 not production BERT support or a general model registry.
 
-It also exposed a concrete loading concern that toy fixtures could hide: repeatedly
+It also exposed concrete loading costs that toy fixtures could hide. Repeatedly
 calling a per-parameter helper that reopens a SafeTensors shard would reread the same
-checkpoint bytes many times. `ribn-hf::LocalWeightSet` now owns that reusable behavior:
-it opens each resolved shard lazily on first use, reuses it for later tensor views,
-and leaves unused shards unopened. Model-specific tensor aliases, expected shapes
-and semantic mapping remain above the package layer.
+checkpoint bytes many times, and reparsing a shard header for every tensor lookup
+would rescan metadata describing the whole shard. `ribn-safetensors` therefore
+validates each artifact once, retaining the tensor metadata and payload offsets, so
+later lookups are index lookups rather than reparses. `ribn-hf::LocalWeightSet` owns
+the reuse above that: it opens each resolved shard lazily on first use, reuses it for
+later tensor views, and leaves unused shards unopened. Model-specific tensor aliases,
+expected shapes and semantic mapping remain above the package layer.
+
+The remaining scaling cost is residency, because a resident artifact owns its whole
+file. Mapping immutable local files would avoid that copy, but mapping requires an
+`unsafe` call that this workspace forbids, so owned bytes remain the only storage and
+residency is an explicit policy instead: `LocalWeightSet::weight_set_resident(n)`
+keeps at most `n` shard files open and evicts the least recently used one, which caps
+host memory at one shard instead of the sum of every shard a model touches. Retaining
+everything stays available and remains the default, because it is the fastest policy
+for small models and the choice belongs to the loader. A future streaming or mapped
+reader is the natural next step before the HF path becomes the production loader for
+large checkpoints.
 
 Remote repository IDs/revisions, tokenizer/processor metadata, prepared backend
 storage and the general architecture resolver remain future work.
@@ -305,12 +319,15 @@ Implemented as provisional scaffolding:
 - `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
 - coherent parameter-version checks for queued non-AR work;
 - executor-informed variable-length batch sizing without a universal work unit;
-- SafeTensors format-level validation/borrowed tensor access;
-- local HF-style config plus single/sharded SafeTensors package resolution;
+- SafeTensors format-level validation that retains tensor metadata and payload
+  offsets once, so later lookups are indexed rather than reparsed;
+- local HF-style config plus single/sharded SafeTensors package resolution,
+  including Hugging Face cache snapshots whose members are symlinks into that
+  repository's immutable `blobs` directory;
 - an actual BERT architecture reference path over that package boundary, including
   embeddings, self-attention, residual/LayerNorm, FFN and pooler execution;
-- `LocalWeightSet` lazily owns each resolved SafeTensors shard once for repeated
-  parameter access while leaving model semantics above the package layer;
+- `LocalWeightSet` lazily owns each resolved SafeTensors shard with a configurable
+  residency bound, leaving model semantics above the package layer;
 - BERT attention-mask semantics and padded-versus-ragged batch-cost pressure tests
   pass without changing the common `ribn-batch` contract;
 - stable AR `RequestId` passed separately from `SequenceId` into executor admission;
