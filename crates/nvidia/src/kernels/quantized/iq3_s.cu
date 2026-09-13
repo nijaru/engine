@@ -100,31 +100,61 @@ extern "C" __global__ void iq3_s_gemv_warp(
     }
 
     const int blocks_per_output = input_size / 256;
+    // Same per-lane element mapping as the batched variant, so both paths
+    // accumulate identical partial sums in identical order: chunked prefill
+    // stays bit-identical to serial prefill while this path's activation reads
+    // coalesce like the batched kernel's.
+    const int group_low = lane >> 3;
+    const int index = (lane & 7) * 4;
+    const int sub = (lane & 7) >> 1;
+    const int lane_in = (lane & 1) * 4;
+    const int code_offset = group_low * 8 + sub * 2 + (lane & 1);
+    const int code_byte = code_offset >> 3;
+    const int code_bit = code_offset & 7;
+    const int sign_shift = lane_in;
     float accumulator = 0.0f;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 110;
-        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
         const unsigned char* low_codes = block + 2;
         const unsigned char* high_codes = block + 66;
         const unsigned char* signs = block + 74;
         const unsigned char* scales = block + 106;
-        const int group = lane >> 2;
-        const int sub = lane & 3;
-        const int scale_nibble =
-            (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
-        const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
-        const unsigned char sign_bits = signs[group * 4 + sub];
-        for (int lane_in = 0; lane_in < 8; ++lane_in) {
-            const int code_index = group * 8 + sub * 2 + lane_in / 4;
-            const int high_bit =
-                (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
-            const int code = (int)low_codes[code_index] | (high_bit << 8);
-            const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
-            const int grid_index = code * 4 + (lane_in & 3);
-            const float value = group_scale * (float)grid[grid_index] * (float)sign;
-            accumulator += value * input[block_index * 256 + group * 32 + sub * 8 + lane_in];
+        const float d = decode_f16((unsigned short)block[0] | ((unsigned short)block[1] << 8u));
+        const int scale_nibble_low =
+            (int)((scales[group_low / 2] >> ((group_low & 1) * 4)) & 0x0fu);
+        const int scale_nibble_high =
+            (int)((scales[group_low / 2 + 2] >> ((group_low & 1) * 4)) & 0x0fu);
+        const float group_scale_low = d * (1.0f + 2.0f * (float)scale_nibble_low);
+        const float group_scale_high = d * (1.0f + 2.0f * (float)scale_nibble_high);
+        const unsigned char sign_bits_low = signs[group_low * 4 + sub];
+        const unsigned char sign_bits_high = signs[group_low * 4 + sub + 16];
+        const int code_low = (int)low_codes[code_offset]
+            | ((int)((high_codes[code_byte] >> code_bit) & 1u) << 8);
+        const int code_high = (int)low_codes[code_offset + 32]
+            | ((int)((high_codes[code_byte + 4] >> code_bit) & 1u) << 8);
+        const unsigned int grid_low = *(const unsigned int*)(grid + code_low * 4);
+        const unsigned int grid_high = *(const unsigned int*)(grid + code_high * 4);
+        float value_low[4];
+        float value_high[4];
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float grid_value_low = (float)(int)((grid_low >> (8 * t)) & 0xffu);
+            const float grid_value_high = (float)(int)((grid_high >> (8 * t)) & 0xffu);
+            const int sign_low =
+                ((sign_bits_low >> (sign_shift + t)) & 1u) == 0u ? 1 : -1;
+            const int sign_high =
+                ((sign_bits_high >> (sign_shift + t)) & 1u) == 0u ? 1 : -1;
+            value_low[t] = group_scale_low * grid_value_low * (float)sign_low;
+            value_high[t] = group_scale_high * grid_value_high * (float)sign_high;
         }
+        const float4* row_input = (const float4*)(input + block_index * 256);
+        const float4 low = row_input[lane];
+        const float4 high = row_input[32 + lane];
+        accumulator += value_low[0] * low.x + value_low[1] * low.y
+            + value_low[2] * low.z + value_low[3] * low.w
+            + value_high[0] * high.x + value_high[1] * high.y
+            + value_high[2] * high.z + value_high[3] * high.w;
     }
     const float total = warp_sum(accumulator);
     if (lane == 0) {
@@ -154,6 +184,22 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
     // memory and serializes the member input loads.
     float acc[MAX_BATCH_MEMBERS] = {0.0f};
     const int blocks_per_output = input_size / 256;
+    // Each lane owns four consecutive activations in the low half of the
+    // block (elements `4*lane`) and four in the high half (elements
+    // `128 + 4*lane`). Both runs are 16-byte aligned, so one member's
+    // activations are two `float4` loads per lane and a warp load covers 512
+    // contiguous bytes; the strided byte-per-element form it replaced spent
+    // eight wavefronts per 1 KiB of activations on sector transactions alone.
+    // All four elements of a run share one grid code, so the codebook values
+    // are one aligned word load and the sign byte supplies four bits.
+    const int group_low = lane >> 3;
+    const int index = (lane & 7) * 4;
+    const int sub = (lane & 7) >> 1;
+    const int lane_in = (lane & 1) * 4;
+    const int code_offset = group_low * 8 + sub * 2 + (lane & 1);
+    const int code_byte = code_offset >> 3;
+    const int code_bit = code_offset & 7;
+    const int sign_shift = lane_in;
     for (int block_index = 0; block_index < blocks_per_output; ++block_index) {
         const unsigned char* block =
             weights + (row * blocks_per_output + block_index) * 110;
@@ -162,25 +208,45 @@ extern "C" __global__ void iq3_s_gemv_warp_batch(
         const unsigned char* high_codes = block + 66;
         const unsigned char* signs = block + 74;
         const unsigned char* scales = block + 106;
-        const int group = lane >> 2;
-        const int sub = lane & 3;
-        const int scale_nibble =
-            (int)((scales[group / 2] >> ((group & 1) * 4)) & 0x0fu);
-        const float group_scale = d * (1.0f + 2.0f * (float)scale_nibble);
-        const unsigned char sign_bits = signs[group * 4 + sub];
-        for (int lane_in = 0; lane_in < 8; ++lane_in) {
-            const int code_index = group * 8 + sub * 2 + lane_in / 4;
-            const int high_bit =
-                (int)((high_codes[code_index / 8] >> (code_index & 7)) & 1u);
-            const int code = (int)low_codes[code_index] | (high_bit << 8);
-            const int sign = ((sign_bits >> lane_in) & 1u) == 0u ? 1 : -1;
-            const int grid_index = code * 4 + (lane_in & 3);
-            const float value = group_scale * (float)grid[grid_index] * (float)sign;
-            #pragma unroll
-            for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
-                if (m < members) {
-                    acc[m] += value * input[(long long)m * input_size + block_index * 256 + group * 32 + sub * 8 + lane_in];
-                }
+        const int scale_nibble_low =
+            (int)((scales[group_low / 2] >> ((group_low & 1) * 4)) & 0x0fu);
+        const int scale_nibble_high =
+            (int)((scales[group_low / 2 + 2] >> ((group_low & 1) * 4)) & 0x0fu);
+        const float group_scale_low = d * (1.0f + 2.0f * (float)scale_nibble_low);
+        const float group_scale_high = d * (1.0f + 2.0f * (float)scale_nibble_high);
+        const unsigned char sign_bits_low = signs[group_low * 4 + sub];
+        const unsigned char sign_bits_high = signs[group_low * 4 + sub + 16];
+        const int code_low = (int)low_codes[code_offset]
+            | ((int)((high_codes[code_byte] >> code_bit) & 1u) << 8);
+        const int code_high = (int)low_codes[code_offset + 32]
+            | ((int)((high_codes[code_byte + 4] >> code_bit) & 1u) << 8);
+        const unsigned int grid_low = *(const unsigned int*)(grid + code_low * 4);
+        const unsigned int grid_high = *(const unsigned int*)(grid + code_high * 4);
+        float value_low[4];
+        float value_high[4];
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float grid_value_low = (float)(int)((grid_low >> (8 * t)) & 0xffu);
+            const float grid_value_high = (float)(int)((grid_high >> (8 * t)) & 0xffu);
+            const int sign_low =
+                ((sign_bits_low >> (sign_shift + t)) & 1u) == 0u ? 1 : -1;
+            const int sign_high =
+                ((sign_bits_high >> (sign_shift + t)) & 1u) == 0u ? 1 : -1;
+            value_low[t] = group_scale_low * grid_value_low * (float)sign_low;
+            value_high[t] = group_scale_high * grid_value_high * (float)sign_high;
+        }
+        const float* member_input = input + block_index * 256;
+        #pragma unroll
+        for (int m = 0; m < MAX_BATCH_MEMBERS; ++m) {
+            if (m < members) {
+                const float4* row_input =
+                    (const float4*)(member_input + (long long)m * input_size);
+                const float4 low = row_input[lane];
+                const float4 high = row_input[32 + lane];
+                acc[m] += value_low[0] * low.x + value_low[1] * low.y
+                    + value_low[2] * low.z + value_low[3] * low.w
+                    + value_high[0] * high.x + value_high[1] * high.y
+                    + value_high[2] * high.z + value_high[3] * high.w;
             }
         }
     }

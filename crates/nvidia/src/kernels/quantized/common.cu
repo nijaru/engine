@@ -1,28 +1,11 @@
+// IEEE binary16 to binary32. Every binary16 value is exactly representable
+// in binary32, so the single convert instruction is bit-identical to an
+// explicit sign/exponent/fraction expansion while avoiding the per-block
+// shift loop that dominated the 32-element block families.
 extern "C" __device__ __forceinline__ float decode_f16(unsigned short bits) {
-    const int sign = (bits & 0x8000u) != 0u ? -1 : 1;
-    const int exponent = (bits >> 10u) & 0x1fu;
-    const int fraction = bits & 0x03ffu;
-    if (exponent == 0) {
-        return (float)sign * ((float)fraction / 1024.0f) * 0.00006103515625f;
-    }
-    if (exponent == 31) {
-        if (fraction == 0) {
-            return sign > 0 ? __int_as_float(0x7f800000) : __int_as_float(0xff800000);
-        }
-        return __int_as_float(0x7fc00000);
-    }
-    float scale = 1.0f;
-    int shift = exponent - 15;
-    if (shift > 0) {
-        for (int i = 0; i < shift; ++i) {
-            scale *= 2.0f;
-        }
-    } else {
-        for (int i = 0; i > shift; --i) {
-            scale *= 0.5f;
-        }
-    }
-    return (float)sign * (1.0f + (float)fraction / 1024.0f) * scale;
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(bits));
+    return value;
 }
 
 extern "C" __device__ __forceinline__ int scale_value(const unsigned char* block, int group) {
@@ -46,4 +29,16 @@ __device__ __forceinline__ float warp_sum(float value) {
         value += __shfl_down_sync(0xffffffffu, value, offset);
     }
     return value;
+}
+
+// Four bytes of an encoded block as one word. The 256-element K-quant block
+// strides are 110 and 210 bytes, so a word inside a block is 4-byte aligned for
+// only half the rows: read the window as two halfwords instead of relying on a
+// `unsigned int` load that would fault on the odd rows.
+__device__ __forceinline__ unsigned int load_block_word(
+    const unsigned char* base,
+    int offset
+) {
+    const unsigned short* halves = (const unsigned short*)(base + offset);
+    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16u);
 }
