@@ -798,3 +798,78 @@ because it is reproducible across five prefill runs and two serving concurrencie
 because the bit-equality assertion it added protects the chunked-versus-serial property
 for every future kernel change. The evidence for this section is in
 `/home/nick/ribn-prefill-kernels-2026-09-13/` alongside the earlier two.
+
+## Chunk-parallel recurrent scan, 2026-09-13 (head `d1fb55d`)
+
+The row-blocking section left `gdn_state_update` at 16% of chunked prefill kernel
+time: 278.6 ms in 12,384 launches of 22.5 us, each launch 48 blocks of 128 threads
+with two 128-iteration dependent sweeps per thread. That launch count is forced by
+the semantics, not by the kernel: a prefill chunk's eight tokens are **one sequence**,
+so token `i`'s update consumes the matrix token `i-1` produced, and the lane has to
+serialize eight launches per layer-chunk. Arithmetic is not the cost (the family runs
+at about 23 GFLOP/s effective); the serial chain and the 48-block launches are.
+
+`crates/nvidia/tests/gdn_chunk_reference.rs` has validated the alternative since
+before this track started, explicitly "before a CUDA chunk kernel exists": the
+unit-lower-triangular chunk transform. This section is that kernel.
+
+### The change
+
+One launch per (layer, chunk), one warp per (v head, 32 value columns) — 48 x 4 = 192
+blocks of 32 threads. Per block: build the intra-chunk coefficients, solve
+`A * update = beta * (V - D_i * K^T S)` by forward substitution, fold the old state
+once, write the chunk's outputs, then decay and carry the state in one fused sweep.
+Three details are load-bearing:
+
+- **Decay is already exponentiated.** `gdn_scalar_gate` writes the per-token factor the
+  per-token kernel multiplies the state by, so every interval factor is a *product* of
+  those factors — never a ratio of cumulative sums, which would need a logarithm and
+  can underflow. A design review of the first draft caught this before any code ran.
+- **`decayed_keys` is unnecessary.** Both right-hand sides share the same triangular
+  system, so solving the combined right-hand side is the reference's two solved
+  systems subtracted.
+- **The scan is a different summation order** from the per-token recurrence, so it
+  cannot be bit-identical to it. That is why it is opt-in: `set_gdn_chunk_scan`,
+  `--gdn-chunk-scan` on the decode bench, and `RIBN_GDN_CHUNK_SCAN=1` on the
+  three-chunk gate. Nothing selects it by default.
+
+### Effect when selected
+
+| | before | after | |
+| --- | --- | --- | --- |
+| chunk-8 prefill | 1.819-1.826 s | 1.622-1.625 s | 1.12x |
+| `gdn_state_update` / `gdn_chunk_scan` | 278.6 ms, 12,384 launches | 75.2 ms, 1,536 launches | 3.7x |
+| per-launch | 22.5 us | 49.0 us | |
+
+The kernel is still latency-bound: 192 blocks of one warp is 1.5 warps per SM, and the
+49 us per launch is dominated by the two 128-iteration state sweeps with too few warps
+to overlap them. The design review's four-warp key-partition split (lanes on value
+columns, warps on key partitions, partial projections reduced through shared memory,
+carry writes distributed the same way) is the next lever; larger or smaller value tiles
+would idle lanes or shrink the grid.
+
+### Correctness
+
+| gate | scope | result |
+| --- | --- | --- |
+| `gdn_chunk_scan_matches_the_per_token_recurrence` | pinned geometry, chunk 1/5/8 | worst relative 7e-7 output, 3e-7 state; asserted at 1e-5 |
+| `gdn_chunk_scan_matches_a_double_precision_recurrence` | small geometry, two carried chunk launches | 7e-8 output, 8.4e-8 state against an f64 host recurrence |
+| serial prefill's 20-step log-probability table | 257-token prompt, scan selected | at most 8e-4 nats in the top-1/2 gap, 1.7e-3 nats in shared log-probs, all 20 chosen tokens identical |
+| `same_sequence_multi_chunk_prefill_matches_batch1_full_model` | 24 tokens, 64 layers, scan selected | **fails: 1.10e-2 against its 5.0e-3 tolerance** (chunk 1, row 6) |
+
+The last row is the finding that matters for adoption, and it is not a defect: 1.10e-2
+is the same order as the 6.2e-3 that a GEMV summation reordering produced at this same
+gate, so it is compound drift through 64 layers and a recurrent state that accumulates
+across tokens, not a wrong result. The kernel is right to 7e-7 per element and the
+token stream is unchanged; what changes is that the chunked lane's hidden states no
+longer sit inside a tolerance that was calibrated when chunked prefill was bit-identical
+to serial prefill. Selecting the scan therefore needs a decision this change does not
+make: re-derive that gate's tolerance with the measured drift as its evidence, qualify
+the lane against something other than the serial oracle, or leave the scan unwired. The
+gate now carries the switch that measures it either way.
+
+### Decision
+
+Landed unwired and opt-in, with its device gates green and its adoption blocker recorded
+rather than argued away. The default path is untouched: serial prefill, decode, the
+default chunked lane, and every other gate behave exactly as at `765f565`.
