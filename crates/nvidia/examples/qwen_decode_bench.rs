@@ -7,6 +7,10 @@
 //! uses by default, so the two modes can be compared on one build; `--tokens` and
 //! `--prompt-tokens` build a repeated prompt for timing.
 //!
+//! `--gemv=<scalar|warp|int-dot>` selects the quantized matrix-vector kernel family,
+//! which is where most prefill time goes; the profiles in
+//! `benchmarks/qwen-prefill-qualification.md` show the split.
+//!
 //! `--prompt-fixture=<path>` reads a reference fixture's prompt tokens instead, and
 //! `--logit-margins=N` prints the first `N` steps' top-five log-probabilities and
 //! top-1/top-2 margin, which is what a comparison against another engine's recorded
@@ -28,8 +32,8 @@ use engine_core::{
     RecurrentStateSpec,
 };
 use engine_nvidia::{
-    CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights, QwenLayerKind,
-    StagedTensorSource,
+    CudaHybridState, CudaQwen35BatchDecode, CudaQwen35Decode, CudaQwen35Weights, GemvMode,
+    QwenLayerKind, StagedTensorSource,
 };
 use engine_qwen::QwenGguf;
 
@@ -204,8 +208,18 @@ fn main() {
             .expect("physical hybrid state");
     state.zero().expect("zero state");
 
+    let gemv_mode = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--gemv="))
+        .map_or(GemvMode::default(), |value| match value {
+            "scalar" => GemvMode::Scalar,
+            "warp" => GemvMode::Warp,
+            "int-dot" => GemvMode::IntegerDot,
+            other => panic!("--gemv expects scalar, warp, or int-dot, got {other}"),
+        });
     let mut executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, EPS)
         .expect("build decode executor");
+    executor.set_gemv_mode(gemv_mode);
     let mut chunk_executor = prefill_chunk.map(|members| {
         CudaQwen35BatchDecode::from_decode(&executor, members)
             .unwrap_or_else(|error| panic!("invalid --prefill-chunk={members}: {error}"))
@@ -243,9 +257,12 @@ fn main() {
         print_logit_margins(0, chosen, &executor.copy_logits().expect("logits readback"));
     }
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
-    let prefill_mode = prefill_chunk.map_or_else(
-        || "serial batch-1 AR loop".to_owned(),
-        |members| format!("same-sequence chunks of {members}"),
+    let prefill_mode = format!(
+        "{} {gemv_mode:?}",
+        prefill_chunk.map_or_else(
+            || "serial batch-1 AR loop".to_owned(),
+            |members| format!("same-sequence chunks of {members}"),
+        )
     );
     println!(
         "prefill {} tokens in {prefill_seconds:.3} s ({:.3} s/token, {prefill_mode})",
