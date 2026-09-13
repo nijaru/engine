@@ -6,6 +6,7 @@
 //! intentionally outside this first local-directory pressure test.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +17,69 @@ use serde_json::Value;
 const CONFIG_FILE: &str = "config.json";
 const SINGLE_WEIGHTS: &str = "model.safetensors";
 const WEIGHT_INDEX: &str = "model.safetensors.index.json";
+const SNAPSHOTS_DIR: &str = "snapshots";
+const BLOBS_DIR: &str = "blobs";
+const REPOSITORY_PREFIX: &str = "models--";
+
+/// Where a local package's members may be resolved from.
+///
+/// A plain package directory confines every member to that directory. A Hugging
+/// Face cache snapshot directory additionally authorizes that repository's
+/// immutable `blobs` directory, because a cache snapshot is a symlink farm whose
+/// entries point at content-addressed blobs beside the `snapshots` directory.
+/// Nothing else outside the root is ever authorized, and the trusted shape is
+/// narrow on purpose: the root must be `<repository>/snapshots/<revision>` under a
+/// `models--` repository directory that contains a `blobs` directory.
+///
+/// Only the directories are trusted here, not the file names. A member still has
+/// to be reached through a relative path inside the package root and to name an
+/// existing regular file, so a snapshot cannot redirect the loader at arbitrary
+/// host files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MemberPolicy {
+    Directory(PathBuf),
+    Snapshot { snapshot: PathBuf, blobs: PathBuf },
+}
+
+impl MemberPolicy {
+    fn classify(root: PathBuf) -> Self {
+        let trusted_blobs = root
+            .parent()
+            .filter(|snapshots| snapshots.file_name() == Some(OsStr::new(SNAPSHOTS_DIR)))
+            .and_then(Path::parent)
+            .filter(|repository| {
+                repository
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(REPOSITORY_PREFIX))
+            })
+            .map(|repository| repository.join(BLOBS_DIR))
+            .filter(|blobs| blobs.is_dir());
+        match trusted_blobs {
+            Some(blobs) => Self::Snapshot {
+                snapshot: root,
+                blobs,
+            },
+            None => Self::Directory(root),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        match self {
+            Self::Directory(root) => root,
+            Self::Snapshot { snapshot, .. } => snapshot,
+        }
+    }
+
+    fn allows(&self, canonical: &Path) -> bool {
+        match self {
+            Self::Directory(root) => canonical.starts_with(root),
+            Self::Snapshot { snapshot, blobs } => {
+                canonical.starts_with(snapshot) || canonical.starts_with(blobs)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WeightLayout {
@@ -33,6 +97,7 @@ pub enum WeightLayout {
 /// to interpret; this layer does not turn architecture names into runtime types.
 pub struct LocalModelPackage {
     root: PathBuf,
+    members: MemberPolicy,
     config_path: PathBuf,
     config: Value,
     weights: Weights,
@@ -77,8 +142,9 @@ impl LocalModelPackage {
         if !canonical_root.is_dir() {
             return Err(PackageError::NotDirectory(canonical_root));
         }
+        let members = MemberPolicy::classify(canonical_root.clone());
 
-        let config_path = canonical_root.join(CONFIG_FILE);
+        let config_path = resolve_member(&members, Path::new(CONFIG_FILE), false)?;
         let config_bytes = fs::read(&config_path).map_err(|error| PackageError::Io {
             path: config_path.clone(),
             message: error.to_string(),
@@ -94,19 +160,17 @@ impl LocalModelPackage {
             ));
         }
 
-        let index_path = canonical_root.join(WEIGHT_INDEX);
-        let weights = if index_path.is_file() {
-            Weights::from_index(&canonical_root, index_path)?
-        } else {
-            let weights_path = canonical_root.join(SINGLE_WEIGHTS);
-            if !weights_path.is_file() {
-                return Err(PackageError::MissingWeights(canonical_root));
-            }
-            Weights::Single(weights_path)
+        let weights = match optional_member(&members, Path::new(WEIGHT_INDEX), true)? {
+            Some(index_path) => Weights::from_index(&members, index_path)?,
+            None => match optional_member(&members, Path::new(SINGLE_WEIGHTS), true)? {
+                Some(path) => Weights::Single(path),
+                None => return Err(PackageError::MissingWeights(canonical_root)),
+            },
         };
 
         Ok(Self {
             root: canonical_root,
+            members,
             config_path,
             config,
             weights,
@@ -184,14 +248,14 @@ impl LocalModelPackage {
         open_artifact(path)
     }
 
-    /// Resolve another file within the package root without assigning semantics
+    /// Resolve another file within the package without assigning semantics
     /// to tokenizer, processor, generation, chat-template, or modality metadata.
     ///
     /// # Errors
     /// Rejects absolute/parent paths and symlink escapes. A missing file returns
     /// [`PackageError::MissingPackageFile`].
     pub fn package_file(&self, relative: impl AsRef<Path>) -> Result<PathBuf, PackageError> {
-        resolve_member(&self.root, relative.as_ref(), false)
+        resolve_member(&self.members, relative.as_ref(), false)
     }
 }
 
@@ -261,7 +325,7 @@ fn open_artifact(path: &Path) -> Result<SafeTensorArtifact, PackageError> {
 }
 
 impl Weights {
-    fn from_index(root: &Path, index_path: PathBuf) -> Result<Self, PackageError> {
+    fn from_index(members: &MemberPolicy, index_path: PathBuf) -> Result<Self, PackageError> {
         let bytes = fs::read(&index_path).map_err(|error| PackageError::Io {
             path: index_path.clone(),
             message: error.to_string(),
@@ -293,7 +357,7 @@ impl Weights {
             let shard = value.as_str().ok_or(PackageError::InvalidWeightIndex(
                 "weight_map shard values must be strings",
             ))?;
-            let path = resolve_member(root, Path::new(shard), true)?;
+            let path = resolve_member(members, Path::new(shard), true)?;
             shards.insert(path.clone());
             resolved.insert(parameter.clone(), path);
         }
@@ -305,7 +369,12 @@ impl Weights {
     }
 }
 
-fn resolve_member(root: &Path, relative: &Path, shard: bool) -> Result<PathBuf, PackageError> {
+/// Resolve a member path, rejecting escapes and non-files.
+fn resolve_member(
+    members: &MemberPolicy,
+    relative: &Path,
+    shard: bool,
+) -> Result<PathBuf, PackageError> {
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative.components().any(|component| {
@@ -315,13 +384,9 @@ fn resolve_member(root: &Path, relative: &Path, shard: bool) -> Result<PathBuf, 
             )
         })
     {
-        return Err(if shard {
-            PackageError::UnsafeShardPath(relative.to_owned())
-        } else {
-            PackageError::UnsafePackagePath(relative.to_owned())
-        });
+        return Err(unsafe_member_path(relative, shard));
     }
-    let joined = root.join(relative);
+    let joined = members.root().join(relative);
     let canonical = fs::canonicalize(&joined).map_err(|error| {
         if shard {
             PackageError::MissingShard {
@@ -335,12 +400,8 @@ fn resolve_member(root: &Path, relative: &Path, shard: bool) -> Result<PathBuf, 
             }
         }
     })?;
-    if !canonical.starts_with(root) {
-        return Err(if shard {
-            PackageError::UnsafeShardPath(relative.to_owned())
-        } else {
-            PackageError::UnsafePackagePath(relative.to_owned())
-        });
+    if !members.allows(&canonical) {
+        return Err(unsafe_member_path(relative, shard));
     }
     if !canonical.is_file() {
         return Err(if shard {
@@ -356,6 +417,29 @@ fn resolve_member(root: &Path, relative: &Path, shard: bool) -> Result<PathBuf, 
         });
     }
     Ok(canonical)
+}
+
+/// Resolve a member that may legitimately be absent.
+fn optional_member(
+    members: &MemberPolicy,
+    relative: &Path,
+    shard: bool,
+) -> Result<Option<PathBuf>, PackageError> {
+    match resolve_member(members, relative, shard) {
+        Ok(path) => Ok(Some(path)),
+        Err(PackageError::MissingShard { .. } | PackageError::MissingPackageFile { .. }) => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unsafe_member_path(relative: &Path, shard: bool) -> PackageError {
+    if shard {
+        PackageError::UnsafeShardPath(relative.to_owned())
+    } else {
+        PackageError::UnsafePackagePath(relative.to_owned())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -434,10 +518,14 @@ impl std::error::Error for PackageError {}
 #[cfg(test)]
 mod tests {
     use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    const CONFIG_BYTES: &[u8] = br#"{"architectures":["FixtureEncoder"],"hidden_size":3}"#;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
@@ -492,11 +580,35 @@ mod tests {
     }
 
     fn write_config(root: &Path) {
-        fs::write(
-            root.join(CONFIG_FILE),
-            br#"{"architectures":["FixtureEncoder"],"hidden_size":3}"#,
-        )
-        .expect("config");
+        fs::write(root.join(CONFIG_FILE), CONFIG_BYTES).expect("config");
+    }
+
+    /// Build a Hugging Face cache repository the way `huggingface_hub` lays it out:
+    /// content-addressed blobs beside a snapshot directory of symlinks.
+    ///
+    /// Each member is `(blob name, snapshot name, bytes)`. Returns the snapshot a
+    /// caller would pass to [`LocalModelPackage::open`] and the canonical blobs
+    /// directory that its members are expected to resolve into.
+    #[cfg(unix)]
+    fn cache_repository(
+        root: &Path,
+        revision: &str,
+        members: &[(&str, &str, Vec<u8>)],
+    ) -> (PathBuf, PathBuf) {
+        let repository = root.join("models--acme--fixture");
+        let blobs = repository.join(BLOBS_DIR);
+        let snapshot = repository.join(SNAPSHOTS_DIR).join(revision);
+        fs::create_dir_all(&blobs).expect("blobs directory");
+        fs::create_dir_all(&snapshot).expect("snapshot directory");
+        for (blob, name, bytes) in members {
+            fs::write(blobs.join(blob), bytes).expect("blob");
+            symlink(
+                Path::new("..").join("..").join(BLOBS_DIR).join(blob),
+                snapshot.join(name),
+            )
+            .expect("snapshot symlink");
+        }
+        (snapshot, fs::canonicalize(&blobs).expect("canonical blobs"))
     }
 
     #[test]
@@ -626,6 +738,164 @@ mod tests {
         assert!(matches!(
             LocalModelPackage::open(dir.path()),
             Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new("../outside.safetensors")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinked_cache_snapshot_through_repository_blobs() {
+        let dir = TestDir::new();
+        let (snapshot, blobs) = cache_repository(
+            dir.path(),
+            "8f9a1c2d",
+            &[
+                ("blob-config", CONFIG_FILE, CONFIG_BYTES.to_vec()),
+                (
+                    "blob-weights",
+                    SINGLE_WEIGHTS,
+                    safetensors_fixture("embeddings.weight", &[1.0, 2.0, 3.0], &[1, 3]),
+                ),
+                ("blob-tokenizer", "tokenizer.json", b"{}\n".to_vec()),
+            ],
+        );
+
+        let package = LocalModelPackage::open(&snapshot).expect("snapshot package");
+        assert_eq!(package.root(), fs::canonicalize(&snapshot).expect("root"));
+        assert_eq!(package.config_path(), blobs.join("blob-config"));
+        assert!(matches!(
+            package.weight_layout(),
+            WeightLayout::Single { path } if path == blobs.join("blob-weights")
+        ));
+        let artifact = package
+            .open_weights_for("embeddings.weight")
+            .expect("artifact through the snapshot link");
+        assert!(artifact.tensor("embeddings.weight").is_ok());
+        assert_eq!(
+            package.package_file("tokenizer.json").expect("tokenizer"),
+            blobs.join("blob-tokenizer")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_sharded_cache_snapshot_through_repository_blobs() {
+        let dir = TestDir::new();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let index = format!(
+            r#"{{"metadata":{{"total_size":24}},"weight_map":{{"embeddings.weight":"{first}","projection.weight":"{second}"}}}}"#
+        );
+        let (snapshot, blobs) = cache_repository(
+            dir.path(),
+            "8f9a1c2d",
+            &[
+                ("blob-config", CONFIG_FILE, CONFIG_BYTES.to_vec()),
+                ("blob-index", WEIGHT_INDEX, index.into_bytes()),
+                (
+                    "blob-first",
+                    first,
+                    safetensors_fixture("embeddings.weight", &[1.0, 2.0, 3.0], &[1, 3]),
+                ),
+                (
+                    "blob-second",
+                    second,
+                    safetensors_fixture("projection.weight", &[4.0, 5.0, 6.0], &[1, 3]),
+                ),
+            ],
+        );
+
+        let package = LocalModelPackage::open(&snapshot).expect("sharded snapshot package");
+        let WeightLayout::Sharded {
+            shards,
+            parameter_count,
+            ..
+        } = package.weight_layout()
+        else {
+            panic!("expected sharded weights");
+        };
+        assert_eq!(parameter_count, 2);
+        assert_eq!(
+            shards,
+            vec![blobs.join("blob-first"), blobs.join("blob-second")]
+        );
+        let mut weights = package.weight_set();
+        assert!(weights.tensor("embeddings.weight").is_ok());
+        assert!(weights.tensor("projection.weight").is_ok());
+        assert_eq!(weights.opened_shard_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_snapshot_policy_still_rejects_links_outside_the_repository() {
+        let dir = TestDir::new();
+        let outside = dir.path().join("outside.safetensors");
+        fs::write(
+            &outside,
+            safetensors_fixture("embeddings.weight", &[1.0, 2.0, 3.0], &[1, 3]),
+        )
+        .expect("outside artifact");
+        let (snapshot, _) = cache_repository(
+            dir.path(),
+            "8f9a1c2d",
+            &[
+                ("blob-config", CONFIG_FILE, CONFIG_BYTES.to_vec()),
+                (
+                    "blob-weights",
+                    SINGLE_WEIGHTS,
+                    safetensors_fixture("embeddings.weight", &[1.0, 2.0, 3.0], &[1, 3]),
+                ),
+            ],
+        );
+        fs::write(dir.path().join("secret.json"), b"{}\n").expect("outside file");
+        symlink(
+            dir.path().join("secret.json"),
+            snapshot.join("tokenizer.json"),
+        )
+        .expect("escaping package link");
+
+        let package = LocalModelPackage::open(&snapshot).expect("snapshot package");
+        assert!(matches!(
+            package.package_file("tokenizer.json"),
+            Err(PackageError::UnsafePackagePath(path)) if path.as_path() == Path::new("tokenizer.json")
+        ));
+
+        // A weight member that escapes the repository is rejected while opening,
+        // so a package never exposes an authorized handle to an outside file.
+        let escaped = cache_repository(
+            dir.path(),
+            "0badc0de",
+            &[("blob-config", CONFIG_FILE, CONFIG_BYTES.to_vec())],
+        )
+        .0;
+        symlink(&outside, escaped.join(SINGLE_WEIGHTS)).expect("escaping weight link");
+        assert!(matches!(
+            LocalModelPackage::open(&escaped),
+            Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new(SINGLE_WEIGHTS)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_shaped_directories_that_are_not_cache_repositories_stay_confined() {
+        let dir = TestDir::new();
+        let outside = dir.path().join("outside.safetensors");
+        fs::write(
+            &outside,
+            safetensors_fixture("embeddings.weight", &[1.0, 2.0, 3.0], &[1, 3]),
+        )
+        .expect("outside artifact");
+
+        // Same directory shape as a cache snapshot, but the repository directory
+        // is not a `models--` cache entry, so only the directory itself is trusted.
+        let snapshot = dir.path().join("plain/snapshots/8f9a1c2d");
+        fs::create_dir_all(dir.path().join("plain/blobs")).expect("sibling blobs");
+        fs::create_dir_all(&snapshot).expect("snapshot directory");
+        write_config(&snapshot);
+        symlink(&outside, snapshot.join(SINGLE_WEIGHTS)).expect("escaping weight link");
+
+        assert!(matches!(
+            LocalModelPackage::open(&snapshot),
+            Err(PackageError::UnsafeShardPath(path)) if path.as_path() == Path::new(SINGLE_WEIGHTS)
         ));
     }
 }
