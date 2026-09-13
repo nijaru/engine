@@ -694,10 +694,105 @@ activation traffic rather than weight traffic: the next lever there is more weig
 rows per warp so each `float4` activation load feeds more than one output row. The
 recurrent scan (`gdn_state_update`, 14%) is the other qualified target. Attention is
 no longer a first-order item at 5.5% and 201 us per launch, and the launch is now
-latency-bound at 256 warps rather than bandwidth-bound.
+latency-bound at 256 warps rather than bandwidth-bound. *The row-blocking lever is
+taken up in the next section, which measures it at 1.10x of chunked prefill and records
+why four rows per warp and a shared-memory codebook both measure worse.*
 
 ### Decision
 
 Kernel-internal, like the batched-GEMV change: no scheduler, ownership, cancellation,
 or output-path behavior changed, and the gates see identical logits. Chunked prefill
 remains the default strategy for this path.
+
+## Batched GEMV row blocking, 2026-09-13 (head `f372a60`)
+
+The multi-row attention section left the eight batched GEMV families at 69% of chunked
+prefill kernel time. Their remaining traffic after the activation-access fix is the
+activation side: every output row streams all eight members' activations, so a
+5120x17408 chunk-8 launch requests roughly 2.8 GB of L1-resident activation reads
+against 47 MB of encoded weights, and none of it is deduplicated because each row
+reads the same members independently. Holding two weight rows in the same warp lets
+one member's `float4` loads feed both.
+
+### The change
+
+`MAX_BATCH_ROWS = 2` is internal to the batched kernels. A warp resolves two weight
+rows (`row_base = warp * 2`), decodes both rows' weights per block, and applies each
+member's two `float4` activation loads to both; the grid shrinks to
+`ceil(output_size / 2)` warps and the entry points the lanes call are unchanged. Each
+row's accumulation is the same expression it was, so a batched member row stays
+bit-identical to the batch-1 warp row.
+
+That identity is now asserted rather than observed: the per-family parity test compares
+`to_bits()` instead of allowing 1e-3. The chunked prefill lane is qualified against the
+serial path, and a batched kernel that merely approximated the batch-1 row would spend
+the model gates' 5e-3 tolerance silently, which is exactly what happened when the
+activation remapping first changed only the batched kernels.
+
+The API is also unchanged, and so is the numerical contract: serial prefill, decode,
+and the serial 20-step log-probability table are byte-identical to the previous head,
+and chunked and serial tables remain identical to each other.
+
+### Effect
+
+| | before | after | |
+| --- | --- | --- | --- |
+| chunk-8 prefill | 2.007-2.015 s | 1.817-1.828 s | 1.10x |
+| serving TTFT, concurrency 1 | 2.004 s | 1.828 s | 1.10x |
+| serving TTFT, concurrency 4 | 8.015 s | 7.264 s | 1.10x |
+| chunking against serial, concurrency 1 | 3.71x | 4.06x | |
+| serial prefill / decode / ITL | 7.427 s / 0.667 s / 33.5, 66.6 ms | unchanged | |
+
+Per family in the chunk-8 profile:
+
+| kernel | before | after | |
+| --- | --- | --- | --- |
+| `iq4_xs_gemv_warp_batch` | 433.8 ms | 365.6 ms | 1.19x |
+| `q5_k_gemv_warp_batch` | 410.4 ms | 330.3 ms | 1.24x |
+| `q4_k_gemv_warp_batch` | 301.0 ms | 256.2 ms | 1.17x |
+| `iq4_nl_gemv_warp_batch` | 40.4 ms | 31.3 ms | 1.29x |
+| `q6_k_gemv_warp_batch` | 39.3 ms | 37.7 ms | 1.04x |
+| `q3_k_gemv_warp_batch` | 30.2 ms | 28.6 ms | 1.06x |
+| `q8_0_gemv_warp_batch` | 91.6 ms | 114.4 ms | 0.80x |
+| `attn_score_gqa`, `gdn_state_update` | 109.5 / 278.0 ms | 109.6 / 278.6 ms | unchanged |
+
+### What the negative results say
+
+Three measurements constrain what is left in these kernels, and two of them are
+negative. Recording them matters more than the 10% above.
+
+- **Four rows per warp is worse, not better.** Prefill measures 2.46 s at
+  `MAX_BATCH_ROWS = 4` against 1.82 s at 2 and 2.01 s at 1. Driver-JIT register counts
+  (printable with `RIBN_LOG_KERNEL_ATTRS=1`, which is the only per-kernel resource view
+  this host allows because `ncu` counters need root) show 56-64 registers with no local
+  memory at two rows, so R=4 fits in registers; what it does not fit is occupancy, and
+  the kernel is latency-bound.
+- **A shared-memory codebook is worse than the local one.** `IQ4_XS`/`IQ4_NL` index
+  their 16-entry codebook dynamically, which puts it in local memory (16 bytes, the one
+  non-zero local count in the set). Eight bank-spread replicas in shared memory,
+  mirroring the integer-dot kernels, measured 1.86 s of prefill against 1.82 s and
+  `iq4_xs` 407.8 ms against 365.6 ms, so the local table stays.
+- **No single resource is saturated.** At two rows, `iq4_xs` issues about 37% of the
+  warp-instruction rate and 18% of the FP32 FMA rate available, with roughly half the
+  activation traffic it started from. The per-family gains are therefore below what
+  halving activation requests would give if L1 bandwidth were binding, and the honest
+  reading is that the remaining time is latency and per-element work rather than a
+  saturated pipe. Going further needs the occupancy and stall counters this host
+  refuses, or cheaper per-element arithmetic (`dp4a`-style integer dots) rather than
+  more amortization.
+
+`q8_0` is the one family that regresses. Its per-element work is the smallest in the
+set - one byte per element, so its decode is amortized over eight times fewer elements
+than the K-quants - and it is warp-count-bound; halving its warps costs more than the
+shared activation load saves. A per-family row count is the fix if that family grows in
+importance, and it needs the compile-time constant to become a per-family define, so it
+is deliberately not in this change.
+
+### Decision
+
+Kernel-internal again: no scheduler, ownership, cancellation, or output-path change,
+and the logits are unchanged in every way the gates can see. The 10% is worth keeping
+because it is reproducible across five prefill runs and two serving concurrencies, and
+because the bit-equality assertion it added protects the chunked-versus-serial property
+for every future kernel change. The evidence for this section is in
+`/home/nick/ribn-prefill-kernels-2026-09-13/` alongside the earlier two.
