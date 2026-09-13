@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -5,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
+use ribn_batch::{
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+};
 use ribn_foundation::{ParameterVersion, ScalarType};
 use ribn_hf::LocalModelPackage;
 
@@ -126,6 +129,7 @@ impl BatchExecutor for PackageEncoder {
     type Input = Vec<u32>;
     type Output = Vec<f32>;
     type Error = ModelError;
+    type Constraint = Infallible;
 
     fn parameter_version(&self) -> ParameterVersion {
         self.version
@@ -133,6 +137,18 @@ impl BatchExecutor for PackageEncoder {
 
     fn max_batch_items(&self) -> usize {
         8
+    }
+
+    fn select_batch(&self, candidates: &[&Self::Input]) -> BatchSelection<Self::Constraint> {
+        BatchSelection::Ready {
+            items: candidates.len(),
+        }
+    }
+
+    fn retained_bytes(&self, _input: &Self::Input) -> u64 {
+        u64::try_from(self.width)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
     }
 
     fn execute(
@@ -201,15 +217,19 @@ fn hf_package_metadata_and_weights_remain_separate_from_model_semantics() {
     let mut runtime = BatchRuntime::new(
         encoder,
         BatchConfig {
-            max_queued_requests: 8,
+            max_waiting_requests: 8,
+            ..BatchConfig::default()
         },
     )
     .expect("runtime");
     let request = runtime.submit(vec![0, 2]).expect("request");
-    assert!(runtime.step().expect("step"));
+    assert!(matches!(
+        runtime.step().expect("step"),
+        StepOutcome::Executed { results: 1 }
+    ));
     let result = runtime.pop_completed().expect("result");
     assert_eq!(result.request(), request);
     assert_eq!(result.parameter_version(), ParameterVersion::new(31));
-    assert_close(result.output(), &[0.5, 0.0, 0.5]);
+    assert_close(result.output().expect("result"), &[0.5, 0.0, 0.5]);
     assert!(package.package_file("tokenizer.json").is_ok());
 }

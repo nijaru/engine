@@ -7,7 +7,9 @@ use ribn::{
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId,
     StepCompletion, SubmissionId, TokenRequest,
 };
-use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
+use ribn_batch::{
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+};
 use ribn_foundation::ParameterVersion;
 
 type EncoderState = Arc<[u32]>;
@@ -18,6 +20,7 @@ impl BatchExecutor for Encoder {
     type Input = Vec<u32>;
     type Output = EncoderState;
     type Error = Infallible;
+    type Constraint = Infallible;
 
     fn parameter_version(&self) -> ParameterVersion {
         ParameterVersion::new(3)
@@ -25,6 +28,18 @@ impl BatchExecutor for Encoder {
 
     fn max_batch_items(&self) -> usize {
         4
+    }
+
+    fn select_batch(&self, candidates: &[&Self::Input]) -> BatchSelection<Self::Constraint> {
+        BatchSelection::Ready {
+            items: candidates.len(),
+        }
+    }
+
+    fn retained_bytes(&self, input: &Self::Input) -> u64 {
+        u64::try_from(input.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
     }
 
     fn execute(
@@ -209,15 +224,31 @@ fn sequential_encoder_state_is_correlated_by_request_identity_without_serializat
     let mut encoder = BatchRuntime::new(
         Encoder,
         BatchConfig {
-            max_queued_requests: 4,
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
         },
     )
     .expect("encoder runtime");
     encoder.submit(vec![3_u32, 30]).expect("first encode");
     encoder.submit(vec![7_u32, 70]).expect("second encode");
-    assert!(encoder.step().expect("encoder step"));
-    let first_state = Arc::clone(encoder.pop_completed().expect("first state").output());
-    let second_state = Arc::clone(encoder.pop_completed().expect("second state").output());
+    assert!(matches!(
+        encoder.step().expect("encoder step"),
+        StepOutcome::Executed { results: 2 }
+    ));
+    let first_state = Arc::clone(
+        encoder
+            .pop_completed()
+            .expect("first state")
+            .output()
+            .expect("first state output"),
+    );
+    let second_state = Arc::clone(
+        encoder
+            .pop_completed()
+            .expect("second state")
+            .output()
+            .expect("second state output"),
+    );
 
     let first_pointer = first_state.as_ptr() as usize;
     let second_pointer = second_state.as_ptr() as usize;

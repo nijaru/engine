@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt;
 
-use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
+use ribn_batch::{
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+};
 use ribn_foundation::ParameterVersion;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +33,25 @@ impl fmt::Display for EncoderError {
 }
 
 impl Error for EncoderError {}
+
+/// Why this fixture refuses to run a request under its own limits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchConstraint {
+    ExceedsTokenBudget { tokens: usize },
+}
+
+impl fmt::Display for BatchConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExceedsTokenBudget { tokens } => write!(
+                f,
+                "request of {tokens} tokens cannot fit the encoder token budget"
+            ),
+        }
+    }
+}
+
+impl Error for BatchConstraint {}
 
 /// Tiny reference encoder: embedding lookup followed by mean pooling.
 ///
@@ -87,6 +108,7 @@ impl BatchExecutor for ReferenceEncoder {
     type Input = Vec<u32>;
     type Output = [f32; 3];
     type Error = EncoderError;
+    type Constraint = BatchConstraint;
 
     fn parameter_version(&self) -> ParameterVersion {
         self.version
@@ -96,18 +118,30 @@ impl BatchExecutor for ReferenceEncoder {
         self.max_items
     }
 
-    fn select_batch(&self, candidates: &[&Self::Input]) -> usize {
-        let mut selected = 0;
+    fn select_batch(&self, candidates: &[&Self::Input]) -> BatchSelection<Self::Constraint> {
+        let head = candidates
+            .first()
+            .expect("the runtime never selects from an empty candidate set");
+        if head.len() > self.max_batch_tokens {
+            return BatchSelection::Rejected(BatchConstraint::ExceedsTokenBudget {
+                tokens: head.len(),
+            });
+        }
+        let mut items = 0;
         let mut tokens = 0_usize;
         for candidate in candidates {
             let next = tokens.saturating_add(candidate.len());
-            if selected > 0 && next > self.max_batch_tokens {
+            if items > 0 && next > self.max_batch_tokens {
                 break;
             }
             tokens = next;
-            selected += 1;
+            items += 1;
         }
-        selected
+        BatchSelection::Ready { items }
+    }
+
+    fn retained_bytes(&self, _input: &Self::Input) -> u64 {
+        u64::try_from(std::mem::size_of::<[f32; 3]>()).expect("fixed pooling width fits u64")
     }
 
     fn execute(
@@ -143,14 +177,18 @@ fn variable_length_encoder_inputs_batch_without_ar_semantics() {
     let mut runtime = BatchRuntime::new(
         ReferenceEncoder::fixture(8),
         BatchConfig {
-            max_queued_requests: 8,
+            max_waiting_requests: 8,
+            ..BatchConfig::default()
         },
     )
     .expect("runtime");
 
     let first = runtime.submit(vec![0, 1]).expect("first request");
     let second = runtime.submit(vec![2, 3, 0]).expect("second request");
-    assert!(runtime.step().expect("encoder batch"));
+    assert!(matches!(
+        runtime.step().expect("encoder batch"),
+        StepOutcome::Executed { results: 2 }
+    ));
 
     let first_output = runtime.pop_completed().expect("first output");
     let second_output = runtime.pop_completed().expect("second output");
@@ -158,8 +196,14 @@ fn variable_length_encoder_inputs_batch_without_ar_semantics() {
     assert_eq!(second_output.request(), second);
     assert_eq!(first_output.parameter_version(), ParameterVersion::new(11));
     assert_eq!(second_output.parameter_version(), ParameterVersion::new(11));
-    assert_close(*first_output.output(), [0.5, 0.5, 0.0]);
-    assert_close(*second_output.output(), [2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0]);
+    assert_close(
+        *first_output.output().expect("first output"),
+        [0.5, 0.5, 0.0],
+    );
+    assert_close(
+        *second_output.output().expect("second output"),
+        [2.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0],
+    );
 }
 
 #[test]
@@ -167,7 +211,8 @@ fn executor_informed_selection_respects_encoder_batch_cost() {
     let mut runtime = BatchRuntime::new(
         ReferenceEncoder::fixture(4),
         BatchConfig {
-            max_queued_requests: 8,
+            max_waiting_requests: 8,
+            ..BatchConfig::default()
         },
     )
     .expect("runtime");
@@ -175,14 +220,20 @@ fn executor_informed_selection_respects_encoder_batch_cost() {
     let first = runtime.submit(vec![0, 1, 2]).expect("first request");
     let second = runtime.submit(vec![3, 2, 1]).expect("second request");
 
-    assert!(runtime.step().expect("first encoder batch"));
+    assert!(matches!(
+        runtime.step().expect("first encoder batch"),
+        StepOutcome::Executed { results: 1 }
+    ));
     assert_eq!(runtime.queued(), 1);
     assert_eq!(
         runtime.pop_completed().expect("first output").request(),
         first
     );
 
-    assert!(runtime.step().expect("second encoder batch"));
+    assert!(matches!(
+        runtime.step().expect("second encoder batch"),
+        StepOutcome::Executed { results: 1 }
+    ));
     assert_eq!(runtime.queued(), 0);
     assert_eq!(
         runtime.pop_completed().expect("second output").request(),

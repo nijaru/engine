@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ribn_batch::{BatchConfig, BatchExecutor, BatchRuntime, Job, JobOutput};
+use ribn_batch::{
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome, Terminal,
+};
 use ribn_foundation::{ParameterVersion, ScalarType};
 use ribn_hf::{LocalModelPackage, LocalWeightSet, PackageError};
 use ribn_safetensors::ArtifactError;
@@ -58,6 +60,27 @@ impl fmt::Display for ModelError {
 }
 
 impl Error for ModelError {}
+
+/// Why this fixture refuses to run a request under its own limits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchConstraint {
+    /// One sequence alone cannot fit the executor's token budget, so waiting will
+    /// never make it runnable.
+    SequenceExceedsTokenBudget { tokens: usize, limit: usize },
+}
+
+impl fmt::Display for BatchConstraint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceExceedsTokenBudget { tokens, limit } => write!(
+                formatter,
+                "sequence of {tokens} tokens exceeds the BERT batch budget of {limit}"
+            ),
+        }
+    }
+}
+
+impl Error for BatchConstraint {}
 
 #[derive(Clone, Debug, PartialEq)]
 struct BertConfig {
@@ -750,6 +773,7 @@ impl BatchExecutor for BertReference {
     type Input = BertInput;
     type Output = BertOutput;
     type Error = ModelError;
+    type Constraint = BatchConstraint;
 
     fn parameter_version(&self) -> ParameterVersion {
         self.version
@@ -759,7 +783,16 @@ impl BatchExecutor for BertReference {
         self.max_batch_items
     }
 
-    fn select_batch(&self, candidates: &[&Self::Input]) -> usize {
+    fn select_batch(&self, candidates: &[&Self::Input]) -> BatchSelection<Self::Constraint> {
+        let head = candidates
+            .first()
+            .expect("the runtime never selects from an empty candidate set");
+        if head.token_ids.len() > self.max_batch_tokens {
+            return BatchSelection::Rejected(BatchConstraint::SequenceExceedsTokenBudget {
+                tokens: head.token_ids.len(),
+                limit: self.max_batch_tokens,
+            });
+        }
         let mut selected = 0_usize;
         let mut summed_tokens = 0_usize;
         let mut max_sequence = 0_usize;
@@ -783,7 +816,17 @@ impl BatchExecutor for BertReference {
                 break;
             }
         }
-        selected
+        BatchSelection::Ready { items: selected }
+    }
+
+    fn retained_bytes(&self, input: &Self::Input) -> u64 {
+        let hidden = u64::try_from(self.config.hidden_size).unwrap_or(u64::MAX);
+        let sequence = u64::try_from(input.token_ids.len()).unwrap_or(u64::MAX);
+        let mut bytes = sequence.saturating_mul(hidden).saturating_mul(4);
+        if self.pooler.is_some() {
+            bytes = bytes.saturating_add(hidden.saturating_mul(4));
+        }
+        bytes
     }
 
     fn execute(
@@ -1036,7 +1079,8 @@ fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
     let mut runtime = BatchRuntime::new(
         model,
         BatchConfig {
-            max_queued_requests: 4,
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
         },
     )
     .expect("runtime");
@@ -1046,15 +1090,19 @@ fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
     let second = runtime
         .submit(BertInput::new(vec![2]))
         .expect("second request");
-    assert!(runtime.step().expect("BERT batch"));
+    assert!(matches!(
+        runtime.step().expect("BERT batch"),
+        StepOutcome::Executed { results: 2 }
+    ));
 
     let first_output = runtime.pop_completed().expect("first output");
     assert_eq!(first_output.request(), first);
     assert_eq!(first_output.parameter_version(), ParameterVersion::new(41));
-    assert_eq!(first_output.output().sequence, 2);
-    assert_eq!(first_output.output().hidden, 4);
+    let first_output = first_output.output().expect("first output");
+    assert_eq!(first_output.sequence, 2);
+    assert_eq!(first_output.hidden, 4);
     assert_close(
-        &first_output.output().last_hidden_state,
+        &first_output.last_hidden_state,
         &[
             1.632_993_2,
             0.0,
@@ -1068,7 +1116,6 @@ fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
     );
     assert_close(
         first_output
-            .output()
             .pooled_output
             .as_deref()
             .expect("pooler output"),
@@ -1088,7 +1135,8 @@ fn bert_sequence_lengths_drive_executor_batch_selection() {
     let mut runtime = BatchRuntime::new(
         model,
         BatchConfig {
-            max_queued_requests: 4,
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
         },
     )
     .expect("runtime");
@@ -1099,11 +1147,17 @@ fn bert_sequence_lengths_drive_executor_batch_selection() {
     runtime
         .submit(BertInput::new(vec![1, 2]))
         .expect("second request");
-    assert!(runtime.step().expect("first batch"));
+    assert!(matches!(
+        runtime.step().expect("first batch"),
+        StepOutcome::Executed { .. }
+    ));
     assert_eq!(runtime.queued(), 1);
     assert!(runtime.pop_completed().is_some());
     assert!(runtime.pop_completed().is_none());
-    assert!(runtime.step().expect("second batch"));
+    assert!(matches!(
+        runtime.step().expect("second batch"),
+        StepOutcome::Executed { .. }
+    ));
     assert_eq!(runtime.queued(), 0);
 }
 
@@ -1136,6 +1190,62 @@ fn bert_attention_mask_makes_padding_semantically_inert_for_real_tokens() {
 }
 
 #[test]
+fn oversized_sequence_is_rejected_without_blocking_later_requests() {
+    let dir = TestDir::new();
+    write_bert_package(dir.path());
+    let package = LocalModelPackage::open(dir.path()).expect("package");
+    // A five-token budget cannot hold one six-token sequence, but it holds two
+    // two-token sequences, so the oversized head must fail on its own without
+    // stalling the work behind it.
+    let model = BertReference::load(&package, ParameterVersion::new(46), 4, 5).expect("BERT");
+    let mut runtime = BatchRuntime::new(
+        model,
+        BatchConfig {
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
+        },
+    )
+    .expect("runtime");
+
+    let oversized = runtime
+        .submit(BertInput::new(vec![0, 1, 2, 0, 1, 2]))
+        .expect("oversized request");
+    let first = runtime.submit(BertInput::new(vec![0, 1])).expect("first");
+    let second = runtime.submit(BertInput::new(vec![1, 2])).expect("second");
+
+    assert!(matches!(
+        runtime.step().expect("rejecting step"),
+        StepOutcome::Rejected { request } if request == oversized
+    ));
+    assert_eq!(runtime.queued(), 2, "later requests stay queued");
+
+    let rejection = runtime.pop_completed().expect("rejection entry");
+    assert_eq!(rejection.request(), oversized);
+    assert_eq!(rejection.retained_bytes(), 0);
+    assert!(matches!(
+        rejection.outcome(),
+        Terminal::Rejected(BatchConstraint::SequenceExceedsTokenBudget {
+            tokens: 6,
+            limit: 5
+        })
+    ));
+
+    assert!(matches!(
+        runtime.step().expect("later batch"),
+        StepOutcome::Executed { results: 2 }
+    ));
+    assert_eq!(runtime.queued(), 0);
+    assert_eq!(
+        runtime.pop_completed().expect("first output").request(),
+        first
+    );
+    assert_eq!(
+        runtime.pop_completed().expect("second output").request(),
+        second
+    );
+}
+
+#[test]
 fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
     let dir = TestDir::new();
     write_bert_package(dir.path());
@@ -1147,7 +1257,8 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
     let mut ragged_runtime = BatchRuntime::new(
         ragged,
         BatchConfig {
-            max_queued_requests: 4,
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
         },
     )
     .expect("ragged runtime");
@@ -1157,7 +1268,10 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
     ragged_runtime
         .submit(BertInput::new(vec![1, 2]))
         .expect("ragged second");
-    assert!(ragged_runtime.step().expect("ragged batch"));
+    assert!(matches!(
+        ragged_runtime.step().expect("ragged batch"),
+        StepOutcome::Executed { .. }
+    ));
     assert_eq!(ragged_runtime.queued(), 0);
 
     let padded = BertReference::load(&package, ParameterVersion::new(45), 4, 6)
@@ -1166,7 +1280,8 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
     let mut padded_runtime = BatchRuntime::new(
         padded,
         BatchConfig {
-            max_queued_requests: 4,
+            max_waiting_requests: 4,
+            ..BatchConfig::default()
         },
     )
     .expect("padded runtime");
@@ -1176,8 +1291,14 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
     padded_runtime
         .submit(BertInput::new(vec![1, 2]))
         .expect("padded second");
-    assert!(padded_runtime.step().expect("padded batch"));
+    assert!(matches!(
+        padded_runtime.step().expect("padded batch"),
+        StepOutcome::Executed { .. }
+    ));
     assert_eq!(padded_runtime.queued(), 1);
-    assert!(padded_runtime.step().expect("padded tail"));
+    assert!(matches!(
+        padded_runtime.step().expect("padded tail"),
+        StepOutcome::Executed { .. }
+    ));
     assert_eq!(padded_runtime.queued(), 0);
 }

@@ -191,25 +191,43 @@ The first two runtime families are deliberately different:
 
 The early variable-length reference encoder showed that request count alone is not
 enough to form a safe batch. The resulting `select_batch` hook deliberately exposes
-no universal cost unit: the executor sees its own inputs and returns a shorter FIFO
-prefix. Reordering, length bucketing, heterogeneous batching, and shared cost
-metadata remain unresolved until real workloads demonstrate that they belong in the
-common runtime.
+no universal cost unit: the executor sees its own inputs and returns either a FIFO
+prefix it can execute, a temporary block, or a rejected head request. Reordering,
+length bucketing, heterogeneous batching, and shared cost metadata remain
+unresolved until real workloads demonstrate that they belong in the common runtime.
+
+Admission has three distinct outcomes because "cannot fit right now" and "can never
+fit" need different handling. `Blocked` leaves the queue untouched and names the
+condition that must change before progress is possible; `Rejected` fails only the
+queue head and keeps later work moving. Neither is a runtime invariant failure, so a
+transient resource shortage cannot be mistaken for a broken executor.
+
+The runtime also accounts for waiting work and retained results separately. Waiting
+work is bounded by request count, while terminal entries the caller has not consumed
+are bounded by both a result count and a byte budget. `retained_bytes` lets the
+executor state what one retained output will hold, and the runtime reserves that
+before submitting work rather than discovering it afterwards. Batching is an
+optimization, so a selected batch shrinks to the largest prefix the retention budget
+can hold; the runtime reports `RetainedResults` or `RetainedOutputBytes` only when
+not even one request fits, which is the caller's signal to consume retained entries.
+Terminal rejections carry no payload and stay deliverable while the byte budget is
+exhausted. The byte budget is per runtime, so a deployment sharing one host or device
+pool across runtimes still needs one accounting authority per pool.
 
 The BERT architecture pressure test is the first substantially real model-semantic
 use of this path. It preserves the same executor-defined request/result boundary and
 runs actual BERT attention and feed-forward structure. Follow-up tests add attention
 masks and compare padded versus ragged batch cost: masked padding is semantically
 inert for real tokens, and the concrete executor can shorten a padded FIFO batch even
-when the same requests fit a ragged token budget. No new common batching abstraction
-was required. The next useful pressure comes from real device memory/compute
-admission, asynchronous execution and optimized kernels rather than another synthetic
-cost type.
+when the same requests fit a ragged token budget. A further test proves that a
+sequence exceeding the token budget is rejected as a request-local failure while the
+work behind it still executes. No new common batching abstraction was required. The
+next useful pressure comes from real device memory/compute admission, asynchronous
+execution and optimized kernels rather than another synthetic cost type.
 
 `ribn-batch` is not yet an embedding API or the final encoder scheduler. In
-particular, cancellation, asynchronous device execution, resource admission,
-per-request failures, padding/mask policy, and optimized device batching remain
-unfinished.
+particular, cancellation, asynchronous device execution, shared-pool accounting,
+padding/mask policy, and optimized device batching remain unfinished.
 
 Further runtime families should be introduced only when real execution regimes
 justify them. Iterative diffusion/flow work and full-duplex sessions are known
