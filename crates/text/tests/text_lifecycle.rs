@@ -12,7 +12,7 @@
 #![cfg(feature = "cuda")]
 
 use ribn::GenerationOptions;
-use ribn_text::{LoadOptions, TextInput, TextModel, TextRequest};
+use ribn_text::{FinishReason, LoadOptions, TextInput, TextModel, TextRequest};
 
 const DEFAULT_MODEL: &str = "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf";
 
@@ -103,27 +103,59 @@ fn repeated_abandonment_stays_bounded() {
     );
 }
 
-/// An input that fails to prepare must not strand the members already submitted,
-/// so a failing batch is retryable rather than poisoning the engine.
+/// An input that fails to prepare must fail the batch *before* anything is
+/// submitted, so no member is left running with no owner and the model stays
+/// usable.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
-fn an_unpreparable_batch_input_leaves_the_model_usable() {
+fn an_unpreparable_batch_input_fails_before_submitting_anything() {
     let mut model = load();
-    let vocabulary = u32::MAX;
-    let error = model
-        .generate_batch(vec![
-            TextRequest::new(TextInput::Prompt("first".to_owned()), options()),
-            TextRequest::new(TextInput::Tokens(vec![vocabulary]), options()),
-        ])
-        .expect_err("an out-of-range token must fail the batch");
-    eprintln!("unpreparable batch rejected with: {error}");
+    for attempt in 0..3 {
+        let error = model
+            .generate_batch(vec![
+                TextRequest::new(TextInput::Prompt("first".to_owned()), options()),
+                // Empty chat is rejected while preparing inputs, before enqueue.
+                TextRequest::new(TextInput::Chat(Vec::new()), options()),
+            ])
+            .expect_err("an empty chat input must fail the batch");
+        eprintln!("attempt {attempt} rejected with: {error}");
+    }
 
     let responses = model
         .generate_batch(vec![TextRequest::new(
             TextInput::Prompt("second attempt".to_owned()),
             options(),
         )])
-        .expect("retry after a rejected batch");
+        .expect("retry after rejected batches");
     assert_eq!(responses.len(), 1);
     assert!(!responses[0].tokens.is_empty());
+}
+
+/// A request whose input the executor rejects fails only itself: the other batch
+/// member still completes, and the model stays usable. This is the engine's
+/// request-local failure behavior seen through the facade, and it is why the
+/// facade must not treat a `Finished` reason as a batch-level error.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn an_invalid_token_fails_only_its_own_batch_member() {
+    let mut model = load();
+    let responses = model
+        .generate_batch(vec![
+            TextRequest::new(TextInput::Prompt("first".to_owned()), options()),
+            TextRequest::new(TextInput::Tokens(vec![u32::MAX]), options()),
+        ])
+        .expect("an invalid token is rejected per request, not per batch");
+    assert_eq!(responses.len(), 2);
+    assert!(!responses[0].tokens.is_empty(), "valid member generated");
+    assert!(
+        matches!(responses[1].reason, FinishReason::Failed(_)),
+        "invalid member reports a local failure: {:?}",
+        responses[1].reason
+    );
+    assert!(responses[1].tokens.is_empty());
+
+    let response = model
+        .generate("still serving", options())
+        .expect("model usable after a per-request failure");
+    assert!(!response.tokens.is_empty());
 }
