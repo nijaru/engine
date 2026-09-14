@@ -72,12 +72,8 @@ impl Output {
 
     pub(crate) fn credits(&self, id: OutputId) -> usize {
         let mailbox = self.mailboxes[id.0].as_ref().expect("live mailbox");
-        if mailbox.terminal {
+        if mailbox.terminal || mailbox.discarded {
             return 0;
-        }
-        if mailbox.discarded {
-            // Only terminal publication follows discard; it consumes no capacity.
-            return 1;
         }
         (self.limit - self.buffered - self.reserved)
             .min(self.per_request - mailbox.events.len() - mailbox.reserved)
@@ -101,17 +97,24 @@ impl Output {
         mailbox.reserved = 0;
     }
 
+    pub(crate) fn can_finish(&self, id: OutputId) -> bool {
+        let mailbox = self.mailboxes[id.0].as_ref().expect("live mailbox");
+        mailbox.discarded || self.credits(id) > 0
+    }
+
     pub(crate) fn push_to(&mut self, id: OutputId, event: Event) {
-        assert!(self.credits(id) > 0, "output exceeded its reservation");
-        let mailbox = self.mailboxes[id.0].as_mut().expect("live mailbox");
+        let mailbox = self.mailboxes[id.0].as_ref().expect("live mailbox");
         debug_assert_eq!(mailbox.request, event.request());
-        mailbox.terminal = matches!(event, Event::Finished { .. });
         if mailbox.discarded {
-            if mailbox.terminal {
-                self.reclaim(id.0);
-            }
+            // Discard also cancels execution. Only its settled terminal may arrive;
+            // it retires the mailbox without consuming delivery capacity.
+            assert!(matches!(event, Event::Finished { .. }));
+            self.reclaim(id.0);
             return;
         }
+        assert!(self.credits(id) > 0, "output exceeded its reservation");
+        let mailbox = self.mailboxes[id.0].as_mut().expect("live mailbox");
+        mailbox.terminal = matches!(event, Event::Finished { .. });
         mailbox.events.push_back(event);
         self.buffered += 1;
         self.link(id.0);
@@ -242,6 +245,8 @@ mod tests {
         let b_box = output.register(b);
         output.reserve(a_box, 3);
         output.discard(a);
+        assert_eq!(output.credits(a_box), 0);
+        assert!(output.can_finish(a_box));
         assert_eq!(output.credits(b_box), 1);
         assert_eq!(output.reserved, 3);
         output.unreserve(a_box);

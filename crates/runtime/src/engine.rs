@@ -468,7 +468,7 @@ impl Engine {
                 .pop_front()
                 .expect("terminal queue was nonempty");
             let sequence = self.slots[index].as_mut().expect("terminal slot exists");
-            if !sequence.notified && self.output.credits(sequence.output) > 0 {
+            if !sequence.notified && self.output.can_finish(sequence.output) {
                 self.output.push_to(
                     sequence.output,
                     Event::Finished {
