@@ -282,6 +282,18 @@ impl Engine {
         Ok(())
     }
 
+    /// Cancel execution and permanently relinquish this request's output.
+    ///
+    /// Idempotent, including after its execution slot or terminal mailbox has been
+    /// reclaimed. In-flight resources remain owned until completion or shutdown;
+    /// this operation neither drives execution nor synchronizes the device.
+    pub fn discard(&mut self, request: RequestId) {
+        // A reclaimed execution identity may still have an undrained mailbox.
+        // UnknownRequest is the only cancellation error and is harmless here.
+        let _ = self.cancel(request);
+        self.output.discard(request);
+    }
+
     /// Drain ready requests round-robin, preserving each request's event order.
     pub fn pop_event(&mut self) -> Option<Event> {
         self.output.pop()

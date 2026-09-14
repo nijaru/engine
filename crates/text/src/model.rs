@@ -68,11 +68,6 @@ pub struct TextModel {
     tokenizer: GgufTokenizer,
     engine: Engine,
     memory: MemoryReport,
-    /// Requests whose streams were dropped. Cancellation is intent rather than
-    /// completion, so an in-flight request may have no terminal event yet; the
-    /// next call that drives the runtime reclaims these instead of leaving a
-    /// mailbox that still holds output capacity.
-    discarded: Vec<RequestId>,
 }
 
 impl TextModel {
@@ -103,7 +98,6 @@ impl TextModel {
             tokenizer,
             engine,
             memory,
-            discarded: Vec::new(),
         })
     }
 
@@ -139,7 +133,6 @@ impl TextModel {
         input: TextInput,
         mut options: GenerationOptions,
     ) -> Result<TextStream<'_>, TextError> {
-        self.reclaim_discarded();
         let tokens = encode_input(&self.tokenizer, input)?;
         if !options.stop_tokens.contains(&self.tokenizer.eos_token_id()) {
             options.stop_tokens.push(self.tokenizer.eos_token_id());
@@ -217,7 +210,6 @@ impl TextModel {
             }
             prepared.push((tokens, options));
         }
-        self.reclaim_discarded();
 
         let mut responses = Vec::with_capacity(prepared.len());
         let mut positions = HashMap::with_capacity(prepared.len());
@@ -225,7 +217,9 @@ impl TextModel {
             let id = match self.engine.enqueue(TokenRequest::new(tokens, options)) {
                 Ok(id) => id,
                 Err(error) => {
-                    self.cancel_batch(positions.keys().copied());
+                    for id in positions.keys().copied() {
+                        self.engine.discard(id);
+                    }
                     return Err(TextError::from_display(error));
                 }
             };
@@ -233,13 +227,28 @@ impl TextModel {
             responses.push(BatchResponse::default());
         }
 
+        let result = self.collect_batch(&positions, &mut responses);
+        // Every exit relinquishes delivery, including step and decoding failures.
+        // The runtime retains physical retirement ownership independently.
+        for id in positions.keys().copied() {
+            self.engine.discard(id);
+        }
+        result?;
+        responses.into_iter().map(BatchResponse::finish).collect()
+    }
+
+    fn collect_batch(
+        &mut self,
+        positions: &HashMap<RequestId, usize>,
+        responses: &mut [BatchResponse],
+    ) -> Result<(), TextError> {
         let mut remaining = responses.len();
         while remaining > 0 {
             let status = self.engine.step().map_err(TextError::from_display)?;
             // Drain only this batch's requests: the engine's global drain also
             // returns events other callers own, and a batch must never
             // interpret another request's output.
-            for (&id, &index) in &positions {
+            for (&id, &index) in positions {
                 let response = &mut responses[index];
                 while let Some(event) = self.engine.pop_event_for(id) {
                     match event {
@@ -268,64 +277,7 @@ impl TextModel {
             }
         }
 
-        responses
-            .into_iter()
-            .map(BatchResponse::finish)
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Discard this request's buffered events, reporting whether its terminal
-    /// event was delivered.
-    fn drain_events(&mut self, request: RequestId) -> bool {
-        let mut terminal = false;
-        while let Some(event) = self.engine.pop_event_for(request) {
-            terminal |= matches!(event, Event::Finished { .. });
-        }
-        terminal
-    }
-
-    /// Cancel a request and take responsibility for its undrained mailbox.
-    /// Cancellation is intent rather than completion, so an in-flight request is
-    /// remembered until a later step delivers its terminal event. Leaving it
-    /// unowned instead would keep output capacity reserved and prevent
-    /// `flush_terminals` from reclaiming the request slot.
-    fn discard(&mut self, request: RequestId) {
-        if let Err(EngineError::UnknownRequest(_)) = self.engine.cancel(request) {
-            return;
-        }
-        if !self.drain_events(request) {
-            self.discarded.push(request);
-        }
-    }
-
-    /// Reclaim dropped streams whose terminal event has now been delivered.
-    fn reclaim_discarded(&mut self) {
-        if self.discarded.is_empty() {
-            return;
-        }
-        // Cancellation completes when the runtime observes it. A step error is
-        // irrelevant here: the discarded request's outcome is already abandoned,
-        // and a sticky fault still surfaces through the caller's own request.
-        let _ = self.engine.step();
-        let pending = std::mem::take(&mut self.discarded);
-        for request in pending {
-            if !self.drain_events(request) {
-                self.discarded.push(request);
-            }
-        }
-    }
-
-    fn cancel_batch(&mut self, requests: impl IntoIterator<Item = RequestId>) {
-        let requests = requests.into_iter().collect::<Vec<_>>();
-        for request in &requests {
-            let _ = self.engine.cancel(*request);
-        }
-        // This path runs only before batch execution starts, so cancellation is
-        // immediate. Drive terminal bookkeeping and discard cancellation events.
-        let _ = self.engine.step();
-        for request in requests {
-            while self.engine.pop_event_for(request).is_some() {}
-        }
+        Ok(())
     }
 
     fn complete(
@@ -421,11 +373,19 @@ impl Iterator for TextStream<'_> {
                     Event::Token { token, .. } => {
                         let bytes = match self.model.tokenizer.decode_bytes(&[token]) {
                             Ok(bytes) => bytes,
-                            Err(error) => return Some(Err(TextError::from_display(error))),
+                            Err(error) => {
+                                self.model.engine.discard(self.request);
+                                self.finished = true;
+                                return Some(Err(TextError::from_display(error)));
+                            }
                         };
                         let text = match self.decoder.push(&bytes) {
                             Ok(text) => text,
-                            Err(error) => return Some(Err(error)),
+                            Err(error) => {
+                                self.model.engine.discard(self.request);
+                                self.finished = true;
+                                return Some(Err(error));
+                            }
                         };
                         return Some(Ok(TextEvent::Delta {
                             token: Some(token),
@@ -453,6 +413,7 @@ impl Iterator for TextStream<'_> {
                     }
                 }
                 Err(error) => {
+                    self.model.engine.discard(self.request);
                     self.finished = true;
                     return Some(Err(TextError::from_display(error)));
                 }
@@ -464,7 +425,7 @@ impl Iterator for TextStream<'_> {
 impl Drop for TextStream<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.model.discard(self.request);
+            self.model.engine.discard(self.request);
         }
     }
 }

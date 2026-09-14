@@ -1,22 +1,7 @@
-//! Abandoned-request cleanup at the engine boundary.
-//!
-//! A streaming frontend can drop a request before it finishes. Ribn's contract is
-//! that cancellation records intent, not completion, and that a request's mailbox
-//! outlives its execution slot until its terminal event is delivered. A frontend
-//! that cancels without draining therefore leaves a mailbox holding output
-//! capacity, and `flush_terminals` cannot reclaim the request without it.
-//!
-//! These tests pin the two engine properties the text facade depends on, because
-//! the facade cannot test them itself without a device:
-//!
-//! - a cancelled request's terminal event arrives through `pop_event_for`, and
-//!   draining it reclaims both mailbox and request slot;
-//! - the global `pop_event` drain can hand back a request another caller owns
-//!   (here: an abandoned one), which is why a batch must drain per request rather
-//!   than route the global drain through its own request map.
-//!
-//! They are lifecycle tests over the public contract; they are not numerical
-//! model qualification and they do not exercise a real device.
+//! Runtime-owned abandonment. Cancellation preserves output; discard relinquishes
+//! present and future delivery while retaining device retirement ownership.
+//! Mailboxes can outlive execution slots, so discard cannot rely on cancellation
+//! succeeding. These host contract tests do not qualify a device or text decoder.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +16,7 @@ use ribn::{
 struct Control {
     batches: Vec<Vec<BatchItem>>,
     released: Vec<SequenceId>,
+    blocked: bool,
 }
 
 /// Minimal single-batch executor: it completes one step behind submission so a
@@ -91,10 +77,14 @@ impl GenerationExecutor for Model {
         let Some(batch) = self.pending.take() else {
             return Ok(None);
         };
+        let blocked = self.control.lock().unwrap().blocked;
         Ok(Some(
             batch
                 .iter()
                 .map(|item| {
+                    if blocked {
+                        return StepOutcome::Blocked(item.sequence);
+                    }
                     StepOutcome::Progress(StepCompletion {
                         sequence: item.sequence,
                         prefix: item.prefix + item.token_budget,
@@ -144,10 +134,88 @@ fn options() -> GenerationOptions {
     GenerationOptions::default()
 }
 
-/// A cancelled request that its owner never drains keeps a mailbox alive; draining
-/// the terminal event reclaims the mailbox and the request slot.
 #[test]
-fn an_abandoned_request_is_reclaimed_only_after_its_terminal_event_is_drained() {
+fn discard_reclaims_a_terminal_mailbox_after_the_execution_slot_is_gone() {
+    let (mut engine, _) = engine();
+    let request = engine
+        .enqueue(TokenRequest::new(vec![1], options()))
+        .unwrap();
+    engine.cancel(request).unwrap();
+    engine.step().unwrap();
+    assert_eq!(engine.status().requests, 0);
+    assert_eq!(engine.status().buffered_events, 1);
+    assert!(matches!(
+        engine.cancel(request),
+        Err(EngineError::UnknownRequest(_))
+    ));
+    engine.discard(request);
+    engine.discard(request);
+    assert_eq!(engine.status().buffered_events, 0);
+    assert!(engine.pop_event().is_none());
+}
+
+#[test]
+fn discard_in_flight_preserves_resources_and_healthy_peer_output() {
+    let (mut engine, control) = engine();
+    let abandoned = engine
+        .enqueue(TokenRequest::new(vec![1], options()))
+        .unwrap();
+    let peer = engine
+        .enqueue(TokenRequest::new(vec![2], options()))
+        .unwrap();
+    engine.step().unwrap();
+    engine.discard(abandoned);
+    assert!(control.lock().unwrap().released.is_empty());
+    assert_eq!(engine.status().active_sequences, 2);
+    let events = drain(&mut engine, peer);
+    assert!(matches!(
+        events.last(),
+        Some(Event::Finished {
+            reason: FinishReason::Length,
+            ..
+        })
+    ));
+    assert!(engine.pop_event_for(abandoned).is_none());
+    assert_eq!(engine.status().buffered_events, 0);
+    assert_eq!(engine.status().requests, 0);
+    assert_eq!(control.lock().unwrap().released.len(), 2);
+}
+
+#[test]
+fn discard_survives_a_blocked_in_flight_completion() {
+    let (mut engine, control) = engine();
+    let request = engine
+        .enqueue(TokenRequest::new(vec![1], options()))
+        .unwrap();
+    control.lock().unwrap().blocked = true;
+    engine.step().unwrap();
+    engine.discard(request);
+    let status = engine.step().unwrap();
+    assert!(status.completed);
+    assert!(!status.submitted);
+    assert_eq!(engine.status().requests, 0);
+    assert_eq!(engine.status().active_sequences, 0);
+    assert_eq!(engine.status().buffered_events, 0);
+    assert_eq!(control.lock().unwrap().released.len(), 1);
+}
+
+#[test]
+fn repeated_discard_without_draining_does_not_retain_events() {
+    let (mut engine, _) = engine();
+    for _ in 0..1024 {
+        let request = engine
+            .enqueue(TokenRequest::new(vec![1], options()))
+            .unwrap();
+        engine.discard(request);
+        engine.step().unwrap();
+        assert_eq!(engine.status().requests, 0);
+        assert_eq!(engine.status().buffered_events, 0);
+    }
+}
+
+/// Cancellation preserves output until the owner drains or discards it.
+#[test]
+fn cancellation_preserves_its_terminal_event_for_the_owner() {
     let (mut engine, _control) = engine();
     let abandoned = engine
         .enqueue(TokenRequest::new(vec![1, 2, 3], options()))
@@ -159,8 +227,8 @@ fn an_abandoned_request_is_reclaimed_only_after_its_terminal_event_is_drained() 
     engine.step().expect("second step");
     engine.cancel(abandoned).expect("cancel");
 
-    // Cancellation is intent: the request is still addressable until its terminal
-    // event is delivered, which is what keeps its mailbox owned rather than leaked.
+    // Cancellation is intent: this submission has not completed yet, so its
+    // execution slot is still addressable independently of mailbox consumption.
     assert!(
         engine.cancel(abandoned).is_ok(),
         "an undrained cancellation stays addressable"

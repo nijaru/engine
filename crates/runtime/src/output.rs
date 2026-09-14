@@ -14,6 +14,7 @@ struct Mailbox {
     events: VecDeque<Event>,
     reserved: usize,
     terminal: bool,
+    discarded: bool,
     linked: bool,
     prev: Option<usize>,
     next: Option<usize>,
@@ -56,6 +57,7 @@ impl Output {
             events: VecDeque::with_capacity(self.per_request.min(4)),
             reserved: 0,
             terminal: false,
+            discarded: false,
             linked: false,
             prev: None,
             next: None,
@@ -72,6 +74,10 @@ impl Output {
         let mailbox = self.mailboxes[id.0].as_ref().expect("live mailbox");
         if mailbox.terminal {
             return 0;
+        }
+        if mailbox.discarded {
+            // Only terminal publication follows discard; it consumes no capacity.
+            return 1;
         }
         (self.limit - self.buffered - self.reserved)
             .min(self.per_request - mailbox.events.len() - mailbox.reserved)
@@ -100,6 +106,12 @@ impl Output {
         let mailbox = self.mailboxes[id.0].as_mut().expect("live mailbox");
         debug_assert_eq!(mailbox.request, event.request());
         mailbox.terminal = matches!(event, Event::Finished { .. });
+        if mailbox.discarded {
+            if mailbox.terminal {
+                self.reclaim(id.0);
+            }
+            return;
+        }
         mailbox.events.push_back(event);
         self.buffered += 1;
         self.link(id.0);
@@ -124,6 +136,29 @@ impl Output {
         self.pop_index(index)
     }
 
+    /// Suppress present and future delivery without relinquishing reservations
+    /// belonging to an in-flight submission. Terminal publication retires the box.
+    pub(crate) fn discard(&mut self, request: RequestId) {
+        let Some(&index) = self.requests.get(&request) else {
+            return;
+        };
+        self.unlink(index);
+        let mailbox = self.mailboxes[index].as_mut().expect("live mailbox");
+        self.buffered -= mailbox.events.len();
+        mailbox.events.clear();
+        mailbox.discarded = true;
+        if mailbox.terminal {
+            self.reclaim(index);
+        }
+    }
+
+    fn reclaim(&mut self, index: usize) {
+        let mailbox = self.mailboxes[index].take().expect("terminal mailbox");
+        assert!(mailbox.events.is_empty() && mailbox.reserved == 0 && !mailbox.linked);
+        self.requests.remove(&mailbox.request);
+        self.free.push(index);
+    }
+
     fn pop_index(&mut self, index: usize) -> Option<Event> {
         let mailbox = self.mailboxes[index].as_mut().expect("live mailbox");
         let event = mailbox.events.pop_front()?;
@@ -132,10 +167,7 @@ impl Output {
             self.unlink(index);
         }
         if matches!(event, Event::Finished { .. }) {
-            let mailbox = self.mailboxes[index].take().expect("terminal mailbox");
-            assert!(mailbox.events.is_empty() && mailbox.reserved == 0);
-            self.requests.remove(&mailbox.request);
-            self.free.push(index);
+            self.reclaim(index);
         }
         Some(event)
     }
@@ -199,6 +231,59 @@ mod tests {
             reason: FinishReason::Length,
             usage: Usage::default(),
         }
+    }
+
+    #[test]
+    fn discard_retains_in_flight_credits_until_settlement() {
+        let mut output = Output::new(4, 4, 2);
+        let a = RequestId(1);
+        let b = RequestId(2);
+        let a_box = output.register(a);
+        let b_box = output.register(b);
+        output.reserve(a_box, 3);
+        output.discard(a);
+        assert_eq!(output.credits(b_box), 1);
+        assert_eq!(output.reserved, 3);
+        output.unreserve(a_box);
+        output.push_to(a_box, finish(a));
+        assert_eq!(output.credits(b_box), 4);
+        assert!(!output.requests.contains_key(&a));
+        assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn discarded_terminal_does_not_need_capacity_held_by_a_peer() {
+        let mut output = Output::new(2, 2, 2);
+        let abandoned = RequestId(1);
+        let peer = RequestId(2);
+        let abandoned_box = output.register(abandoned);
+        output.register(peer);
+        output.push(token(peer, 1));
+        output.push(token(peer, 2));
+        output.discard(abandoned);
+        output.push_to(abandoned_box, finish(abandoned));
+        assert_eq!(output.len(), 2);
+        assert!(!output.requests.contains_key(&abandoned));
+        assert_eq!(output.pop(), Some(token(peer, 1)));
+        assert_eq!(output.pop(), Some(token(peer, 2)));
+    }
+
+    #[test]
+    fn discard_unlinks_ready_mailboxes_without_changing_peer_order() {
+        let mut output = Output::new(8, 4, 3);
+        let ids = [RequestId(1), RequestId(2), RequestId(3)];
+        for id in ids {
+            output.register(id);
+            output.push(token(id, 7));
+            output.push(finish(id));
+        }
+        output.discard(ids[1]);
+        output.discard(ids[0]);
+        assert_eq!(output.pop(), Some(token(ids[2], 7)));
+        assert_eq!(output.pop(), Some(finish(ids[2])));
+        assert!(output.requests.is_empty());
+        assert!(output.head.is_none() && output.tail.is_none());
+        assert_eq!(output.len(), 0);
     }
 
     #[test]

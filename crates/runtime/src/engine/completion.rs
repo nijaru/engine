@@ -58,11 +58,14 @@ impl Engine {
                 RowPlan::Commit(row) => self.commit_row(index, row),
                 RowPlan::Blocked => {
                     blocked += 1;
-                    // The sequence stays runnable in the phase it was scheduled
-                    // for. It made no commitment, so nothing is rolled back.
                     let sequence = self.slots[index]
                         .as_mut()
                         .expect("validated completion slot");
+                    if sequence.work == WorkState::Cancelling {
+                        self.terminate(index, FinishReason::Cancelled);
+                        continue;
+                    }
+                    // The settled submission no longer accesses the sequence.
                     sequence.work = WorkState::Idle;
                     match kind {
                         StepKind::Prefill => self.prefill.push_back(index),
