@@ -67,6 +67,13 @@ request-scoped prepared state be correlated without turning `TokenRequest` into 
 generic multimodal payload container. Those AR contracts are still not intended as
 universal interfaces for every inference workload.
 
+`ribn::driver` adds a low-level owned token interface: one execution worker, cloneable
+handles, bounded request permits and streams, and explicit shutdown/retry. Blocking
+and async access use the same engine. The driver is host-tested but **not yet
+GPU-qualified**; it does not replace the current borrowed text facade or bound raw
+text preprocessing. See its [contract](docs/resource-protocol.md#owned-ar-driver-contract)
+and [qualification](benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
+
 `crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
 encoder/pooling-style batching. Its inputs and outputs are executor-defined and it
 contains no token/prefix/KV concepts. A variable-length reference encoder showed

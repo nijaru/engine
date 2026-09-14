@@ -130,6 +130,50 @@ against the pinned Qwen artifact on the RTX 4090:
 process exit. Kernel arithmetic was unchanged. These gates do not qualify concurrent
 handles, readiness, a real VLM, or the still-opt-in GDN scan.
 
+### Owned token driver host gate (`7005fad`)
+
+The first driver increment adds owned token streams, not a concurrent text/model API.
+The 19 tests in `crates/runtime/src/driver/tests.rs` cover independent callers, stalled
+consumers, retained terminal permits, stop-vector capacity, invalid configuration,
+enqueue rejection, cancellation under saturated admission, cancellation without a
+device batch, dropped submission/next futures, failed sync/release, shutdown retry,
+cancelled shutdown futures, owner drop and worker panic.
+
+Mutation checks observed exit 101, then pass with the mechanism restored:
+
+- `abandoned_in_flight_requests_keep_their_admission_charge_until_retirement`: remove
+  the runtime's private retention guard; a discarded route returns its permit while
+  its sequence still retains input/options storage.
+- `output_credit_return_between_check_and_park_is_not_lost`: omit consumption's wakeup;
+  the test pauses the worker after its condition check and before sleep, returns a
+  credit, then stalls at its three-second deadline (poll fallback is 60 seconds).
+- `queued_submission_and_shutdown_acknowledgements_are_dropped_on_worker_panic`: omit
+  exit's explicit queue drain; queued acknowledgement senders survive disconnection
+  and the awaiting client hits its three-second deadline.
+
+Required host checks, including CUDA-feature clippy, exited 0. The 19 driver tests
+passed 100 consecutive suite runs. These tests exercise the actual driver, not a
+separate scheduling simulation. No model arithmetic changed.
+[Matched direct/driver measurements](runtime-alignment/README.md#owned-token-driver-7005fad)
+record the observed host cost and raw CSV, not inference throughput.
+
+**Device gate pending:** desktop qualification and checkout synchronization could not
+run because Tailscale was stopped and `ssh desktop` failed hostname resolution.
+`owned_driver_preserves_reference_with_stalled_and_abandoned_peers` in the existing
+Qwen CUDA runtime test is compiled but unrun. Do not infer GPU qualification from host
+success. Once desktop is idle/reachable, run both runtime gates serialized:
+
+```sh
+RIBN_MODEL=/path/to/pinned/model.gguf \
+RIBN_REFERENCE=$(pwd)/crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens \
+cargo test --release -p engine-qwen --features cuda --test cuda_runtime --locked \
+  -- --ignored --test-threads=1
+```
+
+Text preprocessing/decoder injection, a bounded concurrent text facade and ordered
+incremental offline batches remain the rest of roadmap slice 2. Current CUDA text
+lifecycle evidence applies to the earlier direct path, not this new driver.
+
 ## Synthetic CPU benchmark
 
 ```sh

@@ -1,6 +1,6 @@
 # Engineering roadmap
 
-Status: ordered implementation and decision gates, reviewed 2026-09-13.
+Status: ordered implementation and decision gates, updated 2026-09-14.
 
 [Target design](inference-engine-design.md) owns architecture and API semantics;
 [resource protocol](resource-protocol.md) owns execution ownership. This document
@@ -32,7 +32,10 @@ Research does not need to settle every future feature before the first slice sta
 It must settle the slice's contract and show that known future requirements do not
 contradict it. Record assumptions and reconsideration triggers, not absolute promises.
 
-## Current baseline
+## Starting baseline
+
+The historical starting point below explains the repair order. Slice entries record
+later changes; [architecture](architecture.md) describes implemented surfaces.
 
 At `2abf382`, Qwen GGUF/CUDA is the only qualified model execution path. The text
 facade remains mutable and single-caller. The batch/BERT, topology and composition
@@ -97,14 +100,33 @@ Decided contract: cloneable handle; one execution owner; owned request streams;
 bounded admission and output; cancellation under saturated admission; explicit owner
 shutdown/failure; one coherent executable lifetime. Direct runtime use remains valid.
 
-Resolve before implementation:
+First increment at `7005fad`: `ribn::driver` owns the existing token engine on one
+worker, with fail-fast preparation permits, encoded-input envelopes, bounded owned
+streams, cancellation/credit wakeups and explicit shutdown retry. Flume supplies
+blocking and async waits without Tokio. A private runtime lifetime guard holds each
+admission charge through retirement, including after stream drop. Exact ownership,
+error and cancellation semantics are in the [resource contract](resource-protocol.md#owned-ar-driver-contract).
 
-- channel/wakeup library and worker ownership; timed device polling fallback;
-- cancellation registration/recheck and output-credit wakeups without lost signals;
-- admission permit acquisition before expensive preprocessing and retained-byte limits;
-- typed error taxonomy and exact stream terminal/cancel semantics;
-- API examples for two simultaneous callers, disconnect, stalled consumer, ordered
-  bounded offline batching, explicit shutdown and runtime embedding.
+Nineteen actual-driver host tests pass, including 100 consecutive suite runs and
+mutation checks for retirement charges, wakeups and queued acknowledgement teardown.
+Required host checks pass. [Direct/driver host cost](../benchmarks/runtime-alignment/README.md#owned-token-driver-7005fad)
+is measured; it is not model throughput. The new CUDA driver test is **unrun**:
+Tailscale is stopped and desktop DNS/SSH is unavailable. Sync and run the pending
+[device gate](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad)
+before calling the driver GPU-qualified.
+
+Remaining before closing this slice:
+
+- un-gate the text lifecycle implementation from CUDA loading and inject the real
+  preprocessing/decoder behavior in host tests; a decoder failure is request-local;
+- bound raw-input bytes, tokenization scratch/concurrency and decoded text payload;
+  reserve before preprocessing. The token driver does not do or bound this work;
+- replace borrowed text streaming with the owned driver rather than wrapping its
+  caller-driven loop; define text-specific errors and trailing UTF-8 terminal semantics;
+- implement ordered incremental offline batching over a bounded admission window,
+  not eager collection of arbitrary iterators; add two-caller/disconnect/shutdown examples;
+- measure the affected real GPU path and frontend overhead. Thread-affine non-Send
+  construction, if required by a real backend, needs a separate factory contract.
 
 Exit: host-testable frontend behavior without CUDA, saturation/race/shutdown tests,
 no orphan requests, and direct-versus-handle overhead measurements. The loaded owner

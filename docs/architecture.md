@@ -1,6 +1,6 @@
 # Current implementation
 
-Observed baseline: `14d0290`. This is a code map, not a second target design.
+Observed baseline: `7005fad` (owned driver host-qualified; device gate pending). This is a code map, not a second target design.
 [Inference engine design](inference-engine-design.md) owns the target;
 [resource protocol](resource-protocol.md) owns contracts;
 [roadmap](roadmap.md) owns implementation order and exit evidence.
@@ -17,8 +17,9 @@ CLI run
 ```
 
 `TextModel::load` selects Qwen GGUF/CUDA directly. `TextStream` borrows the model
-mutably. There is no concurrent owned application handle or HTTP server. Public
-operation sketches in the target design are not executable examples.
+mutably. There is no concurrent text/model handle or HTTP server. The new token-level
+`ribn::driver` provides a separate owned access surface over the same engine; it does
+not wrap the text facade's execution loop.
 
 The runtime keeps one submission in flight, reserves output credits and validates
 all completion rows before logical commitment. `RequestId` and `SequenceId` identify
@@ -38,11 +39,30 @@ Qwen admission reserves full configured continuation state. The adapter translat
 AR batch records into `engine-core` execution and state-manager types. It is not an
 additional scheduler, but it retains legacy coupling and per-step allocation.
 
+## Owned token access
+
+`Driver::spawn` consumes an idle engine. `DriverOwner` controls shutdown/retry;
+cloneable `GenerationHandle`s obtain fail-fast request permits and return owned
+`GenerationStream`s. Flume bounded channels support blocking and runtime-independent
+async clients. One worker alone mutates the engine; direct embedding remains valid.
+
+Permits count preparation, execution and retained delivery, not just execution slots.
+A private sequence lifetime guard retains the permit through failed/in-flight
+retirement after abandonment. Stream Drop records intent and wakes the owner; it does
+not join or maintain a cleanup retry list. Shutdown failure leaves the same worker
+available for retry. Idle/output-blocked workers park; device/deferred-admission polling
+uses a timed fallback. The [resource contract](resource-protocol.md#owned-ar-driver-contract)
+owns bounds, wakeup ordering, error scope and terminal semantics.
+
+The driver has host lifecycle coverage and a compiled but unrun Qwen CUDA test; it is
+not yet GPU-qualified. It does not preprocess raw input, decode text or supply bounded
+offline text batching. See [qualification](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
+
 ## Packages
 
 | Package/path | Current responsibility |
 | --- | --- |
-| `ribn`, `crates/runtime` | AR lifecycle, scheduling, output mailboxes, executor contract |
+| `ribn`, `crates/runtime` | AR lifecycle, scheduling, output mailboxes, executor contract and owned token driver |
 | `ribn-text`, `crates/text` | Shared text processing and current synchronous facade; model module CUDA-gated |
 | `engine-qwen`, `crates/qwen` | Qwen configuration, GGUF interpretation, execution adapter |
 | `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution |
