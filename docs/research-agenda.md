@@ -1,7 +1,10 @@
 # Inference engine research agenda
 
-Date: 2026-09-12
-Status: open design questions to resolve before stabilizing top-level contracts
+Reviewed: 2026-09-14
+Status: supporting investigation reference, not a parallel implementation backlog.
+The [roadmap](roadmap.md) decides which questions block each slice; accepted answers
+belong in the [target design](inference-engine-design.md) or
+[resource protocol](resource-protocol.md).
 
 This agenda exists to keep Ribn from converting promising ideas into permanent
 architecture before they are compared against real models and workloads.
@@ -197,7 +200,37 @@ Protocol compatibility needs executable client tests, not endpoint-name matching
 Track OpenAI Responses/chat/completions/embeddings/audio/images where implemented,
 Anthropic Messages/realtime where implemented, and any native Ribn extensions.
 
-## Research references worth following
+## Reference hierarchy and verified lessons
+
+Primary architectural references are **vLLM, SGLang, TensorRT-LLM/Dynamo and MAX**.
+Use them for particular mechanisms, not as an architecture to copy wholesale.
+DeepSeek's published components inform kernel/communication specialization;
+Megatron Core and TorchTitan inform future training. llama.cpp informs quantization
+and embedded use. mistral.rs and Grout are secondary Rust/API/kernel implementation
+references, not the architectural ceiling. Verify their actual source before adopting
+specific behavior; language similarity alone is not evidence of suitability.
+
+Primary documents inspected 2026-09-14 (moving main/latest/nightly pages, not pinned
+release guarantees):
+
+| Source | Observed lesson | Ribn decision / limit |
+| --- | --- | --- |
+| [vLLM MRV2](https://github.com/vllm-project/vllm/blob/main/docs/design/model_runner_v2.md) | Separates permanent request rows from gathered per-step inputs; owns temporary transfer storage rather than racing pinned metadata; explicit graph lifecycle | Adopt ownership/data-flow principles; measure GPU metadata preparation versus Rust host cost. The document itself warns that MRV2 is incomplete and has open decisions. |
+| [TensorRT-LLM disaggregation](https://nvidia.github.io/TensorRT-LLM/features/disagg-serving.html) | Separates cache exchange from cache management and communication, overlaps independent transfers/computation, handles parallel-layout conversion | Keep state ownership separate from transport; do not implement distributed transport before local lifetime semantics. Disaggregation has transfer costs and is workload-dependent. |
+| [MAX custom models](https://max.modular.com/develop/serve-custom-model-architectures/) | Architecture registration bundles model, config, tokenizer, encodings and weight adapters, reusing serving | Adopt cohesive model-local contribution boundary, not Python package mechanics or a mandatory compiler. |
+| [Megatron inference](https://docs.nvidia.com/megatron-core/developer-guide/nightly/mcore-inference-user-guide.html) | Explicitly targets RL/evaluation with shared model/parallel infrastructure, refit and resharding; distinguishes itself from standalone serving | Coherent snapshot publication belongs early in the design. Fast in-place refit is not permission to mutate weights visible to live requests; qualify numerical rollout consistency independently. |
+
+The supplied SGLang EPD link under `docs_new/docs/advanced_features/` returned 404
+on inspection. Encoder/prefill/decode disaggregation remains an investigation lead,
+not verified behavior from that citation. No private lab architecture is inferred
+from published kernels. DeepSeek, Dynamo, TorchTitan and Rust implementation sources
+still need focused inspection when their corresponding decisions become active.
+
+For each consequential comparison record: the question, current source revision/date,
+mechanism, alternative rejected, workload assumptions, proposed Ribn contract and
+experiment that could disprove it. Source descriptions do not establish Ribn performance.
+
+## Additional references worth following
 
 - vLLM V1 scheduler and Model Runner V2
 - vLLM IR and vLLM-Omni

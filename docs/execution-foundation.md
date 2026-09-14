@@ -1,7 +1,13 @@
 # Shared execution foundation
 
 Date: 2026-09-12
-Status: design-validation boundary; APIs are provisional
+Status: experimental evidence; APIs are provisional, not target contracts.
+
+The [target design](inference-engine-design.md) and
+[resource protocol](resource-protocol.md) supersede prescriptive sketches here.
+This document preserves experiments and their limits; the [roadmap](roadmap.md)
+alone owns next work. Metadata-level tests do not prove owning executable storage,
+training support or distributed execution.
 
 Ribn is an inference engine. The lower-level compute and model infrastructure should,
 however, avoid unnecessary inference-only assumptions so that other execution systems
@@ -160,8 +166,9 @@ The remaining scaling cost is residency, because a resident artifact owns its wh
 file. Mapping immutable local files would avoid that copy, but mapping requires an
 `unsafe` call that this workspace forbids, so owned bytes remain the only storage and
 residency is an explicit policy instead: `LocalWeightSet::weight_set_resident(n)`
-keeps at most `n` shard files open and evicts the least recently used one, which caps
-host memory at one shard instead of the sum of every shard a model touches. Retaining
+keeps at most `n` cached shards and evicts the least recently used one. This is a
+cache-entry bound, not a peak-memory bound: an incoming load can overlap eviction,
+and retained clones may keep old storage alive. Retaining
 everything stays available and remains the default, because it is the fastest policy
 for small models and the choice belongs to the loader. A future streaming or mapped
 reader is the natural next step before the HF path becomes the production loader for
@@ -361,11 +368,11 @@ Implemented as provisional scaffolding:
   pressure as a test-only model of the coupled case, plus the same dependencies
   driven through the real admission loop to establish which of those decisions the
   request contract carries and which it does not;
-- per-row progress negotiation in that loop: a shortened prefill range commits
-  exactly what the backend reported, an explicit blocked outcome keeps a sequence
-  runnable without faulting its peers, and encoder budgets hold without aligning the
-  policy chunk to prompt-item granularity. Completion-time rejection and naming a
-  blocked condition are not carried and remain resource-protocol work.
+- partial-prefill reporting through that loop, with important limits: the fixture
+  budgets each row separately, not an aggregate submission; `Blocked` immediately
+  requeues rather than parking, and permanent infeasibility waits forever. This is
+  not a complete resource-negotiation or liveness proof. The roadmap removes the
+  incomplete blocked outcome until real preparation owns readiness and rejection.
 
 This validates that the broad boundary is implementable and has forced several
 interface changes. It does **not** validate that these exact types are sufficient or

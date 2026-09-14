@@ -1,420 +1,187 @@
-# Roadmap
-
-This is an ordered engineering plan, not release dates. The current Qwen/4090
-path is a qualification workload. The project target is a general inference
-engine; architectural changes are expected when pressure tests expose a better
-design.
-
-[Inference engine design](inference-engine-design.md) is the target architecture.
-[Shared execution foundation](execution-foundation.md) records the provisional
-boundary beneath inference-specific runtimes. [Resource, submission and snapshot
-protocol](resource-protocol.md) records the reservation, handoff and snapshot
-contracts those runtimes need next. [Pipeline composition](pipeline-composition.md)
-records the distinction between genuinely staged execution and tightly coupled
-cross-component scheduling.
-
-## Current status
-
-| Area | Current evidence | Main gap |
-| --- | --- | --- |
-| Shared execution foundation | Dependency-free parameter/version/materialization metadata; node/device/link topology; same logical model placed locally or across nodes; preparation-time semantic-op dispatch experiment | Physical storage/device primitives, broader operator/backend evidence, second hardware backend |
-| Qwen GGUF/CUDA AR | Legacy same-artifact references, new host lifecycle tests, CUDA-feature compilation; same-sequence multi-token prefill is hardware-qualified at `4c22e11` (single-chunk, three-chunk, serving-seam, and end-to-end runtime gates) and is selected by default through `QwenLoadOptions`; the batched GEMV activation access is fixed at `f68e345` (coalesced `float4` runs; 3.9x off those kernels), the chunk lane attends all eight rows in one launch at `b0d2c4e` (attention 683 -> 109 ms), and each batched-GEMV warp resolves two weight rows at `f372a60` (prefill 2.01 s -> 1.82 s, TTFT 2.004 -> 1.828 s and 8.015 -> 7.264 s, serial and decode unchanged, parity test now asserting bit equality), for 6.55 s -> 1.82 s chunked prefill, 7.43 s serial, 0.667 s decode, and 1.83 s / 7.26 s serving TTFT at concurrency 1/4 against 7.43 s / 29.69 s serial; chunked and serial log-probability tables are identical at every head | The batched GEMV families are still 68% of chunked prefill kernel time, but no single resource there is saturated at two rows per warp (about 30% of issue at boost clock, 18% of FP32) and four rows measures worse, so the next gain needs occupancy/stall counters this host refuses (`ncu` needs root) or cheaper per-element arithmetic rather than more amortization; `Q8_0` regresses at two rows and needs a per-family row count if it grows in importance; the recurrent scan at 16% now has an opt-in chunk-parallel form at `d1fb55d` (prefill 1.82 s -> 1.62 s when selected, 3.7x off that family), but adoption remains blocked: the three-chunk gate reports 1.10e-2 against its 5.0e-3 tolerance; summation-order drift is a hypothesis requiring diagnosis, not grounds to widen the gate, so the lane keeps the per-token path by default; then long-prompt numerical fidelity, where ribn's log-probabilities sit 0.08-0.26 nats from llama.cpp's at a 257-token prompt and flip one near-tie of 0.2242 nats with chunking both on and off, so neither mode matches the reference to within its smallest margins; fixed-shape/model assumptions |
-| AR runtime | Explicit ownership/cancellation, bounded per-request output, chunking, multi-token completion; stable `RequestId` is passed into executor admission separately from `SequenceId` | Physical demand is invisible to admission, static full-sequence resources, separate prefill/decode queues, one in-flight batch, production resource-planner cooperation ([resource protocol](resource-protocol.md)) |
-| Non-AR runtime validation | Generic batch runtime bounding waiting work and retained results separately, with ready/blocked/rejected admission and a rejection path that survives an exhausted byte budget; parameter-version pinning; actual BERT encoder semantics checked against an independently generated nondegenerate reference (Hugging Face `transformers`, worst deviation 3.6e-7) with a mask-inertness property that fails if the fixture loses sensitivity; attention masks and padded-versus-ragged batch-cost tests | Async/cancellation/resource admission, shared-pool accounting, device execution and optimized kernels |
-| Text facade | Raw/chat/token inputs, tokenizer/template reuse, streaming/offline batch | Hardwired Qwen GGUF/CUDA loading; mutable single-caller handle |
-| Model/artifact separation | `QwenConfig` independent of GGUF; SafeTensors adapter retaining tensor metadata and offsets once for indexed lookups; local HF-style config + unsharded/sharded weight-package resolver including symlinked cache snapshots; `LocalWeightSet` with a configurable residency bound; Qwen and BERT integrations keep model meaning above artifact parsing | Remote HF repository/revision resolution, tokenizer/processor package integration, architecture resolution when a second production model justifies it, backend materialization path |
-| Cross-runtime composition | Sequential batch-encoder -> AR handoff passes prepared state in-process; stable request identity survives out-of-order handoff; cancellation ownership is validated before and after AR admission | Genuine encoder-decoder model, cross-attention/device-state lifetime, async failure propagation and version compatibility |
-| Multimodal/iterative | VLM pressure test models prompt-positioned encoder items with independent encoder-compute and encoder-cache pressure; staged-vs-coupled distinction is validated; the real admission loop carries encoder work, a per-request admission gate, a shortened prefill range, and an explicit blocked outcome, so encoder budgets no longer depend on aligning `prefill_chunk_tokens` with item granularity; a step budget below one indivisible item still has no rejection path and the request waits | Typed media processor path, real VLM integration and production coupled scheduler/resource seam, including the step-level negotiation that alignment currently substitutes for; iterative/diffusion runtime; realtime session path |
-| CUDA Rust | Resource/toolchain gate complete | Representative quantized/recurrent kernels and full execution integration |
-| Other hardware/distributed | Resource-topology/placement representation only | No second backend, collectives, remote execution or state transfer |
-
-## Milestone order and exit evidence
-
-The numbered sections below describe the work in each area. They are not the order
-to do it in. Adding another model-class pressure test is cheap and feels productive,
-but every one of them inherits the same unresolved lifecycle: unbounded retention,
-reservation that cannot fail before execution, and state whose ownership only covers
-allocation. Resolve the lifecycle first and the later counterexamples become small.
-
-| Milestone | Required exit evidence |
-| --- | --- |
-| 1. Bounded, concurrent execution lifecycle | Close the request-cleanup and retained-count review findings below with regression tests; a minimal cloneable model handle with explicit request ownership, bounded retained output, ready/blocked/rejected admission and an owning snapshot. Exercised with multiple callers, abandoned requests and a stalled consumer. |
-| 2. One real asynchronous non-AR integration | Negotiated prepared submissions with one reservation authority and accepted work ranges; encoder work against real device resources producing owned results whose reservations and completion dependencies survive dequeue, cancellation and handoff failure. |
-| 3. Dynamic hybrid AR resources | KV and recurrent state cooperating with reservations, cache reuse, eviction and preemption. Non-speculative correctness first, then qualified speculative reconciliation. |
-| 4. Real composition counterexamples | A second real decoder and a genuine VLM processor/model path satisfy the model-local integration gate below; a small iterative non-AR path changes shared contracts only where the execution regime demonstrates the need. |
-| 5. Qualification and broader exposure | Matched numerical and workload benchmarks, a tested serving subset, and a materially different backend before calling the shared device boundary general. |
-
-Milestone 1 has partially started: the non-AR runtime now bounds retained results and
-separates blocked from rejected admission, and the resource protocol records the
-reservation, handoff and snapshot contracts the rest of it needs. The public handle,
-explicit request ownership, and snapshot ownership are not implemented.
-
-Two tracks stay independent of this order instead of becoming prerequisites:
-
-- CUDA kernel-language migration keeps its own proof track ([cuda rust migration](cuda-rust-migration.md));
-  existing kernels and vendor libraries stay the qualified implementation while
-  runtime correctness is proven.
-- Distributed placement types stay provisional until real sharding, replication or
-  cross-device execution constrains them. Metadata accepting several device IDs is
-  not yet a distributed execution abstraction.
-
-## Model-local integration acceptance gate
-
-The contribution goal is localized architecture support, not automatic arbitrary
-checkpoint compatibility or a frozen core. The expected scope is:
-
-| Contribution | Normal change boundary |
-| --- | --- |
-| Checkpoint of a supported architecture | Validated configuration/artifact mapping; no code when already supported |
-| New architecture using existing execution mechanisms | Model implementation, processor, backend components, registration and qualification tests |
-| New attention, continuation or resource mechanism | Model/backend implementation and a focused shared-contract extension where necessary |
-| Genuinely new execution regime | Specialized runtime and only the cross-runtime coordination it requires |
-
-A second real decoder and a real VLM must demonstrate that ordinary model additions
-need no model-family branches in cancellation, output routing, protocol adapters or
-unrelated scheduling policy. Record any core changes and why the existing mechanism
-could not represent the model. One central enum/factory/registration edit is acceptable;
-a dynamic plugin ABI and a universal operator graph are not prerequisites.
-
-Contribution readiness also needs reusable execution components and a reproducible
-qualification procedure, not merely traits. Use
-[the model-integration skill](../.agents/skills/model-integration/SKILL.md) for the
-recurring implementation/review checks. Do not advertise arbitrary model support from
-metadata parsing, a successful load, or test-only architecture coverage.
-
-## Open review gates (2026-09-13)
-
-These findings come from source/design review at `46a5340`. The two lifecycle items
-are fixed, with the text-facade path device-verified at `842bc43`; the rest stay open
-until their acceptance evidence exists. Do not treat the open rows as implemented
-behavior.
-
-| Priority / owner | Finding and required exit evidence |
-| --- | --- |
-| **Fixed and device-verified:** text lifecycle | `TextStream::drop` cancelled without taking ownership of the eventual events, while `generate_batch` drained the engine globally and routed by its own request map, so an abandoned mailbox could both panic that map and hold output capacity that `flush_terminals` needs to reclaim a request slot. Now `generate_batch` tokenizes every input before submitting any, drains per request (`pop_event_for`), and `TextStream::drop` cancels and owns the mailbox (`TextModel::discard`/`reclaim_discarded`). Evidence: `crates/runtime/tests/abandoned_requests.rs` (host) and `crates/text/tests/text_lifecycle.rs` (4 ignored device tests, run at `842bc43`: dropped stream then batch, repeated abandonment, unpreparable input, request-local token failure). |
-| **Fixed and host-verified:** batch bounds | `fitting_prefix` and `exhausted_reason` compared successful outputs against `max_retained_results` while a rejection also occupies `terminal`, so an unconsumed rejection let a later output exceed the bound (the public `retained_results()` accessor already reported the correct count). Both checks now use the terminal count, and `retained_outputs` is gone. Regression test: `retained_rejections_count_toward_the_retained_bound`. |
-| Before resource implementation | Resolve the ambiguities in `docs/resource-protocol.md`: already-held claims versus later reservation, ready/blocked/rejected preparation, abandonment and partial-enqueue ownership. Accepted ranges and a blocked outcome now exist in the completion contract (`StepOutcome`, `StepStatus::blocked`), which limits work after submission; it cannot refuse a batch, reserve ahead of one, or reclaim declined capacity, and it has no completion-time rejection or named blocked condition. A fallible `prepare` wrapper around the unchanged exact-prefill contract remains insufficient. |
-| Before asynchronous composition | Reservations follow live allocations beyond dequeue; producer completion and consumer access lifetime govern reuse. A malformed or failed submission still faults every live request through `fault_all`, including requests outside the submitted batch, so one bad row is not yet request-local. Test constrained shared pools, delayed completion, consumer stalls, cancellation and failed handoffs with a real device encoder. |
-| Before optimized-variant promotion | Add explicit finite/shape checks, actual bit equality where promised, and justified numerical bounds for reordered algorithms. Compare persisted hybrid components and continuation, not only hidden outputs. Keep the GDN scan opt-in while its full-model gate fails; diagnose captured real inputs against an independent higher-precision recurrence before setting acceptance criteria. |
-| Before large HF loading | A one-shard cache is not a one-shard peak-memory guarantee: a miss opens the incoming shard before eviction and clones may keep old storage alive. Measure live/peak bytes and qualify byte-aware or streaming loading before claiming a hard memory bound. Descriptor pressure is fixed for GGUF (`docs/execution-foundation.md`: 888 -> 38 open files for the pinned artifact); SafeTensors residency is still open. |
-
-The latest margin comparison does not establish harmless scan drift: the reference
-and Ribn diverge in chosen token at step 18, so step 19 no longer compares the same
-history. Existing error against another engine is not an error budget for a new
-variant. See the corrected evidence in `benchmarks/qwen-prefill-qualification.md`.
-
-For the independent performance track, retain the qualified small-M GEMV path but
-evaluate larger-M tiled quantized GEMM, packed cross-request execution and tiled
-attention instead of assuming larger compile-time accumulators will scale. Kernel
-selection should follow qualified shape/encoding/device regimes. The current global
-row-blocking choice already trades a Q8_0 regression for this artifact's aggregate win.
-Long-context and mixed-arrival benchmarks must precede general performance claims;
-one prompt's prefixes at concurrency 1/4 are not a representative serving workload.
-
-## 0. Reset and validate the top-level architecture before deeper model-specific work
-
-Treat `crates/runtime` as the current AR runtime rather than Ribn's universal
-execution contract. Preserve its proven ownership behavior while introducing the
-general boundaries in `docs/inference-engine-design.md`.
-
-Executable validation scaffolds now establish several useful boundaries:
-
-- `ribn-foundation` separates logical parameter/version identity from physical
-  materialization metadata and keeps request/token/KV/autograd policy out of the
-  dependency base;
-- resource topology describes nodes/devices/links independently of model semantics;
-- a provisional execution plan can place the same logical model/version on one
-  device or across nodes without changing model identity;
-- a test-only semantic-operator experiment selects specialized/reference
-  implementations during preparation rather than walking a registry in the hot
-  execution path, and asks per execution whether that selection is qualified for
-  the step's row count instead of assuming the prepared choice covers every shape;
-- `ribn-batch` demonstrates non-AR execution with executor-defined inputs/outputs,
-  parameter-version pinning, and executor-informed FIFO batch sizing without fake
-  token/prefix/KV semantics;
-- `ribn-safetensors` validates artifact bytes and exposes borrowed format-level
-  tensor views without assigning model semantics or allocating execution tensors;
-- `ribn-hf` resolves a local HF-style `config.json` plus single or sharded
-  SafeTensors weights without choosing model architecture, runtime or backend;
-- a test-only BERT architecture loads that HF/SafeTensors package and executes real
-  encoder structure—embeddings, multi-head self-attention, residual/LayerNorm, FFN
-  and pooler—through `ribn-batch`, while sequence length remains an executor-owned
-  batching constraint;
-- that BERT loading path also exposed a concrete model-loader requirement: one
-  SafeTensors shard should be opened once and serve many parameter views rather than
-  being reread independently for every tensor;
-- the AR executor admission seam receives stable `RequestId` separately from
-  internal `SequenceId`; sequential encoder->decoder tests prove prepared state can
-  remain in-process, correlate correctly independent of handoff order, and transfer
-  cleanup ownership at admission;
-- a VLM scheduler pressure test proves prompt-positioned encoder items can constrain
-  AR prefill and that encoder compute pressure and encoder-cache pressure are
-  independent scheduling facts. This is evidence for scheduler/resource-planner
-  cooperation, not for a universal resource-cost vector or raw media in the AR
-  request.
-
-These tests prove that the separation is implementable, **not** that the exact type
-shapes are finished. `StageId`, `RuntimeClass`, materialized storage IDs, current
-topology fields, `BatchExecutor::select_batch`, the request-admission seam, and the
-VLM test's dependency representation remain pressure-test interfaces.
-
-Remaining work in this architecture-validation stage:
-
-- pressure-test real device resource costs, asynchronous execution, cancellation
-  and failure behavior on the encoder path; masks plus padded/ragged host execution
-  already fit executor-owned batch selection without a universal cost unit;
-- establish the general loaded-model/model-package and architecture-resolution
-  boundary when another production model makes it useful. Qwen is still the only
-  production model path and BERT is a pressure-test integration, so a registry now
-  would mostly formalize strings rather than remove real duplication. An ordinary
-  central Rust enum/registry/factory remains acceptable when evidence justifies it;
-- add tokenizer/processor/package metadata and model capability/operation
-  introspection without a user-visible task-default workflow;
-- integrate a genuine encoder-decoder model to validate cross-attention state,
-  device-resident handoff, cancellation/failure propagation and version
-  compatibility;
-- integrate a real VLM/processor path and use it to turn the test-only
-  prompt-position dependency model into the minimum production scheduler/resource
-  seam actually required;
-- introduce typed application inputs/outputs sufficient for text plus media and
-  non-token results without putting raw media in the AR scheduler;
-- build a concurrent/cloneable Rust `Model` handle or equivalent whose driver owns
-  mutable runtime state;
-- extend the semantic-op experiment to a few real operations/backend
-  implementations and discard it if it turns into compiler machinery without
-  practical benefit;
-- pressure-test the shared device/resource boundary against a materially different
-  backend before calling it general;
-- keep the shared foundation reusable by a future trainer without adding autograd,
-  gradient, optimizer or training-scheduler semantics to Ribn inference.
-
-Do not stabilize crate/trait names before these pressure tests. Reusing or moving
-current code is preferred to adding a parallel hierarchy.
-
-## 1. Pressure-test the architecture with different execution classes
-
-Do this early enough that changing shared contracts is cheap. Full optimized model
-support is not necessary for every test; small/reference-backed implementations can
-expose a wrong boundary.
-
-This is not a license to keep adding model classes ahead of the lifecycle. A new
-pressure test is worth building when it exposes a shared-contract problem no existing
-test can, or when its milestone in the table above is reached. Model classes that
-would only inherit the same unbounded retention, unreservable submission, and
-allocation-only ownership wait, because running them proves nothing new about the
-boundary.
-
-| Path | Current state | What it validates |
-| --- | --- | --- |
-
-The `Current state` column records which pressure test ran, not what it proved.
-`docs/execution-foundation.md` holds the validated behavior and its limits, and is the
-single owner of evidence; this table links to that rather than restating it.
-| Current Qwen hybrid AR | Existing prototype | KV + recurrent state, quantization, chunked generation, cancellation |
-| Dense decoder-only | Not started | New AR architecture without Qwen-specific changes |
-| Encoder/pooling | Actual BERT architecture reference path passes through HF/SafeTensors + `ribn-batch`; sequence-length batch selection, attention masks, and padded-versus-ragged cost pass | Non-AR model semantics do not need AR contracts; next: real device resource admission and asynchronous execution |
-| Sequential encoder-decoder | Cross-runtime state handoff and cancellation ownership pass in-process using stable AR `RequestId` | Next: genuine encoder-decoder model, cross-attention/device state, async failure/version lifetime |
-| VLM | Prompt-positioned encoder-dependency pressure test passes with separate encoder compute/cache constraints | Next: actual processor/model integration and minimum production scheduler/resource interface |
-| Diffusion image/video | Not started | Non-token iterative scheduling and media output |
-| Realtime/full-duplex | Design only | Long-lived session identity, concurrent media input/output, interruption/backpressure |
-| Non-AR text if practical | Not started | Text output does not imply autoregressive execution |
-
-Select small models/configurations when possible so design validation does not turn
-into months of kernel work. A pressure-test implementation may be replaced after it
-has exposed the boundary issues it was built to find.
-
-## 2. Keep Qwen GPU qualification as the regression oracle
-
-Run exact-artifact GPU replay and lifecycle tests through the new AR path while
-architecture work proceeds. Cover concurrency 1/2/8/9, long outputs, mixed prompt
-lengths, final prefill tails, cancellation in prefill/decode, stop/output limits,
-repeated admission, constrained memory and fallback batch shapes.
-
-Compare old/new TTFT, inter-token latency, throughput, CPU scheduling time,
-allocations, host/device memory and preparation. Qwen remains a valuable hard test
-because its hybrid continuation state prevents a KV-only design from looking more
-general than it is.
-
-## 3. Build dynamic continuation resources for the AR runtime
-
-Replace full maximum-context reservation with model-appropriate dynamic resources.
-The scheduler and resource manager should cooperate around capacity, prefix
-matching/reuse, per-step preparation/update, eviction, preemption and release.
-
-For attention state, evaluate paged allocation with compact page tables. For
-recurrent/SSM state, evaluate checkpoint/copy-on-write/materialization strategies.
-A reusable semantic prefix is valid only when every required component agrees on
-the boundary. Add explicit retain/fork/copy-on-write/checkpoint/materialize semantics
-where branching, speculative decoding, parallel candidates or RL rollouts require
-them rather than assuming every continuation is linear.
-
-Use component-based hybrid caches as reference designs, not mandatory
-implementations. Add capacity pressure and cache/resource telemetry before choosing
-eviction or host spill policy. Cache/state identity must include the model and
-parameter/adaptor version that produced it.
-
-## 4. Redesign AR scheduling around the real resource model
-
-Once dynamic resource costs exist, compare the current decode-priority + prefill
-fairness queues with a unified scheduled-token budget. The scheduler should be able
-to express chunked prefill, cached progress, speculative multi-token work,
-encoder-conditioned prompts and preemption without special-case queue proliferation.
-
-The VLM pressure test already shows that a coupled generation path sometimes needs
-per-item prompt-span readiness plus independent encoder-compute and encoder-cache
-capacity. Do not turn those two demonstrated resources into an arbitrary generic
-resource vector. Let an actual VLM integration determine whether the production
-boundary is explicit dependency descriptors, a model/resource planner queried by
-the scheduler, or another small cooperative interface.
-
-Measure FCFS/priority policy, token budgets, prefix locality, preemption/recompute
-and admission watermarks against short/long/shared-prefix workloads. Preserve
-prefill/decode as execution information when kernels need it; do not require those
-to be top-level queue identities.
-
-## 5. Make the host/device path async-first
-
-Target:
-
-- stable request rows for the active lifetime;
-- persistent device metadata and staged incremental writes;
-- packed/ragged batch descriptors and page tables;
-- reusable caller/runtime-owned workspace and completion buffers;
-- scheduler work for step N+1 overlapped with device work for step N;
-- no normal-path device synchronization or metadata copy-back;
-- device-side input metadata preparation/sampling where it reduces measured CPU
-  overhead;
-- explicit graph lifecycle and shape/compatibility checks;
-- mixed prefill/decode kernels when measurements beat separated execution.
-
-Benchmark allocation count, host scheduling, metadata bytes/copies, launch gaps and
-accelerator utilization independently from model FLOPs.
-
-## 6. Continue CUDA Rust migration through the redesigned AR path
-
-Prove representative Q8_1 packing -> quantized integer-dot projection and batched
-GDN/recurrent state updates with numerical references, tails, repeated updates,
-generated-code inspection and matched timings.
-
-Integrate proven kernels through the current backend/resource ownership, not another
-request runtime. Complete operation families incrementally, retaining vendor
-libraries or existing kernels when they remain the best implementation.
-
-Kernel-language migration and top-level runtime migration are separate proof gates.
-
-## 7. Implement general model loading and model-support workflow
-
-Local HF-style package and SafeTensors artifact boundaries now exist as validation
-code. Qwen and BERT provide two concrete model-family integrations against which to
-pressure-test architecture resolution. Extend these layers deliberately rather than
-making the artifact parser responsible for model semantics.
-
-Repeated tensor access is now practical without moving model semantics into the
-package layer: `LocalWeightSet` lazily opens each resolved SafeTensors shard once and
-reuses it for many borrowed tensor views. Backend-specific prepared materialization
-and streaming/loading policy remain future work.
-
-Add Hugging Face repository IDs/revisions, tokenizer/chat-template and processor
-metadata as first-class sources alongside local directories. GGUF remains supported
-for quantized/local use.
-
-Define the model-package/architecture resolver from actual integrations: config,
-logical parameter identity, weight adapters/materializations, processor, supported
-operations, logical stage topology, continuation semantics and backend variants.
-New checkpoints of an existing architecture should not require new scheduler/server
-code. A central enum or registry changing when genuinely new architectures are
-added is acceptable; the failure mode to avoid is model-specific branching scattered
-through unrelated runtime policy.
-
-Research a compatibility/reference backend for day-zero bring-up. Compare an
-optional Transformers/PyTorch bridge, portable graph import and Rust-framework
-reuse on coverage, fidelity, operator support and maintenance. Do not make the
-reference path the production hot path by accident.
-
-Hot-weight/adaptor updates should prepare a new coherent parameter version and
-commit it at a safe boundary. Do not silently retain caches, recurrent checkpoints,
-encoder outputs, or compiled/captured execution variants across incompatible
-versions.
-
-## 8. Build the normal application and serving surfaces
-
-The public Rust handle should be async/concurrent and cloneable while one driver
-owns mutable model/runtime state. Keep a lower-level direct API for embedding and
-specialized control.
-
-Implement public operations as their actual semantics appear: generation/chat,
-embedding/scoring/classification, transcription/translation, speech or media
-output, etc. Do not force these through one generic task selector.
-
-Then add `ribn serve` with a tested compatibility subset. Cover streaming,
-structured errors, finish reasons, usage/logprobs, disconnect cancellation,
-request IDs, bounded admission, health/readiness and metrics. Add expected protocol
-routes where relevant and native extensions only when they expose useful engine
-capability.
-
-Python in-process bindings are an important follow-on for evaluation, RL/post-
-training and the existing ML ecosystem; HTTP is not a sufficient replacement.
-
-## 9. Multimodal, media and session pipelines
-
-Implement media content parts and model processors with explicit ownership and
-security limits. A VLM path should keep processor placeholder/position semantics
-model-specific while sharing useful encoder scheduling/cache and AR serving
-machinery.
-
-Do not assume every encoder is a separate top-level stage. Sequential
-encoder-decoder models can use a shallow staged handoff, while VLM/omni models may
-need a coupled runtime where encoder readiness/cache and AR prompt progress are
-scheduled together. The synthetic VLM pressure test has validated that distinction;
-an actual VLM must now determine the concrete production seam. See
-`docs/pipeline-composition.md`.
-
-For genuinely staged omni/diffusion models, compose logical stages where the model
-has different execution loops. Allow co-located stages to pass device-resident
-payloads without serialization. Add cross-stage cancellation/output ordering before
-supporting distributed placement.
-
-For realtime/full-duplex models, pressure-test a long-lived session lifecycle that
-can accept ordered/timestamped audio/video/text streams while emitting multiple
-output streams. Do not model every chunk as a new AR request when the model itself
-holds state across the session.
-
-Add encoder/media-result caching only with identity that includes source contents,
-processor/config/model revision, parameter/adaptor version and representation
-compatibility.
-
-## 10. Second hardware backend and distributed inference
-
-Use a materially different backend (Metal/Apple or AMD when the implementation is
-ready) to test the resource/device boundary. Shared model/foundation code should
-not require CUDA streams, memory layouts or graph semantics.
-
-Ribn may then add inference-local tensor/expert/pipeline/data/context parallelism,
-collectives, prefill/decode disaggregation and stage/model-state transfer. Keep
-logical model topology separate from deployment topology. External systems allocate
-and place resources; Ribn owns execution within those resources.
-
-Distributed capability must be additive: a one-device plan should collapse to a
-direct in-process runtime/device path without RPC, serialization, synthetic workers,
-or cluster-control overhead.
-
-## 11. Cut over and delete transitional architecture
-
-When the new AR path passes GPU correctness/lifecycle/performance gates and the
-general model/foundation boundary has survived pressure tests, remove the legacy
-serving runtime and Qwen's compatibility translation. Relocate surviving helpers to
-their real model/backend/resource owners.
-
-Do not maintain old/new feature matrices indefinitely. Historical commits and
-reference fixtures preserve the oracle without shipping two architectures.
-
-## Strategic benchmark
-
-Ribn succeeds if it can add modern models without architectural surgery and deliver
-strong latency, throughput, memory efficiency, correctness, reliability and
-integration ergonomics across local, embedded, serving and distributed workloads.
-
-A clean abstraction, Rust implementation or long feature list is not itself the
-result. Rewrites are appropriate when evidence shows the current design is the
-wrong substrate; the project is early enough that avoiding a necessary redesign is
-more expensive than doing it now.
+# Engineering roadmap
+
+Status: ordered implementation and decision gates, reviewed 2026-09-13.
+
+[Target design](inference-engine-design.md) owns architecture and API semantics;
+[resource protocol](resource-protocol.md) owns execution ownership. This document
+owns work order and unresolved decisions. Server-first inference is the priority;
+training is a future execution system sharing demonstrated lower-level mechanisms.
+All v0 interfaces may change. Do not preserve a broken API for compatibility.
+
+## Engineering method
+
+For each slice:
+
+1. Inspect current source and relevant experiments. Research current primary sources
+   for consequential uncertain choices; record revision/date and limitations.
+2. State the contract in its existing owner: inputs/results, owner at each transition,
+   cancellation and error scope, memory bounds, readiness and shutdown. Include the
+   direct single-model path and a materially different counterexample.
+3. Resolve competing designs with a small experiment when reasoning is insufficient.
+   Do not mistake a fixture for model support or a prototype type for a stable API.
+4. Write contract tests and implement a complete vertical slice. Replace obsolete
+   paths instead of adding wrappers. Keep qualified kernels while replacing control
+   plumbing unless kernel changes are independently required.
+5. Run host checks and affected device gates, inspect actual user behavior and compare
+   performance where the change affects it. Update current-state evidence only then.
+
+Agents may choose local representation and algorithms within the contract. A change
+in ownership, failure isolation, observable API semantics, bounds, execution order or
+numerical policy requires a design/test update before dependent implementation.
+Research does not need to settle every future feature before the first slice starts.
+It must settle the slice's contract and show that known future requirements do not
+contradict it. Record assumptions and reconsideration triggers, not absolute promises.
+
+## Current baseline
+
+At `2abf382`, Qwen GGUF/CUDA is the only qualified model execution path. The text
+facade remains mutable and single-caller. The batch/BERT, topology and composition
+paths are design experiments, not production model coverage.
+
+- Progress completion allows partial prefill, but also incorrectly allows zero
+  successful prefill. `Blocked` requeues immediately, potentially in the same step;
+  there is no parked state or readiness protocol. Remove that incomplete API until
+  real preparation supplies ordinary backpressure and reactivation.
+- Text cleanup improved but is not complete: unknown execution identity can still
+  have an output mailbox; batch/stream error paths can abandon cleanup. Move discard
+  responsibility into the runtime rather than extending frontend retry lists.
+- Batch terminal-count bounds were fixed with a failing-before regression. Output
+  dequeue still does not establish a bound on downstream live physical allocations.
+- Qwen reserves full continuation capacity and translates through legacy core types.
+  Foundation version/topology metadata does not own executable storage.
+- Device gates at `6f0ebbf`: lifecycle 4/4 (76.80 s), exact-token runtime (174.39 s),
+  CUDA reference 61/61 (408.84 s). These qualify that revision's tested device paths,
+  not missing lifecycle/readiness contracts. See [runtime evidence](../benchmarks/runtime-contract.md).
+
+Detailed historical experiments remain in [execution foundation](execution-foundation.md)
+and [pipeline composition](pipeline-composition.md). Performance/numerical evidence
+belongs in [benchmarks](../benchmarks/README.md), not repeated milestone tables.
+
+## Ordered vertical slices
+
+### 1. Repair the execution ownership baseline
+
+Decided scope:
+
+- retain positive contiguous partial-prefill completion and whole-batch validation;
+- remove incomplete completion-time blocking and redundant completion-plan copies;
+- runtime-owned cancel-and-discard, including terminal mailboxes after slot release;
+- remove frontend cleanup queues and ensure every batch/stream error relinquishes
+  request interest without releasing device-visible storage;
+- distinguish request-local rejection from executor corruption. Conservative global
+  faulting remains correct for unknown device state, not ordinary resource shortage.
+
+Exit: failing-before regressions for zero progress, discarded terminal mailboxes,
+late completion, mixed healthy/abandoned consumers and error cleanup; output-credit
+accounting stays bounded; affected device gates pass. Do not build a synthetic
+readiness framework merely to retain the old `Blocked` variant.
+
+### 2. Owned concurrent application access
+
+Decided contract: cloneable handle; one execution owner; owned request streams;
+bounded admission and output; cancellation under saturated admission; explicit owner
+shutdown/failure; one coherent executable lifetime. Direct runtime use remains valid.
+
+Resolve before implementation:
+
+- channel/wakeup library and worker ownership; timed device polling fallback;
+- cancellation registration/recheck and output-credit wakeups without lost signals;
+- admission permit acquisition before expensive preprocessing and retained-byte limits;
+- typed error taxonomy and exact stream terminal/cancel semantics;
+- API examples for two simultaneous callers, disconnect, stalled consumer, ordered
+  bounded offline batching, explicit shutdown and runtime embedding.
+
+Exit: host-testable frontend behavior without CUDA, saturation/race/shutdown tests,
+no orphan requests, and direct-versus-handle overhead measurements. The loaded owner
+pins one actual executable configuration; no metadata-only snapshot wrapper or
+unimplemented general architecture registry counts as snapshot ownership.
+
+### 3. Real asynchronous encoder and prepared resources
+
+Use actual encoder device work to determine preparation and readiness representation.
+Resolve concrete accepted ranges, one pool authority, waiting versus rejection,
+pre-submit abandonment, partial enqueue and producer/consumer completion ownership
+according to the resource protocol. Budget resources across the whole submission.
+
+Exit: constrained shared pool, delayed completion, cancellation, failed handoff,
+consumer stall and permanent oversized-input rejection with healthy peer progress.
+Charges survive dequeue until safe reuse. Prove downstream workspace remains available.
+Do not implement a universal cost vector or operation graph as a prerequisite.
+
+### 4. Dynamic hybrid AR and model-local integration
+
+Implement dynamic KV plus recurrent-state ownership, valid prefix reuse, eviction and
+preemption before speculative reconciliation. Compare unified token-budget scheduling
+with current queues using actual resource costs and mixed-arrival workloads.
+
+A second real decoder and real VLM/processor must integrate with model/processor,
+backend, registration and tests—not family branches in cancellation, routing or
+protocols. A genuinely new mechanism may require a focused shared-contract change.
+A sequential encoder-decoder and small iterative model then test composition beyond
+AR without forcing every encoder into its own stage.
+
+Exit: independent numerical references, constrained resources, continuation and
+cancellation qualification; documented shared changes and their concrete necessity.
+Replace legacy Qwen/core translation as its real consumers migrate. Delete unused
+paths immediately; do not wait for every future runtime class to remove dead code.
+
+### 5. Serving qualification and wider systems
+
+Implement a documented protocol subset over the owned application API, not another
+execution loop. Test streaming, errors, disconnects, overload, health/readiness,
+metrics and security limits. Python in-process use follows the same semantics.
+
+Qualify mixed lengths/arrivals, long context, stalled clients and memory pressure.
+Report throughput within explicit latency objectives, latency distributions, host
+cost, peak memory and cancellation latency. A benchmark needs pinned workload,
+artifact, numerical policy, revisions and repeated matched measurements.
+
+Test a materially different backend before calling device contracts general.
+Implement collectives and real sharding before promoting topology metadata into a
+distributed runtime. Local single-device execution must not require serialization
+or synthetic worker/process layers.
+
+### 6. Training integration, then training execution
+
+First establish trainer-to-rollout version publication and tensor/result interchange.
+Start drain-and-replace; overlapping snapshots require explicit extra memory and
+compatibility evidence. Never expose optimizer-mutating storage to inference.
+
+A later small forward/backward/update reference test determines shared operator/model
+semantics. Training owns gradients, activation lifetimes, optimizers and its scheduler.
+Checkpoint/restart and distributed training require their own qualification. Revisit
+shared model representation if duplicated semantics becomes a measured maintenance or
+correctness problem; do not impose autograd on inference preemptively.
+
+## Independent qualification tracks and blockers
+
+- **GDN scan:** opt-in only. Full-model gate fails `1.10e-2` versus `5.0e-3`; cause
+  unestablished. Diagnose captured real state against a higher-precision recurrence.
+  Existing baseline reference error grants no tolerance budget. Compare common
+  histories; step 19 after step-18 token divergence is not a common-history comparison.
+- **Kernel scaling:** retain qualified small-M GEMV; investigate tiled quantized GEMM,
+  packed cross-request work and tiled attention. Do not repeat measured losers without
+  new evidence: four rows per warp, shared IQ4 codebook, pre-elimination decayed keys.
+  Compilation is not GPU qualification; CUDA Rust migration has its own
+  [gate](cuda-rust-migration.md), not priority over runtime correctness.
+- **Artifact loading:** GGUF lazy readers reduced sampled descriptors 888→38. HF
+  shard-cache count is not a hard peak-byte limit; incoming loads and retained clones
+  can overlap. Qualify streaming/byte-aware ownership before large-model claims.
+- **Research:** [research agenda](research-agenda.md) supplies candidate sources and
+  later topics. Only the relevant questions above block a slice; do not turn broad
+  research into a second implementation backlog.
+
+## Required checks
+
+```sh
+python3 tools/check-boundaries.py
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked --features cuda -- -D warnings
+```
+
+Capture actual exit codes, including when logging through pipes. CUDA-feature checks
+compile otherwise gated frontend code but do not replace serialized device tests.
+Follow the [model-integration skill](../.agents/skills/model-integration/SKILL.md)
+for model/numerical qualification. Record failed and unrun gates explicitly.

@@ -1,276 +1,167 @@
 # Resource, submission and snapshot protocol
 
-Status: provisional design contract. None of this is implemented. It records the
-contract the runtime needs before dynamic continuation resources, speculation, or a
-second non-AR runtime are built on top of the current seams, so that work does not
-have to invent it piecemeal later.
+Status: accepted direction, not implemented APIs. The 2026-09-13 review replaces
+contradictory claim/reservation sketches with the ownership rules below. The
+[roadmap](roadmap.md) owns implementation order and exit evidence.
 
-This is not a universal framework. The responsibilities below address concrete
-failure modes, but the illustrative signatures are not ready to implement unchanged.
+## Current boundary and immediate correction
 
-## Unresolved contract details
+`GenerationExecutor` currently combines admission, submission and completion.
+Qwen reserves its full continuation capacity at admission and executes the offered
+range. The experimental completion-time `Blocked` outcome has no readiness source,
+parking or request-local rejection. The engine requeues and can resubmit it inside
+that same `step`; `yield_now` in a frontend does not fix this.
 
-The 2026-09-13 design review identified four requirements the sketches below do not
-yet express consistently. Resolve them before implementation, with the acceptance
-tests at the end of this document:
+Remove that incomplete outcome rather than treating it as resource negotiation.
+Keep positive partial-prefill completion: it reports a contiguous consumed range,
+not permission to exceed physical capacity and not a pre-submit reservation.
+Introduce ordinary resource waiting with a real preparation implementation and its
+readiness source, not another isolated completion enum.
 
-- **One reservation authority.** Section 1 describes claims as already reserved,
-  while section 2 reserves them later. Choose one ownership transition; an estimate
-  is not an owning reservation, and one allocation must not be charged twice.
-- **Negotiated work.** Preparation must distinguish ready, temporarily blocked and
-  request-local rejection, and expose the accepted per-request work ranges before
-  submission. Returning only `Prepared` or an execution error cannot resolve an
-  unavailable encoder item in the middle of a scheduler-selected prefill chunk.
-- **Abandonment and partial enqueue.** Distinguish pre-existing continuation from
-  newly reserved persistent growth. Abandoning unsubmitted work must not strand new
-  reservations; any partial device submission keeps an owner through completion or
-  quarantine, including driver-error paths.
-- **Pool boundedness and progress.** Reservations must follow allocations through
-  dequeue and handoff until safe reuse. One accounting authority prevents aggregate
-  overspend but does not by itself prevent upstream results from consuming the
-  workspace needed downstream. Prove progress under consumer stalls and constrained
-  pools, with reserved downstream headroom or another concrete admission policy.
+Keep these invariants throughout replacement:
 
-These are open design obligations, not implemented guarantees. The roadmap owns
-priority and completion status.
+- validate every submitted row before logical commitment;
+- reserve output capacity before launch;
+- cancellation records intent; it never proves completion;
+- malformed completion or uncertain executor state faults the execution owner,
+  including its other live requests; ordinary request rejection is different;
+- retain ownership of anything the device may access until completion is known.
 
-## What the runtime does today
+## One authority, four ownership states
 
-The AR runtime is honest about ownership and about committed progress, and the gaps
-are all in the same place: physical resource demand is invisible to the code that
-decides what runs next.
+For each shared physical pool, one allocator/accountant grants reservations. The
+model/backend calculates concrete demand and asks that authority during preparation.
+The scheduler does not charge the same reservation again.
 
-- `GenerationExecutor::admit` validates a request and reserves that sequence's whole
-  continuation bundle. `Admission::Deferred` already distinguishes "not now" from
-  "invalid".
-- `BatchItem::token_budget` is the exact prefill advancement or the maximum
-  *committed* decode advancement, and `output_budget` explicitly excludes
-  speculative draft work. Both describe committed progress, not physical demand.
-- `batch_tokens` (`BatchRuntime`) bounds waiting work and retained results, and
-  admits work as ready, blocked, or rejected.
-- `Engine` keeps one batch in flight, reserves output capacity before submission,
-  treats one executor fault as faulting all in-flight work, and retains physical
-  ownership when safe teardown cannot be established.
+1. **Candidate:** scheduler policy offers work; no new allocation is owned by the
+   candidate. Token counts are policy bounds, not a universal memory cost.
+2. **Prepared:** the backend owns newly granted reservations and an accepted range
+   for each ready request. Existing continuation remains sequence-owned. Preparation
+   may shorten work, report temporary waiting, or reject an impossible request.
+3. **Submitted:** the executor consumes the prepared work and owns every resource
+   visible to partially or fully enqueued device work, even if enqueue fails.
+4. **Settled:** after completion, temporary storage can return to its pool; accepted
+   persistent growth transfers to continuation or result ownership. Logical progress
+   reflects the actual valid continuation boundary, not speculative physical work.
 
-Those invariants are load-bearing and this document keeps all of them:
+Demand estimates are plain values. Reservations are owning, non-duplicable leases.
+Moving a lease between owners does not reserve again. Physical storage and its
+charge live together; popping a result from a queue does not release its charge.
+Reference-counted sharing is valid where necessary, but must not duplicate accounting.
 
-- validate a complete batch before changing logical progress;
-- reserve output capacity before submission;
-- cancellation is intent, not device completion;
-- retain physical ownership when safe teardown cannot be established.
+Abandoning prepared, unsubmitted work releases **all new** reservations, including
+uncommitted persistent growth. It does not release pre-existing continuation. Ordinary
+RAII can handle host-only reservation release; fallible device retirement needs an
+explicit executor-owned retry/quarantine path. Drop cannot assert device completion.
 
-## 1. Prepared submission
+An enqueue error must distinguish a clean rejection before device access from
+uncertain partial submission. Never return ownership to the caller as though nothing
+happened after device-visible mutations. A separate `prepare` method alone cannot
+make enqueue infallible; the implementation must retain a concrete completion owner.
 
-**Problem.** A step's physical demand is not a function of its committed token
-count. Verifying a speculative step needs candidate state and verification inputs;
-a chunked prefill needs additional KV pages; a coupled multimodal step needs encoder
-output storage plus decoder workspace. The scheduler currently compares token
-budgets, so it cannot refuse work it cannot afford, and an executor that runs first
-and accounts afterwards can overshoot any bound the caller set.
+Do not add public generic `PreparedSubmission`, `PoolClaim` or lease traits until the
+real encoder/backend integration establishes their necessary representation.
 
-**Shape.** Split submission into a fallible reservation phase and an ownership
-transfer, and let the executor declare what the reservation covers.
+## Feasible batches and waiting
 
-```rust
-/// Bytes one prepared step has reserved from a pool the executor does not own.
-pub struct PoolClaim {
-    pool: PoolId,
-    bytes: u64,
-    /// Temporary claims are released on completion; committed claims belong to
-    /// continuation state and are released with the sequence.
-    kind: ClaimKind,
-}
+Preparation considers aggregate submission resources, including shared encoder work,
+cache residency, workspace, continuation growth and output capacity. A per-row budget
+reset is not a batch bound. Choose the accepted ranges before executing their work.
 
-pub trait PreparedSubmission {
-    /// What this prepared step already holds. The caller accounts for these
-    /// before it agrees to enqueue.
-    fn claims(&self) -> &[PoolClaim];
+A prepared report distinguishes:
 
-    /// Give up the reservation without executing. Every temporary claim is
-    /// released; committed claims stay with the sequence.
-    fn abandon(self) -> Result<(), ExecutionError>;
-}
+- **Ready:** positive feasible work with owned reservations;
+- **Waiting:** no committed work; a concrete condition can change;
+- **Rejected:** permanent request-local infeasibility, with a useful diagnostic.
 
-pub trait GenerationExecutor {
-    /// Validate and reserve a batch without enqueuing device work. On error
-    /// nothing is retained and live sequence state is unchanged.
-    fn prepare(&mut self, batch: &[BatchItem])
-        -> Result<Self::Prepared, ExecutionError>;
+One oversized indivisible item must not wait forever for a per-step budget that
+cannot grow. Do not infer impossibility from an arbitrary retry count.
 
-    /// Enqueue a prepared batch. Ownership of its reservations moves here with
-    /// the call. A partially enqueued batch must still leave this executor owning
-    /// completion for everything the device can observe.
-    fn enqueue(&mut self, prepared: Self::Prepared) -> SubmissionId;
-}
-```
+Waiting requests park outside runnable queues. Readiness uses a generation/epoch or
+registration-and-recheck protocol so notification before parking cannot be lost.
+Reactivation works with no device batch in flight. Cancellation and shutdown wake
+parked owners; output consumption wakes output-blocked work. A new compute-budget
+epoch differs from an external encoder dependency becoming ready.
 
-`prepare`/`enqueue` replace `submit`. The reason is not symmetry: a single call
-cannot both fail cleanly *and* guarantee that ownership survives a partial enqueue.
-After `prepare` returns, the only remaining decisions are the caller's accounting
-and the ownership transfer, and neither can fail in a way that loses state.
+Device completion may initially require timed event polling. A worker should sleep
+on commands/readiness while idle and use bounded timed waits while polling such a
+backend. Document that fallback rather than claiming fully event-driven execution.
+Do not stall healthy requests merely because another request is waiting.
 
-**Completion reconciles every component.** `StepCompletion` reports a prefix and
-sampled tokens; a hybrid sequence also carries recurrent state, convolution history,
-and KV rows. Reconciliation therefore commits continuation state per component, not
-per scalar position, and a reusable boundary retained after termination must be the
-component-wise boundary — not simply the furthest physically computed position.
+## Output ownership and boundedness
 
-**Rollback is not a thing.** A failed or abandoned step releases only what it
-reserved for that step. Anything the device may already have written stays owned
-until completion is established, which is what the current fault model already
-requires.
+The execution owner owns cancellation and discarded mailboxes. A frontend dropping
+a request relinquishes interest once; it does not maintain a second cleanup queue.
+Discard must work after an execution slot is freed but its terminal mailbox remains.
+It suppresses future delivery without releasing in-flight storage early.
 
-## 2. One accounting authority per shared pool
+Bound submission count, input bytes/tokens, retained event count/bytes and active
+physical storage separately. A bounded channel containing arbitrarily large vectors
+is not a memory bound. Public collect helpers intentionally allocate the requested
+result; document their limit and offer incremental consumption for large workloads.
 
-**Problem.** Independently bounded runtimes do not make a bounded pipeline. Encoder
-results, AR continuation state, execution workspace and cached features can all
-occupy one device, and two runtimes that each believe they hold some bytes will
-happily fill the pool with upstream results while leaving no workspace for the
-downstream stage that must consume them.
+Cancellation must remain deliverable when the ordinary submission queue is full.
+Use per-request cancellation intent plus a wakeup, or a separately bounded control
+path whose capacity follows admitted requests—not an unbounded emergency queue.
 
-**Shape.** The pool has one owner that hands out reservations; runtimes state
-demand in concrete bytes through their own `PoolClaim`s and never interpret each
-other's.
+## Cross-runtime device ownership
 
-```rust
-/// The single accounting authority for one shared pool. External orchestrators
-/// still decide physical allocation; this only decides who may consume it.
-pub struct PoolBudget { /* capacity, outstanding reservations */ }
+A device-resident result needs its representation, model identity, pool charge and
+producer completion dependency. The consumer must wait on that dependency before
+reading. Storage cannot be overwritten until all consumer device accesses finish;
+an `Arc` alone proves neither completion nor exclusive reuse.
 
-impl PoolBudget {
-    /// Reserve `bytes`, or report the shortfall without reserving anything.
-    pub fn reserve(&self, bytes: u64, kind: ClaimKind) -> Result<PoolReservation, Shortfall>;
-    /// Release a reservation. Idempotent, because release retries happen.
-    pub fn release(&self, reservation: PoolReservation);
-}
-```
+Cancellation before downstream admission leaves the producer/transport owner
+responsible for retirement. Successful admission transfers that responsibility to
+the consumer. Failed handoffs retain an owner. Unknown completion quarantines the
+storage and its charge rather than returning it to a free list.
 
-The scheduler asks an executor for claims, reserves them, and only then permits
-`enqueue`. A refused reservation is ordinary backpressure, not an error: the
-request waits, and the runtime reports which pool is short so an operator can see
-whether the bottleneck is continuation state, workspace, or an upstream backlog.
+Async host-to-device transfers likewise own an immutable staging buffer until the
+copy completes. Reusable pinned metadata is not automatically safe transfer storage.
 
-Model and backend code still calculates demand. What moves into the shared layer is
-only the decision to grant or refuse it, and the aggregate view that prevents two
-stages from double-spending one pool.
+Pool boundedness is not progress: upstream results can fill a pool and starve the
+consumer workspace needed to release them. Reserve downstream headroom or admit
+whole pipeline resource envelopes for the concrete pipeline; prove this with a
+constrained-pool test before generalizing it.
 
-## 3. Completion and access ownership across runtimes
+## Owning executable snapshot
 
-**Problem.** The sequential encoder→decoder handoff proves that admission transfers
-ownership of a prepared state. It does not establish that the encoder's writes are
-visible to the decoder, that the decoder is the last reader, or that its buffer may
-be reused. An `Arc` says who may *access* an allocation, not who may *overwrite* it.
-Cancelling after encoder submission cannot reclaim its output, because AR admission
-never happened but the device may still be writing.
+A snapshot is the owned executable configuration: prepared weights/materializations,
+adapters, processor configuration and execution resources. A numeric version is not
+an owner. Mutable request state stays in the runtime, not inside a shared mutable
+snapshot object protected by one global lock.
 
-**Shape.** A handoff carries a completion dependency and an owned access lease
-alongside the representation.
+Start with one loaded execution owner's lifetime pinning one snapshot. Implement
+**drain-and-replace** first: stop new admission, finish/cancel old work, establish
+completion, release old resources, then publish the replacement. Concurrent old/new
+snapshots are a distinct double-buffered policy requiring measured extra capacity,
+not another name for draining.
 
-```rust
-/// Proof that a producer's writes are visible to a consumer.
-pub struct CompletionDependency(/* backend-owned */);
+An accepted request uses one coherent snapshot. Derived-state reuse requires semantic
+compatibility (parameters, adapters, processor, numerical policy and trust domain)
+and physical compatibility (backend, encoding, layout, addresses where captured).
+Do not partially reuse hybrid continuation unless all required components form a
+valid boundary. Exact snapshot identity is a safe initial compatibility policy;
+relax it only with evidence.
 
-/// Exclusive access to a prepared state until it is dropped.
-pub struct StateLease { /* opaque */ }
+Trainer-to-rollout updates eventually prepare a serving materialization and publish
+it at an explicit version boundary. Inference must never observe tensors while an
+optimizer mutates them. Sharing logical parameter identity does not require training
+master weights and quantized serving weights to share an allocation.
 
-pub struct Handoff<S> {
-    state: S,
-    /// Which model snapshot and representation `state` belongs to.
-    identity: StateIdentity,
-    ready: CompletionDependency,
-    lease: StateLease,
-}
-```
+## Acceptance evidence
 
-Requirements:
+- Positive partial prefill, final-prefill output rules, credit refunds, malformed
+  mixed rows with no logical commit, cancellation during delayed completion.
+- Discard before admission, during execution, after terminal publication, on decoder
+  errors and on batch failure; stalled and healthy consumers together; bounded memory.
+- Multiple callers, queue saturation, cancellation under saturation, owner shutdown,
+  lost-wakeup interleavings and worker failure propagation.
+- A real asynchronous encoder: aggregate resource pressure, partial enqueue failure,
+  abandonment of new persistent growth, consumer stalls, failed handoffs and delayed
+  producer/consumer completion without premature reuse or leaked reservations.
+- Snapshot draining and replacement, incompatible adapter/processor state, and later
+  explicit overlap accounting before supporting concurrent versions.
 
-- a consumer must not read a state before its completion dependency is satisfied;
-- a producer must not reuse or free a state while any access lease is outstanding;
-- cancellation does not imply completion, so a cancelled handoff keeps its lease;
-- a faulted handoff's state is quarantined with the pool that owns it, not returned
-  to a free list;
-- the representation stays backend-specific. This layer never learns what a tensor,
-  KV block, or recurrent state is, only that some prepared state exists and who may
-  touch it.
-
-**Pinned host metadata is not a transfer buffer.** Reusable metadata can live in
-pinned host memory, but an asynchronous transfer must read a buffer whose lifetime
-the transfer owns. Overwriting shared metadata while a copy is in flight is a data
-race that no ownership check catches today, because the buffer is borrowed rather
-than owned.
-
-## 4. Owning model snapshot
-
-**Problem.** `ParameterVersion` labels a parameter set consistently, and the batch
-runtime detects a version change instead of preserving the previous version for
-queued work. A version label does not own a coherent executable snapshot, and "the
-versions are equal" is not a compatibility rule.
-
-**Shape.** An admitted request pins an immutable snapshot for its lifetime.
-
-```rust
-/// One executable model configuration: weights, adapters, processor
-/// configuration, and the prepared resources they require.
-pub struct ModelSnapshot { /* version, owned artifacts, prepared resources */ }
-
-impl ModelSnapshot {
-    pub fn version(&self) -> ParameterVersion;
-    /// May derived state from `self` be reused for a request on `other`?
-    pub fn semantic_compatibility(&self, other: &Self) -> Compatibility;
-    /// May this allocation, captured graph, or prepared state be used by the
-    /// backend execution prepared for `other`?
-    pub fn physical_compatibility(&self, other: &Self) -> Compatibility;
-}
-```
-
-A single coarse snapshot epoch is enough to start; per-parameter multiversioning is
-not required. Drain-and-replace is an acceptable update policy before seamless hot
-swap is worth building: new admissions pin the new snapshot, existing requests keep
-the old one alive until they finish, and the old snapshot is released when its last
-request does.
-
-**Semantic and physical compatibility are different questions** and must not collapse
-into one equality check:
-
-- *Semantic*: may this prompt prefix, recurrent checkpoint, or encoder result be
-  reused without changing the intended computation? If `false` for a component, that
-  component is recomputed and the rest may still be reused.
-- *Physical*: may this buffer, captured graph, or transferred state be used by this
-  prepared backend execution? Equal logical weight versions do not make state
-  interchangeable between different quantized materializations, and a captured graph
-  has additional address and layout lifetime constraints.
-
-Cache reuse keys are therefore built from snapshot identity plus materialization
-identity, not from token content alone. Multi-tenant reuse additionally needs a
-trust domain: two tenants may legitimately share tokens whose *state* must not be
-shared.
-
-## Acceptance tests
-
-Each one is written to fail against the current code, which is the point.
-
-1. **Reservation under pressure.** With a constrained pool, prepare a multi-token
-   step, inject failures before and after enqueue, accept only a prefix, and verify
-   the resulting continuation matches a non-speculative reference with no leaked or
-   prematurely reused reservation.
-2. **Consumer stall.** Stall a consumer while submissions continue, run encoder and
-   decoder work against a small shared pool, and verify retained memory plateaus,
-   overload is explicit (which pool, how much short), and cancellation still works.
-3. **Handoff lifetime.** Run an asynchronous encoder→decoder handoff with
-   cancellation at each handoff point, delayed completion, producer failure, and an
-   attempted buffer reuse, and verify no reader observes incomplete writes while an
-   independent request still completes.
-4. **Snapshot transition.** Keep requests running across a snapshot change, alter an
-   adapter or processor configuration, and verify reuse happens only for explicitly
-   compatible state while old allocations stay alive until their users finish.
-
-## What this does not change
-
-- Models still own their state layouts, kernels, and materialization choices.
-- The scheduler stays cheap: expensive planning and profiling do not move onto the
-  per-step path, and the pool owner only grants or refuses reservations.
-- `ribn-batch` keeps its ready/blocked/rejected admission and its waiting and
-  retained bounds; it gains pool claims rather than a second admission model.
-- No universal resource vector, tensor abstraction, or dynamic plugin ABI appears
-  here. A `PoolClaim` is bytes plus a pool handle, and `Handoff` is generic over a
-  backend-specific representation.
+Host fixtures prove lifecycle transitions, not GPU memory safety or model support.
+Run real device qualification for the affected execution path.

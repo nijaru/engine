@@ -1,6 +1,6 @@
 # Ribn
 
-A Rust-first general model inference runtime and serving engine.
+A Rust-first, server-first general model inference engine.
 
 The goal is state-of-the-art inference performance, model coverage, reliability,
 and familiar CLI/library/server workflows across modern model classes. The current
@@ -154,12 +154,18 @@ requires an actual compatible NVIDIA GPU.
 
 ## Documentation
 
-- [Inference engine design](docs/inference-engine-design.md)
-- [Shared execution foundation](docs/execution-foundation.md)
-- [Pipeline composition](docs/pipeline-composition.md)
-- [Architecture](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
-- [Research agenda](docs/research-agenda.md)
+Implementation references, in order:
+
+1. [Target design](docs/inference-engine-design.md) — priorities, architecture and API semantics.
+2. [Execution contracts](docs/resource-protocol.md) — ownership, preparation, waiting and snapshots.
+3. [Roadmap](docs/roadmap.md) — ordered slices, open decisions and acceptance evidence.
+
+Supporting references (not competing implementation plans):
+
+- [Current implementation](docs/architecture.md)
+- [Foundation experiments](docs/execution-foundation.md)
+- [Composition experiments](docs/pipeline-composition.md)
+- [Research sources and questions](docs/research-agenda.md)
 - [Runtime redesign history](docs/runtime-redesign.md)
 - [Runtime verification](benchmarks/runtime-contract.md)
 - [Benchmarks](benchmarks/README.md)

@@ -1,11 +1,52 @@
 # Inference engine design
 
-Date: 2026-09-12 (America/Los_Angeles)
-Status: target architecture; current Qwen/CUDA implementation is a prototype subsystem
+Reviewed: 2026-09-13 (America/Los_Angeles)
+Status: authoritative target architecture. Boundaries below are accepted direction;
+exact public signatures and preparation/wakeup types remain open until their roadmap
+gates pass. This is not a claim of implemented support.
+
+## Reference ownership and implementation rules
+
+Read these three references for architectural work, in order:
+
+1. This document owns product priorities, decomposition and public API semantics.
+2. [Resource protocol](resource-protocol.md) owns execution/resource ownership and
+   state-transition rules. Do not reinterpret them in a frontend or model adapter.
+3. [Roadmap](roadmap.md) owns sequencing, unresolved decisions and acceptance gates.
+
+[Architecture](architecture.md) describes current code, not competing target rules.
+[Execution foundation](execution-foundation.md) and
+[pipeline composition](pipeline-composition.md) retain experiments and limitations;
+their provisional types are not required implementation architecture.
+[Research agenda](research-agenda.md) lists investigation topics, not an alternate
+backlog. Historical designs do not override these references.
+
+Before implementing an architectural slice, resolve its externally observable
+contract: ownership, permitted transitions, failure scope, cancellation, boundedness,
+readiness and shutdown. Record any unresolved choice explicitly in the roadmap.
+Choose internal data structures, helper names and qualified kernel details locally.
+If source or a counterexample contradicts a contract, revise the owning reference
+and its tests rather than silently weakening the contract or layering a workaround.
+
+Design enough to implement the next vertical slice safely, not every future trait.
+A small executable counterexample may precede final API signatures; label it as an
+experiment and do not build production dependents on unresolved contracts. A gate
+closes only with the stated evidence, not with compilation or more documentation.
 
 ## Decision
 
-Ribn is a general model inference engine. The current token-generation runtime is
+Ribn is a **server-first**, general model inference engine. Optimize and qualify
+sustained concurrent execution, throughput within latency objectives, bounded memory,
+fairness, overload and cancellation before local startup convenience. In-process
+Rust/Python and local CLI use share the same engine; server-first does not require
+HTTP, IPC or a multiprocess single-device deployment.
+
+All v0 APIs are unstable. Replace flawed contracts and remove obsolete paths rather
+than preserving them with compatibility shims. Preserve correctness evidence, not
+historical architecture. Future training and distribution should require localized
+extensions; this is a goal to pressure-test, not a promise of zero future refactors.
+
+The current token-generation runtime is
 an **autoregressive (AR) runtime**, not the definition of the whole engine.
 
 That distinction matters because current inference workloads include decoder-only
@@ -97,6 +138,143 @@ Configuration should distinguish model/load settings, execution/resource setting
 scheduling policy, request-generation settings, and server settings. Defaults are
 convenience, not hidden task selection. Explicit request values override resolved
 model defaults where supported.
+
+## Greenfield review: inference first, training-compatible below policy
+
+The from-scratch design would have four boundaries, not a universal engine graph:
+
+1. **Artifact and model definition:** validated configuration, processors, parameter
+   mappings and operation semantics; no serving lifecycle.
+2. **Prepared execution:** an owning backend-specific model snapshot, device storage,
+   qualified kernels and explicit completion/resource ownership.
+3. **Execution policy:** AR, batch and later iterative/training loops, each with its
+   own scheduling and state semantics. Share mechanisms only when implementations
+   demonstrate reuse.
+4. **Application access:** operation-specific owned requests/results, bounded
+   submission, cancellation, diagnostics and frontend adapters.
+
+A single-model request should cross the application boundary once, not pass through
+an orchestrator, worker, executor and engine that forward identical calls. Genuine
+multi-runtime dependencies justify orchestration; a model with one runtime does not.
+
+### Rust API decision
+
+Keep two deliberate surfaces. The application surface is an owned cloneable handle
+backed by a single mutable execution owner. The direct surface lets an embedding
+application drive that same runtime without channels or a background thread.
+Do not implement synchronous and asynchronous execution as separate schedulers.
+
+The intended usage is `model.generate(request).await?` or
+`model.stream(request).await?`, returning an owned response or request stream that
+can outlive the borrow used to submit it. These are target signatures, not working
+examples. A stream owns cancellation interest, yields ordered deltas and one terminal
+outcome, and supports explicit cancellation. Dropping it abandons delivery and asks
+the execution owner to retire the request; it never waits for GPU completion.
+
+Use a model loader for source/revision/device preparation and operation-specific
+handles or checked methods for supported capabilities. Do not expose a giant
+`infer(Any) -> Any` API, nor implement unsupported operations as silent fallbacks.
+Introduce typed media and tensor interchange when a real operation needs them.
+Borrowed input is convenient for direct calls; queued input must be owned or share
+an explicitly immutable allocation. Keep backend tensor types out of network APIs.
+
+Separate load/resource settings, scheduler policy and per-request sampling settings.
+Use ordinary structs/builders with validated defaults; avoid typestate builders for
+unrelated configuration choices. Use typed errors distinguishing invalid input,
+unsupported capability, overload, request failure and owner/device failure. Preserve
+underlying error sources; strings alone are poor diagnostics and control flow.
+
+Batch convenience must admit a bounded window and preserve input ordering; collecting
+an arbitrary iterator before admission is not bounded batching. Offer incremental
+results for large offline workloads. A stalled stream must backpressure its request
+without blocking cancellation or unrelated consumers. Preprocessing also needs byte
+limits and bounded concurrency; moving tokenization before enqueue does not bound it.
+
+A worker thread is a practical first execution owner for thread-affine/blocking GPU
+APIs. Async clients await bounded channels; they do not block an async executor with
+GPU polling or tokenization. Keep a blocking wrapper for CLI/local use and make its
+runtime restrictions explicit. The core scheduler need not depend on Tokio. Adopt
+one established channel/wakeup implementation instead of inventing synchronization.
+
+### Performance, UX and contribution consequences
+
+| Decision | Benefit | Cost and required evidence |
+| --- | --- | --- |
+| Single execution owner | Local mutation, simpler cancellation, no global hot-path mutex | Queue/wakeup overhead; compare direct and handle paths with a trivial executor and real GPU |
+| Owned request stream | Concurrent callers and predictable disconnect cleanup | Bounded per-request state; prove saturation and drop races |
+| Coarse model dispatch | Simple registration and backend specialization | Dispatch once per batch/operation; do not assert zero cost or force per-layer virtual calls |
+| Backend-native execution | Packed layouts, vendor kernels, graphs and fusion remain available | More backend implementation work; qualify scope and retain references |
+| Operation-specific API | Familiar semantics and useful errors | Some surface growth as actual operations land, preferable to untyped payloads |
+| Versioned executable ownership | Safe cache/update boundaries and future rollout integration | Drain latency or explicit double-buffer memory, not free hot swapping |
+
+First optimize algorithm and data movement: scalable prefill GEMM versus small-M
+GEMV, tiled attention, dynamic hybrid continuation capacity, packed cross-request
+work, persistent metadata and reusable buffers. Then measure queue overhead, CPU
+allocation, scheduling gaps and synchronization. Rust alone does not make a GPU
+engine fast. Asynchronous APIs alone do not overlap CPU/GPU work.
+
+Report load time/peak host and device memory, TTFT, inter-token latency, throughput,
+latency tails, cancellation latency and stalled-consumer memory under matched
+workloads. Keep direct-path host overhead separate from model execution. One 4090
+prompt sweep cannot establish SOTA performance or a universal scheduling policy.
+
+Contributors should implement model semantics, processors and backend components,
+register the architecture centrally, then run a common lifecycle/numerical harness.
+Do not promise every model is a forward-function plugin: a new state mechanism may
+need a shared contract change. The second decoder and real VLM remain the proof.
+
+### Training decision and reconsideration trigger
+
+Training is a plausible subsequent product, not an inference mode. It needs losses,
+backward execution, saved activations/rematerialization, gradients, optimizers,
+precision/scaling policy, collectives and checkpoint/restart semantics. A token
+scheduler and quantized forward implementation cannot provide those by extension.
+
+Share artifact I/O, logical parameter identity, useful device/storage primitives,
+completion dependencies and collectives where concrete implementations align. Allow
+shared model semantics or a small operation vocabulary later; do not force optimized
+inference through an eager tensor/autograd abstraction to reserve that option.
+Training and inference may use different model programs and materializations while
+sharing tested mathematical components. Native Rust control also does not require
+rewriting working CUDA/vendor kernels into Rust immediately.
+
+The first integration target should be trainer-to-rollout snapshot publication and
+in-process Python tensor/result interchange, with explicit lifetime and version
+ownership. A future trainer should first prove a small forward/backward/update loop
+against an independent reference, then checkpoint recovery and distributed progress.
+That experiment—not metadata types—determines whether a shared model/operator layer
+actually saves work. Reconsider the split if maintaining two model semantics becomes
+a demonstrated correctness or contribution bottleneck.
+
+### Gap and alignment decision
+
+At `2abf382`, the crate graph has useful format separation but the Qwen adapter still
+translates `ribn::BatchItem` through `engine-core::ExecutionBatch` and state managers.
+`ribn-foundation` mostly describes identities/topology rather than owning executable
+storage. `TextModel` hardcodes Qwen loading, borrows mutably for streaming, flattens
+errors and duplicates request cleanup. Completion planning clones token vectors and
+allocates temporary row plans; `Blocked` is immediately resubmitted. These are source
+observations, not inferred benchmark bottlenecks.
+
+Align by replacing incomplete mechanisms, not by adding more layers around them:
+
+1. Remove completion-time blocking until preparation can own real waiting; retain
+   strictly positive partial progress and allocation-free whole-batch validation.
+2. Move cancel-and-discard into the runtime mailbox owner and remove frontend cleanup
+   queues. Exercise errors and abandoned terminal mailboxes with host regressions.
+3. Add the bounded owned handle over this owner, with real wakeups, typed errors,
+   host-testable text behavior and one pinned executable lifetime. No general registry
+   or hot-swap machinery is needed to establish that lifetime.
+4. Use the real asynchronous encoder to establish preparation/reservations and
+   dependencies. Then introduce dynamic hybrid AR resources and real model additions.
+5. Replace legacy Qwen/core translation at the physical execution boundary, preserving
+   the qualification oracle. Delete obsolete helpers as their last consumers move;
+   do not wait for all future model classes before deleting dead paths.
+
+Keep existing provisional foundation/batch tests as counterexamples, not architecture
+requirements. Do not enlarge them into production frameworks without real consumers.
+The [resource protocol](resource-protocol.md) owns precise lifecycle and preparation
+rules; the [roadmap](roadmap.md) owns sequencing and completion status.
 
 ## Model package boundary
 
@@ -339,6 +517,12 @@ Supporting a use case means implementing and qualifying it; listing it here only
 means the architecture must not make it require a foundational rewrite.
 
 ## External design lessons
+
+The comparisons below are inherited research leads, not freshly verified feature
+claims or accepted implementation choices. Verify current primary source and pin
+its revision before using a volatile external behavior to decide a contract. Retain
+that evidence with the decision; do not copy another engine's process structure
+without measuring the need in Rust.
 
 | Engine | What to borrow | Main trade-off / warning |
 | --- | --- | --- |

@@ -11,8 +11,9 @@ Read `../../../docs/roadmap.md` for the model-local integration acceptance gate 
 current priorities. Read `../../../docs/inference-engine-design.md` and
 `../../../docs/pipeline-composition.md` when the integration changes execution or
 composition. If resource admission or handoff changes, also read
-`../../../docs/resource-protocol.md`; its unresolved sketches are not implementable
-contracts yet.
+`../../../docs/resource-protocol.md` and `../execution-contracts/SKILL.md`.
+The protocol owns lifecycle rules; exact preparation/readiness types require the
+real implementation and roadmap gate, not transcription of a speculative sketch.
 
 1. Identify whether this is an existing-architecture checkpoint, a new architecture
    using existing mechanisms, a new state/resource mechanism, or a new execution

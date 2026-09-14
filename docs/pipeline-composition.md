@@ -1,7 +1,12 @@
 # Pipeline composition and coupled execution
 
 Date: 2026-09-12
-Status: design-validation note; boundaries remain provisional
+Status: experimental evidence; boundaries remain provisional.
+
+Use [target design](inference-engine-design.md) for architecture and
+[resource protocol](resource-protocol.md) for accepted ownership rules. This document
+retains counterexamples, not a second implementation contract. Roadmap gates override
+historical next-step suggestions below.
 
 Ribn should not turn every architectural component of a model into a top-level
 runtime stage. A stage boundary is justified by execution lifecycle, scheduling,
@@ -162,13 +167,14 @@ Not carried today:
   makes the row block forever rather than fail: the engine has no *completion*-time
   rejection, only admission-time failure. A request that can never proceed therefore
   waits instead of reporting that;
-- naming the condition. `Blocked` says a row could not proceed, not what must change,
-  so a driver can wait and retry but cannot yet distinguish a ready encoder from a
-  compute-budget wait. Requests, tokens and encoding are per-frame facts here; fine
-  placement is left open;
-- priority between blocked and newly-ready rows, and whether a blocked row holds its
-  slot in the batch. With one batch in flight the scheduler retries it in the next
-  step, which is adequate for one model and not a policy.
+- actual waiting. `Blocked` names no readiness condition and the engine may resubmit
+  the same row inside that same `step`. Frontend `yield_now` does not park it;
+- aggregate encoder admission. The fixture resets compute budget per row, so its
+  single-request budget checks do not establish a submission-wide bound.
+
+The accepted correction is to remove completion-time `Blocked` until real preparation
+can own waiting/reactivation and request-local rejection. Positive shortened progress
+remains useful but does not itself solve pre-execution resource negotiation.
 
 Those are the concrete reasons the incremental `prepare`-then-`enqueue` contract in
 [the resource protocol](resource-protocol.md) still matters: negotiation happens after
@@ -244,8 +250,8 @@ Remaining before stabilizing composition contracts:
 - integrate an actual VLM processor/model and let its real feature tensors, prompt
   positions, cache lifetime and device costs determine the production coupled
   scheduler/resource seam;
-- decide how a completion-time rejection and a named blocked condition should work,
-  since progress negotiation can limit work but cannot yet refuse it;
+- establish pre-execution rejection and named readiness with the real resource
+  planner, rather than extending an incomplete completion-time blocking enum;
 - validate version compatibility and async failure propagation for both staged and
   coupled derived state.
 
