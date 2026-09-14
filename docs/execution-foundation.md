@@ -360,7 +360,12 @@ Implemented as provisional scaffolding:
 - VLM prompt-position dependency scheduling with separate encoder compute/cache
   pressure as a test-only model of the coupled case, plus the same dependencies
   driven through the real admission loop to establish which of those decisions the
-  request contract carries and which it does not.
+  request contract carries and which it does not;
+- per-row progress negotiation in that loop: a shortened prefill range commits
+  exactly what the backend reported, an explicit blocked outcome keeps a sequence
+  runnable without faulting its peers, and encoder budgets hold without aligning the
+  policy chunk to prompt-item granularity. Completion-time rejection and naming a
+  blocked condition are not carried and remain resource-protocol work.
 
 This validates that the broad boundary is implementable and has forced several
 interface changes. It does **not** validate that these exact types are sufficient or
