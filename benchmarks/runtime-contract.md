@@ -41,13 +41,14 @@ peers. `crates/runtime/tests/multimodal_admission.rs` exercises the same negotia
 against encoder-item budgets, including a chunk that spans two items completing
 without chunk alignment.
 
-`crates/runtime/tests/abandoned_requests.rs` pins the contract an abandoned
-request depends on: a cancelled request stays addressable until its terminal event
-is drained, draining it releases both mailbox and request slot, and the aggregate
-`pop_event` drain is round-robin across clients, so it can hand one caller an
-event another caller owns. A frontend that routes the aggregate drain through its
-own request map can therefore read a request it never submitted; that is why
-request-scoped callers use `pop_event_for`.
+`crates/runtime/tests/abandoned_requests.rs` separates execution and mailbox
+lifetimes: an execution slot can be reclaimed before its terminal event is consumed.
+`Engine::discard` cancels and suppresses present/future delivery, even after that
+slot is gone, while retaining in-flight retirement ownership. Tests cover repeated
+discard without draining, healthy peers and in-flight cancellation. Output unit tests
+pin reservation retention, ready-list unlinking and discarded terminal publication
+when a peer holds all buffer capacity. Request-scoped callers use `pop_event_for`;
+the aggregate drain intentionally includes other clients' events.
 
 ## Shared text frontend
 
@@ -74,13 +75,30 @@ cargo test --release -p ribn-text --features cuda --test text_lifecycle \
 It covers a stream dropped mid-flight followed by `generate_batch` (which
 previously panicked, because the abandoned request's terminal event reached a
 batch that indexed its own request map with it), six abandonments followed by an
-ordinary request (an undrained mailbox would hold output capacity that
-`flush_terminals` needs to reclaim the request), an unpreparable batch input
+ordinary request (undrained output can exhaust shared delivery capacity), an unpreparable batch input
 failing before anything is submitted, and an invalid token failing only its own
 batch member. Run it serially: each test loads the full 27B artifact, so parallel
 processes contend for device memory. (The earlier parallel attempts failed on
 descriptors first, at 1024 open files; that loader cost is fixed and recorded in
 `docs/execution-foundation.md`.)
+
+### Runtime-owned discard qualification (2026-09-14)
+
+Revision `4477a0e` removes the text facade's discard/retry list. Batch collection
+relinquishes all submitted requests on both success and error; stream engine/decoder
+errors relinquish delivery immediately. Physical retirement remains runtime-owned.
+
+- Host workspace tests, formatting, boundaries, default and CUDA-feature all-target
+  clippy passed with actual zero exit statuses.
+- `discard_survives_a_blocked_in_flight_completion` failed before the cancellation
+  branch fix and passed after it. The old branch erased cancellation intent.
+- CUDA text lifecycle: **4/4, 77.32 s**, serialized on the RTX 4090 with the pinned
+  Qwen artifact. Log: `desktop:~/ribn-lifecycle-2026-09-14/01-runtime-discard.log`.
+- Other newly added discard tests exercise a new API, not failing-before tests against
+  an API that previously existed. Host fixture tests do not exercise text decoding.
+- Full CUDA kernel/reference and exact-token gates were not rerun for this slice;
+  kernel arithmetic and the Qwen executor were unchanged. This is not a new numerical
+  qualification claim. Concurrent handles and event-driven readiness remain undone.
 
 ## Synthetic CPU benchmark
 

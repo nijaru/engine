@@ -61,6 +61,12 @@ belongs in [benchmarks](../benchmarks/README.md), not repeated milestone tables.
 
 ### 1. Repair the execution ownership baseline
 
+Partially implemented at `4477a0e`: runtime-owned discard replaces frontend cleanup
+lists; batch and stream errors relinquish output interest. Host checks and CUDA text
+lifecycle 4/4 passed. A failing-before test also pins cancellation through the legacy
+blocked completion branch. See [qualification](../benchmarks/runtime-contract.md#runtime-owned-discard-qualification-2026-09-14).
+Completion API removal and positive-progress validation remain next.
+
 Decided scope:
 
 - retain positive contiguous partial-prefill completion and whole-batch validation;
