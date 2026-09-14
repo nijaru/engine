@@ -142,7 +142,7 @@ scheduler, or another small cooperative interface.
 `crates/runtime/tests/multimodal_admission.rs` asks the same questions through the
 real `Engine` instead of a pure function, and the answers divide the list above.
 
-Carried today:
+Carried by admission:
 
 - `Admission::Deferred` is a working per-request encoder gate: the engine retries the
   request on later steps and commits no prompt token while it waits, so "do not start
@@ -150,7 +150,7 @@ Carried today:
 - a backend can perform encoder work inside its own step, and encoder output published
   by anyone is reused rather than recomputed, across requests as well as across steps.
 
-Carried since the progress-negotiation change (2026-09-13):
+Historical completion experiment (`6f0ebbf`, superseded by `14d0290`):
 
 - a prefill row may accept *fewer* inputs than the engine offered, so a backend stops
   before a placeholder it cannot encode instead of overspending an encoder budget or
@@ -161,7 +161,7 @@ Carried since the progress-negotiation change (2026-09-13):
   it commits no progress, stays runnable, does not fault its peers, and is observable
   through `StepStatus::blocked`. A short or blocked step is ordinary, not an error.
 
-Not carried today:
+Limits of that historical experiment:
 
 - permanent infeasibility. A step budget smaller than one indivisible encoder item
   makes the row block forever rather than fail: the engine has no *completion*-time
@@ -172,9 +172,11 @@ Not carried today:
 - aggregate encoder admission. The fixture resets compute budget per row, so its
   single-request budget checks do not establish a submission-wide bound.
 
-The accepted correction is to remove completion-time `Blocked` until real preparation
-can own waiting/reactivation and request-local rejection. Positive shortened progress
-remains useful but does not itself solve pre-execution resource negotiation.
+At `14d0290`, completion-time `Blocked` is removed. The fixture now shares an
+aggregate submission budget and rejects permanently impossible uncached items during
+admission. It exercises positive shortened rows only; temporary inability to advance
+at a leading dependency remains unexpressible, not silently represented as success.
+Positive shortened progress does not itself solve pre-execution resource negotiation.
 
 Those are the concrete reasons the incremental `prepare`-then-`enqueue` contract in
 [the resource protocol](resource-protocol.md) still matters: negotiation happens after
@@ -239,9 +241,9 @@ Completed coupled pressure tests:
 - cached items bypass encoder compute but still represent cache residency;
 - encoder compute and cache are independent scheduling constraints;
 - later dependencies can shorten a chunk after earlier dependencies were satisfied;
-- a submitted prefill row accepts a shorter range than the scheduler offered, and a
-  row that cannot proceed reports `Blocked` without faulting its peers, so encoder
-  budgets hold without aligning the policy chunk to item granularity.
+- submitted prefill rows can report a positive shortened range within a shared
+  encoder budget, when every offered row can advance; impossible uncached items are
+  rejected at admission. Temporary row-level waiting remains an unimplemented seam.
 
 Remaining before stabilizing composition contracts:
 

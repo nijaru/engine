@@ -1,22 +1,24 @@
 # Resource, submission and snapshot protocol
 
-Status: accepted direction, not implemented APIs. The 2026-09-13 review replaces
+Status: accepted direction. Current completion/discard behavior is identified below;
+prepared resources, readiness and snapshot replacement are not implemented APIs. The 2026-09-13 review replaces
 contradictory claim/reservation sketches with the ownership rules below. The
 [roadmap](roadmap.md) owns implementation order and exit evidence.
 
-## Current boundary and immediate correction
+## Current boundary
 
-`GenerationExecutor` currently combines admission, submission and completion.
+At `14d0290`, `GenerationExecutor` combines admission, submission and completion.
 Qwen reserves its full continuation capacity at admission and executes the offered
-range. The experimental completion-time `Blocked` outcome has no readiness source,
-parking or request-local rejection. The engine requeues and can resubmit it inside
-that same `step`; `yield_now` in a frontend does not fix this.
+range. `poll` returns one positive `StepCompletion` per row. `None` means submitted
+work remains pending, not a settled request waiting for a resource.
 
-Remove that incomplete outcome rather than treating it as resource negotiation.
-Keep positive partial-prefill completion: it reports a contiguous consumed range,
-not permission to exceed physical capacity and not a pre-submit reservation.
-Introduce ordinary resource waiting with a real preparation implementation and its
-readiness source, not another isolated completion enum.
+The incomplete completion-time `Blocked` enum was removed: it had no readiness source
+or parking and could immediately resubmit unchanged work. Positive partial-prefill
+completion remains: it reports a contiguous consumed range, not permission to exceed
+physical capacity and not a pre-submit reservation. Ordinary resource waiting must
+arrive with a real preparation implementation and its readiness source, not another
+isolated completion enum. `Admission::Deferred` and device polling still rely on
+explicit driver steps; the current synchronous facade is not event-driven.
 
 Keep these invariants throughout replacement:
 

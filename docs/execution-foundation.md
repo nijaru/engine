@@ -371,8 +371,10 @@ Implemented as provisional scaffolding:
 - partial-prefill reporting through that loop, with important limits: the fixture
   budgets each row separately, not an aggregate submission; `Blocked` immediately
   requeues rather than parking, and permanent infeasibility waits forever. This is
-  not a complete resource-negotiation or liveness proof. The roadmap removes the
-  incomplete blocked outcome until real preparation owns readiness and rejection.
+  not a complete resource-negotiation or liveness proof. At `14d0290`, the incomplete
+  blocked outcome is removed. The fixture now shares an aggregate submission budget
+  and rejects impossible uncached items at admission, but temporary row-level waiting
+  still requires real preparation/readiness work.
 
 This validates that the broad boundary is implementable and has forced several
 interface changes. It does **not** validate that these exact types are sufficient or

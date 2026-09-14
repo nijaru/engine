@@ -65,7 +65,16 @@ Partially implemented at `4477a0e`: runtime-owned discard replaces frontend clea
 lists; batch and stream errors relinquish output interest. Host checks and CUDA text
 lifecycle 4/4 passed. A failing-before test also pins cancellation through the legacy
 blocked completion branch. See [qualification](../benchmarks/runtime-contract.md#runtime-owned-discard-qualification-2026-09-14).
-Completion API removal and positive-progress validation remain next.
+At `14d0290`, the completion-time blocking API is removed and prefill advancement
+must be positive. Completion validation no longer allocates/clones row plans and
+retains batch-slot capacity. Zero-progress rejection has a failing-before regression;
+partial-prefill runs with a two-credit output pool; mixed malformed rows, cancellation,
+failed release and faulted retirement are covered. Host checks pass. Combined device
+gates at `14d0290` pass: text lifecycle 4/4 (76.91 s), exact-token runtime (174.22 s),
+CUDA reference 61/61 (408.13 s), each with recorded exit 0. The next design gate is
+owned concurrent access. Direct host injection into the CUDA-gated text decoder and
+broader frontend error-path testing remain part of that gate; current device tests
+are narrow, not exhaustive frontend failure coverage.
 
 Decided scope:
 

@@ -1,6 +1,6 @@
 # Current implementation
 
-Observed baseline: `4477a0e`. This is a code map, not a second target design.
+Observed baseline: `14d0290`. This is a code map, not a second target design.
 [Inference engine design](inference-engine-design.md) owns the target;
 [resource protocol](resource-protocol.md) owns contracts;
 [roadmap](roadmap.md) owns implementation order and exit evidence.
@@ -28,9 +28,11 @@ the submitted batch.
 
 Output mailboxes can outlive execution slots. `Engine::discard` owns abandonment
 across those lifetimes; the text facade has no separate cleanup list. Discard suppresses
-delivery without driving the runtime or establishing device completion. Completion-time
-`Blocked` still requeues immediately and has no readiness protocol; it is scheduled
-for removal. Its cancellation branch now preserves cancellation intent.
+delivery without driving the runtime or establishing device completion. Completion
+returns positive `StepCompletion` rows, including shortened prefill ranges; the
+incomplete completion-time `Blocked` API was removed. Validation borrows all rows
+before moving them into commitment and retains batch-buffer capacity. Genuine
+resource parking/reactivation remains unimplemented.
 
 Qwen admission reserves full configured continuation state. The adapter translates
 AR batch records into `engine-core` execution and state-manager types. It is not an

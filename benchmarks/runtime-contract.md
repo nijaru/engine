@@ -32,14 +32,14 @@ shutdown retries, and conservative retention after uncertain teardown. New tests
 per-request mailbox isolation, draining after execution-slot reuse, bounded ready
 list membership, source-format-independent model geometry, and small-executor defaults.
 
-`crates/runtime/tests/progress_negotiation.rs` pins the completion contract: a
-shortened prefill range commits exactly what was reported, sampled output belongs only
-to the row that finished the prompt, a decode row may not report an empty successful
-step or a token count that disagrees with its advancement, a blocked row must name its
-own sequence, and a blocked row is reported and stays runnable rather than failing its
-peers. `crates/runtime/tests/multimodal_admission.rs` exercises the same negotiation
-against encoder-item budgets, including a chunk that spans two items completing
-without chunk alignment.
+`crates/runtime/tests/progress_negotiation.rs` pins positive partial completion:
+shortened prefill commits exactly the reported range, output belongs only to final
+prefill, and decode output matches advancement. A two-credit output pool tests refunds
+when an offered final-prefill range is shortened. Zero-prefill success is rejected
+with a failing-before regression. Mixed malformed rows commit no healthy peer output.
+`crates/runtime/tests/multimodal_admission.rs` checks shared submission budgets and
+admission-time rejection of impossible items. It deliberately cannot express temporary
+mid-request waiting; no completion-time `Blocked` API remains.
 
 `crates/runtime/tests/abandoned_requests.rs` separates execution and mailbox
 lifetimes: an execution slot can be reclaimed before its terminal event is consumed.
@@ -90,8 +90,10 @@ errors relinquish delivery immediately. Physical retirement remains runtime-owne
 
 - Host workspace tests, formatting, boundaries, default and CUDA-feature all-target
   clippy passed with actual zero exit statuses.
-- `discard_survives_a_blocked_in_flight_completion` failed before the cancellation
-  branch fix and passed after it. The old branch erased cancellation intent.
+- At that revision, `discard_survives_a_blocked_in_flight_completion` failed before
+  the cancellation branch fix and passed after it. The old branch erased cancellation
+  intent. Removal of blocked outcomes later replaced this with partial-completion
+  cancellation coverage.
 - CUDA text lifecycle: **4/4, 77.32 s**, serialized on the RTX 4090 with the pinned
   Qwen artifact. Log: `desktop:~/ribn-lifecycle-2026-09-14/01-runtime-discard.log`.
 - Other newly added discard tests exercise a new API, not failing-before tests against
@@ -99,6 +101,34 @@ errors relinquish delivery immediately. Physical retirement remains runtime-owne
 - Full CUDA kernel/reference and exact-token gates were not rerun for this slice;
   kernel arithmetic and the Qwen executor were unchanged. This is not a new numerical
   qualification claim. Concurrent handles and event-driven readiness remain undone.
+
+### Positive completion and combined gates (2026-09-14)
+
+Revision `14d0290` removes runtime `StepOutcome`/`StepStatus::blocked`. Qwen and all
+runtime adapters return `StepCompletion` directly. Successful prefill advancement
+must be positive; final-prefill output is exactly one token, intermediate output is
+empty, and decode output equals advancement. Whole-batch validation borrows rows
+without allocating/cloning a row plan; commit moves rows and retains batch capacity.
+This is a source-level allocation removal, not an allocation-free runtime or measured
+model-speedup claim.
+
+The zero-prefill regression failed with the old predicate (exit 101) and passed with
+positive advancement required. The partial-prefill test uses a two-event global pool
+to require refund of unused final-prefill credits. Discard retirement tests also cover
+failed release with mailbox reuse and uncertain completion through shutdown.
+
+All required host checks passed with actual zero exit codes. Serialized device gates
+against the pinned Qwen artifact on the RTX 4090:
+
+| Gate | Result | Time | Log under `desktop:~/ribn-lifecycle-2026-09-14/` |
+| --- | --- | --- | --- |
+| Text lifecycle | 4/4, exit 0 | 76.91 s | `02-completion-text.log` |
+| Exact-token runtime | 1/1, exit 0 | 174.22 s | `03-completion-runtime.log` |
+| CUDA reference | 61/61, exit 0 | 408.13 s | `04-completion-reference.log` |
+
+`completion-revision.txt` pins the tested commit; `completion-exits.txt` records each
+process exit. Kernel arithmetic was unchanged. These gates do not qualify concurrent
+handles, readiness, a real VLM, or the still-opt-in GDN scan.
 
 ## Synthetic CPU benchmark
 

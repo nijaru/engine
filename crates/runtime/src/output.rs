@@ -237,6 +237,22 @@ mod tests {
     }
 
     #[test]
+    fn repeated_discard_reuses_mailbox_storage() {
+        let mut output = Output::new(2, 2, 1);
+        for value in 1..=1024 {
+            let request = RequestId(value);
+            let id = output.register(request);
+            output.push_to(id, token(request, 7));
+            output.discard(request);
+            assert_eq!(output.len(), 0);
+            output.push_to(id, finish(request));
+            assert!(output.requests.is_empty());
+            assert_eq!(output.mailboxes.len(), 1);
+            assert_eq!(output.free.len(), 1);
+        }
+    }
+
+    #[test]
     fn discard_retains_in_flight_credits_until_settlement() {
         let mut output = Output::new(4, 4, 2);
         let a = RequestId(1);
