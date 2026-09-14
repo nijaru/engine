@@ -83,6 +83,95 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
     }
 }
 
+#[test]
+#[ignore = "requires an idle CUDA GPU, RIBN_MODEL, and independently recorded RIBN_REFERENCE token fixture"]
+fn owned_driver_preserves_reference_with_stalled_and_abandoned_peers() {
+    use ribn::driver::{Driver, DriverConfig, GenerationStream};
+
+    fn collect(mut stream: GenerationStream) -> Vec<u32> {
+        let request = stream.request_id();
+        let mut tokens = Vec::new();
+        let mut terminal = false;
+        while let Some(event) = stream.next_blocking() {
+            let event = event.expect("owned driver event");
+            assert_eq!(event.request(), request);
+            match event {
+                Event::Token { token, .. } => tokens.push(token),
+                Event::Finished { reason, .. } => {
+                    assert_eq!(reason, FinishReason::Length);
+                    assert!(!terminal);
+                    terminal = true;
+                }
+            }
+        }
+        assert!(terminal);
+        tokens
+    }
+
+    let model = std::env::var("RIBN_MODEL").expect("RIBN_MODEL GGUF path");
+    let fixture = std::env::var("RIBN_REFERENCE").expect("RIBN_REFERENCE fixture path");
+    let reference = reference(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let prepared = QwenCuda::load_gguf(
+        model,
+        QwenLoadOptions {
+            context_tokens: u32::try_from(reference.prompt.len() + reference.output.len()).unwrap(),
+            max_sequences: 3,
+            ..QwenLoadOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.info().name, reference.artifact);
+    let engine = Engine::new(
+        prepared,
+        EngineConfig {
+            max_active_requests: 3,
+            max_queued_requests: 0,
+            max_queued_input_tokens: reference.prompt.len() as u64 * 3,
+            max_buffered_events: 6,
+            max_events_per_request: 2,
+        },
+        SchedulePolicy::default(),
+    )
+    .unwrap();
+    let (mut owner, handle) = Driver::spawn(
+        engine,
+        DriverConfig {
+            max_requests: 3,
+            events_per_request: 1,
+            ..DriverConfig::default()
+        },
+    )
+    .unwrap();
+    let request = || {
+        TokenRequest::new(
+            reference.prompt.clone(),
+            GenerationOptions {
+                max_output_tokens: u32::try_from(reference.output.len()).unwrap(),
+                ..GenerationOptions::default()
+            },
+        )
+    };
+    let mut abandoned = handle.stream_blocking(request()).unwrap();
+    let stalled = handle.stream_blocking(request()).unwrap();
+    let healthy = handle.stream_blocking(request()).unwrap();
+    assert!(
+        matches!(abandoned.next_blocking(), Some(Ok(Event::Token { token, .. })) if token == reference.output[0])
+    );
+    drop(abandoned);
+    let collector = std::thread::spawn(move || collect(healthy));
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while !collector.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "stalled peer blocked the healthy stream"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(collector.join().unwrap(), reference.output);
+    assert_eq!(collect(stalled), reference.output);
+    owner.shutdown().unwrap();
+}
+
 fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decode: bool) {
     let max_output_tokens = u32::try_from(reference.output.len()).unwrap();
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();

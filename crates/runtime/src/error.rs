@@ -43,4 +43,11 @@ impl fmt::Display for EngineError {
     }
 }
 
-impl std::error::Error for EngineError {}
+impl std::error::Error for EngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Execution(error) | Self::Faulted(error) => Some(error),
+            _ => None,
+        }
+    }
+}

@@ -106,6 +106,94 @@ Cancellation must remain deliverable when the ordinary submission queue is full.
 Use per-request cancellation intent plus a wakeup, or a separately bounded control
 path whose capacity follows admitted requests—not an unbounded emergency queue.
 
+## Owned AR driver contract
+
+The first owned-access increment drives the existing token runtime; it is not the
+loaded-model or multimodal application API. `Driver::spawn(engine, config)` consumes
+an idle, open engine and returns a shutdown owner and cloneable submission handle.
+Direct `Engine` use remains channel-free. One worker owns execution, including failed
+retirement. Moving an engine requires its existing `GenerationExecutor: Send` contract;
+this increment does not support non-Send/thread-affine executor construction.
+
+### Admission and bounds
+
+- Admission is fail-fast. `try_reserve` acquires one request permit or returns typed
+  overload; there is no hidden, potentially unbounded queue of waiting producers.
+  A frontend must acquire this permit **before** expensive preprocessing. The token
+  driver itself accepts already-encoded input, not raw media or preprocessing tasks.
+- Permits cover unsubmitted preparation, queued commands, execution and undelivered
+  stream output. A permit returns only after runtime retirement and stream delivery
+  both relinquish it. A private runtime lifetime guard pins the admission charge even
+  after the worker drops a discarded route; there is no frontend retirement retry list.
+  Runtime execution-slot counts are not application request counts.
+- Each permit has a configured encoded-input byte envelope covering token storage and
+  stop-token vector capacity plus the runtime's cloned stop list. The aggregate bound
+  is request permits times this envelope. Overflow is rejected. Caller-owned inputs
+  before acceptance, allocator overhead and immutable loaded model storage are not
+  included. Raw-input/tokenizer scratch bounds remain a frontend obligation.
+- Each stream has a bounded channel of token events. Runtime mailboxes remain bounded
+  separately: at most the runtime event limit plus permit count times stream capacity
+  are buffered. Runtime global event capacity must cover every permitted request's
+  per-request mailbox limit, so a stalled peer cannot monopolize delivery credits.
+  This conservative configuration can be revisited with shared-credit evidence.
+- Tokens/usage are copied values, not shared device storage. Runtime execution-error
+  diagnostic strings are bounded to 4096 UTF-8 bytes at construction; overflow ends
+  with an explicit truncation marker. This bounds retained diagnostic payload, not
+  backend formatting scratch. Collected caller-owned results are deliberately outside
+  buffered-delivery accounting; physical output leases belong to a later real encoder.
+
+### Delivery, wakeups and failure
+
+Use Flume 0.12 bounded channels for both blocking and runtime-independent async waits.
+One capacity-one wake channel coalesces notifications; commands and persistent atomic
+cancellation/discard flags are the authoritative state. The worker drains old wake
+notifications **before** inspecting state, never after checking a condition and before
+sleeping. Mutators publish state before notifying. This covers arrivals, stream drops,
+explicit cancel and output-credit return without a second cancellation queue.
+
+- `stream(...).await` or its blocking counterpart returns after runtime enqueue, not
+  model admission or device completion. Rejection before enqueue returns a typed error.
+  Dropping the submission future relinquishes its request even across enqueue/ack races.
+- An owned stream yields ordered token events and one terminal event or owner error,
+  then remains exhausted. Dropping an individual `next` future loses no event.
+  Explicit cancel preserves already-buffered output and requests a `Cancelled` terminal;
+  it can race with an already-settled terminal. Dropping the stream suppresses delivery.
+- The worker never blocks sending output. Only it sends to each stream; it checks channel
+  space before draining that runtime mailbox. Consumption wakes the execution owner.
+- An idle/output-blocked owner sleeps indefinitely on the wake channel. Pending device
+  completion and legacy `Admission::Deferred` use a configured nonzero timed-poll
+  fallback. This is not the future resource-readiness protocol. Synchronous backend
+  calls remain non-preemptible; wakeups cannot interrupt a blocked driver operation.
+- Request-local runtime admission failures remain `FinishReason::Failed`. Driver-level
+  enqueue rejection retains its `EngineError` source. Execution-owner failure stops
+  admission, preserves events already handed to stream channels, then exposes an
+  owner-scoped error. Undelivered runtime-mailbox events are abandoned; no final
+  request usage is promised after owner failure. It does not relabel healthy peers
+  as individually invalid.
+
+### Shutdown
+
+The non-cloneable shutdown owner has blocking and async shutdown methods. Shutdown
+closes admission first, abandons outstanding delivery and synchronizes/releases the
+engine. Previously queued stream events remain readable, followed by an owner-closed
+error unless a terminal was already delivered. Shutdown is not per-request cancellation.
+A failed shutdown reports its source and leaves the same worker owning the engine for
+explicit retry. Cancelling the shutdown future does not reopen admission or discard
+that retry owner: its next shutdown call observes the same attempt's result before
+another retry starts. Successful shutdown reports cleanup success, not recovery from
+an earlier execution fault; handles retain that fault as their diagnostic.
+Dropping the owner requests final shutdown without joining; the
+worker retains resources through cleanup, with the runtime's conservative quarantine
+on unresolved completion. Explicit shutdown is required for error reporting.
+
+Worker exit closes queue insertion before explicitly draining queued acknowledgements.
+Flume receiver disconnection alone does not drop queued values while senders remain;
+otherwise a queued reply sender can keep a waiting client alive forever.
+Worker unwind is reported distinctly, never as successful exhaustion. Defensive engine
+Drop still establishes completion or retains device-visible ownership. Process abort,
+OOM abort and a backend that never returns cannot promise recoverable notification.
+No force-kill timeout may release device-visible memory.
+
 ## Cross-runtime device ownership
 
 A device-resident result needs its representation, model identity, pool charge and

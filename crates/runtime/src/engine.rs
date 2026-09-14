@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
@@ -42,6 +43,9 @@ enum WorkState {
 }
 
 struct Sequence {
+    // An owned driver can pin its admission charge through runtime retirement,
+    // including after stream/route abandonment. Direct calls retain nothing extra.
+    _retention: Option<Arc<dyn Send + Sync>>,
     request: RequestId,
     id: SequenceId,
     input: Option<TokenRequest>,
@@ -160,6 +164,10 @@ impl Engine {
         Self::new(model, config, policy)
     }
 
+    pub(crate) const fn config(&self) -> EngineConfig {
+        self.config
+    }
+
     #[must_use]
     pub const fn info(&self) -> &ExecutorInfo {
         &self.info
@@ -200,6 +208,22 @@ impl Engine {
     /// # Errors
     /// Rejects invalid input, exhausted queue bounds, or a closed/faulted engine.
     pub fn enqueue(&mut self, input: TokenRequest) -> Result<RequestId, EngineError> {
+        self.enqueue_inner(input, None)
+    }
+
+    pub(crate) fn enqueue_retained(
+        &mut self,
+        input: TokenRequest,
+        retention: Arc<dyn Send + Sync>,
+    ) -> Result<RequestId, EngineError> {
+        self.enqueue_inner(input, Some(retention))
+    }
+
+    fn enqueue_inner(
+        &mut self,
+        input: TokenRequest,
+        retention: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RequestId, EngineError> {
         self.check_open()?;
         input.options.sampling.validate()?;
         let prompt_tokens =
@@ -230,6 +254,7 @@ impl Engine {
         });
         let output = self.output.register(request);
         self.slots[index] = Some(Sequence {
+            _retention: retention,
             output,
             request,
             id,

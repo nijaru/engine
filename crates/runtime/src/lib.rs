@@ -10,6 +10,7 @@
 //! This remains a migration target, not a claim of GPU performance qualification.
 
 mod config;
+pub mod driver;
 mod engine;
 mod error;
 mod executor;

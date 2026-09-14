@@ -103,13 +103,26 @@ pub enum Admission {
     Deferred,
 }
 
+/// Bounded retained diagnostic (at most 4096 UTF-8 bytes). Backend formatting
+/// scratch is outside this bound; oversized diagnostics end in a truncation marker.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionError(String);
+pub struct ExecutionError(Box<str>);
 
 impl ExecutionError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        const LIMIT: usize = 4096;
+        const SUFFIX: &str = "… [truncated]";
+        let mut message = message.into();
+        if message.len() > LIMIT {
+            let mut end = LIMIT - SUFFIX.len();
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push_str(SUFFIX);
+        }
+        Self(message.into_boxed_str())
     }
 }
 
