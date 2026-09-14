@@ -111,9 +111,40 @@ Nineteen actual-driver host tests pass, including 100 consecutive suite runs and
 mutation checks for retirement charges, wakeups and queued acknowledgement teardown.
 Required host checks pass. [Direct/driver host cost](../benchmarks/runtime-alignment/README.md#owned-token-driver-7005fad)
 is measured; it is not model throughput. The new CUDA driver test is **unrun**:
-Tailscale is stopped and desktop DNS/SSH is unavailable. Sync and run the pending
+desktop SSH remains unavailable. On 2026-09-14 Tailscale was restarted and disco
+pings succeeded, but system DNS failed and TCP/22 timed out via the tailnet IP.
+The cause is unverified; no GPU availability was established. Sync and run the pending
 [device gate](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad)
 before calling the driver GPU-qualified.
+
+#### Audit alignment order (2026-09-14)
+
+The [source-traced assessment](architecture.md#slice-2-boundary-audit-2026-09-14-84a146a)
+finds remaining text-boundary gaps, not a reason to replace the token driver.
+[Text cutover semantics](inference-engine-design.md#proposed-text-cutover-semantics-slice-2-audit-2026-09-14)
+are proposed, pending implementation approval. Preserve the existing gate order:
+
+1. Restore SSH, verify device availability and serialize the two runtime CUDA gates.
+   Keep the owned driver unqualified until they pass; do not infer a network root cause
+   from disco success and TCP timeouts.
+2. Resolve the proposed text contract before dependent code: bounded processor work
+   and its shutdown/cancellation owner, per-item ordered batching instead of whole-input
+   preparation atomicity, UTF-8/error terminal precedence and typed source retention.
+   Define raw/message capacity and rendered/scratch/decoded byte limits at their growth
+   points. Decide refill overload behavior when other handles hold permits; do not add
+   an unbounded waiter queue or silently busy-retry.
+3. Replace the borrowed execution loop with the actual host-testable owned facade and
+   CUDA-only assembly. Test decoder failure with a healthy peer, cancelled preprocessing,
+   dropped submission/next futures, saturation, buffered owner failure and incomplete
+   UTF-8 for normal completion/cancel/error. Retain shutdown retry ownership.
+4. Replace eager batching and its atomic-preparation test together. A lazy iterator
+   instrumented with pull counts must prove bounded lookahead; a stalled earliest item
+   must bound later retained results. Test invalid later input, per-item decoder failure,
+   shared-handle overload and batch drop without abandoning unrelated requests.
+5. Exercise CLI write/disconnect cleanup and explicit shutdown, rerun host/CUDA-feature
+   checks and affected device gates, then measure matched frontend overhead. Document
+   collect-result exclusions; use limited file/stdin reads before claiming CLI ingestion
+   is bounded. No serving-memory claim follows from token-driver bounds alone.
 
 Remaining before closing this slice:
 

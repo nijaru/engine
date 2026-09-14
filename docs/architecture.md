@@ -58,6 +58,41 @@ The driver has host lifecycle coverage and a compiled but unrun Qwen CUDA test; 
 not yet GPU-qualified. It does not preprocess raw input, decode text or supply bounded
 offline text batching. See [qualification](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
 
+## Slice-2 boundary audit (2026-09-14, `84a146a`)
+
+Scope: token driver → text processing/delivery → CLI. This is a source-traced
+assessment, not renewed GPU qualification or a review of kernel correctness.
+
+Preserve the single worker, runtime-owned discard, retirement-held admission charge,
+nonblocking delivery and retryable shutdown. `driver.rs` and `driver/worker.rs`
+keep these responsibilities separate without another scheduler. The remaining
+application gaps are not a reason to replace that owner.
+
+| Priority / finding | Evidence and consequence | Bounded correction |
+| --- | --- | --- |
+| High: preprocessing precedes bounds | `text/src/model.rs::stream` calls `encode_input` before enqueue; `gguf/src/tokenizer.rs::encode` allocates per-byte BPE strings, and `render_chat` renders into a complete string. Template fuel is not a declared byte envelope. Token admission cannot bound this earlier work. | Reserve before preprocessing; bound accepted raw storage, rendered bytes, encoded output and processor scratch/concurrency. Enforce limits during growth, not only after allocation. |
+| High: bounded batching conflicts with current failure semantics | `TextModel::generate_batch` collects the whole iterator and prepares every input before enqueue. `an_unpreparable_batch_input_fails_before_submitting_anything` explicitly requires all-input preparation before execution. An arbitrary incremental iterator cannot retain that atomicity and also use bounded preparation. | Replace whole-batch atomic preparation with the proposed per-item ordered contract in the target design; migrate the test deliberately. |
+| High: decoder failure is batch-wide | `collect_batch` propagates `decode_bytes`/UTF-8 errors with `?`; `generate_batch` then discards every member. Runtime admission rejection already remains per-member, so failure scope differs by layer. | Return a typed per-item decode failure and abandon only that item's token stream; prove healthy peers continue. |
+| Medium: text lifecycle and diagnostics remain coupled to loading | `text/src/lib.rs` CUDA-gates all of `model`; `TextError::from_display` erases sources. The two local unit tests exercise only `Utf8Decoder`; actual facade lifecycle tests load CUDA. | Separate CUDA assembly from the real facade and inject processor/executor behavior; preserve typed source chains and test failure/drop/shutdown at that surface. |
+| Medium: decoded delivery has no explicit byte policy | `decode_bytes` allocates a vector based on vocabulary spelling; `Utf8Decoder::push` copies into pending storage and an owned string. The token driver's fixed-size events do not bound this added storage. | Validate a model-specific maximum decoded token size or use bounded decoding, and account for retained text deltas and terminal staging. |
+
+Current stream completion flushes an incomplete code point as a replacement delta
+before `Finished`; batch completion appends that replacement directly. Neither path
+has the owned driver's buffered-events-then-owner-error behavior yet. The replacement
+must specify that distinction rather than treating owner failure as normal completion.
+
+CLI `run.rs::read_input` also reads a whole file/stdin before loading or admission.
+It is caller-owned input today, outside the token-driver bound; any future claim of
+bounded CLI ingestion must add a limited read at this boundary. CLI write failure
+already drops the borrowed stream and attempts explicit model shutdown; preserve that
+cleanup behavior during cutover.
+
+Audit verification: dependency-boundary and whitespace checks passed; all 19 driver
+unit tests passed again. `cargo test -p ribn-text --locked` succeeded with **zero tests**,
+confirming the default-feature facade coverage gap. Full workspace/clippy and device
+gates were not rerun for this documentation-only assessment. Kernel/backend internals,
+other runtime families and quantitative processor peak memory were not audited here.
+
 ## Packages
 
 | Package/path | Current responsibility |
