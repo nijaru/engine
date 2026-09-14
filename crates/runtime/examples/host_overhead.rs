@@ -6,7 +6,7 @@ use std::time::Instant;
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, ExecutionError, ExecutorInfo, GenerationExecutor,
     GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId, StepCompletion,
-    SubmissionId, TokenRequest,
+    StepOutcome, SubmissionId, TokenRequest,
 };
 
 struct ImmediateModel {
@@ -47,13 +47,16 @@ impl GenerationExecutor for ImmediateModel {
         );
         Ok(SubmissionId::new(self.next_submission))
     }
-    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
         if let Some(rows) = &self.pending {
             for row in rows {
                 self.prefixes.insert(row.sequence, row.prefix);
             }
         }
-        Ok(self.pending.take())
+        Ok(self
+            .pending
+            .take()
+            .map(|rows| rows.into_iter().map(StepOutcome::Progress).collect()))
     }
     fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {
         assert!(self.pending.is_none());

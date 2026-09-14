@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
     FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, RequestId,
-    SchedulePolicy, SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,
+    SchedulePolicy, SequenceId, StepCompletion, StepOutcome, SubmissionId, TokenRequest, Usage,
 };
 
 #[allow(
@@ -135,7 +135,7 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
         assert_eq!(submission.get(), self.next_submission);
         let control = self.control.lock().unwrap();
         if control.fail_poll {
@@ -150,17 +150,19 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
             .iter()
             .map(|item| {
                 self.states.get_mut(&item.sequence).unwrap().update();
-                StepCompletion {
+                StepOutcome::Progress(StepCompletion {
                     sequence: item.sequence,
                     prefix: item.prefix + item.token_budget,
                     tokens: (0..item.output_budget)
                         .map(|i| 100 + item.prefix + i)
                         .collect(),
-                }
+                })
             })
             .collect::<Vec<_>>();
-        if control.malformed {
-            rows.last_mut().unwrap().prefix += 1;
+        if control.malformed
+            && let Some(StepOutcome::Progress(row)) = rows.last_mut()
+        {
+            row.prefix += 1;
         }
         Ok(Some(rows))
     }

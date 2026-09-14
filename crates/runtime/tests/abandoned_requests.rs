@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineError, Event, ExecutionError, ExecutorInfo, FinishReason,
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SequenceId, StepCompletion,
-    SubmissionId, TokenRequest,
+    StepOutcome, SubmissionId, TokenRequest,
 };
 
 #[derive(Default)]
@@ -86,7 +86,7 @@ impl GenerationExecutor for Model {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
         assert_eq!(submission.get(), self.next_submission);
         let Some(batch) = self.pending.take() else {
             return Ok(None);
@@ -94,12 +94,14 @@ impl GenerationExecutor for Model {
         Ok(Some(
             batch
                 .iter()
-                .map(|item| StepCompletion {
-                    sequence: item.sequence,
-                    prefix: item.prefix + item.token_budget,
-                    tokens: (0..item.output_budget)
-                        .map(|i| 200 + item.prefix + i)
-                        .collect(),
+                .map(|item| {
+                    StepOutcome::Progress(StepCompletion {
+                        sequence: item.sequence,
+                        prefix: item.prefix + item.token_budget,
+                        tokens: (0..item.output_budget)
+                            .map(|i| 200 + item.prefix + i)
+                            .collect(),
+                    })
                 })
                 .collect(),
         ))

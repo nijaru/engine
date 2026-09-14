@@ -93,6 +93,27 @@ pub struct StepCompletion {
     pub tokens: Vec<u32>,
 }
 
+/// One submitted row's settled outcome. A backend chooses the feasible range
+/// before performing physical work; this reports what it settled on. It is not a
+/// reservation protocol: the scheduler has already committed the batch's output
+/// capacity, and this can only accept less work than the row allowed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StepOutcome {
+    /// Consumed `completion.prefix - BatchItem::prefix` contiguous inputs,
+    /// starting at the submitted prefix. A prefill row may accept fewer inputs
+    /// than its budget; a decode row must advance by at least one.
+    Progress(StepCompletion),
+    /// The sequence made no progress and committed nothing this submission: the
+    /// backend could not do the row's work inside its own limits (an encoder item
+    /// that is not ready, or a step budget smaller than an indivisible item). The
+    /// engine keeps the sequence runnable and may submit it again.
+    ///
+    /// A permanent inability to proceed is not expressible yet, so a backend must
+    /// not report `Blocked` for a condition that cannot change. Naming the
+    /// condition and rejecting infeasible work belong to the resource protocol.
+    Blocked(SequenceId),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
     Ready,
@@ -157,7 +178,8 @@ pub trait GenerationExecutor: Send {
     /// partially queued work is uncertain; never silently retry mutated state.
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError>;
 
-    /// Observe completion once, in batch order. Partial results stay internal.
+    /// Observe completion once, in batch order: exactly one outcome per
+    /// submitted row, in the order the rows were submitted.
     ///
     /// # Errors
     /// A terminal device/completion error faults the engine. Ownership remains
@@ -165,7 +187,7 @@ pub trait GenerationExecutor: Send {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError>;
+    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError>;
 
     /// Free one completed sequence. Successful release must be idempotent.
     ///

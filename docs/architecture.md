@@ -157,6 +157,15 @@ policy/mechanics to revisit as dynamic resources, cache reuse, speculation and
 async overlap land. A unified scheduled-token budget is a strong candidate for the
 future AR scheduler.
 
+What the completion contract does promise now: a submitted row reports either the
+contiguous range it consumed (`StepOutcome::Progress`, at most the offered budget and
+with output only when it finished the prompt) or that it could not proceed
+(`StepOutcome::Blocked`, no progress, sequence stays runnable, peers unaffected). The
+whole batch is still validated before anything commits, and a malformed outcome still
+faults conservatively. Naming a blocked condition and rejecting permanently infeasible
+work are open, and belong with the resource protocol rather than the completion
+contract.
+
 ## AR continuation resources
 
 Do not assume continuation state is KV. Full attention, sliding-window attention,

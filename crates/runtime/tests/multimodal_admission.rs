@@ -19,12 +19,16 @@
 //!   committed while it waits.
 //! - A backend can perform encoder work inside its own step and reuse the output
 //!   across requests, and the engine's loop neither duplicates nor loses that work.
-//! - A prefill completion must advance *exactly* the chunk the engine chose
-//!   (`crates/runtime/src/engine/completion.rs`), so a backend cannot shorten a step
-//!   to stop before an unavailable placeholder. Its only alternatives are to do the
-//!   work anyway or to fail the submission, which faults every request in the batch.
-//!   Encoder budgets therefore hold only when `SchedulePolicy::prefill_chunk_tokens`
-//!   aligns with prompt-item granularity; the third test pins that constraint.
+//! - A prefill row may accept *fewer* inputs than the engine offered
+//!   (`crates/runtime/src/engine/completion.rs`), and a row that can do nothing
+//!   reports `StepOutcome::Blocked` instead of overspending an encoder budget or
+//!   faulting its peers. A step budget smaller than one indivisible item therefore
+//!   no longer forces an overrun, and `SchedulePolicy::prefill_chunk_tokens` no
+//!   longer has to align with prompt-item granularity.
+//! - What a blocked row still cannot express is permanent infeasibility: with a step
+//!   budget below one item's cost the request waits forever, because the engine has
+//!   no rejection outcome for a *completion*. That is the next contract gap, and one
+//!   test pins it deliberately.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -32,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, Event, ExecutionError, ExecutorInfo, FinishReason,
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId,
-    StepCompletion, SubmissionId, TokenRequest,
+    StepCompletion, StepOutcome, SubmissionId, TokenRequest,
 };
 
 /// Prompt tokens with this value mark a placeholder span that a prompt-position
@@ -49,12 +53,6 @@ struct EncoderItem {
     span: (u32, u32),
     /// Encoder work this item costs, charged against the step's budget.
     compute: u32,
-}
-
-impl EncoderItem {
-    fn overlaps(self, start: u32, end: u32) -> bool {
-        self.span.0 < end && start < self.span.1
-    }
 }
 
 /// Prompt-position dependencies declared by the prompt itself: each maximal run of
@@ -105,11 +103,24 @@ struct Control {
 
 type Shared = Arc<Mutex<Control>>;
 
+/// One submitted row plus the range the backend decided it could afford. The
+/// decision is made in `submit`, before any encoder work, and `poll` only
+/// reports it: a backend that executes first and negotiates afterwards has
+/// already overspent.
+struct Planned {
+    item: BatchItem,
+    /// Inputs this row will consume, starting at `item.prefix`. Zero means the
+    /// row is blocked on an item that does not fit the remaining step budget.
+    accepted: u32,
+    tokens: Vec<u32>,
+}
+
 struct EncoderModel {
     info: ExecutorInfo,
     control: Shared,
     items: HashMap<SequenceId, Vec<EncoderItem>>,
-    pending: Option<Vec<BatchItem>>,
+    prompt_tokens: HashMap<SequenceId, u32>,
+    pending: Option<Vec<Planned>>,
     next_submission: u64,
 }
 
@@ -127,9 +138,60 @@ impl EncoderModel {
             },
             control,
             items: HashMap::new(),
+            prompt_tokens: HashMap::new(),
             pending: None,
             next_submission: 0,
         }
+    }
+
+    /// The longest prefix of this row that fits the step budget, consuming
+    /// prompt tokens up to the first item that cannot be encoded. An item is
+    /// indivisible: its span cannot be entered without paying its whole cost.
+    fn plan_prefill(&self, item: &BatchItem, control: &mut Control) -> (Planned, u32) {
+        let limit = item.prefix + item.token_budget;
+        let items = self.items_for(item.sequence);
+        let mut accepted = item.prefix;
+        let mut budget = control.step_budget;
+        let mut spent = 0_u32;
+        while accepted < limit {
+            let blocking = items
+                .iter()
+                .find(|encoder| encoder.span.0 <= accepted && accepted < encoder.span.1);
+            match blocking {
+                Some(encoder) if !control.published.contains(&encoder.id) => {
+                    if encoder.compute > budget {
+                        // Not affordable now: stop before the item's span.
+                        break;
+                    }
+                    budget -= encoder.compute;
+                    spent = spent.saturating_add(encoder.compute);
+                    control.encoded.push(encoder.id);
+                    control.published.insert(encoder.id);
+                }
+                _ => {}
+            }
+            accepted += 1;
+        }
+        let tokens = if accepted
+            == self
+                .prompt_tokens
+                .get(&item.sequence)
+                .copied()
+                .unwrap_or_default()
+            && item.output_budget == 1
+        {
+            vec![100 + item.prefix]
+        } else {
+            Vec::new()
+        };
+        (
+            Planned {
+                item: *item,
+                accepted: accepted - item.prefix,
+                tokens,
+            },
+            spent,
+        )
     }
 
     fn items_for(&self, sequence: SequenceId) -> Vec<EncoderItem> {
@@ -152,6 +214,9 @@ impl GenerationExecutor for EncoderModel {
         self.items
             .entry(sequence)
             .or_insert_with(|| prompt_items(&request.tokens));
+        self.prompt_tokens
+            .entry(sequence)
+            .or_insert_with(|| u32::try_from(request.tokens.len()).unwrap_or(u32::MAX));
         let control = self.control.lock().unwrap();
         if control.gate_admission
             && let Some(first) = self.items_for(sequence).first()
@@ -168,27 +233,31 @@ impl GenerationExecutor for EncoderModel {
 
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         assert!(self.pending.is_none());
-        let mut spent = 0_u32;
-        {
+        let planned = {
             let mut control = self.control.lock().unwrap();
-            for item in batch {
-                for encoder in self.items_for(item.sequence) {
-                    if !encoder.overlaps(item.prefix, item.prefix + item.token_budget)
-                        || control.published.contains(&encoder.id)
-                    {
-                        continue;
+            let mut spent = 0_u32;
+            let planned = batch
+                .iter()
+                .map(|item| match item.kind {
+                    ribn::StepKind::Prefill => {
+                        let (plan, cost) = self.plan_prefill(item, &mut control);
+                        spent = spent.saturating_add(cost);
+                        plan
                     }
-                    spent = spent.saturating_add(encoder.compute);
-                    control.encoded.push(encoder.id);
-                    control.published.insert(encoder.id);
-                }
-            }
+                    ribn::StepKind::Decode => Planned {
+                        item: *item,
+                        accepted: 1,
+                        tokens: vec![100 + item.prefix],
+                    },
+                })
+                .collect::<Vec<_>>();
             control.spent_per_submission.push(spent);
             if spent > control.step_budget {
                 control.overruns += 1;
             }
-        }
-        self.pending = Some(batch.to_vec());
+            planned
+        };
+        self.pending = Some(planned);
         self.next_submission += 1;
         Ok(SubmissionId::new(self.next_submission))
     }
@@ -196,33 +265,25 @@ impl GenerationExecutor for EncoderModel {
     fn poll(
         &mut self,
         _submission: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
-        let Some(batch) = self.pending.take() else {
+    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+        let Some(planned) = self.pending.take() else {
             return Ok(None);
         };
         Ok(Some(
-            batch
-                .iter()
-                .map(|item| match item.kind {
-                    ribn::StepKind::Prefill => {
-                        // The engine asks for sampling on the chunk that completes
-                        // the prompt, and validates the row against that budget.
-                        let tokens = if item.output_budget == 1 {
-                            vec![100 + item.prefix]
-                        } else {
-                            Vec::new()
-                        };
-                        StepCompletion {
-                            sequence: item.sequence,
-                            prefix: item.prefix + item.token_budget,
-                            tokens,
-                        }
+            planned
+                .into_iter()
+                .map(|plan| {
+                    if plan.accepted == 0 {
+                        // Nothing could be done for this sequence inside the step
+                        // budget. Reporting that is the point: the engine keeps it
+                        // runnable instead of faulting its peers.
+                        return StepOutcome::Blocked(plan.item.sequence);
                     }
-                    ribn::StepKind::Decode => StepCompletion {
-                        sequence: item.sequence,
-                        prefix: item.prefix + 1,
-                        tokens: vec![100 + item.prefix],
-                    },
+                    StepOutcome::Progress(StepCompletion {
+                        sequence: plan.item.sequence,
+                        prefix: plan.item.prefix + plan.accepted,
+                        tokens: plan.tokens,
+                    })
                 })
                 .collect(),
         ))
@@ -230,6 +291,7 @@ impl GenerationExecutor for EncoderModel {
 
     fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {
         self.items.remove(&sequence);
+        self.prompt_tokens.remove(&sequence);
         Ok(())
     }
 
@@ -272,6 +334,24 @@ fn request(prompt: Vec<u32>, output: u32) -> TokenRequest {
             ..GenerationOptions::default()
         },
     )
+}
+
+/// Drive a bounded number of steps, reporting the events and whether any
+/// submission came back with a blocked row.
+fn drive(engine: &mut Engine, steps: usize) -> (Vec<Event>, bool) {
+    let mut events = Vec::new();
+    let mut blocked = false;
+    for _ in 0..steps {
+        let status = engine.step().expect("step");
+        blocked |= status.blocked > 0;
+        while let Some(event) = engine.pop_event() {
+            events.push(event);
+        }
+        if engine.status().requests == 0 {
+            break;
+        }
+    }
+    (events, blocked)
 }
 
 fn drain(engine: &mut Engine) -> Vec<Event> {
@@ -375,11 +455,59 @@ fn coupled_encoder_work_is_reused_across_requests_with_the_same_prompt() {
 /// unencoded placeholder. When the chunk spans more encoder work than the step
 /// budget allows, the work happens anyway; the alternative is failing the batch,
 /// which faults unrelated requests too.
+/// A chunk that spans more encoder work than one step can afford is now shortened
+/// to the affordable prefix instead of overspending, and the row that cannot fit
+/// reports `Blocked` rather than faulting its peers.
 #[test]
-fn encoder_budget_holds_only_when_the_policy_chunk_matches_item_granularity() {
+fn a_chunk_spanning_items_is_shortened_instead_of_overspending() {
     let control = Arc::new(Mutex::new(Control {
         // Room for one item's work, but not for both items at once.
         step_budget: 1,
+        ..Control::default()
+    }));
+    let mut runtime = engine(&control, policy(8));
+    runtime
+        .enqueue(request(two_item_prompt(), 1))
+        .expect("enqueue");
+    let (events, blocked) = drive(&mut runtime, 64);
+
+    let control = control.lock().unwrap();
+    assert_eq!(
+        control.overruns, 0,
+        "the model stops before work it cannot afford"
+    );
+    assert!(
+        control.spent_per_submission.iter().all(|spent| *spent <= 1),
+        "every step stayed inside the budget: {:?}",
+        control.spent_per_submission
+    );
+    assert_eq!(
+        control.encoded,
+        vec![ItemId(1)],
+        "only the affordable item was encoded, and only once"
+    );
+    assert!(
+        blocked,
+        "the item that cannot fit is reported as blocked, not executed anyway"
+    );
+    assert!(
+        events.is_empty(),
+        "a blocked request produces no tokens and is still waiting: {events:?}"
+    );
+    assert_eq!(
+        runtime.status().requests,
+        1,
+        "the blocked request stays runnable and its peers would proceed"
+    );
+}
+
+/// With room for the wider item, the same prompt completes: the engine accepts a
+/// shortened range, then the remainder on the next step, and the policy chunk no
+/// longer has to align with encoder-item granularity.
+#[test]
+fn a_shortened_range_lets_a_chunk_spanning_items_complete_within_budget() {
+    let control = Arc::new(Mutex::new(Control {
+        step_budget: 2,
         ..Control::default()
     }));
     let mut runtime = engine(&control, policy(8));
@@ -398,13 +526,16 @@ fn encoder_budget_holds_only_when_the_policy_chunk_matches_item_granularity() {
         })
     ));
     let control = control.lock().unwrap();
-    assert_eq!(
-        control.overruns, 1,
-        "an eight-token chunk spans both items, so one submission must overspend"
-    );
+    assert_eq!(control.overruns, 0, "the budget held for every submission");
     assert_eq!(
         control.spent_per_submission.first().copied(),
-        Some(3),
-        "the model spent both items' compute in one step because it had no way to refuse"
+        Some(1),
+        "the first step accepted only up to the item it could afford"
     );
+    assert_eq!(
+        control.spent_per_submission.get(1).copied(),
+        Some(2),
+        "the next step afforded the wider item and finished the prompt"
+    );
+    assert_eq!(control.encoded, vec![ItemId(1), ItemId(4)]);
 }

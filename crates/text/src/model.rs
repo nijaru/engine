@@ -259,7 +259,11 @@ impl TextModel {
                     }
                 }
             }
-            if !status.submitted && !status.completed && remaining > 0 {
+            // Yield when a step could not advance this batch: no submission was
+            // possible, nothing completed, or a submitted row reported that it
+            // could not proceed yet. Resubmitting blocked work immediately would
+            // only spin.
+            if (status.blocked > 0 || (!status.submitted && !status.completed)) && remaining > 0 {
                 std::thread::yield_now();
             }
         }
@@ -444,7 +448,7 @@ impl Iterator for TextStream<'_> {
             }
             match self.model.engine.step() {
                 Ok(status) => {
-                    if !status.submitted && !status.completed {
+                    if status.blocked > 0 || (!status.submitted && !status.completed) {
                         std::thread::yield_now();
                     }
                 }

@@ -8,7 +8,7 @@ use engine_core::{
 };
 use ribn::{
     Admission, BatchItem, ExecutionError, ExecutorInfo, SequenceId, StepCompletion, StepKind,
-    SubmissionId, TokenRequest,
+    StepOutcome, SubmissionId, TokenRequest,
 };
 
 use crate::state;
@@ -260,7 +260,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
     pub(crate) fn poll(
         &mut self,
         id: SubmissionId,
-    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
         let pending = self
             .pending
             .as_ref()
@@ -284,7 +284,15 @@ impl<B: ComputeBackend> QwenExecution<B> {
             self.faulted = true;
         }
         self.restore(&pending.items, pending.states);
-        result.map(Some)
+        // Qwen either executes the submitted range or faults: it never declines a
+        // row, because every step it is asked for fits its own prepared limits.
+        result.map(|rows| {
+            Some(
+                rows.into_iter()
+                    .map(StepOutcome::Progress)
+                    .collect::<Vec<_>>(),
+            )
+        })
     }
 
     fn commit(

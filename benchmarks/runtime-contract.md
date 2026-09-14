@@ -32,6 +32,15 @@ shutdown retries, and conservative retention after uncertain teardown. New tests
 per-request mailbox isolation, draining after execution-slot reuse, bounded ready
 list membership, source-format-independent model geometry, and small-executor defaults.
 
+`crates/runtime/tests/progress_negotiation.rs` pins the completion contract: a
+shortened prefill range commits exactly what was reported, sampled output belongs only
+to the row that finished the prompt, a decode row may not report an empty successful
+step or a token count that disagrees with its advancement, a blocked row must name its
+own sequence, and a blocked row is reported and stays runnable rather than failing its
+peers. `crates/runtime/tests/multimodal_admission.rs` exercises the same negotiation
+against encoder-item budgets, including a chunk that spans two items completing
+without chunk alignment.
+
 `crates/runtime/tests/abandoned_requests.rs` pins the contract an abandoned
 request depends on: a cancelled request stays addressable until its terminal event
 is drained, draining it releases both mailbox and request slot, and the aggregate

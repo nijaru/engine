@@ -145,22 +145,35 @@ Carried today:
 - a backend can perform encoder work inside its own step, and encoder output published
   by anyone is reused rather than recomputed, across requests as well as across steps.
 
+Carried since the progress-negotiation change (2026-09-13):
+
+- a prefill row may accept *fewer* inputs than the engine offered, so a backend stops
+  before a placeholder it cannot encode instead of overspending an encoder budget or
+  failing the submission. `StepOutcome::Progress` reports the range actually consumed,
+  sampled output belongs only to the row that finished the prompt, and the engine
+  commits exactly what was reported;
+- a row that can do nothing inside the step's limits reports `StepOutcome::Blocked`:
+  it commits no progress, stays runnable, does not fault its peers, and is observable
+  through `StepStatus::blocked`. A short or blocked step is ordinary, not an error.
+
 Not carried today:
 
-- a prefill completion must advance *exactly* the chunk the engine chose, so a backend
-  cannot return a shorter range and stop before an unavailable placeholder. Decode may
-  advance partially; prefill may not. The remaining options are to do the work anyway,
-  exceeding an internal encoder budget, or to fail the submission, which faults every
-  request in that batch rather than only the one whose encoder is missing;
-- encoder budgets therefore hold only when `SchedulePolicy::prefill_chunk_tokens`
-  aligns with the prompt's encoder-item granularity. Two of the three admission tests
-  pin this: one shows aligned chunking staying inside budget, the other shows an
-  eight-token chunk spanning both items and overspending in a single step because the
-  model had no way to refuse.
+- permanent infeasibility. A step budget smaller than one indivisible encoder item
+  makes the row block forever rather than fail: the engine has no *completion*-time
+  rejection, only admission-time failure. A request that can never proceed therefore
+  waits instead of reporting that;
+- naming the condition. `Blocked` says a row could not proceed, not what must change,
+  so a driver can wait and retry but cannot yet distinguish a ready encoder from a
+  compute-budget wait. Requests, tokens and encoding are per-frame facts here; fine
+  placement is left open;
+- priority between blocked and newly-ready rows, and whether a blocked row holds its
+  slot in the batch. With one batch in flight the scheduler retries it in the next
+  step, which is adequate for one model and not a policy.
 
-That is the concrete reason the incremental `prepare`-then-`enqueue` contract in
-[the resource protocol](resource-protocol.md) exists: negotiation before a step is
-fixed, rather than a policy chunk the backend must honor or fail on.
+Those are the concrete reasons the incremental `prepare`-then-`enqueue` contract in
+[the resource protocol](resource-protocol.md) still matters: negotiation happens after
+submission, so it can limit work but cannot refuse a batch, reserve capacity ahead of
+one, or reclaim declined capacity. This change deliberately settles none of that.
 
 ## Do not choose an opaque request handle too early
 
@@ -219,7 +232,10 @@ Completed coupled pressure tests:
 - encoder computation can occur just in time for the prompt span that consumes it;
 - cached items bypass encoder compute but still represent cache residency;
 - encoder compute and cache are independent scheduling constraints;
-- later dependencies can shorten a chunk after earlier dependencies were satisfied.
+- later dependencies can shorten a chunk after earlier dependencies were satisfied;
+- a submitted prefill row accepts a shorter range than the scheduler offered, and a
+  row that cannot proceed reports `Blocked` without faulting its peers, so encoder
+  budgets hold without aligning the policy chunk to item granularity.
 
 Remaining before stabilizing composition contracts:
 
@@ -228,6 +244,8 @@ Remaining before stabilizing composition contracts:
 - integrate an actual VLM processor/model and let its real feature tensors, prompt
   positions, cache lifetime and device costs determine the production coupled
   scheduler/resource seam;
+- decide how a completion-time rejection and a named blocked condition should work,
+  since progress negotiation can limit work but cannot yet refuse it;
 - validate version compatibility and async failure propagation for both staged and
   coupled derived state.
 
