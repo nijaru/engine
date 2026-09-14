@@ -149,7 +149,9 @@ reader used to open the checkpoint file eagerly, and staging opens one reader pe
 tensor, so the pinned 27B artifact held 888 descriptors at peak against a 1024
 soft limit; two concurrent loads in one process failed with `EMFILE`. A reader now
 opens on first read and releases the descriptor when the payload is exhausted, so
-opening many readers costs no descriptors and only in-flight reads hold one.
+opening many readers costs no descriptors and only in-flight reads hold one: the
+same load peaks at 38 descriptors. Exact-token device qualification was re-run
+against the changed reader, so the staged weights remain the reference artifact's.
 Consistent with the SafeTensors boundary, this is a property of artifact access:
 the model decides which tensors it needs, while the format adapter decides how a
 descriptor is held.

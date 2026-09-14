@@ -68,9 +68,10 @@ batch that indexed its own request map with it), six abandonments followed by an
 ordinary request (an undrained mailbox would hold output capacity that
 `flush_terminals` needs to reclaim the request), an unpreparable batch input
 failing before anything is submitted, and an invalid token failing only its own
-batch member. Run it serially: each test loads the full artifact, and parallel
-loads exceed a default 1024-descriptor limit (see the loader note in
-`docs/execution-foundation.md`).
+batch member. Run it serially: each test loads the full 27B artifact, so parallel
+processes contend for device memory. (The earlier parallel attempts failed on
+descriptors first, at 1024 open files; that loader cost is fixed and recorded in
+`docs/execution-foundation.md`.)
 
 ## Synthetic CPU benchmark
 
