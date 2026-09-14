@@ -146,11 +146,8 @@ impl GenerationExecutor for Decoder {
         Ok(SubmissionId::new(self.next_submission))
     }
 
-    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<ribn::StepOutcome>>, ExecutionError> {
-        Ok(self
-            .pending
-            .take()
-            .map(|rows| rows.into_iter().map(ribn::StepOutcome::Progress).collect()))
+    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+        Ok(self.pending.take())
     }
 
     fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {

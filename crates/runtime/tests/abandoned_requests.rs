@@ -9,14 +9,13 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineError, Event, ExecutionError, ExecutorInfo, FinishReason,
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SequenceId, StepCompletion,
-    StepOutcome, SubmissionId, TokenRequest,
+    SubmissionId, TokenRequest,
 };
 
 #[derive(Default)]
 struct Control {
     batches: Vec<Vec<BatchItem>>,
     released: Vec<SequenceId>,
-    blocked: bool,
 }
 
 /// Minimal single-batch executor: it completes one step behind submission so a
@@ -72,26 +71,20 @@ impl GenerationExecutor for Model {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         assert_eq!(submission.get(), self.next_submission);
         let Some(batch) = self.pending.take() else {
             return Ok(None);
         };
-        let blocked = self.control.lock().unwrap().blocked;
         Ok(Some(
             batch
                 .iter()
-                .map(|item| {
-                    if blocked {
-                        return StepOutcome::Blocked(item.sequence);
-                    }
-                    StepOutcome::Progress(StepCompletion {
-                        sequence: item.sequence,
-                        prefix: item.prefix + item.token_budget,
-                        tokens: (0..item.output_budget)
-                            .map(|i| 200 + item.prefix + i)
-                            .collect(),
-                    })
+                .map(|item| StepCompletion {
+                    sequence: item.sequence,
+                    prefix: item.prefix + item.token_budget,
+                    tokens: (0..item.output_budget)
+                        .map(|i| 200 + item.prefix + i)
+                        .collect(),
                 })
                 .collect(),
         ))
@@ -182,12 +175,13 @@ fn discard_in_flight_preserves_resources_and_healthy_peer_output() {
 }
 
 #[test]
-fn discard_survives_a_blocked_in_flight_completion() {
+fn discard_survives_a_partial_in_flight_completion() {
     let (mut engine, control) = engine();
+    // A prompt longer than the prefill chunk settles on a positive partial
+    // range, so the in-flight completion is valid but does not finish the prompt.
     let request = engine
-        .enqueue(TokenRequest::new(vec![1], options()))
+        .enqueue(TokenRequest::new(vec![1; 20], options()))
         .unwrap();
-    control.lock().unwrap().blocked = true;
     engine.step().unwrap();
     engine.discard(request);
     let status = engine.step().unwrap();

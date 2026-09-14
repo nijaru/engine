@@ -120,7 +120,7 @@ impl GenerationExecutor for Model {
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.0.submit(batch)
     }
-    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         self.0.poll(id)
     }
     fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {

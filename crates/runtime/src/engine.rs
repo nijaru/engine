@@ -20,11 +20,6 @@ pub struct StepStatus {
     pub submitted: bool,
     pub completed: bool,
     pub output_blocked: bool,
-    /// Rows in the completed submission that reported `StepOutcome::Blocked`:
-    /// they made no progress because the backend could not do their work inside
-    /// its own limits. A driver that sees this should wait for the condition to
-    /// change rather than resubmit the same work immediately.
-    pub blocked: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,9 +310,7 @@ impl Engine {
     /// # Panics
     /// Panics if an internal sequence or model-ownership invariant is broken.
     pub fn step(&mut self) -> Result<StepStatus, EngineError> {
-        let report = self.poll_completion()?;
-        let completed = report.completed;
-        let blocked = report.blocked;
+        let completed = self.poll_completion()?;
         self.flush_terminals()?;
         if let Some(error) = &self.fault {
             return Err(EngineError::Faulted(error.clone()));
@@ -325,7 +318,6 @@ impl Engine {
         if self.closed || self.pending.is_some() {
             return Ok(StepStatus {
                 completed,
-                blocked,
                 ..StepStatus::default()
             });
         }
@@ -335,7 +327,6 @@ impl Engine {
         if self.batch.is_empty() {
             return Ok(StepStatus {
                 completed,
-                blocked,
                 output_blocked: !self.prefill.is_empty() || !self.decode.is_empty(),
                 ..StepStatus::default()
             });
@@ -356,7 +347,6 @@ impl Engine {
         Ok(StepStatus {
             submitted: true,
             completed,
-            blocked,
             output_blocked: false,
         })
     }

@@ -20,15 +20,19 @@
 //! - A backend can perform encoder work inside its own step and reuse the output
 //!   across requests, and the engine's loop neither duplicates nor loses that work.
 //! - A prefill row may accept *fewer* inputs than the engine offered
-//!   (`crates/runtime/src/engine/completion.rs`), and a row that can do nothing
-//!   reports `StepOutcome::Blocked` instead of overspending an encoder budget or
-//!   faulting its peers. A step budget smaller than one indivisible item therefore
-//!   no longer forces an overrun, and `SchedulePolicy::prefill_chunk_tokens` no
-//!   longer has to align with prompt-item granularity.
-//! - What a blocked row still cannot express is permanent infeasibility: with a step
-//!   budget below one item's cost the request waits forever, because the engine has
-//!   no rejection outcome for a *completion*. That is the next contract gap, and one
-//!   test pins it deliberately.
+//!   (`crates/runtime/src/engine/completion.rs`), so a step budget smaller than one
+//!   indivisible item no longer forces a per-row overrun. The submission budget is
+//!   aggregate: rows share one step budget instead of each resetting it.
+//! - An indivisible item that exceeds the whole step budget can never run, so the
+//!   backend rejects it at admission. That is request-local: peers keep running.
+//!
+//! What is still not expressible: a *temporary* inability of a row to make progress
+//! (for example, an earlier row consumed the aggregate budget before this row's
+//! leading item). There is no completion-time waiting outcome any more, so a backend
+//! must not submit a row whose first action is an unaffordable item. The fixture
+//! therefore relies on leading plain tokens to guarantee positive progress; tests
+//! that would need temporary waiting are documented limitations, not fabricated
+//! successes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -36,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, Event, ExecutionError, ExecutorInfo, FinishReason,
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId,
-    StepCompletion, StepOutcome, SubmissionId, TokenRequest,
+    StepCompletion, SubmissionId, TokenRequest,
 };
 
 /// Prompt tokens with this value mark a placeholder span that a prompt-position
@@ -90,7 +94,7 @@ struct Control {
     encoded: Vec<ItemId>,
     /// Whether admission waits for the first item to be published.
     gate_admission: bool,
-    /// Encoder compute each submission may spend.
+    /// Encoder compute one whole submission may spend, shared across its rows.
     step_budget: u32,
     /// Submissions that had to spend more than `step_budget`.
     overruns: usize,
@@ -109,8 +113,8 @@ type Shared = Arc<Mutex<Control>>;
 /// already overspent.
 struct Planned {
     item: BatchItem,
-    /// Inputs this row will consume, starting at `item.prefix`. Zero means the
-    /// row is blocked on an item that does not fit the remaining step budget.
+    /// Inputs this row will consume, starting at `item.prefix`. The fixture only
+    /// plans rows that advance, because a completion cannot report zero progress.
     accepted: u32,
     tokens: Vec<u32>,
 }
@@ -144,14 +148,20 @@ impl EncoderModel {
         }
     }
 
-    /// The longest prefix of this row that fits the step budget, consuming
-    /// prompt tokens up to the first item that cannot be encoded. An item is
-    /// indivisible: its span cannot be entered without paying its whole cost.
-    fn plan_prefill(&self, item: &BatchItem, control: &mut Control) -> (Planned, u32) {
+    /// The longest prefix of this row that fits the shared remaining budget,
+    /// consuming prompt tokens up to the first item that cannot be encoded. An
+    /// item is indivisible: its span cannot be entered without paying its whole
+    /// cost. Admission rejects a permanent impossibility, so any span reached
+    /// here fits the whole step budget; the shared budget can still stop a row.
+    fn plan_prefill(
+        &self,
+        item: &BatchItem,
+        control: &mut Control,
+        budget: &mut u32,
+    ) -> (Planned, u32) {
         let limit = item.prefix + item.token_budget;
         let items = self.items_for(item.sequence);
         let mut accepted = item.prefix;
-        let mut budget = control.step_budget;
         let mut spent = 0_u32;
         while accepted < limit {
             let blocking = items
@@ -159,11 +169,11 @@ impl EncoderModel {
                 .find(|encoder| encoder.span.0 <= accepted && accepted < encoder.span.1);
             match blocking {
                 Some(encoder) if !control.published.contains(&encoder.id) => {
-                    if encoder.compute > budget {
-                        // Not affordable now: stop before the item's span.
+                    if encoder.compute > *budget {
+                        // Not affordable inside this submission's shared budget.
                         break;
                     }
-                    budget -= encoder.compute;
+                    *budget -= encoder.compute;
                     spent = spent.saturating_add(encoder.compute);
                     control.encoded.push(encoder.id);
                     control.published.insert(encoder.id);
@@ -172,6 +182,10 @@ impl EncoderModel {
             }
             accepted += 1;
         }
+        assert!(
+            accepted > item.prefix,
+            "the fixture must not submit a row that cannot advance"
+        );
         let tokens = if accepted
             == self
                 .prompt_tokens
@@ -210,24 +224,31 @@ impl GenerationExecutor for EncoderModel {
         sequence: SequenceId,
         request: &TokenRequest,
     ) -> Result<Admission, ExecutionError> {
-        // Admission may be retried, so registration must be idempotent.
-        self.items
-            .entry(sequence)
-            .or_insert_with(|| prompt_items(&request.tokens));
-        self.prompt_tokens
-            .entry(sequence)
-            .or_insert_with(|| u32::try_from(request.tokens.len()).unwrap_or(u32::MAX));
-        let control = self.control.lock().unwrap();
+        // Rejected/deferred admission retains no sequence-owned state.
+        let items = prompt_items(&request.tokens);
+        let mut control = self.control.lock().unwrap();
+        // A permanent impossibility is a request-local rejection, not a wait.
+        if items
+            .iter()
+            .any(|item| item.compute > control.step_budget && !control.published.contains(&item.id))
+        {
+            return Err(ExecutionError::new(
+                "encoder item is larger than the step budget",
+            ));
+        }
         if control.gate_admission
-            && let Some(first) = self.items_for(sequence).first()
+            && let Some(first) = items.first()
             && !control.published.contains(&first.id)
         {
-            drop(control);
-            self.control.lock().unwrap().deferred += 1;
+            control.deferred += 1;
             return Ok(Admission::Deferred);
         }
-        drop(control);
-        self.control.lock().unwrap().admitted += 1;
+        control.admitted += 1;
+        self.items.insert(sequence, items);
+        self.prompt_tokens.insert(
+            sequence,
+            u32::try_from(request.tokens.len()).expect("validated prompt length"),
+        );
         Ok(Admission::Ready)
     }
 
@@ -235,12 +256,13 @@ impl GenerationExecutor for EncoderModel {
         assert!(self.pending.is_none());
         let planned = {
             let mut control = self.control.lock().unwrap();
+            let mut budget = control.step_budget;
             let mut spent = 0_u32;
             let planned = batch
                 .iter()
                 .map(|item| match item.kind {
                     ribn::StepKind::Prefill => {
-                        let (plan, cost) = self.plan_prefill(item, &mut control);
+                        let (plan, cost) = self.plan_prefill(item, &mut control, &mut budget);
                         spent = spent.saturating_add(cost);
                         plan
                     }
@@ -265,25 +287,17 @@ impl GenerationExecutor for EncoderModel {
     fn poll(
         &mut self,
         _submission: SubmissionId,
-    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         let Some(planned) = self.pending.take() else {
             return Ok(None);
         };
         Ok(Some(
             planned
                 .into_iter()
-                .map(|plan| {
-                    if plan.accepted == 0 {
-                        // Nothing could be done for this sequence inside the step
-                        // budget. Reporting that is the point: the engine keeps it
-                        // runnable instead of faulting its peers.
-                        return StepOutcome::Blocked(plan.item.sequence);
-                    }
-                    StepOutcome::Progress(StepCompletion {
-                        sequence: plan.item.sequence,
-                        prefix: plan.item.prefix + plan.accepted,
-                        tokens: plan.tokens,
-                    })
+                .map(|plan| StepCompletion {
+                    sequence: plan.item.sequence,
+                    prefix: plan.item.prefix + plan.accepted,
+                    tokens: plan.tokens,
                 })
                 .collect(),
         ))
@@ -334,24 +348,6 @@ fn request(prompt: Vec<u32>, output: u32) -> TokenRequest {
             ..GenerationOptions::default()
         },
     )
-}
-
-/// Drive a bounded number of steps, reporting the events and whether any
-/// submission came back with a blocked row.
-fn drive(engine: &mut Engine, steps: usize) -> (Vec<Event>, bool) {
-    let mut events = Vec::new();
-    let mut blocked = false;
-    for _ in 0..steps {
-        let status = engine.step().expect("step");
-        blocked |= status.blocked > 0;
-        while let Some(event) = engine.pop_event() {
-            events.push(event);
-        }
-        if engine.status().requests == 0 {
-            break;
-        }
-    }
-    (events, blocked)
 }
 
 fn drain(engine: &mut Engine) -> Vec<Event> {
@@ -450,54 +446,128 @@ fn coupled_encoder_work_is_reused_across_requests_with_the_same_prompt() {
     );
 }
 
-/// The constraint, pinned rather than assumed: a prefill completion must advance
-/// exactly the chunk the policy chose, so a backend cannot stop before an
-/// unencoded placeholder. When the chunk spans more encoder work than the step
-/// budget allows, the work happens anyway; the alternative is failing the batch,
-/// which faults unrelated requests too.
-/// A chunk that spans more encoder work than one step can afford is now shortened
-/// to the affordable prefix instead of overspending, and the row that cannot fit
-/// reports `Blocked` rather than faulting its peers.
+/// Two distinct prompts each carry one item that costs two units. With a shared
+/// three-unit submission budget, the first row's item consumes two units and the
+/// second row is shortened before its own item instead of both rows resetting the
+/// budget. Both rows still advance, so the completion contract can report them.
 #[test]
-fn a_chunk_spanning_items_is_shortened_instead_of_overspending() {
+fn the_step_budget_is_shared_across_the_rows_of_one_submission() {
     let control = Arc::new(Mutex::new(Control {
-        // Room for one item's work, but not for both items at once.
-        step_budget: 1,
+        step_budget: 3,
         ..Control::default()
     }));
     let mut runtime = engine(&control, policy(8));
     runtime
-        .enqueue(request(two_item_prompt(), 1))
-        .expect("enqueue");
-    let (events, blocked) = drive(&mut runtime, 64);
-
+        .enqueue(request(
+            vec![1, 1, MEDIA, MEDIA, MEDIA, MEDIA, 1, 1, 1, 1],
+            1,
+        ))
+        .expect("first enqueue");
+    runtime
+        .enqueue(request(
+            vec![1, 1, 1, MEDIA, MEDIA, MEDIA, MEDIA, 1, 1, 1],
+            1,
+        ))
+        .expect("second enqueue");
+    let events = drain(&mut runtime);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::Finished {
+                    reason: FinishReason::Length,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "both requests finish: {events:?}"
+    );
     let control = control.lock().unwrap();
     assert_eq!(
         control.overruns, 0,
-        "the model stops before work it cannot afford"
+        "no submission overspent the shared budget"
     );
+    // Item at [2,6) for `first`, item at [3,7) for `second`; the second item is
+    // only encoded after the first submission spent the budget on the first.
+    assert_eq!(control.encoded, vec![ItemId(2), ItemId(3)]);
     assert!(
-        control.spent_per_submission.iter().all(|spent| *spent <= 1),
-        "every step stayed inside the budget: {:?}",
+        control
+            .spent_per_submission
+            .iter()
+            .all(|spent| *spent <= control.step_budget),
+        "shared budget was exceeded: {:?}",
         control.spent_per_submission
     );
     assert_eq!(
-        control.encoded,
-        vec![ItemId(1)],
-        "only the affordable item was encoded, and only once"
+        control.spent_per_submission.first().copied(),
+        Some(2),
+        "the first submission only afforded the first row's item"
+    );
+}
+
+/// An item larger than the whole step budget can never run, so admission rejects
+/// it request-locally. A healthy peer with only affordable items keeps running,
+/// and no encoder work is performed for the impossible item.
+#[test]
+fn an_impossible_item_is_rejected_at_admission_without_harming_its_peer() {
+    let control = Arc::new(Mutex::new(Control {
+        // Room for a one-unit item but not the wider two-unit item.
+        step_budget: 1,
+        ..Control::default()
+    }));
+    let mut runtime = engine(&control, policy(8));
+    let impossible = runtime
+        .enqueue(request(two_item_prompt(), 1))
+        .expect("enqueue impossible");
+    let healthy = runtime
+        .enqueue(request(vec![1, 1, 1, 1], 1))
+        .expect("enqueue healthy");
+
+    let mut impossible_reason = None;
+    let mut healthy_finished = false;
+    for _ in 0..64 {
+        runtime.step().expect("step");
+        while let Some(event) = runtime.pop_event() {
+            match event.request() {
+                request if request == impossible => {
+                    if let Event::Finished { reason, .. } = event {
+                        impossible_reason = Some(reason);
+                    }
+                }
+                request if request == healthy => {
+                    if matches!(
+                        event,
+                        Event::Finished {
+                            reason: FinishReason::Length,
+                            ..
+                        }
+                    ) {
+                        healthy_finished = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if impossible_reason.is_some() && healthy_finished {
+            break;
+        }
+    }
+
+    let control = control.lock().unwrap();
+    assert_eq!(control.overruns, 0);
+    assert!(
+        control.encoded.is_empty(),
+        "no encoder work ran for an impossible item"
     );
     assert!(
-        blocked,
-        "the item that cannot fit is reported as blocked, not executed anyway"
+        matches!(impossible_reason, Some(FinishReason::Failed(_))),
+        "the impossible request is rejected, got {impossible_reason:?}"
     );
     assert!(
-        events.is_empty(),
-        "a blocked request produces no tokens and is still waiting: {events:?}"
-    );
-    assert_eq!(
-        runtime.status().requests,
-        1,
-        "the blocked request stays runnable and its peers would proceed"
+        healthy_finished,
+        "the healthy peer completes despite the request-local rejection"
     );
 }
 

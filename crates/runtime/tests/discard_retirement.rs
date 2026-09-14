@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use ribn::{
     Admission, BatchItem, Engine, Event, ExecutionError, ExecutorInfo, GenerationExecutor,
-    GenerationLimits, GenerationOptions, RequestId, SequenceId, StepCompletion, StepOutcome,
-    SubmissionId, TokenRequest,
+    GenerationLimits, GenerationOptions, RequestId, SequenceId, StepCompletion, SubmissionId,
+    TokenRequest,
 };
 
 #[derive(Default)]
@@ -40,19 +40,17 @@ impl GenerationExecutor for Model {
         Ok(SubmissionId::new(1))
     }
 
-    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         if self.control.lock().unwrap().fail_poll {
             return Err(ExecutionError::new("completion uncertain"));
         }
         Ok(self.pending.take().map(|batch| {
             batch
                 .into_iter()
-                .map(|item| {
-                    StepOutcome::Progress(StepCompletion {
-                        sequence: item.sequence,
-                        prefix: item.prefix + item.token_budget,
-                        tokens: vec![7; item.output_budget as usize],
-                    })
+                .map(|item| StepCompletion {
+                    sequence: item.sequence,
+                    prefix: item.prefix + item.token_budget,
+                    tokens: vec![7; item.output_budget as usize],
                 })
                 .collect()
         }))

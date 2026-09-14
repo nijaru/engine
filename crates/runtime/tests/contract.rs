@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, EngineError, Event, ExecutionError, ExecutorInfo,
     FinishReason, GenerationExecutor, GenerationLimits, GenerationOptions, RequestId,
-    SchedulePolicy, SequenceId, StepCompletion, StepOutcome, SubmissionId, TokenRequest, Usage,
+    SchedulePolicy, SequenceId, StepCompletion, SubmissionId, TokenRequest, Usage,
 };
 
 #[allow(
@@ -135,7 +135,7 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
     fn poll(
         &mut self,
         submission: SubmissionId,
-    ) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         assert_eq!(submission.get(), self.next_submission);
         let control = self.control.lock().unwrap();
         if control.fail_poll {
@@ -150,17 +150,17 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
             .iter()
             .map(|item| {
                 self.states.get_mut(&item.sequence).unwrap().update();
-                StepOutcome::Progress(StepCompletion {
+                StepCompletion {
                     sequence: item.sequence,
                     prefix: item.prefix + item.token_budget,
                     tokens: (0..item.output_budget)
                         .map(|i| 100 + item.prefix + i)
                         .collect(),
-                })
+                }
             })
             .collect::<Vec<_>>();
         if control.malformed
-            && let Some(StepOutcome::Progress(row)) = rows.last_mut()
+            && let Some(row) = rows.last_mut()
         {
             row.prefix += 1;
         }
@@ -444,6 +444,55 @@ fn output_backpressure_preserves_reserved_completion_credits() {
             completion_tokens: 0,
         },
     }));
+}
+
+/// A cancelled in-flight request must refund its reserved output capacity when the
+/// submission settles, or a tight pool would starve every later request.
+#[test]
+fn cancelled_in_flight_completion_refunds_reserved_output_credits() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut cfg = config();
+    cfg.max_active_requests = 1;
+    cfg.max_buffered_events = 2;
+    let mut runtime = Engine::new(
+        Model::<DenseState>::new(control.clone()),
+        cfg,
+        SchedulePolicy::default(),
+    )
+    .unwrap();
+    let cancelled = runtime.enqueue(request(1, 3)).unwrap();
+    assert!(runtime.step().unwrap().submitted);
+    runtime.cancel(cancelled).unwrap();
+    // The model delays its first poll, so the observed completion still holds the
+    // reservation the scheduler made before cancellation.
+    assert!(!runtime.step().unwrap().completed);
+    assert!(runtime.step().unwrap().completed);
+    assert_eq!(runtime.status().requests, 0);
+    assert_eq!(
+        runtime.status().buffered_events,
+        1,
+        "only the terminal event remains"
+    );
+    assert!(matches!(
+        runtime.pop_event_for(cancelled),
+        Some(Event::Finished {
+            reason: FinishReason::Cancelled,
+            ..
+        })
+    ));
+    assert_eq!(runtime.status().buffered_events, 0);
+
+    // Only two events fit at once, so a later request can reserve output only if
+    // the cancelled charge was returned to the pool.
+    runtime.enqueue(request(1, 1)).unwrap();
+    let events = drain(&mut runtime);
+    assert!(matches!(
+        events.last(),
+        Some(Event::Finished {
+            reason: FinishReason::Length,
+            ..
+        })
+    ));
 }
 
 #[test]

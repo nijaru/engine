@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use ribn::{
     Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, RequestId, SequenceId,
-    StepOutcome, SubmissionId, TokenRequest,
+    StepCompletion, SubmissionId, TokenRequest,
 };
 
 use crate::execution::model_error;
@@ -64,7 +64,7 @@ impl GenerationExecutor for QwenCuda {
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.resources()?.execution.submit(batch)
     }
-    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepOutcome>>, ExecutionError> {
+    fn poll(&mut self, id: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
         self.resources()?.execution.poll(id)
     }
     fn release(&mut self, id: SequenceId) -> Result<(), ExecutionError> {

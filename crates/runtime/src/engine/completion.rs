@@ -1,29 +1,11 @@
 //! Validate the entire submitted batch before committing any output or prefix.
 use super::{Engine, WorkState};
-use crate::{
-    EngineError, Event, ExecutionError, FinishReason, StepCompletion, StepKind, StepOutcome,
-};
-
-/// What one validated row is allowed to do when the batch is committed.
-enum RowPlan {
-    Commit(StepCompletion),
-    /// The backend reported that it could do nothing for this sequence. The row
-    /// committed no progress and is resubmitted later.
-    Blocked,
-}
-
-/// Result of observing one submission: whether it completed, and how many rows
-/// reported that they could not proceed.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct CompletionReport {
-    pub completed: bool,
-    pub blocked: usize,
-}
+use crate::{EngineError, Event, ExecutionError, FinishReason, StepCompletion, StepKind};
 
 impl Engine {
-    pub(super) fn poll_completion(&mut self) -> Result<CompletionReport, EngineError> {
+    pub(super) fn poll_completion(&mut self) -> Result<bool, EngineError> {
         let Some(submission) = self.pending else {
-            return Ok(CompletionReport::default());
+            return Ok(false);
         };
         let completion = self
             .model
@@ -31,7 +13,7 @@ impl Engine {
             .expect("engine owns model")
             .poll(submission);
         let rows = match completion {
-            Ok(None) => return Ok(CompletionReport::default()),
+            Ok(None) => return Ok(false),
             Ok(Some(rows)) => rows,
             Err(error) => {
                 self.fault_all(&error);
@@ -39,106 +21,74 @@ impl Engine {
                 return Err(EngineError::Faulted(error));
             }
         };
-        let Some(plans) = self.plan_completion(&rows) else {
+        // Every row is validated before any logical prefix or output changes.
+        if !self.completion_is_valid(&rows) {
             let error = ExecutionError::new(
                 "completion does not match its submitted sequence, prefix, or output budget",
             );
             self.fault_all(&error);
             self.flush_terminals()?;
             return Err(EngineError::Faulted(error));
-        };
+        }
         self.pending = None;
         self.release_output_reservations();
-        // Every row was validated before any logical prefix or output is changed.
-        let kinds = self.batch.iter().map(|item| item.kind).collect::<Vec<_>>();
-        let slots = std::mem::take(&mut self.batch_slots);
-        let mut blocked = 0_usize;
-        for ((plan, index), kind) in plans.into_iter().zip(slots).zip(kinds) {
-            match plan {
-                RowPlan::Commit(row) => self.commit_row(index, row),
-                RowPlan::Blocked => {
-                    blocked += 1;
-                    let sequence = self.slots[index]
-                        .as_mut()
-                        .expect("validated completion slot");
-                    if sequence.work == WorkState::Cancelling {
-                        self.terminate(index, FinishReason::Cancelled);
-                        continue;
-                    }
-                    // The settled submission no longer accesses the sequence.
-                    sequence.work = WorkState::Idle;
-                    match kind {
-                        StepKind::Prefill => self.prefill.push_back(index),
-                        StepKind::Decode => self.decode.push_back(index),
-                    }
-                }
-            }
+        for (position, row) in rows.into_iter().enumerate() {
+            self.commit_row(self.batch_slots[position], row);
         }
         self.batch.clear();
-        Ok(CompletionReport {
-            completed: true,
-            blocked,
-        })
+        self.batch_slots.clear();
+        Ok(true)
     }
 
-    /// Validate every row and decide what each may commit. `None` means the
-    /// batch is malformed and nothing may be committed.
-    fn plan_completion(&self, rows: &[StepOutcome]) -> Option<Vec<RowPlan>> {
+    /// Validate every row against the settled batch. `false` means the batch is
+    /// malformed and nothing may be committed.
+    fn completion_is_valid(&self, rows: &[StepCompletion]) -> bool {
         if rows.len() != self.batch.len() {
-            return None;
+            return false;
         }
         rows.iter()
             .zip(&self.batch)
             .zip(&self.batch_slots)
-            .map(|((row, item), &index)| {
-                let sequence = self.slots[index].as_ref()?;
+            .all(|((row, item), &index)| {
+                let Some(sequence) = self.slots[index].as_ref() else {
+                    return false;
+                };
                 if sequence.work == WorkState::Idle || sequence.id != item.sequence {
-                    return None;
+                    return false;
                 }
-                match row {
-                    StepOutcome::Blocked(blocked) => {
-                        if *blocked != item.sequence || sequence.prefix != item.prefix {
-                            return None;
-                        }
-                        Some(RowPlan::Blocked)
+                if row.sequence != item.sequence || sequence.prefix != item.prefix {
+                    return false;
+                }
+                let Some(advance) = row.prefix.checked_sub(item.prefix) else {
+                    return false;
+                };
+                let Ok(outputs) = u32::try_from(row.tokens.len()) else {
+                    return false;
+                };
+                match item.kind {
+                    // A prefill row may accept fewer inputs than its budget, but
+                    // only positive progress is a completion. Sampled output
+                    // belongs only to the row that completed the prompt; an
+                    // intermediate one produces none.
+                    StepKind::Prefill => {
+                        advance > 0
+                            && advance <= item.token_budget
+                            && if row.prefix == sequence.prompt_tokens {
+                                outputs == 1 && outputs <= item.output_budget
+                            } else {
+                                outputs == 0
+                            }
                     }
-                    StepOutcome::Progress(row) => {
-                        if row.sequence != item.sequence || sequence.prefix != item.prefix {
-                            return None;
-                        }
-                        let advance = row.prefix.checked_sub(item.prefix)?;
-                        let outputs = u32::try_from(row.tokens.len()).ok()?;
-                        let accepted = match item.kind {
-                            // A prefill row may accept fewer inputs than its budget,
-                            // which is how a backend stops before work it cannot do.
-                            // Sampled output belongs only to the row that completed
-                            // the prompt; an intermediate one produces none.
-                            StepKind::Prefill => {
-                                advance <= item.token_budget
-                                    && if row.prefix == sequence.prompt_tokens {
-                                        outputs == item.output_budget
-                                    } else {
-                                        outputs == 0
-                                    }
-                            }
-                            // Decode is not allowed to make an empty successful step:
-                            // a backend with nothing to commit reports `Blocked`.
-                            StepKind::Decode => {
-                                advance > 0
-                                    && advance <= item.token_budget
-                                    && outputs == advance
-                                    && outputs <= item.output_budget
-                            }
-                        };
-                        if accepted {
-                            Some(RowPlan::Commit(row.clone()))
-                        } else {
-                            None
-                        }
+                    // Decode is not allowed to make an empty successful step: a
+                    // backend with nothing to commit must not report a completion.
+                    StepKind::Decode => {
+                        advance > 0
+                            && advance <= item.token_budget
+                            && outputs == advance
+                            && outputs <= item.output_budget
                     }
                 }
             })
-            .collect()
     }
 
     fn commit_row(&mut self, index: usize, row: StepCompletion) {
