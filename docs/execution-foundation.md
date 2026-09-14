@@ -144,6 +144,16 @@ the reuse above that: it opens each resolved shard lazily on first use, reuses i
 later tensor views, and leaves unused shards unopened. Model-specific tensor aliases,
 expected shapes and semantic mapping remain above the package layer.
 
+GGUF tensor readers exposed the same class of cost from the other side. Opening a
+reader used to open the checkpoint file eagerly, and staging opens one reader per
+tensor, so the pinned 27B artifact held 888 descriptors at peak against a 1024
+soft limit; two concurrent loads in one process failed with `EMFILE`. A reader now
+opens on first read and releases the descriptor when the payload is exhausted, so
+opening many readers costs no descriptors and only in-flight reads hold one.
+Consistent with the SafeTensors boundary, this is a property of artifact access:
+the model decides which tensors it needs, while the format adapter decides how a
+descriptor is held.
+
 The remaining scaling cost is residency, because a resident artifact owns its whole
 file. Mapping immutable local files would avoid that copy, but mapping requires an
 `unsafe` call that this workspace forbids, so owned bytes remain the only storage and

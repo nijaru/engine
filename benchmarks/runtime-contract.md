@@ -32,6 +32,14 @@ shutdown retries, and conservative retention after uncertain teardown. New tests
 per-request mailbox isolation, draining after execution-slot reuse, bounded ready
 list membership, source-format-independent model geometry, and small-executor defaults.
 
+`crates/runtime/tests/abandoned_requests.rs` pins the contract an abandoned
+request depends on: a cancelled request stays addressable until its terminal event
+is drained, draining it releases both mailbox and request slot, and the aggregate
+`pop_event` drain is round-robin across clients, so it can hand one caller an
+event another caller owns. A frontend that routes the aggregate drain through its
+own request map can therefore read a request it never submitted; that is why
+request-scoped callers use `pop_event_for`.
+
 ## Shared text frontend
 
 `ribn-text` reuses the low-level runtime for raw prompt, chat-message, and token-ID
@@ -44,6 +52,25 @@ CLI behavior uses the same frontend: default text input is one user chat message
 `--raw` bypasses the chat template, and prompt/file/piped-stdin input share the
 same generation implementation. GPU numerical qualification remains the separate
 hardware gate below.
+
+Request ownership in that frontend is device-qualified separately, because
+`TextModel::load` needs a Qwen CUDA executor and no host fixture constructs one:
+
+```sh
+ENGINE_QWEN_GGUF=/absolute/path/model.gguf \
+cargo test --release -p ribn-text --features cuda --test text_lifecycle \
+  -- --ignored --test-threads=1
+```
+
+It covers a stream dropped mid-flight followed by `generate_batch` (which
+previously panicked, because the abandoned request's terminal event reached a
+batch that indexed its own request map with it), six abandonments followed by an
+ordinary request (an undrained mailbox would hold output capacity that
+`flush_terminals` needs to reclaim the request), an unpreparable batch input
+failing before anything is submitted, and an invalid token failing only its own
+batch member. Run it serially: each test loads the full artifact, and parallel
+loads exceed a default 1024-descriptor limit (see the loader note in
+`docs/execution-foundation.md`).
 
 ## Synthetic CPU benchmark
 
