@@ -360,12 +360,10 @@ impl GgufFile {
         let range = self.tensor_data_range(name)?;
         let spec = WeightTensorSpec::new(name.to_owned(), dimensions, DataType::F32)
             .map_err(|error| GgufError::InvalidTensorSpec(error.to_string()))?;
-        let mut file = File::open(&self.path).map_err(|error| GgufError::io(&self.path, &error))?;
-        file.seek(SeekFrom::Start(range.start))
-            .map_err(|error| GgufError::io(&self.path, &error))?;
         Ok(TensorDataReader {
             path: self.path.clone(),
-            file,
+            offset: range.start,
+            file: None,
             remaining: range.end - range.start,
             spec,
             value_type,
@@ -394,15 +392,37 @@ impl GgufFile {
 
 /// Sequential reader over one encoded tensor payload. The reader stops exactly
 /// at the tensor's encoded byte length and cannot consume the next tensor.
+///
+/// The file is opened on first read and released once the payload is exhausted
+/// or the reader is dropped. Opening a reader is therefore cheap in descriptors,
+/// which matters when a caller opens one per tensor: a large checkpoint has
+/// hundreds of tensors, and holding a descriptor for each of them at once can
+/// exceed a process's open-file limit before any execution starts.
 pub struct TensorDataReader {
     path: PathBuf,
-    file: File,
+    /// Absolute file offset of the next unread byte.
+    offset: u64,
+    file: Option<File>,
     remaining: u64,
     spec: WeightTensorSpec,
     value_type: u32,
 }
 
 impl TensorDataReader {
+    /// Open the payload lazily and position it at the current offset.
+    fn open(&mut self) -> io::Result<&mut File> {
+        if self.file.is_none() {
+            let mut file = File::open(&self.path)?;
+            file.seek(SeekFrom::Start(self.offset))?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("payload file was just opened"))
+    }
+
+    /// Release the descriptor; a later read reopens at `offset`.
+    fn close(&mut self) {
+        self.file = None;
+    }
     /// Read and dequantize the next complete block in this tensor payload.
     /// `None` means the bounded tensor range is exhausted. The GGML value type
     /// is captured when the reader is opened, so callers cannot decode a block
@@ -475,8 +495,12 @@ impl Read for TensorDataReader {
         let requested = usize::try_from(self.remaining)
             .unwrap_or(usize::MAX)
             .min(buffer.len());
-        let read = self.file.read(&mut buffer[..requested])?;
+        let read = self.open()?.read(&mut buffer[..requested])?;
         self.remaining -= read as u64;
+        self.offset += read as u64;
+        if self.remaining == 0 {
+            self.close();
+        }
         Ok(read)
     }
 }
@@ -1288,6 +1312,63 @@ mod tests {
             .tensor_data_range("token_embd.weight")
             .expect("tensor range");
         assert_eq!(range.end - range.start, 64);
+    }
+
+    /// Open descriptors in this process, including the one this directory read
+    /// holds while counting.
+    #[cfg(target_os = "linux")]
+    fn open_descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(Iterator::count)
+            .unwrap_or(0)
+    }
+
+    /// A checkpoint has hundreds of tensors and a caller may open a reader for
+    /// each before reading any. Holding a descriptor per reader exhausted this
+    /// process's 1024-descriptor limit on a real 27B artifact, so opening a
+    /// reader must not cost a descriptor until it is read, and an exhausted
+    /// reader must release the one it held.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opening_readers_costs_no_descriptor_until_they_are_read() {
+        let path = std::env::temp_dir().join(format!("engine-gguf-{}-fd.gguf", std::process::id()));
+        std::fs::write(&path, fixture()).expect("write fixture");
+        let parsed = GgufFile::open(&path).expect("open fixture");
+        let before = open_descriptors();
+
+        let mut readers = (0..512)
+            .map(|_| parsed.open_tensor("token_embd.weight").expect("reader"))
+            .collect::<Vec<_>>();
+        let after_open = open_descriptors();
+        assert!(
+            after_open <= before + 4,
+            "opening {} readers held {} descriptors (baseline {before})",
+            readers.len(),
+            after_open
+        );
+
+        // Reading streams the payload and releases the descriptor at the end.
+        let mut payload = Vec::new();
+        readers[0].read_to_end(&mut payload).expect("read payload");
+        assert_eq!(payload.len(), 64);
+        let after_read = open_descriptors();
+        assert!(
+            after_read <= before + 4,
+            "an exhausted reader still held a descriptor: {after_read} (baseline {before})"
+        );
+
+        // Chunked reads over a fresh reader return the same bytes.
+        let mut chunked = Vec::new();
+        let mut reader = parsed.open_tensor("token_embd.weight").expect("reader");
+        let mut chunk = [0_u8; 7];
+        loop {
+            let read = reader.read(&mut chunk).expect("chunked read");
+            if read == 0 {
+                break;
+            }
+            chunked.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(chunked, payload);
     }
 
     #[test]
