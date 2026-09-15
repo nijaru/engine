@@ -92,6 +92,17 @@ fn parse() -> Result<Arguments, String> {
     })
 }
 
+/// Distinct, semantically different questions per caller. Identical output for
+/// different questions would mean requests share each other's input or output.
+const QUESTIONS: [&str; 6] = [
+    "Name one primary color.",
+    "Name one planet.",
+    "Name one fruit.",
+    "Name one country.",
+    "Name one musical instrument.",
+    "Name one number between one and nine.",
+];
+
 fn options(tokens: u32) -> GenerationOptions {
     GenerationOptions {
         max_output_tokens: tokens,
@@ -137,16 +148,6 @@ fn main() -> Result<(), String> {
         drop(abandoned);
     }
 
-    // Distinct, semantically different questions per caller: identical output for
-    // different questions would mean requests share each other's input or output.
-    const QUESTIONS: [&str; 6] = [
-        "Name one primary color.",
-        "Name one planet.",
-        "Name one fruit.",
-        "Name one country.",
-        "Name one musical instrument.",
-        "Name one number between one and nine.",
-    ];
     let mut handles = Vec::with_capacity(arguments.callers);
     for caller in 0..arguments.callers {
         let model = model.clone();
@@ -168,7 +169,7 @@ fn main() -> Result<(), String> {
             .map_err(|_| "caller thread panicked".to_owned())?
             .map_err(|error| format!("caller failed: {error}"))?;
         println!(
-            "caller {caller} ("{question}"): {} tokens in {:.1?} ({:?})",
+            "caller {caller} ({question}): {} tokens in {:.1?} ({:?})",
             response.tokens.len(),
             elapsed,
             response.reason
