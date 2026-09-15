@@ -116,7 +116,8 @@ is measured; it is not model throughput. The CUDA device gate **passed on 2026-0
 2/2 in 199.11 s on the idle RTX 4090 with the pinned artifact, including
 `owned_driver_preserves_reference_with_stalled_and_abandoned_peers`. See the
 [device evidence](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
-Driver-level matched direct-versus-handle cost remains host-only.
+The matched direct-versus-handle comparison is host-only at the driver level; the text
+facade adds a device comparison below.
 
 #### Audit alignment order (2026-09-14)
 
@@ -150,7 +151,6 @@ is now implemented and host-qualified.
    (item 1). CLI file/stdin ingestion is now bounded before loading by the processor's
    input allowance, including chat-role bytes, with a one-byte overflow probe. Host
    reader tests and CUDA-feature CLI process tests cover exact/oversized input.
-   Matched frontend overhead remains unmeasured.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
 owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
@@ -166,17 +166,26 @@ The chat stop-token set is decided and implemented; see
 [the policy and its evidence](../benchmarks/runtime-contract.md#chat-stop-policy-2026-09-14).
 It also governs the legacy `ribn local` path. Reasoning controls remain unexposed.
 
-Remaining before closing this slice:
+Matched frontend overhead is measured on the device: at concurrency 1 the handle path
+adds a fixed 5–12 ms per request plus about 0.3–0.5 ms per delivered token, under 0.5%
+of end-to-end time once the prompt carries real work. See
+[CUDA frontend overhead](../benchmarks/runtime-alignment/README.md#owned-text-facade-over-cuda-d61b62c).
 
-- measure matched direct-versus-handle frontend overhead on the GPU path; the device
-  gates now cover correctness, not comparative cost;
+Remaining, and not required to close this slice:
+
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
-  factory contract.
+  factory contract;
+- reasoning controls remain unexposed, so thinking stays fixed off in the text facade;
+- matched concurrency-above-1 and mixed-arrival frontend comparison belongs to the
+  serving slice, not to this single-request measurement.
 
 Exit: device-qualified frontend behavior, saturation/race/shutdown evidence on both
 paths, no orphan requests, and matched frontend overhead measurements. The loaded owner
 pins one actual executable configuration; no metadata-only snapshot wrapper or
 unimplemented general architecture registry counts as snapshot ownership.
+
+Slice status: **closed at 2026-09-15** (`d61b62c`), except for the explicitly
+conditional items above. The remaining work moves to slice 3.
 
 ### 3. Real asynchronous encoder and prepared resources
 

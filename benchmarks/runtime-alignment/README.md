@@ -22,12 +22,56 @@ adds eight channel slots per stream. No model math or device completion delay ru
 
 The owned path costs more than direct dispatch. These observations expose channel,
 notification and worker bookkeeping cost; they establish neither model throughput nor
-serving latency. Real GPU driver performance and mixed-arrival workload comparisons
-remain unmeasured. No claim of faster execution follows from the async interface.
+serving latency. The matched CUDA comparison below covers the real GPU path at
+concurrency 1; concurrency above 1 and mixed-arrival workloads remain unmeasured. No
+claim of faster execution follows from the async interface.
 
 ```sh
 cargo run --release -p ribn --example host_overhead --locked -- --driver
 ```
+
+## Owned text facade over CUDA (`d61b62c`)
+
+Measured 2026-09-15 on the idle RTX 4090, Fedora, Rust 1.98.0, release mode, pinned
+artifact SHA-256 `322e194f…23482`, concurrency 1. Five independently loaded direct/handle
+pairs per workload, alternating mode order per pair. Model load and shutdown are outside
+timing; one warmup per workload precedes each measured sample. Both modes use the same
+`GgufProcessor`, the same `Engine::with_defaults` engine configuration, the same sampling
+options, and the same incremental UTF-8 decoding work. Raw observations:
+[owned-text-facade-cuda-overhead-2026-09-15.csv](owned-text-facade-cuda-overhead-2026-09-15.csv).
+
+```sh
+ssh desktop   # idle GPU, one process at a time
+RIBN_MODEL=/path/pinned.gguf cargo test --release -p ribn-text --features cuda \
+  --locked --offline --lib matched_frontend_overhead -- --ignored --test-threads=1 --nocapture
+```
+
+Median of five pairs per mode; `TTFT` is submission-to-first-delivered-text-token and
+`elapsed` includes full consumption of the terminal event:
+
+| Workload | Direct TTFT | Handle TTFT | ΔTTFT | Direct elapsed | Handle elapsed | Δelapsed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Raw, 9 prompt / 32 output tokens, `Length` | 86.7 ms | 92.1 ms | +5.4 ms (+6.2%) | 938.2 ms | 950.5 ms | +12.3 ms (+1.3%) |
+| Chat, 17 prompt / 2 output tokens, `Stop` | 142.3 ms | 150.3 ms | +8.0 ms (+5.6%) | 164.3 ms | 172.8 ms | +8.4 ms (+5.1%) |
+| Raw, 347 prompt / 32 output tokens, `Length` | 2550.6 ms | 2562.1 ms | +11.5 ms (+0.4%) | 3649.8 ms | 3665.7 ms | +16.0 ms (+0.4%) |
+
+Every one of the ten loaded configurations produced identical tokens, text, finish
+reason and usage per workload, which extends determinism evidence across load
+boundaries as well as across requests. Within-mode spread was under 1% of the median
+except for the handle path's 2-token chat TTFT (149.6–155.6 ms).
+
+Interpretation for the slice-2 exit: the owned handle costs a fixed **5–12 ms per
+request** — channel submission, wakeup and worker scheduling — plus roughly 0.3–0.5 ms
+per delivered token of extra delivery work. That is under 0.5% of end-to-end time for a
+347-prompt-token request and under 1.5% for a short raw request; only a trivially short
+chat request pays a visible ~5% relative cost. The async/bounded-retention guarantees
+therefore do not impose a throughput-relevant penalty at concurrency 1.
+
+Limits of this evidence: it is a **single-request host-overhead comparison**, not serving
+throughput. It does not cover concurrency above 1, mixed arrivals, or batch windows, and
+the direct path polls `Engine::step` with `yield_now` while the handle path parks on
+channels, so host CPU usage is deliberately not matched. No SOTA or vLLM/SGLang parity
+claim follows from it.
 
 ## Historical output-isolation comparison
 
