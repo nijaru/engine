@@ -94,6 +94,16 @@ and local HF-style package fixtures now exercise this path from artifact metadat
 through model-owned parameter interpretation. There is deliberately no universal
 work/cost unit or length-bucketing policy yet.
 
+`crates/bert` (`engine-bert`) is the first non-decoder model path: a BERT-style
+bidirectional encoder with embedding summation, mean-centred LayerNorm, exact-erf
+GELU, masked attention and a pooler, with projections on cuBLAS. It owns one model
+family's semantics — which parameters exist and how a package's tensors map onto them
+— while artifacts stay with `ribn-hf`, kernels and device state with `engine-nvidia`,
+and scheduling with a runtime. It is hardware-qualified against an independent
+Hugging Face reference for its fixture geometry; see [encoder
+qualification](benchmarks/encoder-qualification.md). The prepared-resource layer above
+it is roadmap slice 3 work and is not implemented yet.
+
 `crates/safetensors` (`ribn-safetensors`) is a thin artifact adapter. It validates
 SafeTensors bytes and exposes names, shapes, dtypes, and borrowed payload bytes; it
 does not assign parameter semantics or allocate execution tensors.
@@ -169,6 +179,7 @@ requires an actual compatible NVIDIA GPU.
 | `crates/hf` (`ribn-hf`) | Local HF-style config/weight package resolution without model semantics |
 | `crates/text` (`ribn-text`) | Current shared text/chat/token input and generation-result frontend |
 | `crates/qwen` | Qwen definition, GGUF mapping, and current CUDA AR executor |
+| `crates/bert` | BERT encoder configuration, parameter mapping and CUDA forward |
 | `crates/nvidia` | NVIDIA physical state, resources, and kernels |
 | `crates/gguf` | Generic GGUF metadata/tensor reader and current tokenizer support |
 | `crates/core` | Legacy execution/state contracts retained for cutover/reference tests |

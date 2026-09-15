@@ -211,12 +211,27 @@ The first concrete representation is deliberately not generic. Increments:
   oversized-head rejection with a healthy peer, closed-pool refusal, and lease retention
   across a failed submission. Workspace checks pass (`boundaries`, `fmt`, 49 test suites,
   `clippy` default and CUDA).
-- **3b.** A real device encoder execution that determines the remaining representation:
-  a runtime with delayed completion that allocates real device bytes under a lease,
-  reports accepted ranges from concrete shapes, parks capacity-waiting work on the pool
-  epoch, and hands off a device-resident pooled result whose consumer must await the
-  producer's completion dependency. Host fixtures cover lifecycle transitions; the
-  device path is qualified separately.
+- **3b.1 (done 2026-09-15).** A real device encoder now exists: `engine-nvidia` owns the
+  encoder primitives (embedding summation, mean-centred LayerNorm, exact-erf GELU,
+  masked attention with a stable softmax, row bias, residual add, tanh) and
+  `engine-bert` owns the model path — configuration, parameter mapping over a resolved
+  package, cuBLAS projections, and an owned submission that holds its device buffers
+  and a recorded completion event. Qualified against an independent Hugging Face
+  reference: worst absolute deviation 4.77e-7 on hidden states and 1.77e-8 on pooled
+  output across four cases including masking and segment types. See
+  [encoder qualification](../benchmarks/encoder-qualification.md). The path is fp32
+  and fixture-geometry only; a production-size encoder must be re-qualified at its own
+  geometry.
+- **3b.2.** Wire that encoder to the pool authority: reserve its real device envelope
+  under a lease, report accepted ranges from concrete shapes, park capacity-waiting
+  work on the pool epoch with registration-and-recheck, and hand off a device-resident
+  pooled result whose consumer must await the producer's completion dependency. The
+  encoder submission already exposes the pieces the runtime needs — a device byte
+  envelope, a queryable completion event and a read that requires completion first — so
+  this step is a runtime contract, not new model work.
+- **3b.3.** Executor-owned retirement for partial enqueue, replacing error-carried
+  leases with a completion handshake once a real submission can fail after reaching the
+  device.
 - **3c.** Device qualification on the idle RTX 4090: constrained pool, delayed completion,
   cancellation before and after enqueue, failed handoff, consumer stall with a healthy
   peer, and a permanently oversized input rejected while peers progress. Charges survive

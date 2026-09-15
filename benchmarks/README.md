@@ -59,6 +59,14 @@ Minimum online serving metrics:
 
 Throughput without latency/SLO context is not sufficient for a serving claim.
 
+## Qualification evidence
+
+- [Runtime contract](runtime-contract.md) — runtime, driver and text-facade device gates.
+- [Encoder qualification](encoder-qualification.md) — BERT encoder numerical parity with an
+  independent Hugging Face reference.
+- [Qwen prefill qualification](qwen-prefill-qualification.md) — chunked same-sequence prefill.
+- [Runtime alignment](runtime-alignment/README.md) — host and CUDA frontend overhead.
+
 ## Initial workload matrix
 
 Start with deterministic synthetic workloads because they isolate engine behavior, then add realistic traces/datasets.

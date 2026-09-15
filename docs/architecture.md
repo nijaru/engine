@@ -141,7 +141,8 @@ internals, other runtime families and device gates were not audited.
 | `ribn`, `crates/runtime` | AR lifecycle, scheduling, output mailboxes, executor contract and owned token driver |
 | `ribn-text`, `crates/text` | Shared text preprocessing/decoding, cloneable owned facade, ordered bounded-window batching; only CUDA assembly is device-gated |
 | `engine-qwen`, `crates/qwen` | Qwen configuration, GGUF interpretation, execution adapter |
-| `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution |
+| `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution, including the encoder primitives |
+| `engine-bert`, `crates/bert` | BERT encoder semantics: configuration, parameter mapping, device forward and per-request completion |
 | `engine-core`, `crates/core` | Legacy runtime, batch/state, weight and device contracts still consumed by production code |
 | `engine-gguf`, `crates/gguf` | GGUF metadata/tensor access and tokenizer support |
 | `ribn-safetensors`, `crates/safetensors` | Validated artifact tensor views, no model semantics |
@@ -166,6 +167,13 @@ Device numerical/lifecycle evidence belongs in
 [Qwen prefill qualification](../benchmarks/qwen-prefill-qualification.md).
 Compilation alone does not qualify CUDA execution. The opt-in GDN scan remains
 numerically unqualified for promotion.
+
+A second model family now executes on the device: `engine-bert` runs a BERT-style
+encoder with masked attention and a pooler, numerically qualified against an
+independent Hugging Face reference for its fixture geometry
+([evidence](../benchmarks/encoder-qualification.md)). It does not yet reserve its
+device bytes from a shared pool, park on capacity, or hand off a pooled result under a
+completion dependency; that is roadmap slice 3.
 
 Not implemented: general architecture resolution, real media processors, asynchronous
 non-AR device ownership, dynamic hybrid continuation allocation, executable weight
