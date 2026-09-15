@@ -3,6 +3,9 @@
 //! Loading is deliberately separate from facade behavior so the preprocessing,
 //! delivery and batching paths are exercisable without a device.
 
+#[cfg(test)]
+mod overhead;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
