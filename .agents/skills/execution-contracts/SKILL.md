@@ -46,8 +46,8 @@ are genuine failing-before regressions and which demonstrate new behavior only.
 
 ## Verify and record
 
-Run the roadmap checks, including CUDA-feature clippy for the gated facade. Capture
-actual exit codes. Run affected device tests serialized; host tests are not device
+Run the roadmap checks, including CUDA-feature clippy for CUDA assembly and CLI paths.
+Capture actual exit codes. Run affected device tests serialized; host tests are not device
 qualification. Inspect the diff for new allocations, clones, lock/await lifetimes,
 ignored errors and competing cleanup owners. Measure direct/handle overhead and
 representative workload effects when introducing performance-sensitive machinery.

@@ -18,6 +18,9 @@ real implementation and roadmap gate, not transcription of a speculative sketch.
 1. Identify whether this is an existing-architecture checkpoint, a new architecture
    using existing mechanisms, a new state/resource mechanism, or a new execution
    regime. State the supported artifact, operations, shapes, precision and devices.
+   For a new release, inspect its actual architecture and processor metadata rather
+   than assuming an existing family name implies compatibility. Identify reusable
+   components and integration gaps without narrowing the engine to existing models.
 2. Inspect the actual loader, processor, executor and tests; do not infer support
    from configuration enums, a registry entry or documentation alone.
 3. Keep model semantics above artifact parsing. Keep raw media and model-family
@@ -66,8 +69,11 @@ real implementation and roadmap gate, not transcription of a speculative sketch.
 6. Measure matched baselines across the shapes/encodings/devices selected by the
    variant. Include mixed lengths/arrivals and memory pressure for serving claims;
    one prompt's prefixes are only a bounded timing sweep. Report repetitions and
-   variability. Label bottleneck explanations as hypotheses unless discriminated by
-   counters or experiments. Preserve a qualified fallback outside the measured scope.
+   variability. For competitive claims, also pin a relevant external serving baseline
+   on matched supported workloads, hardware and quality settings; an internal speedup
+   is not evidence of parity with vLLM/SGLang. Label bottleneck explanations as
+   hypotheses unless discriminated by counters or experiments. Preserve a qualified
+   fallback outside the measured scope.
 
 ## Deliver reviewable support
 

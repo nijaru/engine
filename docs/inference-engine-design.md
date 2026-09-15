@@ -95,6 +95,28 @@ the AR runtime.
 
 ## Scope and success criterion
 
+The product target is a state-of-the-art, idiomatic Rust inference engine, initially
+competitive with vLLM, SGLang and similar serving engines. Competitive performance,
+broad support for common latest models, hardware portability and production reliability
+are joint goals. Ownership guarantees and deployment simplicity support those goals;
+they are not a substitute market position for an engine that remains uncompetitive.
+
+Success requires measured throughput within latency objectives, memory efficiency,
+numerical correctness and serving reliability on representative matched workloads.
+Pin competitor revisions and supported configurations and report coverage and gaps;
+no current parity or SOTA claim follows from this target. Qualify selected workloads
+first, then expand competitive coverage rather than lowering the product ambition to
+fit the first implementation.
+
+Model-support velocity is a product requirement: common newly released architectures,
+processors and artifact conventions should integrate without duplicating serving
+infrastructure. Broad hardware support means backend-native implementations across
+common accelerators and CPUs, not identical kernels or immediate support for every
+device. Each added model/backend still requires implementation and qualification.
+Idiomatic Rust applies to ownership, APIs, errors and execution organization; it does
+not require rewriting qualified vendor kernels or sacrificing hardware specialization.
+The roadmap sequences this work; possible training remains a later execution system.
+
 "General model inference" does **not** mean any arbitrary checkpoint runs without
 implementation work. That is not realistic for a native optimized Rust engine.
 It means that the engine architecture can support the major current inference

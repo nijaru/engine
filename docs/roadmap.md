@@ -7,6 +7,8 @@ Status: ordered implementation and decision gates, updated 2026-09-14.
 owns work order and unresolved decisions. Server-first inference is the priority;
 training is a future execution system sharing demonstrated lower-level mechanisms.
 All v0 interfaces may change. Do not preserve a broken API for compatibility.
+These slices stage the [competitive product target](inference-engine-design.md#scope-and-success-criterion);
+the initial Qwen/CUDA scope is not a narrower product strategy.
 
 ## Engineering method
 
@@ -134,7 +136,7 @@ is now implemented and host-qualified.
    preparation atomicity, UTF-8/terminal precedence, typed error sources, and
    growth-time byte limits for input/rendered/prompt/decoded payloads. Overload stays
    fail-fast per item with no waiter queue and no spin-retry.
-3. **Done except device evidence.** The borrowed execution loop is replaced by the
+3. **Done.** The borrowed execution loop is replaced by the
    host-testable owned facade with CUDA-only assembly. Host tests cover decode failure
    with a healthy peer, cancellation, dropped streams and batches, a stalled consumer
    beside a healthy request, buffered owner-failure semantics at the driver level, and
@@ -144,8 +146,8 @@ is now implemented and host-qualified.
    pull-counting iterator proves bounded lookahead, and per-item failures — an invalid
    input, a decode error and saturated admission — leave peers unaffected.
 5. **Partially done.** CLI cutover, explicit shutdown and host/CUDA-feature checks are
-   complete, and collect-result exclusions are documented. Matched frontend overhead
-   and the affected device gates still need a reachable GPU. CLI file/stdin ingestion
+   complete, collect-result exclusions are documented, and affected device gates pass
+   (item 1). Matched frontend overhead remains unmeasured. CLI file/stdin ingestion
    remains a whole read and is not claimed as bounded.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
@@ -158,18 +160,14 @@ instead of queueing them. Six CUDA-backed tests pass on the device, including
 multi-request determinism. Evidence:
 [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
+The chat stop-token set is decided and implemented; see
+[the policy and its evidence](../benchmarks/runtime-contract.md#chat-stop-policy-2026-09-14).
+It also governs the legacy `ribn local` path. Reasoning controls remain unexposed.
+
 Remaining before closing this slice:
 
 - measure matched direct-versus-handle frontend overhead on the GPU path; the device
   gates now cover correctness, not comparative cost;
-- the chat stop-token set is decided and implemented: every request stops on the
-  artifact's declared EOS IDs, a chat request also stops on the control-token
-  delimiters its own prompt used, and control tokens never decode into user-visible
-  text while content markup such as a thinking or tool-call tag stays visible. Each
-  delivered event still carries its token ID, so a structured consumer loses nothing.
-  See [the policy and its evidence](../benchmarks/runtime-contract.md#chat-stop-policy-2026-09-14).
-  Reasoning controls remain unexposed, and the same policy now governs the legacy
-  `ribn local` path;
 - bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
   factory contract.
@@ -217,7 +215,10 @@ metrics and security limits. Python in-process use follows the same semantics.
 Qualify mixed lengths/arrivals, long context, stalled clients and memory pressure.
 Report throughput within explicit latency objectives, latency distributions, host
 cost, peak memory and cancellation latency. A benchmark needs pinned workload,
-artifact, numerical policy, revisions and repeated matched measurements.
+artifact, numerical policy, revisions and repeated matched measurements. Compare
+against vLLM/SGLang or another relevant serving baseline on overlapping supported
+workloads with matched hardware and quality settings; report wins, regressions and
+unsupported scope separately. Internal speedups alone do not establish competitiveness.
 
 Test a materially different backend before calling device contracts general.
 Implement collectives and real sharding before promoting topology metadata into a

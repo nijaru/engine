@@ -2,8 +2,9 @@
 
 A Rust-first, server-first general model inference engine.
 
-The goal is state-of-the-art inference performance, model coverage, reliability,
-and familiar CLI/library/server workflows across modern model classes. The current
+The goal is state-of-the-art inference in idiomatic Rust, initially competitive with
+vLLM, SGLang and similar serving engines: performance, broad support for common latest
+models and hardware, reliability, and familiar CLI/library/server workflows. The current
 implementation is an experimental Qwen GGUF/CUDA **autoregressive** path under
 qualification; Qwen and the development RTX 4090 are test/qualification vehicles,
 not the architectural scope of the engine.
@@ -99,8 +100,8 @@ concurrent streaming, and ordered bounded-window offline batching. `TextModel` i
 cloneable handle over an owned token execution worker and `TextOwner` controls
 shutdown. Its behavior is host-qualified and the CUDA-backed lifecycle, cancellation and
 multi-request determinism gates pass on the RTX 4090; `TextOwner::load` is still
-Qwen/GGUF/CUDA assembly. Chat stop policy is still `eos_token_id` only, so chat
-special markers can appear in output (tracked in the roadmap).
+Qwen/GGUF/CUDA assembly. Stop-token and decoding behavior is documented in the
+[text contract](docs/resource-protocol.md#text-application-facade).
 
 A sequential encoder->AR pressure test now passes prepared state in-process and
 correlates it with the correct AR request even when handoffs are installed out of

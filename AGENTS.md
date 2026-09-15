@@ -1,9 +1,25 @@
 # Ribn agent guidance
 
-Ribn (pronounced “ribbon”) is a Rust-first, **server-first general inference engine**.
-Qwen GGUF/CUDA and the RTX 4090 are qualification workloads, not the product boundary.
-Training is a future execution system; preserve useful lower-level reuse without
-putting training policy into inference.
+Ribn (pronounced “ribbon”) targets a **state-of-the-art, idiomatic Rust, server-first
+inference engine**, initially competing with vLLM, SGLang and similar serving engines.
+Broad support for common latest models and hardware is the product goal; Qwen GGUF/CUDA
+and the RTX 4090 are qualification workloads, not the product boundary. Training is a
+possible later execution system, not inference policy.
+
+## Product direction
+
+- Pursue competitive throughput, latency, memory efficiency, model-support velocity
+  and serving reliability together. Correct ownership and Rust ergonomics enable that
+  goal; do not substitute a correctness-only, local-only or niche engine strategy.
+- Distinguish the destination from implemented and qualified support. Current gaps
+  determine staged work, not a smaller product ambition. Do not claim SOTA, universal
+  hardware support or automatic day-zero model support without evidence.
+- Idiomatic Rust means clear ownership, typed interfaces and errors, and cohesive
+  execution—not Rust-only kernels or abstraction for its own sake. Use qualified
+  vendor/external kernels when appropriate; retain backend-native optimization.
+- Follow `docs/inference-engine-design.md#scope-and-success-criterion` for success
+  criteria and `docs/roadmap.md` for sequencing. Do not invent a new competitive niche,
+  kernel strategy or hardware priority from the prototype's limitations.
 
 ## Authority and working reference
 
@@ -111,7 +127,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --features cuda -- -D warnings
 ```
 
-Capture actual exit codes; pipes must not mask failures. The text facade is CUDA-gated,
-so default host builds alone miss it. Device commands/evidence live in
+Capture actual exit codes; pipes must not mask failures. Text behavior is host-testable;
+CUDA assembly and device-specific CLI paths still require CUDA-feature checks.
+Device commands/evidence live in
 `benchmarks/runtime-contract.md`; kernel-language qualification lives in
 `docs/cuda-rust-migration.md`. Report failed or unrun checks explicitly.
