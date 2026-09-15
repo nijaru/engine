@@ -17,6 +17,12 @@ callers. Historical experiments are counterexamples, not implementation mandates
   device fault; uncertain physical state is not ordinary backpressure.
 - Define count and byte bounds, reservation authority and when charges release.
   Include retained consumer allocations, not only queue occupancy.
+- Check a payload bound where the payload is retained, not only where it is consumed.
+  A check inside the consumer bounds whatever survived queuing, so aggregate retention
+  becomes caller concurrency times the envelope rather than the declared bound.
+- A queue owner that can lose its last worker must refuse new work and release queued
+  work once that happens. A pool that keeps accepting jobs nothing will serve turns a
+  processor panic into a caller that waits forever.
 - Define wakeup registration/recheck, cancellation under saturation, no-batch readiness
   and shutdown. A repeated poll or `yield_now` is not a notification protocol.
 - Put changed observable semantics in the existing contract owner before implementing
@@ -30,8 +36,9 @@ Test partial positive progress, malformed mixed rows without logical commitment,
 output-credit refunds, stalled and healthy consumers, abandonment before admission,
 during execution and after terminal publication, decode errors and batch errors.
 For concurrent owners test lost-wakeup interleavings, queue saturation, cancellation,
-worker failure and shutdown. For device handoffs test delayed writes/reads, failed
-handoff, attempted reuse and retained charges under constrained pools.
+worker failure and shutdown, including a worker dying while peers are still queued.
+For device handoffs test delayed writes/reads, failed handoff, attempted reuse and
+retained charges under constrained pools.
 
 Prefer host injection of the real implementation over contract-only mock facades.
 Use an independent model/device reference for numerical behavior. State which tests

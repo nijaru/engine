@@ -1,6 +1,6 @@
 //! Host-only reference implementation of the Qwen3.8-27B decoder layer math,
-//! pinned from llama.cpp `cc83d7b48` (see
-//! `ai/research/qwen35-forward-semantics-llama-cpp-2026-09-02.md`).
+//! pinned from llama.cpp `cc83d7b48`. Re-derive the semantics from that revision;
+//! this module is the in-repository record of what was captured.
 //!
 //! This module exists to cross-validate Engine's understanding of the model
 //! semantics before any CUDA dispatcher work: it consumes dequantized GGUF
