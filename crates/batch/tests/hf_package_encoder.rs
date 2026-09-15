@@ -4,11 +4,13 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ribn_batch::{
     BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
 };
+use ribn_foundation::BytePool;
 use ribn_foundation::{ParameterVersion, ScalarType};
 use ribn_hf::LocalModelPackage;
 
@@ -201,6 +203,10 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn pool() -> Arc<BytePool> {
+    BytePool::new(1 << 40).shared()
+}
+
 #[test]
 fn hf_package_metadata_and_weights_remain_separate_from_model_semantics() {
     let dir = TestDir::new();
@@ -216,6 +222,7 @@ fn hf_package_metadata_and_weights_remain_separate_from_model_semantics() {
     let encoder = PackageEncoder::load(&package, ParameterVersion::new(31)).expect("encoder");
     let mut runtime = BatchRuntime::new(
         encoder,
+        pool(),
         BatchConfig {
             max_waiting_requests: 8,
             ..BatchConfig::default()

@@ -61,7 +61,10 @@ execution infrastructure. It currently models logical parameter versions and
 physical materializations, resource topology, and prepared stage placement without
 request, token, KV, autograd, or optimizer semantics. A test-only RMSNorm experiment
 also checks that semantic/backend compatibility can be resolved at preparation time
-without committing Ribn to a general operator IR.
+without committing Ribn to a general operator IR. It also owns the first shared-pool
+authority: a byte pool that grants owning, identifiable leases and publishes a
+release epoch, so sibling runtimes drawing on one physical pool are bound by one
+constraint.
 
 `crates/runtime` (`ribn`) is currently the low-level **AR generation runtime**. It
 owns token-generation request lifecycle, scheduling, cancellation, bounded output,
@@ -82,7 +85,11 @@ and [qualification](benchmarks/runtime-contract.md#owned-token-driver-host-gate-
 encoder/pooling-style batching. Its inputs and outputs are executor-defined and it
 contains no token/prefix/KV concepts. A variable-length reference encoder showed
 that request count alone is not enough to form safe batches, so the executor can
-shorten the oldest FIFO candidate set using its concrete constraints. SafeTensors
+shorten the oldest FIFO candidate set using its concrete constraints. Retained
+results are charged as owning leases on a shared byte pool rather than against a
+private per-runtime byte budget, so a popped result keeps its charge until its owner
+frees the storage, and a head whose own retention can never fit the pool is rejected
+instead of parked. SafeTensors
 and local HF-style package fixtures now exercise this path from artifact metadata
 through model-owned parameter interpretation. There is deliberately no universal
 work/cost unit or length-bucketing policy yet.

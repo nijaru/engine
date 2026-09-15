@@ -189,10 +189,39 @@ conditional items above. The remaining work moves to slice 3.
 
 ### 3. Real asynchronous encoder and prepared resources
 
-Use actual encoder device work to determine preparation and readiness representation.
-Resolve concrete accepted ranges, one pool authority, waiting versus rejection,
-pre-submit abandonment, partial enqueue and producer/consumer completion ownership
-according to the resource protocol. Budget resources across the whole submission.
+Decided contract: [encoder preparation and prepared
+resources](resource-protocol.md#encoder-preparation-and-prepared-resources) — one byte
+pool authority granting owning leases, accepted ranges rather than per-row budgets,
+waiting distinguished from permanent rejection with a real readiness source, pre-submit
+abandonment releasing all new reservations, partial-enqueue ownership, and a
+device-resident result carrying its lease and producer completion dependency.
+
+The first concrete representation is deliberately not generic. Increments:
+
+- **3a (done 2026-09-15).** `ribn-foundation` owns the first concrete authority
+  (`BytePool`/`PoolLease`/`AllocationId` in `crates/foundation/src/pool.rs`): owning
+  non-duplicable leases, an allocation identity per grant, and a release epoch as the
+  capacity readiness source. `ribn-batch` reserves retained output through the pool
+  instead of a private counter, so one constraint binds every runtime drawing on it;
+  `Rejection::RetainedOutputTooLarge` replaces the per-runtime byte bound, and a failed
+  submission returns its leases inside the error rather than silently releasing bytes
+  the device may still cover. Host evidence: 13 `ribn-batch` unit tests and 11
+  `ribn-foundation` tests, including over-grant refusal, exact-fit grants, charge
+  survival across handoff and dequeue, sibling binding, epoch advance on release,
+  oversized-head rejection with a healthy peer, closed-pool refusal, and lease retention
+  across a failed submission. Workspace checks pass (`boundaries`, `fmt`, 49 test suites,
+  `clippy` default and CUDA).
+- **3b.** A real device encoder execution that determines the remaining representation:
+  a runtime with delayed completion that allocates real device bytes under a lease,
+  reports accepted ranges from concrete shapes, parks capacity-waiting work on the pool
+  epoch, and hands off a device-resident pooled result whose consumer must await the
+  producer's completion dependency. Host fixtures cover lifecycle transitions; the
+  device path is qualified separately.
+- **3c.** Device qualification on the idle RTX 4090: constrained pool, delayed completion,
+  cancellation before and after enqueue, failed handoff, consumer stall with a healthy
+  peer, and a permanently oversized input rejected while peers progress. Charges survive
+  dequeue until safe reuse, and downstream workspace stays available under producer
+  pressure.
 
 Exit: constrained shared pool, delayed completion, cancellation, failed handoff,
 consumer stall and permanent oversized-input rejection with healthy peer progress.

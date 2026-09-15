@@ -1,9 +1,11 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use ribn_batch::{
     BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
 };
+use ribn_foundation::BytePool;
 use ribn_foundation::{ParameterVersion, ScalarType};
 use ribn_safetensors::SafeTensorArtifact;
 
@@ -247,6 +249,10 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn pool() -> Arc<BytePool> {
+    BytePool::new(1 << 40).shared()
+}
+
 #[test]
 fn safetensors_weights_flow_through_model_mapping_and_non_ar_runtime() {
     let artifact = SafeTensorArtifact::from_bytes(artifact_fixture()).expect("artifact");
@@ -254,6 +260,7 @@ fn safetensors_weights_flow_through_model_mapping_and_non_ar_runtime() {
         .expect("artifact-backed encoder");
     let mut runtime = BatchRuntime::new(
         encoder,
+        pool(),
         BatchConfig {
             max_waiting_requests: 8,
             ..BatchConfig::default()

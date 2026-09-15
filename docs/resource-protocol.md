@@ -106,6 +106,52 @@ Cancellation must remain deliverable when the ordinary submission queue is full.
 Use per-request cancellation intent plus a wakeup, or a separately bounded control
 path whose capacity follows admitted requests—not an unbounded emergency queue.
 
+## Encoder preparation and prepared resources
+
+Status: accepted direction; the concrete representation is being established with the
+first real encoder execution. This resolves the questions slice 3 must settle before
+dependent code exists. It does not yet implement them: `ribn-batch` still accounts for
+retained bytes locally, and no device-backed encoder executes.
+
+1. **One authority, owning byte leases.** The first concrete authority is a shared byte
+   pool that grants an owning, non-duplicable lease per reservation. Moving a lease
+   between owners does not reserve again. Physical storage and its charge live in one
+   owner, so a backend that materializes device memory for a lease keeps both together,
+   and popping a result from a queue does not release its charge. A lease carries the
+   allocation identity that a later derived-state compatibility check needs; a bare byte
+   count is not an allocation identity.
+2. **Accepted ranges.** Preparation reports the concrete work the executor accepted and
+   the reservations it granted for that work. The runtime prepares an executable prefix
+   of its queue; it never prepares an arbitrary iterator. Aggregate submission resources
+   are budgeted across the whole prepared range, not reset per row.
+3. **Waiting versus rejection.** Waiting names both a condition and a readiness source.
+   For capacity the source is the pool's allocation epoch; readiness uses
+   registration-and-recheck so a release between the capacity check and parking cannot
+   be lost. Rejection is permanent request-local infeasibility — an indivisible input
+   larger than the pool can ever grant, or an unsupported shape — and is delivered
+   without waiting. A retry count never establishes impossibility. Waiting work parks
+   outside runnable queues and does not stall healthy requests; while a backend provides
+   no completion notification, a bounded timed fallback is explicit, not implied.
+4. **Pre-submit abandonment.** Abandoning prepared, unsubmitted work releases all new
+   reservations, including uncommitted persistent growth, and never releases
+   pre-existing continuation. Host-only reservations may rely on ordinary RAII; fallible
+   device retirement needs an executor-owned retry/quarantine path, and Drop cannot
+   assert device completion.
+5. **Partial enqueue.** An enqueue failure distinguishes clean rejection before device
+   access from uncertain partial submission. After any device-visible mutation the
+   executor retains completion ownership of everything that may have been enqueued; a
+   caller is never given ownership back as though nothing happened.
+6. **Producer/consumer completion ownership.** A device-resident result carries its
+   representation, model identity, pool charge and a producer completion dependency. The
+   consumer waits on that dependency before reading. [Cross-runtime device
+   ownership](#cross-runtime-device-ownership) already owns the reuse, cancellation and
+   quarantine rules; preparation adds only the lease and dependency that make them
+   checkable.
+
+Do not add public generic `PreparedSubmission`, `PoolClaim` or lease traits yet. The
+first representation should be concrete enough to be exercised by a real encoder, and
+generalized only when a second consumer demonstrates the same shape.
+
 ## Owned AR driver contract
 
 The first owned-access increment drives the existing token runtime; it is not the

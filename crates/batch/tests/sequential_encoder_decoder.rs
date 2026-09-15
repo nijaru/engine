@@ -10,7 +10,7 @@ use ribn::{
 use ribn_batch::{
     BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
 };
-use ribn_foundation::ParameterVersion;
+use ribn_foundation::{BytePool, ParameterVersion};
 
 type EncoderState = Arc<[u32]>;
 
@@ -219,10 +219,15 @@ fn run_until_terminal(engine: &mut Engine, request: RequestId) -> FinishReason {
     panic!("decoder request did not finish")
 }
 
+fn pool() -> Arc<BytePool> {
+    BytePool::new(1 << 40).shared()
+}
+
 #[test]
 fn sequential_encoder_state_is_correlated_by_request_identity_without_serialization() {
     let mut encoder = BatchRuntime::new(
         Encoder,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()

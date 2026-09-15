@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use ribn_batch::{
     BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
 };
-use ribn_foundation::ParameterVersion;
+use ribn_foundation::{BytePool, ParameterVersion};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EncoderError {
@@ -172,10 +173,15 @@ fn assert_close(actual: [f32; 3], expected: [f32; 3]) {
     }
 }
 
+fn pool() -> Arc<BytePool> {
+    BytePool::new(1 << 40).shared()
+}
+
 #[test]
 fn variable_length_encoder_inputs_batch_without_ar_semantics() {
     let mut runtime = BatchRuntime::new(
         ReferenceEncoder::fixture(8),
+        pool(),
         BatchConfig {
             max_waiting_requests: 8,
             ..BatchConfig::default()
@@ -210,6 +216,7 @@ fn variable_length_encoder_inputs_batch_without_ar_semantics() {
 fn executor_informed_selection_respects_encoder_batch_cost() {
     let mut runtime = BatchRuntime::new(
         ReferenceEncoder::fixture(4),
+        pool(),
         BatchConfig {
             max_waiting_requests: 8,
             ..BatchConfig::default()

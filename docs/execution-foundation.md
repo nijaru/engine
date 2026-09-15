@@ -345,7 +345,8 @@ Implemented as provisional scaffolding:
 - test-only preparation-time semantic RMSNorm implementation selection, with runtime
   shape support queried per execution so a preparation-time choice is never taken as
   proof that the same implementation serves every step's shape;
-- `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts;
+- `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts, reserving
+  retained output through the shared byte pool instead of a private per-runtime budget;
 - coherent parameter-version checks for queued non-AR work;
 - executor-informed variable-length batch sizing without a universal work unit;
 - SafeTensors format-level validation that retains tensor metadata and payload
@@ -362,6 +363,9 @@ Implemented as provisional scaffolding:
 - BERT attention-mask semantics and padded-versus-ragged batch-cost pressure tests
   pass without changing the common `ribn-batch` contract;
 - stable AR `RequestId` passed separately from `SequenceId` into executor admission;
+- a shared byte-pool authority in `ribn-foundation`: owning non-duplicable leases with
+  allocation identity, a release epoch for capacity readiness, over-grant refusal,
+  permanent-rejection reporting, and release on lease drop/shutdown;
 - sequential encoder->AR handoff, out-of-order correlation, request-local failure,
   and cancellation ownership before/after admission;
 - VLM prompt-position dependency scheduling with separate encoder compute/cache

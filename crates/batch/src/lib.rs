@@ -6,10 +6,16 @@
 //!
 //! The runtime accounts for two different quantities. Waiting work is bounded by
 //! [`BatchConfig::max_waiting_requests`]. Terminal results the caller has not
-//! consumed are bounded by [`BatchConfig::max_retained_results`] and
-//! [`BatchConfig::max_retained_output_bytes`], because a caller that stops
-//! draining results would otherwise grow memory without limit, and because encoder
-//! or media outputs can own substantial host and device allocations.
+//! consumed are bounded by [`BatchConfig::max_retained_results`] and by a shared
+//! [`BytePool`], because a caller that stops draining results would otherwise grow
+//! memory without limit, and because encoder or media outputs can own substantial
+//! host and device allocations.
+//!
+//! The pool is the single byte authority for every runtime drawing on it, so one
+//! constraint binds siblings instead of each runtime enforcing a private byte
+//! budget. Reserving a request's retained output yields an owning [`PoolLease`]
+//! that travels with the entry, so a completed result keeps its charge until the
+//! caller takes responsibility for the storage it covers.
 //!
 //! Admission has three outcomes rather than an integer. The executor reports that
 //! the oldest candidates are [`BatchSelection::Ready`], temporarily
@@ -20,19 +26,20 @@
 //!
 //! Retained capacity is reserved before a batch executes and released when the
 //! caller consumes the result, so an executor cannot overshoot the budget by
-//! running first and accounting afterwards. When an executor's chosen batch does
-//! not fit the retained budget, the runtime runs the largest prefix that fits
-//! instead of blocking: batching is an optimization, so a shorter batch produces
-//! the same results. `step` reports [`BlockReason::RetainedResults`] or
-//! [`BlockReason::RetainedOutputBytes`] only when not even one request fits, which
-//! is the caller's signal to consume retained entries.
+//! running first and accounting afterwards. When the pool cannot cover the whole
+//! selected batch, the runtime runs the largest prefix it can reserve instead of
+//! blocking: batching is an optimization, so a shorter batch produces the same
+//! results. `step` reports [`BlockReason::RetainedResults`] or
+//! [`BlockReason::Pool`] only when not even one request fits, which is the caller's
+//! signal to consume retained entries or wait for capacity to come back.
 
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ribn_foundation::ParameterVersion;
+use ribn_foundation::{AllocationId, BytePool, ParameterVersion, PoolLease, ReserveError};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -48,23 +55,20 @@ impl RequestId {
 
 /// Bounds for waiting work and for terminal results that are still retained.
 ///
-/// The two retention bounds apply only to entries that carry an output.
-/// Rejections hold no bulk payload, so they are bounded by
-/// [`Self::max_retained_results`] alone and remain deliverable while the byte
-/// budget is exhausted.
+/// The count bound applies to every terminal entry. The byte bound is not here: it
+/// belongs to the shared [`BytePool`] the runtime reserves from, so sibling
+/// runtimes cannot each spend the same capacity. Rejections hold no bulk payload,
+/// so they are bounded by [`Self::max_retained_results`] alone and stay
+/// deliverable while the pool is exhausted.
 ///
-/// The defaults are deliberately generous placeholders. A deployment sharing one
-/// host or device pool across runtimes must set both retention bounds from that
-/// pool's real capacity, because the bounds are per runtime and independently
-/// bounded runtimes do not make a bounded pipeline.
+/// Both counts are deliberately placeholder defaults. A deployment sizes them from
+/// its own admission policy, not from the physical pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchConfig {
     /// Requests that may wait for execution.
     pub max_waiting_requests: usize,
     /// Terminal entries that may be retained before the caller consumes them.
     pub max_retained_results: usize,
-    /// Bytes that retained outputs may hold in the shared resource domain.
-    pub max_retained_output_bytes: u64,
 }
 
 impl Default for BatchConfig {
@@ -72,7 +76,6 @@ impl Default for BatchConfig {
         Self {
             max_waiting_requests: 1024,
             max_retained_results: 1024,
-            max_retained_output_bytes: 1 << 30,
         }
     }
 }
@@ -131,9 +134,9 @@ impl<O> JobOutput<O> {
 pub enum BatchSelection<C> {
     /// Execute the oldest `items` candidates.
     ///
-    /// The runtime reserves [`BatchExecutor::retained_bytes`] for every selected
-    /// input before it runs them, so an executor that under-reports its
-    /// retention is what breaks the budget, not the runtime.
+    /// The runtime reserves [`BatchExecutor::retained_bytes`] from the shared pool
+    /// for every selected input before it runs them, so an executor that
+    /// under-reports its retention is what breaks the bound, not the runtime.
     Ready { items: usize },
     /// The oldest candidates are valid but cannot run yet.
     ///
@@ -157,15 +160,37 @@ pub enum BlockReason<C> {
     /// Not even the head request fits the retained-result bound, so the caller
     /// must consume retained results before more work can run.
     RetainedResults,
-    /// Not even the head request fits the retained-output-byte bound, so the
-    /// caller must release retained output bytes before more work can run.
+    /// The shared pool cannot cover the head request while other leases hold
+    /// capacity. The caller must consume retained entries, or wait for a sibling
+    /// runtime to release its own, before more work can run.
     ///
-    /// A byte budget below one output of the smallest supported request blocks
-    /// permanently, which is a configuration error rather than backpressure.
-    RetainedOutputBytes,
+    /// Read [`BatchRuntime::pool`]'s epoch when this is reported and retry after it
+    /// changes instead of polling capacity blindly.
+    Pool {
+        /// Bytes the head request needs reserved before it can run.
+        requested: u64,
+        /// Bytes the pool had available when the reservation failed.
+        available: u64,
+    },
     /// The executor reports that its own resources are not available yet. The
     /// caller that owns those resources decides what releases them.
     Executor(C),
+}
+
+/// Why a request was refused before any work was submitted for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Rejection<C> {
+    /// The executor can never run this request under its own limits.
+    Executor(C),
+    /// This request's own retained output can never fit the shared pool, so
+    /// releasing capacity can never admit it. Permanent request-local
+    /// infeasibility, not backpressure.
+    RetainedOutputTooLarge {
+        /// Bytes the request needs reserved.
+        requested: u64,
+        /// Total bytes the pool can ever grant.
+        capacity: u64,
+    },
 }
 
 /// How one request ended.
@@ -173,8 +198,8 @@ pub enum BlockReason<C> {
 pub enum Terminal<O, C> {
     /// The request executed. Its output stays retained until consumed.
     Output(O),
-    /// The request could not execute under the executor's limits.
-    Rejected(C),
+    /// The request could not execute.
+    Rejected(Rejection<C>),
 }
 
 /// One terminal entry awaiting consumption, in completion order.
@@ -182,7 +207,7 @@ pub struct Completed<O, C> {
     request: RequestId,
     parameter_version: ParameterVersion,
     outcome: Terminal<O, C>,
-    retained_bytes: u64,
+    lease: Option<PoolLease>,
 }
 
 impl<O, C> Completed<O, C> {
@@ -206,12 +231,34 @@ impl<O, C> Completed<O, C> {
         self.outcome
     }
 
+    /// Split into the terminal outcome and the charge covering its storage.
+    ///
+    /// Handing the result to another owner means handing over the lease too:
+    /// dropping it releases pool bytes that owner's storage still needs.
+    /// Rejections carry no lease.
+    #[must_use]
+    pub fn into_parts(self) -> (Terminal<O, C>, Option<PoolLease>) {
+        (self.outcome, self.lease)
+    }
+
+    /// The reservation covering this entry's storage until it is consumed.
+    #[must_use]
+    pub const fn lease(&self) -> Option<&PoolLease> {
+        self.lease.as_ref()
+    }
+
+    /// Identity of the allocation this entry holds, when it produced output.
+    #[must_use]
+    pub fn allocation(&self) -> Option<AllocationId> {
+        self.lease.as_ref().map(PoolLease::allocation)
+    }
+
     /// Bytes this entry retains until the caller consumes it.
     ///
     /// Rejections retain nothing and report zero.
     #[must_use]
-    pub const fn retained_bytes(&self) -> u64 {
-        self.retained_bytes
+    pub fn retained_bytes(&self) -> u64 {
+        self.lease.as_ref().map_or(0, PoolLease::bytes)
     }
 
     /// The completed output, when this request executed rather than failing.
@@ -292,6 +339,12 @@ struct Queued<I> {
     parameter_version: ParameterVersion,
 }
 
+/// One executed batch and the reservations that cover its retained outputs.
+struct Executed<O> {
+    outputs: Vec<JobOutput<O>>,
+    leases: Vec<PoolLease>,
+}
+
 /// What the queue head resolved to before any execution or reservation happened.
 ///
 /// `Ready` stays separate from `Blocked` so the capacity checks that follow can
@@ -305,22 +358,32 @@ enum Resolved<C> {
     },
     /// Per-request retention reservations for the executor's selected prefix.
     Ready {
-        reservations: Vec<u64>,
+        items: usize,
     },
 }
 
 pub struct BatchRuntime<E: BatchExecutor> {
     executor: E,
+    pool: Arc<BytePool>,
     config: BatchConfig,
     queue: VecDeque<Queued<E::Input>>,
     terminal: VecDeque<Completed<E::Output, E::Constraint>>,
-    retained_output_bytes: u64,
 }
 
 impl<E: BatchExecutor> BatchRuntime<E> {
+    /// Create a runtime that reserves retained output from `pool`.
+    ///
+    /// The pool is shared, not owned: sibling runtimes drawing on one physical
+    /// pool pass the same authority, which is what makes a single constraint bind
+    /// all of them.
+    ///
     /// # Errors
     /// Rejects a zero bound or an executor that cannot run one item.
-    pub fn new(executor: E, config: BatchConfig) -> Result<Self, RuntimeError<E::Error>> {
+    pub fn new(
+        executor: E,
+        pool: Arc<BytePool>,
+        config: BatchConfig,
+    ) -> Result<Self, RuntimeError<E::Error>> {
         if config.max_waiting_requests == 0
             || config.max_retained_results == 0
             || executor.max_batch_items() == 0
@@ -329,16 +392,19 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         }
         Ok(Self {
             executor,
+            pool,
             config,
             queue: VecDeque::with_capacity(config.max_waiting_requests),
             terminal: VecDeque::new(),
-            retained_output_bytes: 0,
         })
     }
 
     /// # Errors
-    /// Rejects a full waiting queue or identity exhaustion.
+    /// Rejects a closed pool, a full waiting queue or identity exhaustion.
     pub fn submit(&mut self, input: E::Input) -> Result<RequestId, RuntimeError<E::Error>> {
+        if self.pool.is_closed() {
+            return Err(RuntimeError::PoolClosed);
+        }
         if self.queue.len() >= self.config.max_waiting_requests {
             return Err(RuntimeError::WaitingCapacityExhausted);
         }
@@ -362,100 +428,104 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     /// A [`StepOutcome::Blocked`] result is a wakeup contract rather than a
     /// failure: retry only after the named condition changes. Consuming retained
     /// entries with [`Self::pop_completed`] releases their reservation, which is
-    /// the wakeup for [`BlockReason::RetainedResults`] and
-    /// [`BlockReason::RetainedOutputBytes`].
+    /// the wakeup for [`BlockReason::RetainedResults`]. A sibling runtime's release
+    /// advances the pool epoch, which is the wakeup for [`BlockReason::Pool`].
     ///
     /// # Errors
     /// Rejects a parameter-version change while queued work still targets the
     /// previous version, a malformed executor batch selection, malformed executor
     /// output, an internal queue invariant failure, or an executor failure.
     pub fn step(&mut self) -> Result<StepOutcome<E::Constraint>, RuntimeError<E::Error>> {
-        let mut reservations = match self.resolve_head()? {
+        let mut accepted = match self.resolve_head()? {
             Resolved::Idle => return Ok(StepOutcome::Idle),
             Resolved::Blocked(reason) => return Ok(StepOutcome::Blocked(reason)),
             Resolved::Rejected { request } => return Ok(StepOutcome::Rejected { request }),
-            Resolved::Ready { reservations, .. } => reservations,
+            Resolved::Ready { items } => items,
         };
 
-        // Reserve retained capacity before submitting work, so a full budget
-        // stops execution instead of being discovered after the fact. Batching is
-        // an optimization, so the executor's selected batch shrinks to the largest
-        // prefix the budget can hold rather than blocking on the whole set.
-        let fits = self.fitting_prefix(&reservations);
-        if fits == 0 {
-            return Ok(StepOutcome::Blocked(self.exhausted_reason(reservations[0])));
+        // A rejection occupies the retained-result budget until it is consumed,
+        // exactly like an output, so the count bound applies before anything runs.
+        let free_slots = self
+            .config
+            .max_retained_results
+            .saturating_sub(self.terminal.len());
+        if free_slots == 0 {
+            return Ok(StepOutcome::Blocked(BlockReason::RetainedResults));
         }
-        reservations.truncate(fits);
-        let items = fits;
-        let reservation = reservations
-            .iter()
-            .copied()
-            .fold(0_u64, u64::saturating_add);
+        accepted = accepted.min(free_slots);
 
+        // Reserve every retained output before submitting work, so a full pool
+        // stops execution instead of being discovered after the fact. Batching is
+        // an optimization, so the accepted range shrinks to the largest prefix the
+        // pool grants rather than blocking on the whole selection.
+        let mut leases = Vec::with_capacity(accepted);
+        for queued in self.queue.iter().take(accepted) {
+            let bytes = self.executor.retained_bytes(&queued.input);
+            match self.pool.reserve(bytes) {
+                Ok(lease) => leases.push(lease),
+                Err(ReserveError::Exhausted {
+                    requested,
+                    available,
+                }) if leases.is_empty() => {
+                    return Ok(StepOutcome::Blocked(BlockReason::Pool {
+                        requested,
+                        available,
+                    }));
+                }
+                // A later oversized item stops the prefix here and becomes the
+                // queue head's own rejection once earlier work drains.
+                Err(ReserveError::Exhausted { .. } | ReserveError::TooLarge { .. }) => break,
+                Err(ReserveError::Closed) => return Err(RuntimeError::PoolClosed),
+            }
+        }
+        if leases.is_empty() {
+            return Err(RuntimeError::QueueInvariant);
+        }
+
+        let items = leases.len();
         let version = self.executor.parameter_version();
-        let outputs = self.execute_selected(items)?;
-        let results = outputs.len();
-        self.retained_output_bytes = self.retained_output_bytes.saturating_add(reservation);
+        // Submission may reach the device before failing, so the reservations
+        // travel into the error: nothing releases pool bytes covering state the
+        // device may still access until completion is known.
+        let executed = self.execute_selected(items, leases)?;
+        let results = executed.outputs.len();
         self.terminal
             .extend(
-                outputs
+                executed
+                    .outputs
                     .into_iter()
-                    .zip(reservations)
-                    .map(|(output, retained_bytes)| Completed {
+                    .zip(executed.leases)
+                    .map(|(output, lease)| Completed {
                         request: output.request(),
                         parameter_version: version,
                         outcome: Terminal::Output(output.into_output()),
-                        retained_bytes,
+                        lease: Some(lease),
                     }),
             );
         Ok(StepOutcome::Executed { results })
     }
 
-    /// How many of the executor's selected requests fit the retained budget.
-    fn fitting_prefix(&self, reservations: &[u64]) -> usize {
-        let mut fits = 0_usize;
-        let mut bytes = 0_u64;
-        for reservation in reservations {
-            // Rejections and outputs are both terminal entries the caller has not
-            // consumed, so both occupy the retained-result budget.
-            if self.retained_results().saturating_add(fits) >= self.config.max_retained_results {
-                break;
-            }
-            let next = bytes.saturating_add(*reservation);
-            if self.retained_output_bytes.saturating_add(next)
-                > self.config.max_retained_output_bytes
-            {
-                break;
-            }
-            bytes = next;
-            fits += 1;
-        }
-        fits
-    }
-
-    /// Which retained bound stops even the head request from running.
-    fn exhausted_reason(&self, head_reservation: u64) -> BlockReason<E::Constraint> {
-        if self.retained_results() >= self.config.max_retained_results {
-            BlockReason::RetainedResults
-        } else if self.retained_output_bytes.saturating_add(head_reservation)
-            > self.config.max_retained_output_bytes
-        {
-            BlockReason::RetainedOutputBytes
-        } else {
-            BlockReason::RetainedResults
-        }
-    }
-
     /// Resolve the queue head without executing anything.
     fn resolve_head(&mut self) -> Result<Resolved<E::Constraint>, RuntimeError<E::Error>> {
-        let Some(front) = self.queue.front() else {
-            return Ok(Resolved::Idle);
-        };
         let version = self.executor.parameter_version();
-        if front.parameter_version != version {
-            return Err(RuntimeError::ParameterVersionChanged {
-                queued: front.parameter_version,
-                current: version,
+        let head_retention = match self.queue.front() {
+            None => return Ok(Resolved::Idle),
+            Some(front) => {
+                if front.parameter_version != version {
+                    return Err(RuntimeError::ParameterVersionChanged {
+                        queued: front.parameter_version,
+                        current: version,
+                    });
+                }
+                self.executor.retained_bytes(&front.input)
+            }
+        };
+        // Releasing capacity cannot change the pool's total capacity, so a head
+        // whose own output can never fit is rejected rather than parked.
+        if head_retention > self.pool.capacity() {
+            return self.reject_head(Rejection::RetainedOutputTooLarge {
+                requested: head_retention,
+                capacity: self.pool.capacity(),
             });
         }
 
@@ -471,21 +541,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
                 Ok(Resolved::Blocked(BlockReason::Executor(constraint)))
             }
             BatchSelection::Rejected(constraint) => {
-                if self.terminal.len() >= self.config.max_retained_results {
-                    return Ok(Resolved::Blocked(BlockReason::RetainedResults));
-                }
-                let Some(rejected) = self.queue.pop_front() else {
-                    return Err(RuntimeError::QueueInvariant);
-                };
-                self.terminal.push_back(Completed {
-                    request: rejected.request,
-                    parameter_version: version,
-                    outcome: Terminal::Rejected(constraint),
-                    retained_bytes: 0,
-                });
-                Ok(Resolved::Rejected {
-                    request: rejected.request,
-                })
+                self.reject_head(Rejection::Executor(constraint))
             }
             BatchSelection::Ready { items } => {
                 if items == 0 || items > candidates.len() {
@@ -494,20 +550,44 @@ impl<E: BatchExecutor> BatchRuntime<E> {
                         candidates: candidates.len(),
                     });
                 }
-                let reservations = candidates[..items]
-                    .iter()
-                    .map(|input| self.executor.retained_bytes(input))
-                    .collect::<Vec<_>>();
-                Ok(Resolved::Ready { reservations })
+                Ok(Resolved::Ready { items })
             }
         }
     }
 
+    /// Deliver the head's rejection now, or block while no terminal slot is free.
+    fn reject_head(
+        &mut self,
+        rejection: Rejection<E::Constraint>,
+    ) -> Result<Resolved<E::Constraint>, RuntimeError<E::Error>> {
+        if self.terminal.len() >= self.config.max_retained_results {
+            return Ok(Resolved::Blocked(BlockReason::RetainedResults));
+        }
+        let Some(rejected) = self.queue.pop_front() else {
+            return Err(RuntimeError::QueueInvariant);
+        };
+        self.terminal.push_back(Completed {
+            request: rejected.request,
+            parameter_version: rejected.parameter_version,
+            outcome: Terminal::Rejected(rejection),
+            lease: None,
+        });
+        Ok(Resolved::Rejected {
+            request: rejected.request,
+        })
+    }
+
     /// Drain `items` queued requests and run them as one batch.
+    ///
+    /// `leases` are the reservations made for those items. A failure after the
+    /// executor was called returns them to the caller instead of dropping them,
+    /// because dropping would release pool bytes that may still cover device
+    /// storage.
     fn execute_selected(
         &mut self,
         items: usize,
-    ) -> Result<Vec<JobOutput<E::Output>>, RuntimeError<E::Error>> {
+        leases: Vec<PoolLease>,
+    ) -> Result<Executed<E::Output>, RuntimeError<E::Error>> {
         let mut queued = Vec::with_capacity(items);
         while queued.len() < items {
             let Some(next) = self.queue.pop_front() else {
@@ -529,6 +609,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
                 return Err(RuntimeError::Executor {
                     requests: expected,
                     source,
+                    leases,
                 });
             }
         };
@@ -538,24 +619,22 @@ impl<E: BatchExecutor> BatchRuntime<E> {
                 .zip(expected.iter())
                 .any(|(output, request)| output.request() != *request)
         {
-            return Err(RuntimeError::MalformedCompletion { requests: expected });
+            return Err(RuntimeError::MalformedCompletion {
+                requests: expected,
+                leases,
+            });
         }
-        Ok(outputs)
+        Ok(Executed { outputs, leases })
     }
 
-    /// Consume the oldest terminal entry and release its retained reservation.
+    /// Consume the oldest terminal entry and hand over its reservation.
     ///
-    /// Dropping the returned entry after popping discards the output; handing it
-    /// to another runtime transfers responsibility to that runtime's accounting.
+    /// Dropping the returned entry after popping discards the output and releases
+    /// its charge. Handing the entry to another owner transfers the charge with it,
+    /// because the storage it covers travels too.
     #[must_use]
     pub fn pop_completed(&mut self) -> Option<Completed<E::Output, E::Constraint>> {
-        let entry = self.terminal.pop_front()?;
-        if entry.output().is_some() {
-            self.retained_output_bytes = self
-                .retained_output_bytes
-                .saturating_sub(entry.retained_bytes);
-        }
-        Some(entry)
+        self.terminal.pop_front()
     }
 
     #[must_use]
@@ -571,10 +650,22 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         self.terminal.len()
     }
 
-    /// Bytes currently reserved by retained outputs.
+    /// Bytes this runtime's retained entries currently hold in the shared pool.
+    ///
+    /// A sibling runtime's leases are not counted here; read [`Self::pool`] for the
+    /// authority's own totals.
     #[must_use]
-    pub const fn retained_output_bytes(&self) -> u64 {
-        self.retained_output_bytes
+    pub fn retained_output_bytes(&self) -> u64 {
+        self.terminal
+            .iter()
+            .filter_map(Completed::lease)
+            .fold(0_u64, |total, lease| total.saturating_add(lease.bytes()))
+    }
+
+    /// The shared byte authority this runtime reserves from.
+    #[must_use]
+    pub fn pool(&self) -> &Arc<BytePool> {
+        &self.pool
     }
 
     #[must_use]
@@ -609,11 +700,19 @@ pub enum RuntimeError<E> {
     QueueInvariant,
     MalformedCompletion {
         requests: Vec<RequestId>,
+        /// Reservations covering state the executor may already hold. Keep them
+        /// until completion is known; dropping them releases pool bytes that may
+        /// still cover device storage.
+        leases: Vec<PoolLease>,
     },
     Executor {
         requests: Vec<RequestId>,
         source: E,
+        /// Reservations covering state the executor may already hold.
+        leases: Vec<PoolLease>,
     },
+    /// The shared byte pool is closed, so no new submission is accepted.
+    PoolClosed,
 }
 
 impl<E: fmt::Display> fmt::Display for RuntimeError<E> {
@@ -642,12 +741,13 @@ impl<E: fmt::Display> fmt::Display for RuntimeError<E> {
             Self::QueueInvariant => {
                 f.write_str("batch runtime queue changed while draining a selected batch")
             }
-            Self::MalformedCompletion { requests } => write!(
+            Self::MalformedCompletion { requests, .. } => write!(
                 f,
                 "batch executor returned malformed completion metadata for {} requests",
                 requests.len()
             ),
             Self::Executor { source, .. } => source.fmt(f),
+            Self::PoolClosed => f.write_str("shared byte pool is closed"),
         }
     }
 }
@@ -770,16 +870,52 @@ mod tests {
         }
     }
 
+    fn pool() -> Arc<BytePool> {
+        BytePool::new(1 << 20).shared()
+    }
+
+    /// An executor that always fails after the runtime has reserved for it.
+    struct FailingEncoder;
+
+    impl BatchExecutor for FailingEncoder {
+        type Input = Vec<u32>;
+        type Output = u32;
+        type Error = Constraint;
+        type Constraint = Constraint;
+
+        fn parameter_version(&self) -> ParameterVersion {
+            ParameterVersion::new(1)
+        }
+
+        fn max_batch_items(&self) -> usize {
+            1
+        }
+
+        fn select_batch(&self, _candidates: &[&Self::Input]) -> BatchSelection<Self::Constraint> {
+            BatchSelection::Ready { items: 1 }
+        }
+
+        fn retained_bytes(&self, _input: &Self::Input) -> u64 {
+            1
+        }
+
+        fn execute(
+            &mut self,
+            _batch: Vec<Job<Self::Input>>,
+        ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+            Err(Constraint::WorkspaceBusy)
+        }
+    }
+
     fn config() -> BatchConfig {
         BatchConfig {
             max_waiting_requests: 8,
             max_retained_results: 4,
-            max_retained_output_bytes: 1 << 20,
         }
     }
 
     fn runtime() -> BatchRuntime<Encoder> {
-        BatchRuntime::new(Encoder::new(), config()).expect("runtime")
+        BatchRuntime::new(Encoder::new(), pool(), config()).expect("runtime")
     }
 
     #[test]
@@ -829,6 +965,7 @@ mod tests {
     fn retained_results_are_bounded_when_the_caller_stops_draining() {
         let mut runtime = BatchRuntime::new(
             Encoder::new(),
+            pool(),
             BatchConfig {
                 max_retained_results: 2,
                 ..config()
@@ -882,14 +1019,9 @@ mod tests {
     fn retained_output_bytes_are_reserved_before_execution() {
         let mut executor = Encoder::new();
         executor.bytes_per_token = 1 << 19;
-        let mut runtime = BatchRuntime::new(
-            executor,
-            BatchConfig {
-                max_retained_output_bytes: 1 << 19,
-                ..config()
-            },
-        )
-        .expect("runtime");
+        let pool = BytePool::new(1 << 19).shared();
+        let mut runtime =
+            BatchRuntime::new(executor, Arc::clone(&pool), config()).expect("runtime");
         runtime.submit(vec![1]).expect("first request");
         runtime.submit(vec![2]).expect("second request");
 
@@ -899,18 +1031,133 @@ mod tests {
             "the executor wanted both requests, but only one reservation fits"
         );
         assert_eq!(runtime.retained_output_bytes(), 1 << 19);
+        assert_eq!(pool.granted(), 1 << 19);
         assert_eq!(
-            runtime.step().expect("byte-blocked step"),
-            StepOutcome::Blocked(BlockReason::RetainedOutputBytes)
+            runtime.step().expect("pool-blocked step"),
+            StepOutcome::Blocked(BlockReason::Pool {
+                requested: 1 << 19,
+                available: 0
+            })
         );
         assert_eq!(runtime.executor().batches.len(), 1);
 
-        runtime.pop_completed().expect("release bytes");
+        // Consuming the entry hands the charge over rather than releasing it:
+        // the caller's storage still occupies those bytes.
+        let (outcome, lease) = runtime
+            .pop_completed()
+            .expect("released entry")
+            .into_parts();
+        assert!(matches!(outcome, Terminal::Output(_)));
+        let lease = lease.expect("outputs carry a lease");
+        assert_eq!(lease.bytes(), 1 << 19);
+        assert_eq!(pool.granted(), 1 << 19);
         assert_eq!(runtime.retained_output_bytes(), 0);
+        assert_eq!(
+            runtime
+                .step()
+                .expect("step while the caller holds the charge"),
+            StepOutcome::Blocked(BlockReason::Pool {
+                requested: 1 << 19,
+                available: 0
+            }),
+            "a popped result keeps its bytes reserved until its owner frees them"
+        );
+        drop(lease);
+        assert_eq!(pool.granted(), 0);
         assert_eq!(
             runtime.step().expect("step after release"),
             StepOutcome::Executed { results: 1 }
         );
+    }
+
+    #[test]
+    fn one_pool_binds_every_runtime_drawing_on_it() {
+        let pool = BytePool::new(1 << 19).shared();
+        let mut first_executor = Encoder::new();
+        first_executor.bytes_per_token = 1 << 19;
+        let mut second_executor = Encoder::new();
+        second_executor.bytes_per_token = 1 << 19;
+        let mut first =
+            BatchRuntime::new(first_executor, Arc::clone(&pool), config()).expect("first runtime");
+        let mut second = BatchRuntime::new(second_executor, Arc::clone(&pool), config())
+            .expect("second runtime");
+        first.submit(vec![1]).expect("first request");
+        second.submit(vec![1]).expect("second request");
+        assert_eq!(
+            first.step().expect("first step"),
+            StepOutcome::Executed { results: 1 }
+        );
+        assert_eq!(
+            second.step().expect("sibling step"),
+            StepOutcome::Blocked(BlockReason::Pool {
+                requested: 1 << 19,
+                available: 0
+            }),
+            "a private per-runtime budget would have admitted this work"
+        );
+        let epoch = pool.epoch();
+        drop(first.pop_completed().expect("first entry"));
+        assert!(pool.epoch() > epoch, "release advances the readiness epoch");
+        assert_eq!(
+            second.step().expect("sibling step after release"),
+            StepOutcome::Executed { results: 1 }
+        );
+    }
+
+    #[test]
+    fn a_head_larger_than_the_pool_is_rejected_not_waited_out() {
+        let mut executor = Encoder::new();
+        executor.bytes_per_token = 1024;
+        let pool = BytePool::new(1024).shared();
+        let mut runtime = BatchRuntime::new(executor, pool, config()).expect("runtime");
+        let oversized = runtime.submit(vec![0; 2]).expect("oversized request");
+        let healthy = runtime.submit(vec![0; 1]).expect("healthy request");
+        assert_eq!(
+            runtime.step().expect("rejecting step"),
+            StepOutcome::Rejected { request: oversized }
+        );
+        assert_eq!(
+            runtime.pop_completed().expect("rejection").outcome(),
+            &Terminal::Rejected(Rejection::RetainedOutputTooLarge {
+                requested: 2048,
+                capacity: 1024
+            })
+        );
+        assert_eq!(
+            runtime.step().expect("healthy peer still runs"),
+            StepOutcome::Executed { results: 1 }
+        );
+        assert_eq!(
+            runtime.pop_completed().expect("healthy output").request(),
+            healthy
+        );
+    }
+
+    #[test]
+    fn a_closed_pool_refuses_new_work_and_a_failed_submission_keeps_its_charge() {
+        let pool = BytePool::new(1 << 19).shared();
+        let mut runtime =
+            BatchRuntime::new(Encoder::new(), Arc::clone(&pool), config()).expect("runtime");
+        pool.close();
+        assert!(matches!(
+            runtime.submit(vec![1]),
+            Err(RuntimeError::PoolClosed)
+        ));
+        drop(runtime);
+
+        // A submission that fails after reaching the executor must not free its
+        // reservation: the executor may still hold state the device can read.
+        let pool = BytePool::new(1 << 19).shared();
+        let mut runtime = BatchRuntime::new(FailingEncoder, pool, config()).expect("runtime");
+        runtime.submit(vec![1]).expect("request");
+        let error = runtime.step().expect_err("executor failure");
+        match error {
+            RuntimeError::Executor { leases, .. } => {
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].bytes(), 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -938,7 +1185,7 @@ mod tests {
     fn oversized_head_is_rejected_without_blocking_later_work() {
         let mut executor = Encoder::new();
         executor.token_budget = Some(2);
-        let mut runtime = BatchRuntime::new(executor, config()).expect("runtime");
+        let mut runtime = BatchRuntime::new(executor, pool(), config()).expect("runtime");
         let oversized = runtime.submit(vec![1, 2, 3]).expect("oversized request");
         let first = runtime.submit(vec![4]).expect("first request");
         let second = runtime.submit(vec![5]).expect("second request");
@@ -955,7 +1202,9 @@ mod tests {
         assert_eq!(entry.retained_bytes(), 0);
         assert!(matches!(
             entry.outcome(),
-            Terminal::Rejected(Constraint::ExceedsTokenBudget { tokens: 3 })
+            Terminal::Rejected(Rejection::Executor(Constraint::ExceedsTokenBudget {
+                tokens: 3
+            }))
         ));
 
         assert_eq!(
@@ -977,14 +1226,7 @@ mod tests {
         let mut executor = Encoder::new();
         executor.token_budget = Some(2);
         executor.bytes_per_token = 1 << 19;
-        let mut runtime = BatchRuntime::new(
-            executor,
-            BatchConfig {
-                max_retained_output_bytes: 1 << 19,
-                ..config()
-            },
-        )
-        .expect("runtime");
+        let mut runtime = BatchRuntime::new(executor, pool(), config()).expect("runtime");
         runtime.submit(vec![1]).expect("fitting request");
         assert_eq!(
             runtime.step().expect("first step"),
@@ -1021,6 +1263,7 @@ mod tests {
         executor.token_budget = Some(2);
         let mut runtime = BatchRuntime::new(
             executor,
+            pool(),
             BatchConfig {
                 max_retained_results: 1,
                 ..config()
@@ -1060,6 +1303,7 @@ mod tests {
     fn waiting_capacity_is_bounded_independently_of_retained_results() {
         let mut runtime = BatchRuntime::new(
             Encoder::new(),
+            pool(),
             BatchConfig {
                 max_waiting_requests: 1,
                 ..config()

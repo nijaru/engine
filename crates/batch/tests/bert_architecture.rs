@@ -4,11 +4,14 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ribn_batch::{
-    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome, Terminal,
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, Rejection,
+    StepOutcome, Terminal,
 };
+use ribn_foundation::BytePool;
 use ribn_foundation::{ParameterVersion, ScalarType};
 use ribn_hf::{LocalModelPackage, LocalWeightSet, PackageError};
 use ribn_safetensors::ArtifactError;
@@ -1073,6 +1076,10 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+fn pool() -> Arc<BytePool> {
+    BytePool::new(1 << 40).shared()
+}
+
 #[test]
 fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
     let dir = TestDir::new();
@@ -1083,6 +1090,7 @@ fn actual_bert_encoder_semantics_load_from_hf_package_and_run_non_ar() {
 
     let mut runtime = BatchRuntime::new(
         model,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()
@@ -1295,6 +1303,7 @@ fn bert_sequence_lengths_drive_executor_batch_selection() {
     let model = BertReference::load(&package, ParameterVersion::new(42), 4, 3).expect("BERT");
     let mut runtime = BatchRuntime::new(
         model,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()
@@ -1361,6 +1370,7 @@ fn oversized_sequence_is_rejected_without_blocking_later_requests() {
     let model = BertReference::load(&package, ParameterVersion::new(46), 4, 5).expect("BERT");
     let mut runtime = BatchRuntime::new(
         model,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()
@@ -1385,10 +1395,12 @@ fn oversized_sequence_is_rejected_without_blocking_later_requests() {
     assert_eq!(rejection.retained_bytes(), 0);
     assert!(matches!(
         rejection.outcome(),
-        Terminal::Rejected(BatchConstraint::SequenceExceedsTokenBudget {
-            tokens: 6,
-            limit: 5
-        })
+        Terminal::Rejected(Rejection::Executor(
+            BatchConstraint::SequenceExceedsTokenBudget {
+                tokens: 6,
+                limit: 5
+            }
+        ))
     ));
 
     assert!(matches!(
@@ -1417,6 +1429,7 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
         .with_batch_layout(BertBatchLayout::Ragged);
     let mut ragged_runtime = BatchRuntime::new(
         ragged,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()
@@ -1440,6 +1453,7 @@ fn padded_layout_cost_can_shorten_a_batch_that_fits_ragged_execution() {
         .with_batch_layout(BertBatchLayout::Padded);
     let mut padded_runtime = BatchRuntime::new(
         padded,
+        pool(),
         BatchConfig {
             max_waiting_requests: 4,
             ..BatchConfig::default()
