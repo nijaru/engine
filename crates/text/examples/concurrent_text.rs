@@ -21,11 +21,12 @@ struct Arguments {
     tokens: u32,
     callers: usize,
     sequences: Option<usize>,
+    abandon: bool,
 }
 
 fn usage() -> String {
     "concurrent_text [model.gguf] [--prompt <text>] [--tokens <n>] [--callers <n>] \
-     [--sequences <n>]"
+     [--sequences <n>] [--no-abandon]"
         .to_owned()
 }
 
@@ -37,6 +38,7 @@ fn parse() -> Result<Arguments, String> {
     let mut tokens = 64_u32;
     let mut callers = 4_usize;
     let mut sequences = None;
+    let mut abandon = true;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -66,6 +68,7 @@ fn parse() -> Result<Arguments, String> {
                         .map_err(|_| usage())?,
                 );
             }
+            "--no-abandon" => abandon = false,
             _ if argument.starts_with("--") => return Err(usage()),
             other => other.clone_into(&mut model),
         }
@@ -85,6 +88,7 @@ fn parse() -> Result<Arguments, String> {
         tokens,
         callers,
         sequences,
+        abandon,
     })
 }
 
@@ -117,19 +121,21 @@ fn main() -> Result<(), String> {
 
     // One caller abandons a live stream. Dropping it must not disturb its peers,
     // because the execution owner retains retirement ownership.
-    let mut abandoned = model
-        .stream_blocking(
-            TextInput::prompt(&arguments.prompt),
-            options(arguments.tokens),
-        )
-        .map_err(|error| format!("abandoned stream failed to start: {error}"))?;
-    if let Some(event) = abandoned.next() {
-        match event.map_err(|error| error.to_string())? {
-            TextEvent::Delta { text, .. } => print!("[abandoned after {text:?}] "),
-            TextEvent::Finished { .. } => {}
+    if arguments.abandon {
+        let mut abandoned = model
+            .stream_blocking(
+                TextInput::prompt(&arguments.prompt),
+                options(arguments.tokens),
+            )
+            .map_err(|error| format!("abandoned stream failed to start: {error}"))?;
+        if let Some(event) = abandoned.next() {
+            match event.map_err(|error| error.to_string())? {
+                TextEvent::Delta { text, .. } => print!("[abandoned after {text:?}] "),
+                TextEvent::Finished { .. } => {}
+            }
         }
+        drop(abandoned);
     }
-    drop(abandoned);
 
     let mut handles = Vec::with_capacity(arguments.callers);
     for caller in 0..arguments.callers {
