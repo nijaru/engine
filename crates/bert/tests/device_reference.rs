@@ -145,7 +145,13 @@ fn device_encoder_matches_the_transformers_reference() {
             "{}: hidden state must stay finite",
             case.name
         );
+        worst_hidden = worst_hidden.max(hidden_deviation);
+        worst_pooled = worst_pooled.max(pooled_deviation);
     }
+    println!(
+        "worst over {} cases: last_hidden_state={worst_hidden:e} pooled_output={worst_pooled:e}",
+        cases.len()
+    );
 }
 
 #[test]
