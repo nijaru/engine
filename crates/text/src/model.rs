@@ -319,6 +319,11 @@ impl TextOwner {
                 "text processor bounds must all be nonzero",
             ));
         }
+        if !driver.owns(&handle) {
+            return Err(TextError::InvalidInput(
+                "driver owner and generation handle belong to different workers",
+            ));
+        }
         if config.preprocessing_workers == 0 {
             return Err(TextError::InvalidInput(
                 "text preprocessing needs at least one worker",

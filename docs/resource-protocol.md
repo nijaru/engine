@@ -204,9 +204,11 @@ no second execution loop and no device state.
 
 `TextOwner` is the non-cloneable lifecycle owner; it owns the token driver's
 shutdown owner and the preprocessing pool. `TextModel` is a cloneable generation
-handle over the same worker. `TextConfig` carries preprocessing worker count and
-batch window; `ProcessorLimits` carries the text byte bounds. CUDA/GGUF assembly
-is `TextOwner::load`, and it is the only part that needs a device.
+handle over the same worker. Assembly rejects a shutdown owner and generation handle
+that came from different workers, because that pair would shut down one worker while
+another served requests. `TextConfig` carries preprocessing worker count and batch
+window; `ProcessorLimits` carries the text byte bounds. CUDA/GGUF assembly is
+`TextOwner::load`, and it is the only part that needs a device.
 
 Implementation status and host evidence: [architecture](architecture.md#owned-text-facade)
 and [runtime evidence](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
@@ -226,6 +228,9 @@ above it and must be bounded independently:
   explicit token limit; a caller-supplied token vector is checked before admission.
   Exceeding any limit is a request-local rejection with a typed error; it is never a
   device fault.
+- The retained-input bound is checked **before** an input is queued, so aggregate
+  queued retention is the permit count times that envelope rather than whatever
+  callers happen to hold while preprocessing waits.
 - Encoded tokens plus the runtime's stop-list copy must still fit the permit's
   encoded-input envelope. The text layer does not enlarge that envelope.
 - Preprocessing runs on a fixed, bounded worker pool with a bounded queue. Jobs
@@ -235,6 +240,10 @@ above it and must be bounded independently:
 - Preprocessing must not occupy the execution worker or an async executor thread.
   Cancelling an async submission does not strand state: the permit is released by
   the job, not by the cancelled future.
+- A pool that loses its last worker — including through a processor panic — becomes
+  observably closed: queued jobs are released and later submissions are refused, so
+  no caller waits on a queue nothing will serve. Once closure begins, a worker that
+  is about to start a queued job drops it instead of beginning new work.
 - Immutable loaded vocabulary, caller-collected results and caller-owned input
   before acceptance are outside buffered application storage. Decoded delta text
   and terminal staging are inside it and are bounded per token and per request.
@@ -249,6 +258,9 @@ above it and must be bounded independently:
   terminal bookkeeping, not recovery.
 - A decode error abandons only its own request. Peers continue, and the failing
   request yields one typed error instead of a text terminal.
+- A terminated stream releases its decode scratch and keeps only its terminal
+  outcome until its consumer reads it, so a retained finished stream does not
+  accumulate request payload.
 - Owner failure preserves events already handed to stream channels, then yields
   one owner error. It does not invent successful usage or perform an ordinary
   terminal flush, and it does not relabel healthy peers as invalid.

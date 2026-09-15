@@ -149,10 +149,12 @@ is now implemented and host-qualified.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
 owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
-owned `TextStream`, and ordered bounded-window `TextBatch`. Sixteen host tests pass
-(40 consecutive suite runs) with a real GGUF tokenizer, the real driver and a scripted
-fixture device, including per-item overload under full permit retention; the CUDA
-lifecycle tests were migrated but are unrun. Evidence:
+owned `TextStream`, and ordered bounded-window `TextBatch`. Twenty-one host tests pass
+with a real GGUF tokenizer, the real driver and a scripted fixture device, including
+per-item overload under full permit retention, bound-checking at the retention
+boundary, owner-failure delivery and a dead preprocessing pool that fails callers
+instead of queueing them; the CUDA lifecycle tests were migrated but are unrun.
+Evidence:
 [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
 Remaining before closing this slice:

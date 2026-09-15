@@ -168,7 +168,7 @@ built from synthetic byte-level metadata, the real token driver and the real fac
 over a scripted fixture `GenerationExecutor`. Only the device is substituted, so the
 preprocessing, delivery, batching and shutdown paths under test are production ones.
 
-Sixteen tests pass (40 consecutive suite runs, no failures):
+Twenty-one tests pass with no failures across consecutive suite runs:
 
 - concurrent callers on cloned handles, plus the async submission path;
 - a decode failure settling exactly one request while its peer completes;
@@ -187,7 +187,20 @@ Sixteen tests pass (40 consecutive suite runs, no failures):
 - dropping a batch abandoning delivery without stranding the owner;
 - shutdown closing admission while reporting success;
 - zero preprocessing workers rejected at assembly;
-- a stalled consumer not blocking a peer request.
+- a stalled consumer not blocking a peer request;
+- the decoded-payload bound rejecting one oversized token for its own request only;
+- the rendered-prompt bound during template expansion, with the raw input inside its
+  own bound;
+- owner failure preserving delivered events, inventing no terminal, and reporting one
+  error after which the stream stays exhausted;
+- a failed text shutdown reported through its owner, with the same owner retrying and
+  succeeding;
+- a preprocessing pool whose only worker panics reporting failures to its caller and
+  to later submissions instead of queueing them forever;
+- permit refund under a two-permit pool where three rejected requests would exhaust
+  the pool if any leaked;
+- every `drain` assertion requiring exactly one terminal event, so a duplicated or
+  missing terminal cannot pass unnoticed.
 
 Required checks at this revision, each with captured exit 0:
 

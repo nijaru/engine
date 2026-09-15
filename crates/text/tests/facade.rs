@@ -37,10 +37,18 @@ fn limits() -> ProcessorLimits {
     }
 }
 
+/// Decodes to twenty bytes, so a test can exceed `max_decoded_token_bytes`.
+const LONG_TOKEN: u32 = 256;
+
 fn processor(limits: ProcessorLimits) -> Arc<dyn TextProcessor> {
-    let tokens = (0..=255_u8)
+    processor_with_template(limits, CHAT_TEMPLATE)
+}
+
+fn processor_with_template(limits: ProcessorLimits, template: &str) -> Arc<dyn TextProcessor> {
+    let mut tokens = (0..=255_u8)
         .map(|byte| MetadataValue::String(byte_token_symbol(byte).to_string()))
-        .collect();
+        .collect::<Vec<_>>();
+    tokens.push(MetadataValue::String("a".repeat(20)));
     let mut metadata = BTreeMap::new();
     metadata.insert(
         "tokenizer.ggml.model".to_owned(),
@@ -60,7 +68,7 @@ fn processor(limits: ProcessorLimits) -> Arc<dyn TextProcessor> {
     );
     metadata.insert(
         "tokenizer.ggml.token_type".to_owned(),
-        MetadataValue::Array((0..256).map(|_| MetadataValue::I32(1)).collect()),
+        MetadataValue::Array((0..257).map(|_| MetadataValue::I32(1)).collect()),
     );
     metadata.insert(
         "tokenizer.ggml.bos_token_id".to_owned(),
@@ -76,10 +84,40 @@ fn processor(limits: ProcessorLimits) -> Arc<dyn TextProcessor> {
     );
     metadata.insert(
         "tokenizer.chat_template".to_owned(),
-        MetadataValue::String("{% for m in messages %}{{ m.content }}{% endfor %}".to_owned()),
+        MetadataValue::String(template.to_owned()),
     );
     let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("fixture vocabulary");
     Arc::new(GgufProcessor::new(tokenizer, limits))
+}
+
+const CHAT_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}";
+
+/// Delegates to a real processor but unwinds on one sentinel input, standing in
+/// for a processor bug. A test uses it to check that a dead pool reports failures
+/// instead of leaving callers queued forever.
+struct PanickingProcessor {
+    inner: Arc<dyn TextProcessor>,
+}
+
+impl TextProcessor for PanickingProcessor {
+    fn limits(&self) -> ProcessorLimits {
+        self.inner.limits()
+    }
+
+    fn encode(&self, input: TextInput) -> Result<Vec<u32>, TextError> {
+        if matches!(&input, TextInput::Prompt(text) if text == "panic") {
+            panic!("fixture processor panic");
+        }
+        self.inner.encode(input)
+    }
+
+    fn decode_token_into(&self, token: u32, out: &mut Vec<u8>) -> Result<(), TextError> {
+        self.inner.decode_token_into(token, out)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.inner.eos_token_id()
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +127,12 @@ struct Plan {
     /// While set, the fixture reports pending work for decode rows only, so a
     /// request can be observed after its prefill without completing.
     hold: AtomicBool,
+    /// While set, completion polling fails, faulting the execution owner.
+    fail_poll: AtomicBool,
+    /// While set, synchronization fails, so cleanup must be retried.
+    fail_sync: AtomicBool,
+    /// Completed polls, so a test can wait for work to commit before faulting.
+    polls: AtomicUsize,
 }
 
 impl Plan {
@@ -101,6 +145,18 @@ impl Plan {
 
     fn holding(&self, hold: bool) {
         self.hold.store(hold, Ordering::SeqCst);
+    }
+
+    fn failing_polls(&self, fail: bool) {
+        self.fail_poll.store(fail, Ordering::SeqCst);
+    }
+
+    fn failing_sync(&self, fail: bool) {
+        self.fail_sync.store(fail, Ordering::SeqCst);
+    }
+
+    fn polls(&self) -> usize {
+        self.polls.fetch_add(0, Ordering::SeqCst)
     }
 }
 
@@ -174,6 +230,10 @@ impl GenerationExecutor for Fixture {
     }
 
     fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+        self.plan.polls.fetch_add(1, Ordering::SeqCst);
+        if self.plan.fail_poll.load(Ordering::SeqCst) {
+            return Err(ExecutionError::new("fixture poll failure"));
+        }
         let holding = self.plan.hold.load(Ordering::SeqCst);
         if holding
             && self
@@ -215,6 +275,9 @@ impl GenerationExecutor for Fixture {
     }
 
     fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        if self.plan.fail_sync.load(Ordering::SeqCst) {
+            return Err(ExecutionError::new("fixture synchronization failure"));
+        }
         self.batch = None;
         self.states.clear();
         Ok(())
@@ -235,6 +298,14 @@ impl Harness {
     /// The global event budget divided by the per-request mailbox limit sets the
     /// driver's request permits, so it also bounds how many requests can be live.
     fn with_events(limits: ProcessorLimits, config: TextConfig, events: usize) -> Self {
+        Self::with_processor(processor(limits), config, events)
+    }
+
+    fn with_processor(
+        processor: Arc<dyn TextProcessor>,
+        config: TextConfig,
+        events: usize,
+    ) -> Self {
         let plan = Arc::new(Plan::default());
         let engine = Engine::new(
             Fixture::new(plan.clone()),
@@ -253,8 +324,7 @@ impl Harness {
         .expect("fixture engine");
         let driver = DriverConfig::for_engine(&engine);
         let (shutdown, handle) = Driver::spawn(engine, driver).expect("driver spawn");
-        let owner =
-            TextOwner::new(processor(limits), shutdown, handle, config).expect("text owner");
+        let owner = TextOwner::new(processor, shutdown, handle, config).expect("text owner");
         let model = owner.model().clone();
         Self { owner, model, plan }
     }
@@ -274,6 +344,15 @@ fn options() -> GenerationOptions {
     GenerationOptions {
         max_output_tokens: 8,
         ..GenerationOptions::default()
+    }
+}
+
+/// Wait for an observable fixture state instead of sleeping a guessed duration.
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !condition() {
+        assert!(Instant::now() < deadline, "fixture never reached the state");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -299,22 +378,63 @@ fn run<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn drain(stream: &mut ribn_text::TextStream) -> (String, Vec<u32>, Option<FinishReason>) {
-    let mut text = String::new();
-    let mut tokens = Vec::new();
-    let mut finish = None;
+#[derive(Default)]
+struct Drained {
+    text: String,
+    tokens: Vec<u32>,
+    terminals: Vec<FinishReason>,
+    error: Option<TextError>,
+}
+
+/// Consume a stream to its end, recording every terminal so a duplicated or
+/// missing terminal is visible rather than silently overwritten.
+fn drain_until_error(stream: &mut ribn_text::TextStream) -> Drained {
+    let mut drained = Drained::default();
     while let Some(event) = stream.next_blocking() {
-        match event.expect("stream event") {
-            ribn_text::TextEvent::Delta { token, text: delta } => {
+        match event {
+            Ok(ribn_text::TextEvent::Delta { token, text }) => {
                 if let Some(token) = token {
-                    tokens.push(token);
+                    drained.tokens.push(token);
                 }
-                text.push_str(&delta);
+                drained.text.push_str(&text);
             }
-            ribn_text::TextEvent::Finished { reason, .. } => finish = Some(reason),
+            Ok(ribn_text::TextEvent::Finished { reason, .. }) => drained.terminals.push(reason),
+            Err(error) => {
+                drained.error = Some(error);
+                break;
+            }
         }
     }
-    (text, tokens, finish)
+    drained
+}
+
+/// Consume a stream that must end with exactly one terminal and no error.
+fn drain(stream: &mut ribn_text::TextStream) -> (String, Vec<u32>, Option<FinishReason>) {
+    let drained = drain_until_error(stream);
+    assert!(
+        drained.error.is_none(),
+        "unexpected stream error: {:?}",
+        drained.error
+    );
+    assert_eq!(
+        drained.terminals.len(),
+        1,
+        "exactly one terminal event: {:?}",
+        drained.terminals
+    );
+    (
+        drained.text,
+        drained.tokens,
+        drained.terminals.into_iter().next(),
+    )
+}
+
+/// A `TextStream` is not `Debug`, so `expect_err` cannot be used on it.
+fn expect_stream_err(result: Result<ribn_text::TextStream, TextError>, what: &str) -> TextError {
+    match result {
+        Ok(_) => panic!("{what}"),
+        Err(error) => error,
+    }
 }
 
 #[test]
@@ -506,7 +626,9 @@ fn a_stalled_consumer_does_not_block_a_peer() {
 
 #[test]
 fn input_bounds_reject_before_admission_and_release_the_permit() {
-    let harness = Harness::start(
+    // Two permits only: if any rejected request leaked its permit, the three
+    // rejections below would exhaust the pool and the final request would fail.
+    let harness = Harness::with_events(
         ProcessorLimits {
             max_input_bytes: 8,
             max_rendered_bytes: 8,
@@ -517,6 +639,7 @@ fn input_bounds_reject_before_admission_and_release_the_permit() {
             preprocessing_workers: 2,
             batch_window: 1,
         },
+        8,
     );
     harness.plan.script(b'h', &[u32::from(b'!'), EOS]);
 
@@ -527,7 +650,7 @@ fn input_bounds_reject_before_admission_and_release_the_permit() {
     assert!(matches!(
         oversized,
         TextError::LimitExceeded {
-            field: "prompt bytes",
+            field: "input bytes",
             allowed: 8,
             actual: 10,
         }
@@ -543,15 +666,27 @@ fn input_bounds_reject_before_admission_and_release_the_permit() {
     assert!(matches!(
         chat,
         TextError::LimitExceeded {
-            field: "chat message bytes",
+            field: "input bytes",
             ..
         }
     ));
 
-    // "hi" is two tokens under the byte vocabulary but renders to one byte.
+    let over_tokens = harness
+        .model
+        .generate_blocking(TextInput::prompt("hih"), options())
+        .expect_err("three tokens exceed the prompt-token bound");
+    assert!(matches!(
+        over_tokens,
+        TextError::LimitExceeded {
+            field: "prompt tokens",
+            ..
+        }
+    ));
+
+    // "h" is one token and one byte: within every bound.
     let tokens = harness
         .model
-        .generate_blocking(TextInput::prompt("hi"), options())
+        .generate_blocking(TextInput::prompt("h"), options())
         .expect("within bounds");
     assert_eq!(tokens.text, "!");
 
@@ -854,4 +989,167 @@ fn shared_handle_overload_is_reported_per_item() {
             Err(error) => panic!("model stopped serving after overload: {error}"),
         }
     }
+}
+
+#[test]
+fn an_oversized_decoded_token_settles_only_its_request() {
+    // Four bytes per token, while the fixture's long token decodes to twenty.
+    let harness = Harness::start(
+        ProcessorLimits {
+            max_decoded_token_bytes: 4,
+            ..limits()
+        },
+        TextConfig {
+            preprocessing_workers: 2,
+            batch_window: 2,
+        },
+    );
+    harness
+        .plan
+        .script(b'A', &[LONG_TOKEN, u32::from(b'x'), EOS]);
+    harness.plan.script(b'B', &[u32::from(b'k'), EOS]);
+
+    let mut stream = harness
+        .model
+        .stream_blocking(TextInput::prompt("A"), options())
+        .expect("start stream");
+    let event = stream.next_blocking().expect("one event");
+    assert!(
+        matches!(event, Err(TextError::Decode { token, .. }) if token == LONG_TOKEN),
+        "the decoded bound is enforced per token: {event:?}"
+    );
+    assert!(stream.next_blocking().is_none(), "exactly one error");
+
+    let peer = harness
+        .model
+        .generate_blocking(TextInput::prompt("B"), options())
+        .expect("peer unaffected");
+    assert_eq!(peer.text, "k");
+}
+
+#[test]
+fn the_rendered_prompt_bound_is_enforced_during_template_expansion() {
+    let harness = Harness::with_processor(
+        processor_with_template(
+            ProcessorLimits {
+                max_input_bytes: 64,
+                max_rendered_bytes: 8,
+                ..limits()
+            },
+            "PADDING-PADDING-PADDING-{{ messages[0].content }}",
+        ),
+        TextConfig {
+            preprocessing_workers: 2,
+            batch_window: 1,
+        },
+        32,
+    );
+    // The raw message is inside its own bound, so only rendering can reject it.
+    let error = harness
+        .model
+        .generate_blocking(TextInput::chat(vec![Message::user("hi")]), options())
+        .expect_err("rendered output exceeds its bound");
+    assert!(
+        matches!(
+            error,
+            TextError::LimitExceeded {
+                field: "rendered prompt bytes",
+                allowed: 8,
+                ..
+            }
+        ),
+        "the render bound, not the input bound: {error:?}"
+    );
+}
+
+#[test]
+fn owner_failure_preserves_delivered_events_and_reports_once() {
+    let harness = Harness::default_start();
+    harness.plan.script(b'A', &[u32::from(b'a'); 40]);
+    // Hold decode so the prefill commits and delivers while the request is live;
+    // that delivered event is then unread when the owner faults.
+    harness.plan.holding(true);
+    let mut stream = harness
+        .model
+        .stream_blocking(
+            TextInput::prompt("A"),
+            GenerationOptions {
+                max_output_tokens: 32,
+                ..GenerationOptions::default()
+            },
+        )
+        .expect("start stream");
+    wait_until(|| harness.plan.polls() >= 1);
+
+    harness.plan.failing_polls(true);
+    harness.plan.holding(false);
+    let drained = drain_until_error(&mut stream);
+    assert!(
+        drained.terminals.is_empty(),
+        "an owner failure must not invent a terminal: {:?}",
+        drained.terminals
+    );
+    assert!(
+        drained.text.chars().all(|character| character == 'a'),
+        "delivered events stay readable: {:?}",
+        drained.text
+    );
+    assert!(
+        matches!(drained.error, Some(TextError::Owner(_))),
+        "one owner error: {:?}",
+        drained.error
+    );
+    assert!(
+        stream.next_blocking().is_none(),
+        "the owner error is reported once"
+    );
+}
+
+#[test]
+fn a_failed_text_shutdown_retains_the_same_owner_for_retry() {
+    let mut harness = Harness::default_start();
+    harness.plan.failing_sync(true);
+    let error = harness
+        .owner
+        .shutdown()
+        .expect_err("cleanup failure is reported");
+    assert!(matches!(error, TextError::Owner(_)), "{error:?}");
+
+    harness.plan.failing_sync(false);
+    harness
+        .owner
+        .shutdown()
+        .expect("the same owner retries and succeeds");
+}
+
+#[test]
+fn a_dead_preprocessing_pool_fails_requests_instead_of_blocking_them() {
+    let harness = Harness::with_processor(
+        Arc::new(PanickingProcessor {
+            inner: processor(limits()),
+        }),
+        TextConfig {
+            preprocessing_workers: 1,
+            batch_window: 1,
+        },
+        32,
+    );
+
+    let error = expect_stream_err(
+        harness
+            .model
+            .stream_blocking(TextInput::prompt("panic"), options()),
+        "a panicking processor must report an error, not hang its caller",
+    );
+    assert!(matches!(error, TextError::Closed), "{error:?}");
+
+    // Its only worker is gone, so queued and new work must be refused rather
+    // than retained by a pool nothing will serve.
+    let error = expect_stream_err(
+        harness
+            .model
+            .stream_blocking(TextInput::prompt("A"), options()),
+        "a dead pool must refuse new work",
+    );
+    assert!(matches!(error, TextError::Closed), "{error:?}");
 }

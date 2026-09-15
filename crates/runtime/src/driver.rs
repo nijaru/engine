@@ -329,6 +329,14 @@ pub struct DriverOwner {
 }
 
 impl DriverOwner {
+    /// Whether `handle` came from the same [`Driver::spawn`] call. A frontend uses
+    /// this to reject a pair assembled from two different workers, which would
+    /// otherwise shut down one worker while another served requests.
+    #[must_use]
+    pub fn owns(&self, handle: &GenerationHandle) -> bool {
+        Arc::ptr_eq(&self.shared, &handle.shared)
+    }
+
     /// Close admission, abandon delivery and establish device completion.
     /// Blocks the calling thread; do not call from an async executor task.
     ///

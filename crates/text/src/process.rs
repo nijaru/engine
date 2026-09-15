@@ -7,7 +7,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use engine_gguf::{ChatMessage, ChatTemplateOptions, GgufTokenizer};
@@ -53,6 +53,36 @@ impl ProcessorLimits {
             && self.max_rendered_bytes > 0
             && self.max_prompt_tokens > 0
             && self.max_decoded_token_bytes > 0
+    }
+
+    /// Bytes one input retains for its request, whatever the variant. Text and
+    /// already-encoded token input are measured separately from rendered output
+    /// and decoded payload.
+    #[must_use]
+    pub fn retained_bytes(input: &TextInput) -> usize {
+        match input {
+            TextInput::Prompt(text) => text.len(),
+            TextInput::Chat(messages) => messages.iter().fold(0usize, |total, message| {
+                total
+                    .saturating_add(message.role.len())
+                    .saturating_add(message.content.len())
+            }),
+            TextInput::Tokens(tokens) => tokens.len().saturating_mul(size_of::<u32>()),
+        }
+    }
+
+    /// Reject an input that exceeds the retained-input bound. This is checked
+    /// before an input is queued, so the aggregate bound is permits times this
+    /// envelope rather than however much callers happen to retain meanwhile.
+    ///
+    /// # Errors
+    /// Returns a request-local limit error.
+    pub fn check_input(self, input: &TextInput) -> Result<(), TextError> {
+        let bytes = Self::retained_bytes(input);
+        if bytes > self.max_input_bytes {
+            return Err(TextError::limit("input bytes", self.max_input_bytes, bytes));
+        }
+        Ok(())
     }
 }
 
@@ -116,35 +146,18 @@ impl TextProcessor for GgufProcessor {
     }
 
     fn encode(&self, input: TextInput) -> Result<Vec<u32>, TextError> {
+        // The retention boundary checks the same rule before queuing; this keeps
+        // the processor authoritative for direct callers.
+        self.limits.check_input(&input)?;
         let tokens = match input {
             TextInput::Tokens(tokens) => tokens,
             TextInput::Prompt(text) => {
-                if text.len() > self.limits.max_input_bytes {
-                    return Err(TextError::limit(
-                        "prompt bytes",
-                        self.limits.max_input_bytes,
-                        text.len(),
-                    ));
-                }
                 self.tokenizer.encode(&text).map_err(TextError::Processor)?
             }
             TextInput::Chat(messages) => {
                 if messages.is_empty() {
                     return Err(TextError::InvalidInput(
                         "chat input must contain at least one message",
-                    ));
-                }
-                let mut bytes = 0usize;
-                for message in &messages {
-                    bytes = bytes
-                        .saturating_add(message.role.len())
-                        .saturating_add(message.content.len());
-                }
-                if bytes > self.limits.max_input_bytes {
-                    return Err(TextError::limit(
-                        "chat message bytes",
-                        self.limits.max_input_bytes,
-                        bytes,
                     ));
                 }
                 let messages = messages
@@ -242,7 +255,8 @@ struct Job {
 
 struct PoolState {
     jobs: Sender<Job>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
+    limits: ProcessorLimits,
 }
 
 /// Owner of the preprocessing workers. Workers exit once every client and this
@@ -257,24 +271,64 @@ pub(crate) struct PoolClient {
     state: Arc<PoolState>,
 }
 
+/// Reports one worker leaving, including through a panic. The last worker to
+/// leave makes the pool observably dead: it refuses new work and drops queued
+/// jobs, so no caller waits on a queue nothing will serve.
+struct Worker<'a> {
+    jobs: &'a Receiver<Job>,
+    closed: &'a AtomicBool,
+    live: &'a AtomicUsize,
+}
+
+impl Drop for Worker<'_> {
+    fn drop(&mut self) {
+        if self.live.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        // Dropping a queued job drops its reply sender, which reports a closed
+        // pool to its caller and returns that permit.
+        while self.jobs.try_recv().is_ok() {}
+    }
+}
+
 impl Pool {
     /// Start `workers` preprocessing threads with a queue bounded by `queue`.
     pub(crate) fn start(processor: &Arc<dyn TextProcessor>, workers: usize, queue: usize) -> Self {
         let (jobs, receiver) = flume::bounded(queue);
+        let closed = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicUsize::new(workers));
         for index in 0..workers {
             let processor = Arc::clone(processor);
-            let receiver = receiver.clone();
-            // A failed thread simply reduces preprocessing capacity; the queue
-            // still bounds outstanding work, so losing one worker is not fatal.
-            let _ = thread::Builder::new()
+            let worker_jobs = receiver.clone();
+            let worker_closed = closed.clone();
+            let worker_live = live.clone();
+            let started = thread::Builder::new()
                 .name(format!("ribn-preprocess-{index}"))
-                .spawn(move || run_worker(&*processor, &receiver));
+                .spawn(move || {
+                    let _worker = Worker {
+                        jobs: &worker_jobs,
+                        closed: &worker_closed,
+                        live: &worker_live,
+                    };
+                    run_worker(&*processor, &worker_jobs, &worker_closed);
+                });
+            if started.is_err() {
+                // A worker that never starts must still be accounted, or a lost
+                // thread would keep the pool looking alive forever.
+                drop(Worker {
+                    jobs: &receiver,
+                    closed: &closed,
+                    live: &live,
+                });
+            }
         }
         drop(receiver);
         Self {
             state: Arc::new(PoolState {
                 jobs,
-                closed: AtomicBool::new(false),
+                closed,
+                limits: processor.limits(),
             }),
         }
     }
@@ -298,14 +352,17 @@ impl PoolClient {
 
     /// Queue preparation under an existing permit.
     ///
-    /// The queue length cannot exceed the permit pool, because every queued job
-    /// owns one permit; a full queue therefore means the layer is shutting down.
+    /// The input must satisfy the retained-input bound before it is queued, so
+    /// the aggregate queue retention is permits times that envelope. The queue
+    /// length cannot exceed the permit pool either, because every queued job owns
+    /// one permit.
     pub(crate) fn submit(
         &self,
         input: TextInput,
         options: GenerationOptions,
         permit: RequestPermit,
     ) -> Result<Receiver<Result<Prepared, TextError>>, TextError> {
+        self.state.limits.check_input(&input)?;
         if self.is_closed() {
             return Err(TextError::Closed);
         }
@@ -323,8 +380,13 @@ impl PoolClient {
     }
 }
 
-fn run_worker(processor: &dyn TextProcessor, jobs: &Receiver<Job>) {
+fn run_worker(processor: &dyn TextProcessor, jobs: &Receiver<Job>, closed: &AtomicBool) {
     while let Ok(job) = jobs.recv() {
+        if closed.load(Ordering::SeqCst) {
+            // Shutdown or pool failure already began. Do not start queued work:
+            // dropping the job reports a closed pool and returns its permit.
+            continue;
+        }
         let result = prepare(processor, job.input, job.options, job.permit);
         // A dropped caller means the result, and its permit, are released here.
         let _ = job.reply.try_send(result);

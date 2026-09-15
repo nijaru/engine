@@ -110,6 +110,9 @@ impl TextStream {
             }
             Ok(Event::Finished { reason, usage, .. }) => {
                 let trailing = self.decoder.finish();
+                // Release decode scratch: a terminated stream keeps only its
+                // terminal outcome until its consumer reads it.
+                self.bytes = Vec::new();
                 if trailing.is_empty() {
                     self.done = true;
                     return Ok(TextEvent::Finished { reason, usage });
@@ -132,6 +135,7 @@ impl TextStream {
     /// A request-local decode failure abandons only this request.
     fn abandon(&mut self, error: TextError) -> TextError {
         self.done = true;
+        self.bytes = Vec::new();
         // Dropping the driver stream records discard intent without joining.
         self.stream = None;
         error
