@@ -79,7 +79,9 @@ fn cases() -> Vec<Case> {
         .collect()
 }
 
-fn assert_close(actual: &[f32], expected: &[f32], case: &str, label: &str) {
+/// Compare against the reference and report the worst deviation, so the recorded
+/// evidence carries a measured number rather than only a pass.
+fn assert_close(actual: &[f32], expected: &[f32], case: &str, label: &str) -> f32 {
     assert_eq!(
         actual.len(),
         expected.len(),
@@ -101,6 +103,11 @@ fn assert_close(actual: &[f32], expected: &[f32], case: &str, label: &str) {
         actual[worst_index],
         expected[worst_index]
     );
+    println!(
+        "{case}/{label}: max_abs_deviation={worst:e} elements={}",
+        actual.len()
+    );
+    worst
 }
 
 #[test]
@@ -109,6 +116,8 @@ fn device_encoder_matches_the_transformers_reference() {
     let encoder = CudaBertEncoder::load(fixture(), 0).expect("prepare encoder");
     let cases = cases();
     assert!(!cases.is_empty(), "the reference must carry cases");
+    let mut worst_hidden = 0.0_f32;
+    let mut worst_pooled = 0.0_f32;
     for case in &cases {
         let request = EncoderRequest {
             token_ids: case.token_ids.clone(),
@@ -116,13 +125,13 @@ fn device_encoder_matches_the_transformers_reference() {
             attention_mask: case.attention_mask.clone(),
         };
         let output = encoder.encode(&request).expect("encode");
-        assert_close(
+        let hidden_deviation = assert_close(
             &output.last_hidden_state,
             &case.last_hidden_state,
             &case.name,
             "last_hidden_state",
         );
-        assert_close(
+        let pooled_deviation = assert_close(
             &output.pooled,
             &case.pooled_output,
             &case.name,
