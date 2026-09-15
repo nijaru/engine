@@ -99,14 +99,14 @@ fn main() -> Result<(), String> {
     let arguments = parse()?;
     println!("loading {}", arguments.model);
     let started = Instant::now();
-    let options = LoadOptions {
+    let load = LoadOptions {
         max_sequences: arguments
             .sequences
             .unwrap_or(LoadOptions::default().max_sequences),
         ..LoadOptions::default()
     };
-    let (mut owner, memory) = TextOwner::load(&arguments.model, options)
-        .map_err(|error| format!("load failed: {error}"))?;
+    let (mut owner, memory) =
+        TextOwner::load(&arguments.model, load).map_err(|error| format!("load failed: {error}"))?;
     println!(
         "ready in {:.1?}: {} bytes reserved for sequence state, {} device bytes free",
         started.elapsed(),
