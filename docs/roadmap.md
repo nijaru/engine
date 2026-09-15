@@ -158,7 +158,6 @@ Remaining before closing this slice:
 
 - run the CUDA-backed text lifecycle tests and matched direct-versus-handle frontend
   measurements on a reachable GPU; the current numbers cover only the host driver path;
-- add executable concurrent-caller/disconnect/shutdown examples beyond the library tests;
 - bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
   factory contract.

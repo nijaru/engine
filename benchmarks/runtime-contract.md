@@ -206,6 +206,10 @@ cargo test --release -p ribn-text --features cuda --test text_lifecycle --locked
   -- --ignored --test-threads=1
 ```
 
+`crates/text/examples/concurrent_text.rs` exercises concurrent callers, an abandoned
+live stream and explicit shutdown against a loaded model. It compiles under the CUDA
+feature and is **unrun**, so it is a usage example, not qualification.
+
 Matched direct-versus-handle frontend overhead on the real GPU path is still unmeasured;
 the only measured host comparison remains the token-driver benchmark above.
 

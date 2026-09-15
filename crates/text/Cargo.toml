@@ -17,5 +17,9 @@ engine-gguf = { path = "../gguf" }
 engine-qwen = { path = "../qwen", optional = true }
 flume = { version = "0.12", default-features = false, features = ["async"] }
 
+[[example]]
+name = "concurrent_text"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
