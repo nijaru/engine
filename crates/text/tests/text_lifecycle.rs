@@ -223,3 +223,49 @@ fn cancellation_is_request_local() {
 
     drop(loaded.owner);
 }
+
+/// Distinct prompts must produce distinct, coherent text across sequential
+/// requests to one owner. Earlier gates only asserted that tokens arrived, so a
+/// degrading continuation could pass them.
+#[test]
+#[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
+fn sequential_requests_stay_coherent() {
+    let loaded = load();
+    let mut responses = Vec::new();
+    for index in 0..4 {
+        let response = loaded
+            .model
+            .generate_blocking(
+                TextInput::prompt(format!("Name one primary color. Variant {index}.")),
+                options(),
+            )
+            .expect("generate");
+        eprintln!(
+            "request {index}: prompt_tokens={} completion={} text={:?}",
+            response.usage.prompt_tokens, response.usage.completion_tokens, response.text
+        );
+        responses.push(response);
+    }
+
+    for (index, response) in responses.iter().enumerate() {
+        let text = response.text.trim();
+        assert!(!text.is_empty(), "request {index} produced empty text");
+        let distinct = text
+            .chars()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct > 3 && text.split_whitespace().count() >= 2,
+            "request {index} is degenerate, not language: {text:?}"
+        );
+    }
+    let texts = responses
+        .iter()
+        .map(|response| response.text.trim())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        texts.len(),
+        responses.len(),
+        "distinct prompts must not collapse onto identical output"
+    );
+}
