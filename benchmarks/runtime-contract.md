@@ -174,7 +174,8 @@ Sixteen tests pass (40 consecutive suite runs, no failures):
 - a decode failure settling exactly one request while its peer completes;
 - invalid UTF-8 reported with its offending token;
 - a terminal flush replacing an incomplete trailing code point exactly once;
-- cancellation returning a `Cancelled` terminal while buffered deltas stay readable;
+- cancellation returning a `Cancelled` terminal for its own request while the owner
+  keeps serving (buffered-event preservation is proven by the driver tests, not here);
 - oversized prompt/message/prompt-token inputs rejected before admission, with the
   same handle still serving afterwards (permit refund on the failure path);
 - ordered per-item batch outcomes with a rejected input between healthy ones, and a

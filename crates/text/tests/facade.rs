@@ -420,7 +420,7 @@ fn terminal_flush_replaces_an_incomplete_code_point_once() {
 }
 
 #[test]
-fn cancellation_delivers_its_terminal_and_keeps_buffered_output() {
+fn cancellation_delivers_its_terminal_for_its_own_request() {
     let harness = Harness::default_start();
     harness.plan.script(
         b'A',
@@ -445,14 +445,21 @@ fn cancellation_delivers_its_terminal_and_keeps_buffered_output() {
     stream.cancel();
     harness.plan.holding(false);
 
-    // Already-delivered output stays readable; cancellation is a terminal, not a
-    // replacement-character flush, and it does not fabricate successful usage.
+    // Cancellation is an ordinary terminal, not a replacement-character flush,
+    // and it does not fabricate successful usage. This scenario consumes the
+    // delivered delta before cancelling, so it does not by itself prove that
+    // buffered events survive cancellation: the driver's own tests cover that
+    // (`cancelling_next_future_loses_no_event_and_drop_wakes_idle_owner`).
     let (text, _, reason) = drain(&mut stream);
     assert_eq!(reason, Some(FinishReason::Cancelled));
     assert!(
+        !text.contains('\u{fffd}'),
+        "cancellation must not invent a terminal flush: {text:?}"
+    );
+    assert!(
         text.chars()
             .all(|character| matches!(character, 'a' | 'b' | 'c')),
-        "buffered deltas stay readable: {text:?}"
+        "any delivered text comes from the script: {text:?}"
     );
 
     let healthy = harness
