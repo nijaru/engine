@@ -75,6 +75,10 @@ const MAX_ATTENTION_SEQUENCE: usize = 4096;
 const F32_BYTES: u32 = 4;
 
 const ENCODER_OPS_SOURCE: &str = r#"
+// NVRTC compiles without the host math headers, so the infinity NVRTC does not
+// define is expressed by its bit pattern.
+#define NEG_INFINITY (__int_as_float(0xff800000))
+
 // Block-wide sum reduction over the first `count` scratch slots, leaving the result
 // in scratch[0]. Every thread must reach both barriers.
 __device__ float block_sum(float* scratch, float value) {
@@ -247,7 +251,7 @@ extern "C" __global__ void attention_context(
     const int offset = head * head_width;
     const float* query_row = query + (long)query_position * hidden + offset;
 
-    float maximum = -INFINITY;
+    float maximum = NEG_INFINITY;
     for (int position = threadIdx.x; position < sequence; position += blockDim.x) {
         const float* key_row = key + (long)position * hidden + offset;
         float score = 0.0f;
@@ -255,7 +259,7 @@ extern "C" __global__ void attention_context(
             score = fmaf(query_row[index], key_row[index], score);
         }
         score *= scale;
-        probabilities[position] = mask[position] != 0 ? score : -INFINITY;
+        probabilities[position] = mask[position] != 0 ? score : NEG_INFINITY;
         maximum = fmaxf(maximum, probabilities[position]);
     }
     maximum = block_maximum(scratch, maximum);
@@ -263,7 +267,7 @@ extern "C" __global__ void attention_context(
     float total = 0.0f;
     for (int position = threadIdx.x; position < sequence; position += blockDim.x) {
         const float score = probabilities[position];
-        const float weight = score == -INFINITY ? 0.0f : expf(score - maximum);
+        const float weight = score == NEG_INFINITY ? 0.0f : expf(score - maximum);
         probabilities[position] = weight;
         total += weight;
     }
