@@ -24,6 +24,9 @@ putting training policy into inference.
   contracts. Do not invent a universal framework to avoid making concrete decisions.
 - Keep commits focused and the tree green. Preserve unrelated work and device artifacts.
 
+- Keep `README.md` stable and low-maintenance: identity, setup, current interfaces and
+  documentation links. Do not turn it into a status log or a next-steps list.
+
 ## Architecture constraints
 
 - Keep one mutable execution owner, bounded application submission and owned requests.
@@ -90,9 +93,11 @@ changing lifecycle, preparation, resource ownership or concurrent application ac
   or widen tolerances based on existing reference error.
 - Do not repeat measured losers without new evidence: `MAX_BATCH_ROWS=4`, shared IQ4
   codebook, pre-elimination `decayed_keys`. See benchmark evidence for conditions.
-- Serialize full-model device tests on `ssh desktop`; preserve its untracked
-  `cuda-rust-probe/simt/*`. Profiler counters currently require unavailable privilege;
-  do not infer measured occupancy/stall causes from speculation.
+- Serialize full-model device tests on `ssh desktop`, one model process at a time, and
+  check GPU utilization before launching. Its login shell is fish, so send multi-line
+  scripts with `ssh desktop bash -s`. Preserve its untracked `cuda-rust-probe/simt/*`.
+  Profiler counters currently require unavailable privilege; do not infer measured
+  occupancy/stall causes from speculation.
 - Benchmark server workloads with mixed lengths/arrivals, memory pressure and latency
   objectives. One prompt's prefixes are not representative throughput evidence.
 
