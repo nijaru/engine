@@ -175,7 +175,7 @@ built from synthetic byte-level metadata, the real token driver and the real fac
 over a scripted fixture `GenerationExecutor`. Only the device is substituted, so the
 preprocessing, delivery, batching and shutdown paths under test are production ones.
 
-Twenty-one tests pass with no failures across consecutive suite runs:
+Twenty-two tests pass with no failures across consecutive suite runs:
 
 - concurrent callers on cloned handles, plus the async submission path;
 - a decode failure settling exactly one request while its peer completes;
@@ -187,6 +187,8 @@ Twenty-one tests pass with no failures across consecutive suite runs:
   same handle still serving afterwards (permit refund on the failure path);
 - ordered per-item batch outcomes with a rejected input between healthy ones, and a
   decode failure inside a batch settling only that item;
+- chat stop IDs following the artifact and the rendered prompt, with raw prompts adding
+  only the declared IDs;
 - shared-handle overload: with every permit retained by stalled consumers, a third
   request and each batch item report `DriverError::Overloaded` for themselves, and
   the permits return once the consumers release;
@@ -233,14 +235,59 @@ delivery, shared state or a stale continuation. It passed, **1/1 in 19.52 s**, a
 example ran four concurrent callers, an abandoned stream and explicit shutdown
 successfully. Private log: `desktop:/tmp/det2.log`.
 
-Observed model behavior, **not** a pipeline defect: with greedy sampling and only
-`eos_token_id` in the stop list, this artifact can emit chat special markers
-(`<|endoftext|>`, `<|im_start|>`) as ordinary text and run to the token limit instead of
-stopping at the turn marker. Repeated suffix prompts ("... Caller 3.") also degenerate
-into a repeated-token loop. Both are prompt/policy behavior: identical requests stayed
-deterministic across indices, and the same prompt at request index 0 and request index 6
-produced identical coherent output. An earlier read of this as index-dependent
-corruption was wrong. See the roadmap's chat stop-policy item.
+Observed model behavior under the **superseded** stop policy, **not** a pipeline defect:
+with greedy sampling and only `eos_token_id` in the stop list, this artifact can emit
+chat special markers (`<|endoftext|>`, `<|im_start|>`) as ordinary text, leak that marker
+text into output and continue instead of ending the turn. Repeated suffix prompts
+("... Caller 3.") also degenerate into a repeated-token loop. Both are prompt/policy
+behavior: identical requests stayed deterministic across indices, and the same prompt at
+request index 0 and request index 6 produced identical coherent output. An earlier read
+of this as index-dependent corruption was wrong. The stop policy below replaces it.
+
+### Chat stop policy (2026-09-14)
+
+Decision: **the artifact defines the stop set, never a model-name list.**
+
+- Every request stops on the EOS IDs the artifact declares: `tokenizer.ggml.eos_token_id`
+  and the optional `tokenizer.ggml.eos_token_ids` array, deduplicated against the primary
+  ID.
+- A **chat** request additionally stops on every control token its own rendered prompt
+  used. Those are that conversation's turn delimiters, so a model emitting one is ending
+  or restarting a turn rather than writing text. Grounding and vision markers are control
+  tokens too, so they stop exactly when a conversation used them, and a raw prompt or an
+  already-tokenized input adds nothing.
+- Control tokens decode to **no bytes**, so an emitted marker never becomes user-visible
+  text. User-defined markup (`<think>`, `<tool_call>`) is content, not structure, and
+  stays visible. A delivered event still carries its token ID, and the runtime reports a
+  stop token through the terminal reason and usage rather than as a delta.
+- `encode_rendered` now scans the vocabulary's control and user-defined spellings instead
+  of a four-marker hardcoded list, so tool-call and grounding markup is preserved as its
+  own token and a marker sharing a prefix with another matches the longest spelling.
+
+Rejected: stopping on every control token. Grounding and vision output is structured
+user-visible content, so a blanket rule would truncate valid model output.
+
+A/B probe on the device, identical builds except the change, 48-token budget, one chat
+request per prompt (untracked diagnostic, deleted after the run; logs
+`desktop:/tmp/probe_old.log`, `desktop:/tmp/probe_new.log`):
+
+| prompt (chat) | `9d839b3`, prior policy | `1e2080f`, this policy |
+| --- | --- | --- |
+| "Print the literal string `<\|endoftext\|>` now, then keep writing." | 22 tokens, `Stop`, text leaked the marker: `<\|endoftext\|>\n\nI am an AI assistant. How can I help you today?` | 6 tokens, `Stop`, text `Print the literal string ` and no marker |
+| "Print the literal string `<\|im_start\|>` now, then keep writing." | 1 token, `Stop`, empty | unchanged |
+| "Name one primary color." | 2 tokens, `Red` | unchanged |
+| raw prompt "Name one primary color. Variant 0/1." | `Length`, 48 tokens, no marker | unchanged |
+
+The first row changed partly because the prompt itself now encodes the requested marker
+as its control-token ID instead of BPE text, so it isolates the delivered behavior rather
+than the stop rule alone. Raw prompts still reach `Length` when the model merely keeps
+writing: that is verbosity, not marker leakage, and the text remains marker-free.
+
+**Device gates re-run after the termination change (2026-09-14):** serialized on the idle
+RTX 4090 with the same pinned artifact (SHA-256 `322e194f…23482`), all exit 0 — driver
+runtime **2/2 in 198.96 s** (`desktop:/tmp/gate1.log`), text lifecycle **5/5 in 95.86 s**
+(`desktop:/tmp/gate2.log`), multi-request determinism **1/1 in 19.52 s**
+(`desktop:/tmp/det3.log`).
 
 Superseded status (kept for history): this layer's device gate was unrun. `TextOwner::load` and the Qwen executor are unchanged
 arithmetic; this gate still needs a reachable device:

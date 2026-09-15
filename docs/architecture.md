@@ -60,6 +60,12 @@ The old facade's whole-input batch preparation, borrowed `&mut TextModel` stream
 bounds are `ProcessorLimits` (input bytes, rendered bytes, prompt tokens, decoded
 token bytes); the driver keeps its own encoded-input envelope.
 
+Stop IDs come from the artifact: declared EOS IDs for every request, plus each control
+token a chat prompt itself used, because those are that conversation's turn delimiters.
+Control tokens decode to no bytes while user-defined content markup stays visible, and
+`encode_rendered` scans the vocabulary's control and user-defined spellings instead of a
+hardcoded marker list. See the [chat stop policy](../benchmarks/runtime-contract.md#chat-stop-policy-2026-09-14).
+
 Boundaries and rationale: [resource contract](resource-protocol.md#text-application-facade).
 Host evidence: [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 The CUDA-backed lifecycle, cancellation and multi-request determinism tests pass on the

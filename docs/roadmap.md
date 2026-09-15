@@ -150,7 +150,7 @@ is now implemented and host-qualified.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
 owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
-owned `TextStream`, and ordered bounded-window `TextBatch`. Twenty-one host tests pass
+owned `TextStream`, and ordered bounded-window `TextBatch`. Twenty-two host tests pass
 with a real GGUF tokenizer, the real driver and a scripted fixture device, including
 per-item overload under full permit retention, bound-checking at the retention
 boundary, owner-failure delivery and a dead preprocessing pool that fails callers
@@ -162,14 +162,17 @@ Remaining before closing this slice:
 
 - measure matched direct-versus-handle frontend overhead on the GPU path; the device
   gates now cover correctness, not comparative cost;
-- decide the chat stop-token set. Only the artifact's `eos_token_id` is added today, so
-  a Qwen chat turn that ends with `<|im_end|>`-class markers can run to the token limit
-  and leak marker text into output. This is pre-existing stop policy, not a slice-2
-  regression, and it interacts with the reasoning controls that also remain unexposed;
+- the chat stop-token set is decided and implemented: every request stops on the
+  artifact's declared EOS IDs, a chat request also stops on the control-token
+  delimiters its own prompt used, and control tokens never decode into user-visible
+  text while content markup such as a thinking or tool-call tag stays visible. Each
+  delivered event still carries its token ID, so a structured consumer loses nothing.
+  See [the policy and its evidence](../benchmarks/runtime-contract.md#chat-stop-policy-2026-09-14).
+  Reasoning controls remain unexposed, and the same policy now governs the legacy
+  `ribn local` path;
 - bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
-  factory contract;
-- re-run the gates once the chat stop policy changes, since it alters termination.
+  factory contract.
 
 Exit: device-qualified frontend behavior, saturation/race/shutdown evidence on both
 paths, no orphan requests, and matched frontend overhead measurements. The loaded owner
