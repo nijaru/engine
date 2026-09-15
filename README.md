@@ -47,7 +47,10 @@ cargo run -p ribn-cli --features cuda -- run /path/model.gguf \
   --raw --prompt 'The answer is'
 ```
 
-File input and piped stdin are supported. Interactive terminal chat and an HTTP
+File input and piped stdin are supported. `run` checks input before model loading:
+up to 256 KiB of UTF-8 for raw completion, or 256 KiB minus the four-byte `user` role
+for chat. Oversized input is rejected, not truncated; file/stdin reads consume at most
+one extra byte to detect overflow. Interactive terminal chat and an HTTP
 `serve` command are not implemented yet. `ribn local` remains the legacy numerical
 comparison frontend during migration.
 

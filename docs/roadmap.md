@@ -147,8 +147,10 @@ is now implemented and host-qualified.
    input, a decode error and saturated admission — leave peers unaffected.
 5. **Partially done.** CLI cutover, explicit shutdown and host/CUDA-feature checks are
    complete, collect-result exclusions are documented, and affected device gates pass
-   (item 1). Matched frontend overhead remains unmeasured. CLI file/stdin ingestion
-   remains a whole read and is not claimed as bounded.
+   (item 1). CLI file/stdin ingestion is now bounded before loading by the processor's
+   input allowance, including chat-role bytes, with a one-byte overflow probe. Host
+   reader tests and CUDA-feature CLI process tests cover exact/oversized input.
+   Matched frontend overhead remains unmeasured.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
 owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
@@ -168,7 +170,6 @@ Remaining before closing this slice:
 
 - measure matched direct-versus-handle frontend overhead on the GPU path; the device
   gates now cover correctness, not comparative cost;
-- bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
   factory contract.
 

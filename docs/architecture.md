@@ -117,11 +117,12 @@ bounds input/rendered/prompt/decoded payloads, settles decode failures per reque
 distinguishes ordinary terminals from owner failure, and replaces eager batching with
 ordered bounded-window iteration. `TextStream` is owned rather than borrowed.
 
-Remaining, unchanged by that work:
+Other application boundaries (including subsequent CLI ingestion repair):
 
-- CLI `run.rs::read_input` still reads a whole file/stdin before loading or admission.
-  It is caller-owned input outside the driver bound; a bounded CLI ingestion claim
-  would need a limited read at this boundary.
+- CLI `input.rs` now bounds file/stdin ingestion before loading: it reads at most the
+  processor input allowance plus one overflow-probe byte and rejects excess or invalid
+  UTF-8. Chat reserves room for the user role within that same allowance. Argument
+  storage remains caller-owned; this is a payload bound, not an allocator/RSS bound.
 - `TextResponse.text` and `generate_batch` results are caller-collected storage and are
   deliberately outside buffered-application accounting, exactly like the driver's
   documented collect limit.

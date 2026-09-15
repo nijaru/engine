@@ -1,5 +1,4 @@
-use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Write};
 
 use ribn_text::{
     FinishReason, GenerationOptions, LoadOptions, Message, TextEvent, TextInput, TextModel,
@@ -11,31 +10,36 @@ const USAGE: &str = "ribn run <model.gguf> [--prompt <text> | --file <path>] [--
 pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
     if matches!(arguments, [help] if matches!(help.as_str(), "-h" | "--help")) {
         println!(
-            "{USAGE}\n\nWithout --raw, text input is sent as one user chat message through the model's embedded chat template. If neither --prompt nor --file is given, piped stdin is used. Interactive terminal chat is not implemented yet.\n\nExperimental Qwen GGUF/CUDA path; GPU qualification is pending."
+            "{USAGE}\n\nWithout --raw, text input is sent as one user chat message through the model's embedded chat template. If neither --prompt nor --file is given, piped stdin is used. Interactive terminal chat is not implemented yet.\n\nExperimental Qwen GGUF/CUDA path. Input uses the text processor's byte limit (including the user role in chat mode) and is checked before model loading."
         );
         return Ok(());
     }
-    let options = crate::cli::parse(arguments, USAGE)?;
-    let input_text = read_input(&options)?;
+    let mut options = crate::cli::parse(arguments, USAGE)?;
+    let load = LoadOptions {
+        device: options.device,
+        context_tokens: options.context_length,
+        ..LoadOptions::default()
+    };
+    let mut message = Message::user("");
+    let role_bytes = if options.raw { 0 } else { message.role.len() };
+    let max_text_bytes = load
+        .limits
+        .max_input_bytes
+        .checked_sub(role_bytes)
+        .ok_or_else(|| "input byte limit cannot hold the chat role".to_owned())?;
+    let input_text = crate::input::read(&mut options, max_text_bytes)?;
     let input = if options.raw {
         TextInput::prompt(input_text)
     } else {
-        TextInput::chat(vec![Message::user(input_text)])
+        message.content = input_text;
+        TextInput::chat(vec![message])
     };
 
     eprintln!(
         "preparing model on CUDA device {} with {}-token context capacity (experimental Ribn runtime)",
         options.device, options.context_length
     );
-    let (mut owner, memory) = TextOwner::load(
-        options.model,
-        LoadOptions {
-            device: options.device,
-            context_tokens: options.context_length,
-            ..LoadOptions::default()
-        },
-    )
-    .map_err(display)?;
+    let (mut owner, memory) = TextOwner::load(options.model, load).map_err(display)?;
     eprintln!(
         "ready: {} bytes reserved for sequence state; {} device bytes free after preparation",
         memory.reserved_sequence_bytes, memory.free_after_preparation_bytes
@@ -52,29 +56,6 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; shutdown also failed: {cleanup}")),
     }
-}
-
-fn read_input(options: &crate::cli::RunOptions) -> Result<String, String> {
-    if let Some(prompt) = &options.prompt {
-        return Ok(prompt.clone());
-    }
-    if let Some(path) = &options.file {
-        return fs::read_to_string(path)
-            .map_err(|error| format!("failed to read {}: {error}", path.display()));
-    }
-    let mut stdin = io::stdin();
-    if stdin.is_terminal() {
-        return Err(
-            "no input supplied; use --prompt, --file, or pipe text on stdin (interactive mode is not implemented yet)"
-                .to_owned(),
-        );
-    }
-    let mut input = String::new();
-    stdin.read_to_string(&mut input).map_err(display)?;
-    if input.is_empty() {
-        return Err("stdin contained no input".to_owned());
-    }
-    Ok(input)
 }
 
 fn stream(

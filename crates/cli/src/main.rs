@@ -1,5 +1,7 @@
 #[cfg(any(feature = "cuda", test))]
 mod cli;
+#[cfg(any(feature = "cuda", test))]
+mod input;
 mod inspect;
 #[cfg(feature = "cuda")]
 mod local;
