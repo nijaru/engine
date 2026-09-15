@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Read, Write};
 
 use ribn_text::{
     FinishReason, GenerationOptions, LoadOptions, Message, TextEvent, TextInput, TextModel,
+    TextOwner,
 };
 
 const USAGE: &str = "ribn run <model.gguf> [--prompt <text> | --file <path>] [--raw] [--max-tokens <n>] [--context-length <n>] [--device <ordinal>]";
@@ -26,7 +27,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         "preparing model on CUDA device {} with {}-token context capacity (experimental Ribn runtime)",
         options.device, options.context_length
     );
-    let mut model = TextModel::load(
+    let (mut owner, memory) = TextOwner::load(
         options.model,
         LoadOptions {
             device: options.device,
@@ -35,7 +36,6 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         },
     )
     .map_err(display)?;
-    let memory = model.memory_report();
     eprintln!(
         "ready: {} bytes reserved for sequence state; {} device bytes free after preparation",
         memory.reserved_sequence_bytes, memory.free_after_preparation_bytes
@@ -45,8 +45,8 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         max_output_tokens: options.max_tokens,
         ..GenerationOptions::default()
     };
-    let result = stream(&mut model, input, generation, &mut io::stdout().lock());
-    let shutdown = model.shutdown().map_err(display);
+    let result = stream(owner.model(), input, generation, &mut io::stdout().lock());
+    let shutdown = owner.shutdown().map_err(display);
     match (result, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -78,12 +78,12 @@ fn read_input(options: &crate::cli::RunOptions) -> Result<String, String> {
 }
 
 fn stream(
-    model: &mut TextModel,
+    model: &TextModel,
     input: TextInput,
     options: GenerationOptions,
     output: &mut impl Write,
 ) -> Result<(), String> {
-    let events = model.stream(input, options).map_err(display)?;
+    let events = model.stream_blocking(input, options).map_err(display)?;
     for event in events {
         match event.map_err(display)? {
             TextEvent::Delta { text, .. } => {

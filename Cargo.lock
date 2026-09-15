@@ -337,6 +337,7 @@ version = "0.0.0"
 dependencies = [
  "engine-gguf",
  "engine-qwen",
+ "flume",
  "ribn",
 ]
 

@@ -120,47 +120,51 @@ before calling the driver GPU-qualified.
 #### Audit alignment order (2026-09-14)
 
 The [source-traced assessment](architecture.md#slice-2-boundary-audit-2026-09-14-84a146a)
-finds remaining text-boundary gaps, not a reason to replace the token driver.
-[Text cutover semantics](inference-engine-design.md#proposed-text-cutover-semantics-slice-2-audit-2026-09-14)
-are proposed, pending implementation approval. Preserve the existing gate order:
+found text-boundary gaps, not a reason to replace the token driver. Its findings are
+resolved by the owned text facade; the [text contract](resource-protocol.md#text-application-facade)
+is now implemented and host-qualified.
 
-1. Restore SSH, verify device availability and serialize the two runtime CUDA gates.
-   Keep the owned driver unqualified until they pass; do not infer a network root cause
-   from disco success and TCP timeouts.
-2. Resolve the proposed text contract before dependent code: bounded processor work
-   and its shutdown/cancellation owner, per-item ordered batching instead of whole-input
-   preparation atomicity, UTF-8/error terminal precedence and typed source retention.
-   Define raw/message capacity and rendered/scratch/decoded byte limits at their growth
-   points. Decide refill overload behavior when other handles hold permits; do not add
-   an unbounded waiter queue or silently busy-retry.
-3. Replace the borrowed execution loop with the actual host-testable owned facade and
-   CUDA-only assembly. Test decoder failure with a healthy peer, cancelled preprocessing,
-   dropped submission/next futures, saturation, buffered owner failure and incomplete
-   UTF-8 for normal completion/cancel/error. Retain shutdown retry ownership.
-4. Replace eager batching and its atomic-preparation test together. A lazy iterator
-   instrumented with pull counts must prove bounded lookahead; a stalled earliest item
-   must bound later retained results. Test invalid later input, per-item decoder failure,
-   shared-handle overload and batch drop without abandoning unrelated requests.
-5. Exercise CLI write/disconnect cleanup and explicit shutdown, rerun host/CUDA-feature
-   checks and affected device gates, then measure matched frontend overhead. Document
-   collect-result exclusions; use limited file/stdin reads before claiming CLI ingestion
-   is bounded. No serving-memory claim follows from token-driver bounds alone.
+1. **Still open.** Restore SSH, verify device availability and serialize the two runtime
+   CUDA gates, then the CUDA-backed text lifecycle test. Keep the driver unqualified
+   until they pass; do not infer a network root cause from disco success and TCP
+   timeouts.
+2. **Done.** The text contract landed before dependent code: a bounded preprocessing
+   pool with its own shutdown owner, per-item settlement instead of whole-input
+   preparation atomicity, UTF-8/terminal precedence, typed error sources, and
+   growth-time byte limits for input/rendered/prompt/decoded payloads. Overload stays
+   fail-fast per item with no waiter queue and no spin-retry.
+3. **Done except device evidence.** The borrowed execution loop is replaced by the
+   host-testable owned facade with CUDA-only assembly. Host tests cover decode failure
+   with a healthy peer, cancellation, dropped streams and batches, a stalled consumer
+   beside a healthy request, buffered owner-failure semantics at the driver level, and
+   incomplete UTF-8 on a normal terminal. Driver-level tests retain shutdown retry
+   ownership.
+4. **Done.** Eager batching and its atomic-preparation test were replaced together. A
+   pull-counting iterator proves bounded lookahead, and per-item failures — including a
+   rejected input between healthy ones — leave peers unaffected.
+5. **Partially done.** CLI cutover, explicit shutdown and host/CUDA-feature checks are
+   complete, and collect-result exclusions are documented. Matched frontend overhead
+   and the affected device gates still need a reachable GPU. CLI file/stdin ingestion
+   remains a whole read and is not claimed as bounded.
+
+Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
+owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
+owned `TextStream`, and ordered bounded-window `TextBatch`. Fourteen host tests pass
+with a real GGUF tokenizer, the real driver and a scripted fixture device; the CUDA
+lifecycle tests were migrated but are unrun. Evidence:
+[runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
 Remaining before closing this slice:
 
-- un-gate the text lifecycle implementation from CUDA loading and inject the real
-  preprocessing/decoder behavior in host tests; a decoder failure is request-local;
-- bound raw-input bytes, tokenization scratch/concurrency and decoded text payload;
-  reserve before preprocessing. The token driver does not do or bound this work;
-- replace borrowed text streaming with the owned driver rather than wrapping its
-  caller-driven loop; define text-specific errors and trailing UTF-8 terminal semantics;
-- implement ordered incremental offline batching over a bounded admission window,
-  not eager collection of arbitrary iterators; add two-caller/disconnect/shutdown examples;
-- measure the affected real GPU path and frontend overhead. Thread-affine non-Send
-  construction, if required by a real backend, needs a separate factory contract.
+- run the CUDA-backed text lifecycle tests and matched direct-versus-handle frontend
+  measurements on a reachable GPU; the current numbers cover only the host driver path;
+- add executable concurrent-caller/disconnect/shutdown examples beyond the library tests;
+- bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
+- thread-affine non-Send construction, if a real backend requires it, needs a separate
+  factory contract.
 
-Exit: host-testable frontend behavior without CUDA, saturation/race/shutdown tests,
-no orphan requests, and direct-versus-handle overhead measurements. The loaded owner
+Exit: device-qualified frontend behavior, saturation/race/shutdown evidence on both
+paths, no orphan requests, and matched frontend overhead measurements. The loaded owner
 pins one actual executable configuration; no metadata-only snapshot wrapper or
 unimplemented general architecture registry counts as snapshot ownership.
 

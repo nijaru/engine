@@ -196,23 +196,24 @@ GPU polling or tokenization. Keep a blocking wrapper for CLI/local use and make 
 runtime restrictions explicit. The core scheduler need not depend on Tokio. Adopt
 one established channel/wakeup implementation instead of inventing synchronization.
 
-### Proposed text cutover semantics (slice-2 audit, 2026-09-14)
+### Text cutover semantics (slice-2 audit, 2026-09-14)
 
-These refinements are proposed for approval before implementation; the current
-borrowed facade does not implement them. The [current-code audit](architecture.md#slice-2-boundary-audit-2026-09-14-84a146a)
-records the conflicting paths. The token driver's accepted lifecycle remains owned
+These refinements are implemented in `ribn-text`; the [resource
+protocol](resource-protocol.md#text-application-facade) owns the normative
+contract, and the [current-code audit](architecture.md#slice-2-boundary-audit-2026-09-14-84a146a)
+records the paths they replaced. The token driver's accepted lifecycle remains owned
 by the resource protocol.
 
 - The text layer owns preprocessing and incremental decoding, not execution progress.
-  CUDA loading assembles that layer with the existing owned token driver. A small
-  processor seam must exercise the actual facade on the host, not another simulated
-  lifecycle. Keep model-specific formatting outside the token runtime.
+  CUDA loading assembles that layer with the existing owned token driver, and the
+  facade is exercised on the host over a real tokenizer with only the device
+  substituted. Model-specific formatting stays outside the token runtime.
 - Incremental offline batching yields ordered per-input results from a bounded window.
   Preparation/decode failure settles only that input; previously admitted peers remain
-  owned and may complete. This intentionally replaces all-input preparation atomicity.
+  owned and may complete. This intentionally replaced all-input preparation atomicity.
   A slow first item may hold later completed results, but those results retain window
-  capacity; do not admit replacements merely because execution finished. Dropping the
-  batch abandons its live streams without waiting for device completion.
+  capacity; replacements are not admitted merely because execution finished. Dropping
+  the batch abandons its live streams without waiting for device completion.
 - Ordinary token terminal events, including explicit cancellation, flush incomplete
   UTF-8 once before the text terminal. A decode error abandons only its request and
   yields one typed error. Owner failure drains already-delivered token events under
@@ -220,17 +221,12 @@ by the resource protocol.
   or an ordinary terminal flush. A decoder error encountered first settles that text
   stream; it does not recover the failed execution owner.
 - An admission charge precedes processor work and remains owned while that work can
-  still access retained input, even if the submission future is dropped. Bounded
-  preprocessing must not block an async executor or add an unbounded work queue.
-  Raw/message storage, template expansion, scratch, encoded output, decoded deltas
-  and terminal staging need separate byte accounting. Fuel and token count alone do
-  not establish those bounds. Immutable loaded vocabulary and caller-collected results
-  must be explicitly distinguished from buffered application storage.
-
-Before coding, settle concrete processor limits/enforcement, preprocessing cancellation
-and shutdown, shared-handle overload during a batch window refill, and the collect
-helper's result-size policy in the resource protocol. No universal processor framework
-or second execution worker is implied by these requirements.
+  still access retained input, even if the submission future is dropped. Preprocessing
+  runs on a fixed pool rather than the submitting thread or the execution worker, so it
+  cannot occupy an async executor or grow an unbounded queue. Raw/message storage,
+  template expansion, encoded output, decoded deltas and terminal staging have separate
+  byte accounting; fuel and token count alone do not establish them. Immutable loaded
+  vocabulary and caller-collected results are outside buffered application storage.
 
 ### Performance, UX and contribution consequences
 

@@ -1,17 +1,23 @@
 //! Reusable text-generation frontend for Ribn.
 //!
 //! This crate owns text input formatting, tokenization, incremental decoding,
-//! and ordinary generation results. The scheduler/runtime continues to operate
-//! on token IDs and does not need to know about chat messages or UTF-8 streams.
+//! bounded offline batching, and ordinary generation results. The scheduler and
+//! token runtime below it see only encoded tokens and know nothing about chat
+//! messages or UTF-8 streams.
 
+#[cfg(feature = "cuda")]
+mod cuda;
+mod error;
 mod input;
-#[cfg(feature = "cuda")]
 mod model;
+mod process;
+mod stream;
 
-pub use input::{Message, TextInput};
 #[cfg(feature = "cuda")]
-pub use model::{
-    LoadOptions, MemoryReport, TextError, TextEvent, TextModel, TextRequest, TextResponse,
-    TextStream,
-};
+pub use cuda::{LoadOptions, MemoryReport};
+pub use error::TextError;
+pub use input::{Message, TextInput};
+pub use model::{TextBatch, TextConfig, TextModel, TextOwner, TextRequest, TextResponse};
+pub use process::{GgufProcessor, ProcessorLimits, TextProcessor};
 pub use ribn::{FinishReason, GenerationOptions, Sampling, Usage};
+pub use stream::{TextEvent, TextStream};

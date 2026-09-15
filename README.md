@@ -70,8 +70,8 @@ universal interfaces for every inference workload.
 `ribn::driver` adds a low-level owned token interface: one execution worker, cloneable
 handles, bounded request permits and streams, and explicit shutdown/retry. Blocking
 and async access use the same engine. The driver is host-tested but **not yet
-GPU-qualified**; it does not replace the current borrowed text facade or bound raw
-text preprocessing. See its [contract](docs/resource-protocol.md#owned-ar-driver-contract)
+GPU-qualified**; it accepts encoded input only and does not bound raw text
+preprocessing. See its [contract](docs/resource-protocol.md#owned-ar-driver-contract)
 and [qualification](benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
 
 `crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
@@ -92,11 +92,13 @@ does not assign parameter semantics or allocate execution tensors.
 raw model metadata and resolves files/parameter ownership without choosing a model
 architecture, runtime, backend, or processor implementation.
 
-`crates/text` (`ribn-text`) is the current shared text frontend used by the CLI: raw
-prompt, chat-message and token-ID input, tokenization/chat-template handling,
-incremental UTF-8 decoding, synchronous streaming, offline batching, and terminal
-token usage. `TextModel::load` is still Qwen/GGUF/CUDA-specific and the high-level
-stream borrows the model mutably; both are transitional.
+`crates/text` (`ribn-text`) is the shared text frontend used by the CLI: raw prompt,
+chat-message and token-ID input, tokenization/chat-template handling under explicit
+byte bounds, a bounded preprocessing pool, incremental UTF-8 decoding, owned
+concurrent streaming, and ordered bounded-window offline batching. `TextModel` is a
+cloneable handle over an owned token execution worker and `TextOwner` controls
+shutdown. Its behavior is host-qualified; `TextOwner::load` is still Qwen/GGUF/CUDA
+assembly, and the CUDA-backed lifecycle and numerical gates are unrun.
 
 A sequential encoder->AR pressure test now passes prepared state in-process and
 correlates it with the correct AR request even when handoffs are installed out of

@@ -9,17 +9,20 @@ Observed baseline: `7005fad` (owned driver host-qualified; device gate pending).
 
 ```text
 CLI run
-  → ribn-text: GGUF tokenizer/chat formatting, synchronous borrowed stream
+  → ribn-text: GGUF tokenizer/chat formatting, bounded preprocessing pool,
+    incremental UTF-8 decoding, owned driver streams, ordered bound-window batching
+  → ribn::driver: one execution owner, request permits, bounded streams, shutdown
   → ribn Engine: AR scheduling, request slots, bounded output mailboxes
   → engine-qwen: QwenExecution / QwenCuda
   → legacy engine-core batch/state translation
   → engine-nvidia: physical state, CUDA dispatch and kernels
 ```
 
-`TextModel::load` selects Qwen GGUF/CUDA directly. `TextStream` borrows the model
-mutably. There is no concurrent text/model handle or HTTP server. The new token-level
-`ribn::driver` provides a separate owned access surface over the same engine; it does
-not wrap the text facade's execution loop.
+`TextOwner::load` selects Qwen GGUF/CUDA and assembles the facade over the owned
+token driver. `TextModel` is a cloneable handle over that worker; `TextOwner` is the
+single shutdown owner. CUDA assembly is the only device-dependent part:
+preprocessing, decoding, batching, cancellation and error scoping are host-tested.
+There is no further concurrent text handle and no HTTP server.
 
 The runtime keeps one submission in flight, reserves output credits and validates
 all completion rows before logical commitment. `RequestId` and `SequenceId` identify
@@ -38,6 +41,28 @@ resource parking/reactivation remains unimplemented.
 Qwen admission reserves full configured continuation state. The adapter translates
 AR batch records into `engine-core` execution and state-manager types. It is not an
 additional scheduler, but it retains legacy coupling and per-step allocation.
+
+## Owned text facade
+
+A request reserves a token permit before preprocessing, is prepared on a fixed,
+bounded worker pool, and reaches the runtime as encoded input. Per-token decoding and
+UTF-8 handling happen in the consuming stream, so a decode error abandons only its
+own request. Text terminals distinguish ordinary completion — including explicit
+cancellation, which flushes an incomplete trailing code point once — from owner
+failure, which preserves delivered events and reports one owner error without
+fabricating a terminal flush or usage. Offline batching pulls lazily through a bounded
+admission window and yields ordered per-item outcomes, so there is no batch-wide
+error variant and a stalled earliest item bounds lookahead instead of admitting
+replacements.
+
+The old facade's whole-input batch preparation, borrowed `&mut TextModel` streaming,
+`TextError(String)` source erasure and CUDA-gated facade tests are removed. Text
+bounds are `ProcessorLimits` (input bytes, rendered bytes, prompt tokens, decoded
+token bytes); the driver keeps its own encoded-input envelope.
+
+Boundaries and rationale: [resource contract](resource-protocol.md#text-application-facade).
+Host evidence: [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
+The CUDA-backed lifecycle and numerical gates remain unrun on a device.
 
 ## Owned token access
 
@@ -61,7 +86,9 @@ offline text batching. See [qualification](../benchmarks/runtime-contract.md#own
 ## Slice-2 boundary audit (2026-09-14, `84a146a`)
 
 Scope: token driver → text processing/delivery → CLI. This is a source-traced
-assessment, not renewed GPU qualification or a review of kernel correctness.
+assessment, not renewed GPU qualification or a review of kernel correctness. The
+findings below are now **resolved** by the owned text facade; the table is retained
+as the evidence trail for why the facade was replaced rather than patched.
 
 Preserve the single worker, runtime-owned discard, retirement-held admission charge,
 nonblocking delivery and retryable shutdown. `driver.rs` and `driver/worker.rs`
@@ -76,29 +103,33 @@ application gaps are not a reason to replace that owner.
 | Medium: text lifecycle and diagnostics remain coupled to loading | `text/src/lib.rs` CUDA-gates all of `model`; `TextError::from_display` erases sources. The two local unit tests exercise only `Utf8Decoder`; actual facade lifecycle tests load CUDA. | Separate CUDA assembly from the real facade and inject processor/executor behavior; preserve typed source chains and test failure/drop/shutdown at that surface. |
 | Medium: decoded delivery has no explicit byte policy | `decode_bytes` allocates a vector based on vocabulary spelling; `Utf8Decoder::push` copies into pending storage and an owned string. The token driver's fixed-size events do not bound this added storage. | Validate a model-specific maximum decoded token size or use bounded decoding, and account for retained text deltas and terminal staging. |
 
-Current stream completion flushes an incomplete code point as a replacement delta
-before `Finished`; batch completion appends that replacement directly. Neither path
-has the owned driver's buffered-events-then-owner-error behavior yet. The replacement
-must specify that distinction rather than treating owner failure as normal completion.
+Resolution: the facade now reserves before preprocessing, prepares on a bounded pool,
+bounds input/rendered/prompt/decoded payloads, settles decode failures per request,
+distinguishes ordinary terminals from owner failure, and replaces eager batching with
+ordered bounded-window iteration. `TextStream` is owned rather than borrowed.
 
-CLI `run.rs::read_input` also reads a whole file/stdin before loading or admission.
-It is caller-owned input today, outside the token-driver bound; any future claim of
-bounded CLI ingestion must add a limited read at this boundary. CLI write failure
-already drops the borrowed stream and attempts explicit model shutdown; preserve that
-cleanup behavior during cutover.
+Remaining, unchanged by that work:
 
-Audit verification: dependency-boundary and whitespace checks passed; all 19 driver
-unit tests passed again. `cargo test -p ribn-text --locked` succeeded with **zero tests**,
-confirming the default-feature facade coverage gap. Full workspace/clippy and device
-gates were not rerun for this documentation-only assessment. Kernel/backend internals,
-other runtime families and quantitative processor peak memory were not audited here.
+- CLI `run.rs::read_input` still reads a whole file/stdin before loading or admission.
+  It is caller-owned input outside the driver bound; a bounded CLI ingestion claim
+  would need a limited read at this boundary.
+- `TextResponse.text` and `generate_batch` results are caller-collected storage and are
+  deliberately outside buffered-application accounting, exactly like the driver's
+  documented collect limit.
+- Quantitative processor peak memory was not measured; the bounds are enforced, not
+  profiled.
+
+Audit verification at `84a146a`: dependency-boundary and whitespace checks passed and
+all 19 driver unit tests passed; `cargo test -p ribn-text` succeeded with **zero tests**,
+which is what confirmed the default-feature facade coverage gap. Kernel/backend
+internals, other runtime families and device gates were not audited.
 
 ## Packages
 
 | Package/path | Current responsibility |
 | --- | --- |
 | `ribn`, `crates/runtime` | AR lifecycle, scheduling, output mailboxes, executor contract and owned token driver |
-| `ribn-text`, `crates/text` | Shared text processing and current synchronous facade; model module CUDA-gated |
+| `ribn-text`, `crates/text` | Shared text preprocessing/decoding, cloneable owned facade, ordered bounded-window batching; only CUDA assembly is device-gated |
 | `engine-qwen`, `crates/qwen` | Qwen configuration, GGUF interpretation, execution adapter |
 | `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution |
 | `engine-core`, `crates/core` | Legacy runtime, batch/state, weight and device contracts still consumed by production code |

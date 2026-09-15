@@ -16,7 +16,9 @@ use engine_core::{
 
 mod iq3_s;
 mod tokenizer;
-pub use tokenizer::{ChatMessage, ChatTemplateOptions, GgufTokenizer};
+pub use tokenizer::{
+    ChatMessage, ChatTemplateOptions, GgufTokenizer, byte_token_symbol, token_symbol_byte,
+};
 
 const GGUF_MAGIC: u32 = 0x4655_4747;
 const GGUF_VERSION: u32 = 3;

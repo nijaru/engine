@@ -88,7 +88,12 @@ fn byte_is_direct(byte: u8) -> bool {
     (33..=126).contains(&byte) || (161..=172).contains(&byte) || (174..=255).contains(&byte)
 }
 
-fn byte_to_unicode(byte: u8) -> char {
+/// Vocabulary spelling for a raw byte in a byte-level BPE vocabulary.
+///
+/// Byte-level vocabularies store bytes that are not directly printable as a
+/// shifted code point. Use this pair to build or inspect such a vocabulary.
+#[must_use]
+pub fn byte_token_symbol(byte: u8) -> char {
     if byte_is_direct(byte) {
         char::from(byte)
     } else {
@@ -99,7 +104,9 @@ fn byte_to_unicode(byte: u8) -> char {
     }
 }
 
-fn unicode_to_byte(character: char) -> Option<u8> {
+/// Raw byte represented by one byte-level vocabulary symbol, if any.
+#[must_use]
+pub fn token_symbol_byte(character: char) -> Option<u8> {
     let codepoint = u32::from(character);
     if let Ok(byte) = u8::try_from(codepoint)
         && byte_is_direct(byte)
@@ -238,7 +245,7 @@ impl GgufTokenizer {
                 .as_str()
                 .as_bytes()
                 .iter()
-                .map(|byte| byte_to_unicode(*byte).to_string())
+                .map(|byte| byte_token_symbol(*byte).to_string())
                 .collect();
             let symbols = self.bpe(mapped);
             for symbol in symbols {
@@ -285,27 +292,57 @@ impl GgufTokenizer {
     pub fn decode_bytes(&self, token_ids: &[u32]) -> Result<Vec<u8>, GgufError> {
         let mut bytes = Vec::new();
         for &token_id in token_ids {
-            let token = self
-                .tokens
-                .get(
-                    usize::try_from(token_id).map_err(|_| GgufError::TokenizerEncoding {
-                        detail: format!("token ID {token_id} does not fit this platform"),
-                    })?,
-                )
-                .ok_or_else(|| GgufError::TokenizerEncoding {
-                    detail: format!("token ID {token_id} is outside the vocabulary"),
-                })?;
-            for character in token.chars() {
-                let byte =
-                    unicode_to_byte(character).ok_or_else(|| GgufError::TokenizerEncoding {
-                        detail: format!(
-                            "token {token_id} contains unsupported symbol {character:?}"
-                        ),
-                    })?;
-                bytes.push(byte);
-            }
+            self.append_token_bytes(token_id, &mut bytes, usize::MAX)?;
         }
         Ok(bytes)
+    }
+
+    /// Decode one token into `out`, replacing its contents and never exceeding
+    /// `max_bytes`. A text frontend bounds retained decode output this way without
+    /// a temporary allocation per token.
+    ///
+    /// # Errors
+    /// Returns [`GgufError::TokenizerEncoding`] when the token ID is outside the
+    /// vocabulary, contains an unsupported symbol, or would exceed `max_bytes`.
+    pub fn decode_token_into(
+        &self,
+        token_id: u32,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<(), GgufError> {
+        out.clear();
+        self.append_token_bytes(token_id, out, max_bytes)
+    }
+
+    fn append_token_bytes(
+        &self,
+        token_id: u32,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<(), GgufError> {
+        let token = self
+            .tokens
+            .get(
+                usize::try_from(token_id).map_err(|_| GgufError::TokenizerEncoding {
+                    detail: format!("token ID {token_id} does not fit this platform"),
+                })?,
+            )
+            .ok_or_else(|| GgufError::TokenizerEncoding {
+                detail: format!("token ID {token_id} is outside the vocabulary"),
+            })?;
+        for character in token.chars() {
+            let byte =
+                token_symbol_byte(character).ok_or_else(|| GgufError::TokenizerEncoding {
+                    detail: format!("token {token_id} contains unsupported symbol {character:?}"),
+                })?;
+            if out.len() >= max_bytes {
+                return Err(GgufError::TokenizerEncoding {
+                    detail: format!("token {token_id} exceeds the {max_bytes}-byte decoded limit"),
+                });
+            }
+            out.push(byte);
+        }
+        Ok(())
     }
 
     /// Render the artifact's embedded template for text-only messages.
@@ -321,6 +358,51 @@ impl GgufTokenizer {
         messages: &[ChatMessage],
         options: ChatTemplateOptions,
     ) -> Result<String, GgufError> {
+        self.with_chat_template(messages, |template| {
+            template
+                .render(minijinja::context! {
+                    messages => messages,
+                    add_generation_prompt => options.add_generation_prompt(),
+                    enable_thinking => options.enable_thinking(),
+                })
+                .map_err(|error| template_error(&error))
+        })?
+    }
+
+    /// Render the artifact's template into `out`.
+    ///
+    /// Use this with a byte-limited writer to bound rendered prompt size before
+    /// the caller retains it.
+    ///
+    /// # Errors
+    /// Returns an error for missing/unsupported templates, invalid roles, or a
+    /// writer that rejects the output. Rendering is bounded by `MiniJinja` fuel.
+    pub fn render_chat_to<W: std::io::Write>(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+        out: W,
+    ) -> Result<(), GgufError> {
+        self.with_chat_template(messages, |template| {
+            template
+                .render_captured_to(
+                    minijinja::context! {
+                        messages => messages,
+                        add_generation_prompt => options.add_generation_prompt(),
+                        enable_thinking => options.enable_thinking(),
+                    },
+                    out,
+                )
+                .map(|_| ())
+                .map_err(|error| template_error(&error))
+        })?
+    }
+
+    fn with_chat_template<R>(
+        &self,
+        messages: &[ChatMessage],
+        render: impl FnOnce(&minijinja::Template<'_, '_>) -> R,
+    ) -> Result<R, GgufError> {
         let template = self
             .chat_template
             .as_deref()
@@ -353,15 +435,10 @@ impl GgufTokenizer {
         environment
             .add_template("chat", template)
             .map_err(|error| template_error(&error))?;
-        environment
+        let template = environment
             .get_template("chat")
-            .map_err(|error| template_error(&error))?
-            .render(minijinja::context! {
-                messages => messages,
-                add_generation_prompt => options.add_generation_prompt(),
-                enable_thinking => options.enable_thinking(),
-            })
-            .map_err(|error| template_error(&error))
+            .map_err(|error| template_error(&error))?;
+        Ok(render(&template))
     }
 
     /// Render and encode the embedded Qwen text chat template, preserving its
@@ -377,10 +454,16 @@ impl GgufTokenizer {
         options: ChatTemplateOptions,
     ) -> Result<Vec<u32>, GgufError> {
         let rendered = self.render_chat(messages, options)?;
-        self.encode_rendered_chat(&rendered)
+        self.encode_rendered(&rendered)
     }
 
-    fn encode_rendered_chat(&self, rendered: &str) -> Result<Vec<u32>, GgufError> {
+    /// Encode already-rendered chat text, preserving the template's special
+    /// markers as their vocabulary IDs instead of passing them through ordinary
+    /// `GPT-2`/BPE encoding.
+    ///
+    /// # Errors
+    /// Returns tokenizer or special-token errors.
+    pub fn encode_rendered(&self, rendered: &str) -> Result<Vec<u32>, GgufError> {
         const SPECIAL_MARKERS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"];
         let mut encoded = Vec::new();
         let mut cursor = 0;
@@ -463,9 +546,15 @@ impl GgufTokenizer {
         symbols
     }
 
-    pub(crate) fn from_metadata(
-        metadata: &BTreeMap<String, MetadataValue>,
-    ) -> Result<Self, GgufError> {
+    /// Build a tokenizer from already-parsed GGUF tokenizer metadata.
+    ///
+    /// This is the construction contract behind [`GgufFile::tokenizer`], and it
+    /// lets a host validate tokenizer behavior without opening a model file.
+    ///
+    /// # Errors
+    /// Returns a typed error for missing, mismatched, or malformed tokenizer
+    /// metadata.
+    pub fn from_metadata(metadata: &BTreeMap<String, MetadataValue>) -> Result<Self, GgufError> {
         let tokens = required_string_array(metadata, "tokenizer.ggml.tokens")?;
         let merges = required_string_array(metadata, "tokenizer.ggml.merges")?;
         let token_types = required_i32_array(metadata, "tokenizer.ggml.token_type")?;
@@ -684,7 +773,7 @@ mod tests {
 
     fn tokenizer(template: &str) -> GgufTokenizer {
         let tokens = (0..=255_u8)
-            .map(|byte| byte_to_unicode(byte).to_string())
+            .map(|byte| byte_token_symbol(byte).to_string())
             .collect::<Vec<_>>();
         GgufTokenizer {
             model: "gpt2".into(),

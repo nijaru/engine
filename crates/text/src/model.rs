@@ -1,55 +1,17 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::path::PathBuf;
+//! Cloneable text generation handle over one owned token execution worker.
 
-use engine_gguf::{ChatMessage, ChatTemplateOptions, GgufFile, GgufTokenizer, MetadataValue};
-use engine_qwen::{QwenCuda, QwenLoadOptions};
-use ribn::{Engine, EngineError, Event, GenerationOptions, RequestId, TokenRequest, Usage};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
-use crate::{FinishReason, Message, TextInput};
+use ribn::driver::{DriverOwner, GenerationHandle};
+use ribn::{FinishReason, GenerationOptions, Usage};
 
-/// Model loading and execution limits for the currently supported text path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LoadOptions {
-    pub device: u16,
-    pub context_tokens: u32,
-    pub max_sequences: usize,
-    /// Same-sequence prefill chunk size, or `None` for the serial prefill
-    /// path.
-    pub prefill_chunk_members: Option<usize>,
-    pub weight_budget_bytes: Option<u64>,
-    pub headroom_bytes: u64,
-}
+use crate::error::TextError;
+use crate::input::TextInput;
+use crate::process::{Pool, PoolClient, Prepared, ProcessorLimits, TextProcessor};
+use crate::stream::{TextEvent, TextStream};
 
-impl Default for LoadOptions {
-    fn default() -> Self {
-        let qwen = QwenLoadOptions::default();
-        Self {
-            device: qwen.device,
-            context_tokens: qwen.context_tokens,
-            max_sequences: qwen.max_sequences,
-            prefill_chunk_members: qwen.prefill_chunk_members,
-            weight_budget_bytes: qwen.weight_budget_bytes,
-            headroom_bytes: qwen.headroom_bytes,
-        }
-    }
-}
-
-impl From<LoadOptions> for QwenLoadOptions {
-    fn from(value: LoadOptions) -> Self {
-        Self {
-            device: value.device,
-            context_tokens: value.context_tokens,
-            max_sequences: value.max_sequences,
-            prefill_chunk_members: value.prefill_chunk_members,
-            weight_budget_bytes: value.weight_budget_bytes,
-            headroom_bytes: value.headroom_bytes,
-        }
-    }
-}
-
-pub use engine_qwen::MemoryReport;
-
+/// One text-generation request: input plus generation options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRequest {
     pub input: TextInput,
@@ -58,281 +20,9 @@ pub struct TextRequest {
 
 impl TextRequest {
     #[must_use]
-    pub fn new(input: TextInput, options: GenerationOptions) -> Self {
+    pub const fn new(input: TextInput, options: GenerationOptions) -> Self {
         Self { input, options }
     }
-}
-
-/// Loaded text model with reusable tokenizer and generation runtime.
-pub struct TextModel {
-    tokenizer: GgufTokenizer,
-    engine: Engine,
-    memory: MemoryReport,
-}
-
-impl TextModel {
-    /// Load a supported local GGUF model and prepare its CUDA executor.
-    ///
-    /// # Errors
-    /// Returns an explicit unsupported-architecture error instead of inferring
-    /// execution support from the existence of GGUF metadata.
-    pub fn load(path: impl Into<PathBuf>, options: LoadOptions) -> Result<Self, TextError> {
-        let path = path.into();
-        let file = GgufFile::open(&path).map_err(TextError::from_display)?;
-        let architecture = file
-            .metadata("general.architecture")
-            .and_then(MetadataValue::as_str)
-            .ok_or_else(|| TextError::new("model artifact is missing general.architecture"))?;
-        if architecture != "qwen35" {
-            return Err(TextError::new(format!(
-                "unsupported model architecture {architecture:?}; this build currently executes qwen35 GGUF only"
-            )));
-        }
-        let tokenizer = file.tokenizer().map_err(TextError::from_display)?;
-        drop(file);
-        let executor =
-            QwenCuda::load_gguf(path, options.into()).map_err(TextError::from_display)?;
-        let memory = executor.memory_report();
-        let engine = Engine::with_defaults(executor).map_err(TextError::from_display)?;
-        Ok(Self {
-            tokenizer,
-            engine,
-            memory,
-        })
-    }
-
-    #[must_use]
-    pub const fn memory_report(&self) -> MemoryReport {
-        self.memory
-    }
-
-    /// Apply Ribn's shared text-input preparation without executing the model.
-    ///
-    /// # Errors
-    /// Returns chat-template or tokenization errors.
-    pub fn tokenize(&self, input: TextInput) -> Result<Vec<u32>, TextError> {
-        encode_input(&self.tokenizer, input)
-    }
-
-    /// Decode token IDs with the loaded model's tokenizer.
-    ///
-    /// # Errors
-    /// Returns an error for invalid token IDs or invalid decoded UTF-8.
-    pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String, TextError> {
-        self.tokenizer
-            .decode(tokens)
-            .map_err(TextError::from_display)
-    }
-
-    /// Start a streaming generation request.
-    ///
-    /// # Errors
-    /// Returns formatting, tokenization, admission, or execution errors.
-    pub fn stream(
-        &mut self,
-        input: TextInput,
-        mut options: GenerationOptions,
-    ) -> Result<TextStream<'_>, TextError> {
-        let tokens = encode_input(&self.tokenizer, input)?;
-        if !options.stop_tokens.contains(&self.tokenizer.eos_token_id()) {
-            options.stop_tokens.push(self.tokenizer.eos_token_id());
-        }
-        let request = self
-            .engine
-            .enqueue(TokenRequest::new(tokens, options))
-            .map_err(TextError::from_display)?;
-        Ok(TextStream {
-            model: self,
-            request,
-            decoder: Utf8Decoder::default(),
-            pending_finish: None,
-            finished: false,
-        })
-    }
-
-    /// Generate one raw-text completion to completion.
-    ///
-    /// # Errors
-    /// Returns formatting, tokenization, admission, decoding, or execution errors.
-    pub fn generate(
-        &mut self,
-        prompt: impl Into<String>,
-        options: GenerationOptions,
-    ) -> Result<TextResponse, TextError> {
-        self.complete(TextInput::Prompt(prompt.into()), options)
-    }
-
-    /// Generate from structured chat messages using the artifact's chat template.
-    ///
-    /// # Errors
-    /// Returns formatting, tokenization, admission, decoding, or execution errors.
-    pub fn chat(
-        &mut self,
-        messages: impl Into<Vec<Message>>,
-        options: GenerationOptions,
-    ) -> Result<TextResponse, TextError> {
-        self.complete(TextInput::Chat(messages.into()), options)
-    }
-
-    /// Generate from already-tokenized input without text preprocessing.
-    ///
-    /// # Errors
-    /// Returns admission, decoding, or execution errors.
-    pub fn generate_tokens(
-        &mut self,
-        tokens: impl Into<Vec<u32>>,
-        options: GenerationOptions,
-    ) -> Result<TextResponse, TextError> {
-        self.complete(TextInput::Tokens(tokens.into()), options)
-    }
-
-    /// Submit several requests before driving execution so the runtime can
-    /// batch compatible work. Results preserve input order.
-    ///
-    /// # Errors
-    /// Returns formatting, tokenization, admission, decoding, or execution errors.
-    pub fn generate_batch(
-        &mut self,
-        requests: impl IntoIterator<Item = TextRequest>,
-    ) -> Result<Vec<TextResponse>, TextError> {
-        let requests = requests.into_iter().collect::<Vec<_>>();
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Tokenize every input before submitting anything: an input that fails
-        // to prepare must not strand requests that are already executing.
-        let mut prepared = Vec::with_capacity(requests.len());
-        for request in requests {
-            let tokens = encode_input(&self.tokenizer, request.input)?;
-            let mut options = request.options;
-            if !options.stop_tokens.contains(&self.tokenizer.eos_token_id()) {
-                options.stop_tokens.push(self.tokenizer.eos_token_id());
-            }
-            prepared.push((tokens, options));
-        }
-
-        let mut responses = Vec::with_capacity(prepared.len());
-        let mut positions = HashMap::with_capacity(prepared.len());
-        for (tokens, options) in prepared {
-            let id = match self.engine.enqueue(TokenRequest::new(tokens, options)) {
-                Ok(id) => id,
-                Err(error) => {
-                    for id in positions.keys().copied() {
-                        self.engine.discard(id);
-                    }
-                    return Err(TextError::from_display(error));
-                }
-            };
-            positions.insert(id, responses.len());
-            responses.push(BatchResponse::default());
-        }
-
-        let result = self.collect_batch(&positions, &mut responses);
-        // Every exit relinquishes delivery, including step and decoding failures.
-        // The runtime retains physical retirement ownership independently.
-        for id in positions.keys().copied() {
-            self.engine.discard(id);
-        }
-        result?;
-        responses.into_iter().map(BatchResponse::finish).collect()
-    }
-
-    fn collect_batch(
-        &mut self,
-        positions: &HashMap<RequestId, usize>,
-        responses: &mut [BatchResponse],
-    ) -> Result<(), TextError> {
-        let mut remaining = responses.len();
-        while remaining > 0 {
-            let status = self.engine.step().map_err(TextError::from_display)?;
-            // Drain only this batch's requests: the engine's global drain also
-            // returns events other callers own, and a batch must never
-            // interpret another request's output.
-            for (&id, &index) in positions {
-                let response = &mut responses[index];
-                while let Some(event) = self.engine.pop_event_for(id) {
-                    match event {
-                        Event::Token { token, .. } => {
-                            let bytes = self
-                                .tokenizer
-                                .decode_bytes(&[token])
-                                .map_err(TextError::from_display)?;
-                            response.text.push_str(&response.decoder.push(&bytes)?);
-                            response.tokens.push(token);
-                        }
-                        Event::Finished { reason, usage, .. } => {
-                            response.text.push_str(&response.decoder.finish());
-                            response.finish = Some((reason, usage));
-                            remaining -= 1;
-                        }
-                    }
-                }
-            }
-            // The synchronous facade still polls device completion. Yielding is
-            // only a CPU hint, not resource parking or an event-driven wait.
-            if !status.submitted && !status.completed && remaining > 0 {
-                std::thread::yield_now();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn complete(
-        &mut self,
-        input: TextInput,
-        options: GenerationOptions,
-    ) -> Result<TextResponse, TextError> {
-        let mut text = String::new();
-        let mut tokens = Vec::new();
-        let mut finish = None;
-        let stream = self.stream(input, options)?;
-        for event in stream {
-            match event? {
-                TextEvent::Delta { token, text: delta } => {
-                    if let Some(token) = token {
-                        tokens.push(token);
-                    }
-                    text.push_str(&delta);
-                }
-                TextEvent::Finished { reason, usage } => finish = Some((reason, usage)),
-            }
-        }
-        let (reason, usage) =
-            finish.ok_or_else(|| TextError::new("generation ended without a terminal event"))?;
-        Ok(TextResponse {
-            text,
-            tokens,
-            reason,
-            usage,
-        })
-    }
-}
-
-impl TextModel {
-    /// Establish device completion and release all active sequence resources.
-    ///
-    /// # Errors
-    /// Reports synchronization or resource-release failure.
-    pub fn shutdown(&mut self) -> Result<(), TextError> {
-        self.engine.shutdown().map_err(TextError::from_display)
-    }
-}
-
-/// Incremental text event. Token IDs remain available even when one token does
-/// not independently form valid UTF-8 and therefore has an empty text delta.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TextEvent {
-    /// Incremental decoded text. `token` is absent only for a final replacement
-    /// character when generation ends inside a UTF-8 code point.
-    Delta {
-        token: Option<u32>,
-        text: String,
-    },
-    Finished {
-        reason: FinishReason,
-        usage: Usage,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -343,127 +33,257 @@ pub struct TextResponse {
     pub usage: Usage,
 }
 
-/// Synchronous streaming request over one loaded model.
-/// Dropping an unfinished stream records cancellation; in-flight device work
-/// remains owned until the runtime observes completion.
-pub struct TextStream<'a> {
-    model: &'a mut TextModel,
-    request: RequestId,
-    decoder: Utf8Decoder,
-    pending_finish: Option<(FinishReason, Usage)>,
-    finished: bool,
+/// Assembly settings for the text layer. Execution bounds come from the token
+/// driver the handle already owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextConfig {
+    /// Preprocessing worker threads. Bounds concurrent tokenization.
+    pub preprocessing_workers: usize,
+    /// Offline batch admission window, clamped to the driver's request permits.
+    pub batch_window: usize,
 }
 
-impl Iterator for TextStream<'_> {
-    type Item = Result<TextEvent, TextError>;
+impl Default for TextConfig {
+    fn default() -> Self {
+        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+        Self {
+            preprocessing_workers: workers,
+            batch_window: 8,
+        }
+    }
+}
+
+/// Cloneable text-generation handle.
+///
+/// Every clone shares one execution worker and one preprocessing pool. The
+/// non-cloneable [`TextOwner`] controls shutdown.
+#[derive(Clone)]
+pub struct TextModel {
+    processor: Arc<dyn TextProcessor>,
+    pool: PoolClient,
+    handle: GenerationHandle,
+    window: usize,
+}
+
+impl TextModel {
+    #[must_use]
+    pub fn limits(&self) -> ProcessorLimits {
+        self.processor.limits()
+    }
+
+    /// Offline batch admission window, bounded by the driver's request permits.
+    #[must_use]
+    pub const fn batch_window(&self) -> usize {
+        self.window
+    }
+
+    /// Reserve, preprocess on the bounded pool, then enqueue.
+    ///
+    /// # Errors
+    /// Overload, a request-local preparation failure, or a closed owner.
+    async fn prepare(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<Prepared, TextError> {
+        let permit = self.handle.try_reserve().map_err(TextError::Admission)?;
+        let reply = self.pool.submit(input, options, permit)?;
+        reply.recv_async().await.map_err(|_| TextError::Closed)?
+    }
+
+    /// Blocking counterpart of [`Self::prepare`]. Not for async executor tasks.
+    fn prepare_blocking(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<Prepared, TextError> {
+        let permit = self.handle.try_reserve().map_err(TextError::Admission)?;
+        let reply = self.pool.submit(input, options, permit)?;
+        reply.recv().map_err(|_| TextError::Closed)?
+    }
+
+    /// Start a streaming request. Returns after runtime enqueue, not after model
+    /// admission or device completion.
+    ///
+    /// # Errors
+    /// Overload, a request-local preparation failure, an enqueue rejection, or a
+    /// failed execution owner.
+    pub async fn stream(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<TextStream, TextError> {
+        let prepared = self.prepare(input, options).await?;
+        let stream = prepared
+            .permit
+            .stream(prepared.request)
+            .await
+            .map_err(TextError::Admission)?;
+        Ok(TextStream::new(self.processor.clone(), stream))
+    }
+
+    /// Blocking counterpart of [`Self::stream`]. Not for async executor tasks.
+    ///
+    /// # Errors
+    /// Overload, a request-local preparation failure, an enqueue rejection, or a
+    /// failed execution owner.
+    pub fn stream_blocking(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<TextStream, TextError> {
+        let prepared = self.prepare_blocking(input, options)?;
+        let stream = prepared
+            .permit
+            .stream_blocking(prepared.request)
+            .map_err(TextError::Admission)?;
+        Ok(TextStream::new(self.processor.clone(), stream))
+    }
+
+    /// Generate one response to completion.
+    ///
+    /// # Errors
+    /// Stream failures and a missing terminal event.
+    pub async fn generate(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<TextResponse, TextError> {
+        let mut stream = self.stream(input, options).await?;
+        let mut collector = Collector::default();
+        while let Some(event) = stream.next_async().await {
+            collector.apply(event?);
+        }
+        collector.finish()
+    }
+
+    /// Blocking counterpart of [`Self::generate`]. Not for async executor tasks.
+    ///
+    /// # Errors
+    /// Stream failures and a missing terminal event.
+    pub fn generate_blocking(
+        &self,
+        input: TextInput,
+        options: GenerationOptions,
+    ) -> Result<TextResponse, TextError> {
+        let mut stream = self.stream_blocking(input, options)?;
+        let mut collector = Collector::default();
+        while let Some(event) = stream.next_blocking() {
+            collector.apply(event?);
+        }
+        collector.finish()
+    }
+
+    /// Ordered incremental results over a bounded admission window. Blocking;
+    /// async callers interleave their own [`Self::stream`] futures instead.
+    pub fn batch<'a>(
+        &'a self,
+        requests: impl IntoIterator<Item = TextRequest> + 'a,
+    ) -> TextBatch<'a> {
+        TextBatch {
+            model: self,
+            source: Box::new(requests.into_iter()),
+            window: VecDeque::with_capacity(self.window),
+            drained: false,
+        }
+    }
+
+    /// Collect ordered per-item outcomes.
+    ///
+    /// Each item settles independently, so the returned collection has no
+    /// batch-wide error. This intentionally allocates every requested result;
+    /// use [`Self::batch`] for a bounded workload.
+    pub fn generate_batch(
+        &self,
+        requests: impl IntoIterator<Item = TextRequest>,
+    ) -> Vec<Result<TextResponse, TextError>> {
+        self.batch(requests).collect()
+    }
+}
+
+/// Ordered, incremental offline batching over a bounded admission window.
+///
+/// The caller's iterator is pulled lazily as window capacity frees, so lookahead
+/// is bounded and an unencodable input settles only itself. Dropping the batch
+/// abandons its live streams without waiting for device completion.
+pub struct TextBatch<'a> {
+    model: &'a TextModel,
+    source: Box<dyn Iterator<Item = TextRequest> + 'a>,
+    window: VecDeque<Result<TextStream, TextError>>,
+    drained: bool,
+}
+
+impl TextBatch<'_> {
+    fn fill(&mut self) {
+        while !self.drained && self.window.len() < self.model.window {
+            let Some(request) = self.source.next() else {
+                self.drained = true;
+                break;
+            };
+            let stream = self.model.stream_blocking(request.input, request.options);
+            self.window.push_back(stream);
+        }
+    }
+
+    /// Next input's ordered outcome, or `None` once every input settled.
+    pub fn next_result(&mut self) -> Option<Result<TextResponse, TextError>> {
+        self.fill();
+        let front = self.window.pop_front()?;
+        let result = match front {
+            Err(error) => Err(error),
+            Ok(mut stream) => {
+                let mut collector = Collector::default();
+                let mut failure = None;
+                while let Some(event) = stream.next_blocking() {
+                    match event {
+                        Ok(event) => collector.apply(event),
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                match failure {
+                    Some(error) => Err(error),
+                    None => collector.finish(),
+                }
+            }
+        };
+        self.fill();
+        Some(result)
+    }
+}
+
+impl Iterator for TextBatch<'_> {
+    type Item = Result<TextResponse, TextError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-        if let Some((reason, usage)) = self.pending_finish.take() {
-            self.finished = true;
-            return Some(Ok(TextEvent::Finished { reason, usage }));
-        }
-        loop {
-            if let Some(event) = self.model.engine.pop_event_for(self.request) {
-                match event {
-                    Event::Token { token, .. } => {
-                        let bytes = match self.model.tokenizer.decode_bytes(&[token]) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                self.model.engine.discard(self.request);
-                                self.finished = true;
-                                return Some(Err(TextError::from_display(error)));
-                            }
-                        };
-                        let text = match self.decoder.push(&bytes) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                self.model.engine.discard(self.request);
-                                self.finished = true;
-                                return Some(Err(error));
-                            }
-                        };
-                        return Some(Ok(TextEvent::Delta {
-                            token: Some(token),
-                            text,
-                        }));
-                    }
-                    Event::Finished { reason, usage, .. } => {
-                        let trailing = self.decoder.finish();
-                        if trailing.is_empty() {
-                            self.finished = true;
-                            return Some(Ok(TextEvent::Finished { reason, usage }));
-                        }
-                        self.pending_finish = Some((reason, usage));
-                        return Some(Ok(TextEvent::Delta {
-                            token: None,
-                            text: trailing,
-                        }));
-                    }
-                }
-            }
-            match self.model.engine.step() {
-                Ok(status) => {
-                    if !status.submitted && !status.completed {
-                        std::thread::yield_now();
-                    }
-                }
-                Err(error) => {
-                    self.model.engine.discard(self.request);
-                    self.finished = true;
-                    return Some(Err(TextError::from_display(error)));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for TextStream<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.model.engine.discard(self.request);
-        }
-    }
-}
-
-fn encode_input(tokenizer: &GgufTokenizer, input: TextInput) -> Result<Vec<u32>, TextError> {
-    match input {
-        TextInput::Prompt(text) => tokenizer.encode(&text).map_err(TextError::from_display),
-        TextInput::Tokens(tokens) => Ok(tokens),
-        TextInput::Chat(messages) => {
-            if messages.is_empty() {
-                return Err(TextError::new(
-                    "chat input must contain at least one message",
-                ));
-            }
-            let messages = messages
-                .into_iter()
-                .map(|message| ChatMessage::new(message.role, message.content))
-                .collect::<Vec<_>>();
-            // Preserve the existing Qwen CLI behavior: generation prompt on,
-            // thinking off until reasoning controls have an explicit public API.
-            tokenizer
-                .encode_chat(&messages, ChatTemplateOptions::new(true, false))
-                .map_err(TextError::from_display)
-        }
+        self.next_result()
     }
 }
 
 #[derive(Default)]
-struct BatchResponse {
-    decoder: Utf8Decoder,
+struct Collector {
     text: String,
     tokens: Vec<u32>,
     finish: Option<(FinishReason, Usage)>,
 }
 
-impl BatchResponse {
+impl Collector {
+    fn apply(&mut self, event: TextEvent) {
+        match event {
+            TextEvent::Delta { token, text } => {
+                if let Some(token) = token {
+                    self.tokens.push(token);
+                }
+                self.text.push_str(&text);
+            }
+            TextEvent::Finished { reason, usage } => self.finish = Some((reason, usage)),
+        }
+    }
+
     fn finish(self) -> Result<TextResponse, TextError> {
-        let (reason, usage) = self
-            .finish
-            .ok_or_else(|| TextError::new("generation ended without a terminal event"))?;
+        let (reason, usage) = self.finish.ok_or(TextError::MissingTerminal)?;
         Ok(TextResponse {
             text: self.text,
             tokens: self.tokens,
@@ -473,88 +293,82 @@ impl BatchResponse {
     }
 }
 
-#[derive(Default)]
-struct Utf8Decoder {
-    pending: Vec<u8>,
+/// Non-cloneable lifecycle owner for one loaded text model.
+///
+/// Dropping it requests final cleanup; call an explicit shutdown method to
+/// observe synchronization and release failures.
+pub struct TextOwner {
+    model: TextModel,
+    driver: DriverOwner,
+    pool: Pool,
 }
 
-impl Utf8Decoder {
-    fn push(&mut self, bytes: &[u8]) -> Result<String, TextError> {
-        self.pending.extend_from_slice(bytes);
-        match std::str::from_utf8(&self.pending) {
-            Ok(text) => {
-                let text = text.to_owned();
-                self.pending.clear();
-                Ok(text)
-            }
-            Err(error) if error.error_len().is_none() => {
-                let valid = error.valid_up_to();
-                let prefix = String::from_utf8(self.pending[..valid].to_vec())
-                    .expect("validated UTF-8 prefix");
-                self.pending.drain(..valid);
-                Ok(prefix)
-            }
-            Err(error) => Err(TextError::new(format!(
-                "generated bytes are not valid UTF-8: {error}"
-            ))),
+impl TextOwner {
+    /// Assemble the text layer over an already spawned token driver.
+    ///
+    /// # Errors
+    /// Rejects invalid processor bounds or zero workers/window.
+    pub fn new(
+        processor: Arc<dyn TextProcessor>,
+        driver: DriverOwner,
+        handle: GenerationHandle,
+        config: TextConfig,
+    ) -> Result<Self, TextError> {
+        if !processor.limits().is_valid() {
+            return Err(TextError::InvalidInput(
+                "text processor bounds must all be nonzero",
+            ));
         }
+        if config.preprocessing_workers == 0 {
+            return Err(TextError::InvalidInput(
+                "text preprocessing needs at least one worker",
+            ));
+        }
+        if config.batch_window == 0 {
+            return Err(TextError::InvalidInput("batch window must be nonzero"));
+        }
+        let window = config.batch_window.min(handle.capacity()).max(1);
+        let pool = Pool::start(&processor, config.preprocessing_workers, handle.capacity());
+        Ok(Self {
+            model: TextModel {
+                processor,
+                pool: pool.client(),
+                handle,
+                window,
+            },
+            driver,
+            pool,
+        })
     }
 
-    fn finish(&mut self) -> String {
-        if self.pending.is_empty() {
-            String::new()
-        } else {
-            let trailing = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            trailing
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TextError(String);
-
-impl TextError {
     #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+    pub const fn model(&self) -> &TextModel {
+        &self.model
     }
 
-    fn from_display(error: impl fmt::Display) -> Self {
-        Self::new(error.to_string())
+    /// Close preprocessing and establish device completion.
+    ///
+    /// # Errors
+    /// Reports cleanup failure; the same worker remains available for retry.
+    pub fn shutdown(&mut self) -> Result<(), TextError> {
+        self.pool.close();
+        self.driver.shutdown().map_err(TextError::Owner)
+    }
+
+    /// Async counterpart of [`Self::shutdown`], independent of the caller's
+    /// runtime. Cancelling it keeps the driver's retry ownership.
+    ///
+    /// # Errors
+    /// Reports cleanup failure; the same worker remains available for retry.
+    pub async fn shutdown_async(&mut self) -> Result<(), TextError> {
+        self.pool.close();
+        self.driver.shutdown_async().await.map_err(TextError::Owner)
     }
 }
 
-impl fmt::Display for TextError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for TextError {}
-
-impl From<EngineError> for TextError {
-    fn from(error: EngineError) -> Self {
-        Self::from_display(error)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Utf8Decoder;
-
-    #[test]
-    fn incremental_decoder_retains_split_codepoints() {
-        let mut decoder = Utf8Decoder::default();
-        assert_eq!(decoder.push(&[0xe2]).unwrap(), "");
-        assert_eq!(decoder.push(&[0x82]).unwrap(), "");
-        assert_eq!(decoder.push(&[0xac]).unwrap(), "€");
-    }
-
-    #[test]
-    fn terminal_incomplete_codepoint_is_replaced_once() {
-        let mut decoder = Utf8Decoder::default();
-        assert_eq!(decoder.push(&[0xe2]).unwrap(), "");
-        assert_eq!(decoder.finish(), "�");
+impl Drop for TextOwner {
+    fn drop(&mut self) {
+        // Reject new preprocessing even while cloned handles still exist.
+        self.pool.close();
     }
 }

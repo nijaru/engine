@@ -194,6 +194,93 @@ Drop still establishes completion or retains device-visible ownership. Process a
 OOM abort and a backend that never returns cannot promise recoverable notification.
 No force-kill timeout may release device-visible memory.
 
+## Text application facade
+
+Status: implemented at the host boundary; the CUDA device gate is unrun. The one
+accepted deviation from the first draft is that this layer does **not** own an
+architecture registry or a second worker: it owns text preprocessing, incremental
+decoding and offline batching above the owned token driver. It holds no scheduler,
+no second execution loop and no device state.
+
+`TextOwner` is the non-cloneable lifecycle owner; it owns the token driver's
+shutdown owner and the preprocessing pool. `TextModel` is a cloneable generation
+handle over the same worker. `TextConfig` carries preprocessing worker count and
+batch window; `ProcessorLimits` carries the text byte bounds. CUDA/GGUF assembly
+is `TextOwner::load`, and it is the only part that needs a device.
+
+Implementation status and host evidence: [architecture](architecture.md#owned-text-facade)
+and [runtime evidence](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
+
+### Preprocessing ownership and bounds
+
+The token driver accepts encoded input only. Text preprocessing therefore sits
+above it and must be bounded independently:
+
+- A caller acquires a request permit **before** preprocessing. The permit covers
+  retained raw/message input, template rendering, encoded tokens and driver
+  delivery until retirement. Preprocessing may not run before that reservation.
+- Raw prompt/message content, rendered chat-template bytes, encoded prompt tokens
+  and the bytes one token decodes to are separate limits. Raw content and rendered
+  bytes are rejected while the payload is produced, and decoded bytes are bounded as
+  they are decoded. Encoded prompt tokens are bounded by those byte bounds and by an
+  explicit token limit; a caller-supplied token vector is checked before admission.
+  Exceeding any limit is a request-local rejection with a typed error; it is never a
+  device fault.
+- Encoded tokens plus the runtime's stop-list copy must still fit the permit's
+  encoded-input envelope. The text layer does not enlarge that envelope.
+- Preprocessing runs on a fixed, bounded worker pool with a bounded queue. Jobs
+  own their permit, so outstanding preprocessing cannot exceed the permit pool
+  and the queue is bounded by construction. A dropped submission may let its job
+  finish; the permit returns only when that work releases its input.
+- Preprocessing must not occupy the execution worker or an async executor thread.
+  Cancelling an async submission does not strand state: the permit is released by
+  the job, not by the cancelled future.
+- Immutable loaded vocabulary, caller-collected results and caller-owned input
+  before acceptance are outside buffered application storage. Decoded delta text
+  and terminal staging are inside it and are bounded per token and per request.
+
+### Delivery and terminal semantics
+
+- Ordinary token events decode incrementally. A token that does not complete a
+  UTF-8 code point yields an empty text delta while retaining its token id; bytes
+  that cannot form valid UTF-8 are a request-local decode error.
+- A normal or explicitly cancelled terminal flushes an incomplete final code
+  point once as a replacement delta before the text terminal event. Flushing is
+  terminal bookkeeping, not recovery.
+- A decode error abandons only its own request. Peers continue, and the failing
+  request yields one typed error instead of a text terminal.
+- Owner failure preserves events already handed to stream channels, then yields
+  one owner error. It does not invent successful usage or perform an ordinary
+  terminal flush, and it does not relabel healthy peers as invalid.
+- Text cancellation forwards to the driver's intent flag. It does not wait for
+  device completion and does not discard buffered output.
+
+### Offline batching
+
+- Batching consumes a caller iterator lazily through a bounded admission window.
+  It never collects or prepares an arbitrary iterator before admission. Lookahead
+  is bounded by the window; a stalled earliest item bounds how far later items
+  advance rather than admitting replacements ahead of the ordered head.
+- Results are yielded in input order. Each item settles independently: an
+  unencodable input, an admission failure, a decode error or an item-local
+  terminal failure affects only that item. There is no batch-wide error variant;
+  the collect helper returns ordered per-item outcomes.
+- Collect helpers intentionally allocate the requested result. The incremental
+  iterator is the bounded interface for large workloads. Dropping either abandons
+  live streams without waiting for device completion; the driver retains
+  retirement ownership.
+- Admission is fail-fast. An item that cannot reserve because other handles hold
+  permits reports overload for that item. There is no unbounded waiter queue and
+  no silent spin-retry.
+
+### Shutdown
+
+Closing the preprocessing pool precedes driver shutdown; no new text work starts
+while cleanup runs. `TextOwner` keeps the driver's retry ownership, so a failed or
+cancelled shutdown leaves the same worker available and reports the earlier fault
+through the handle. Successful shutdown reports cleanup success, not recovery from
+an execution fault.
+
 ## Cross-runtime device ownership
 
 A device-resident result needs its representation, model identity, pool charge and

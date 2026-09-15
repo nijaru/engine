@@ -56,6 +56,30 @@ impl Default for DriverConfig {
     }
 }
 
+impl DriverConfig {
+    /// Bounds compatible with `engine`, so a frontend does not have to restate
+    /// the runtime's capacity to stay spawnable.
+    ///
+    /// Permits fit the engine's resident request capacity, and the runtime's
+    /// per-request mailbox limit times the permit count fits its global event
+    /// budget. The per-stream channel matches that mailbox limit, so a permitted
+    /// response is not backpressured merely by driving it through this facade.
+    #[must_use]
+    pub fn for_engine(engine: &Engine) -> Self {
+        let runtime = engine.config();
+        let resident = runtime
+            .max_active_requests
+            .saturating_add(runtime.max_queued_requests);
+        let permits = (runtime.max_buffered_events / runtime.max_events_per_request)
+            .clamp(1, resident.max(1));
+        Self {
+            max_requests: permits,
+            events_per_request: runtime.max_events_per_request,
+            ..Self::default()
+        }
+    }
+}
+
 /// Submission and owner failures retain their runtime error source.
 #[derive(Clone, Debug)]
 pub enum DriverError {
@@ -397,6 +421,13 @@ pub struct GenerationHandle {
 }
 
 impl GenerationHandle {
+    /// Request permits this handle can hold at once. A frontend uses it to bound
+    /// its own admission window and preprocessing queue.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.config.max_requests
+    }
+
     /// Reserve before expensive preprocessing. Does not wait or queue producers.
     ///
     /// # Errors

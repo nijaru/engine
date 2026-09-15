@@ -53,34 +53,20 @@ the aggregate drain intentionally includes other clients' events.
 ## Shared text frontend
 
 `ribn-text` reuses the low-level runtime for raw prompt, chat-message, and token-ID
-input. Its synchronous streaming and offline batch paths are covered by workspace
-and CUDA-feature compilation/tests. Terminal events include explicit prompt and
-completion token accounting. The high-level stream currently borrows one model
-mutably; it is not evidence of a concurrent server driver or HTTP compatibility.
+input. Since the owned text facade landed it is a thin layer over `ribn::driver`:
+bounded preprocessing, incremental decoding and ordered batching above owned request
+streams. Its behavior is host-qualified; only `TextOwner::load` (Qwen GGUF/CUDA
+assembly) needs a device.
 
 CLI behavior uses the same frontend: default text input is one user chat message,
-`--raw` bypasses the chat template, and prompt/file/piped-stdin input share the
-same generation implementation. GPU numerical qualification remains the separate
-hardware gate below.
+`--raw` bypasses the chat template, and prompt/file/piped-stdin input share the same
+generation implementation. GPU numerical qualification remains the separate hardware
+gate below.
 
-Request ownership in that frontend is device-qualified separately, because
-`TextModel::load` needs a Qwen CUDA executor and no host fixture constructs one:
-
-```sh
-ENGINE_QWEN_GGUF=/absolute/path/model.gguf \
-cargo test --release -p ribn-text --features cuda --test text_lifecycle \
-  -- --ignored --test-threads=1
-```
-
-It covers a stream dropped mid-flight followed by `generate_batch` (which
-previously panicked, because the abandoned request's terminal event reached a
-batch that indexed its own request map with it), six abandonments followed by an
-ordinary request (undrained output can exhaust shared delivery capacity), an unpreparable batch input
-failing before anything is submitted, and an invalid token failing only its own
-batch member. Run it serially: each test loads the full 27B artifact, so parallel
-processes contend for device memory. (The earlier parallel attempts failed on
-descriptors first, at 1024 open files; that loader cost is fixed and recorded in
-`docs/execution-foundation.md`.)
+`TextResponse.text` and the `generate_batch` collect helper hold caller-collected
+results and are deliberately outside buffered-application accounting. `TextBatch` is
+the bounded incremental interface. CLI file/stdin ingestion is still a whole read and
+is not claimed as bounded.
 
 ### Runtime-owned discard qualification (2026-09-14)
 
@@ -171,8 +157,58 @@ cargo test --release -p engine-qwen --features cuda --test cuda_runtime --locked
 ```
 
 Text preprocessing/decoder injection, a bounded concurrent text facade and ordered
-incremental offline batches remain the rest of roadmap slice 2. Current CUDA text
-lifecycle evidence applies to the earlier direct path, not this new driver.
+incremental offline batches are now implemented and host-qualified (see the owned text
+facade gate below). Current CUDA text lifecycle evidence still applies to the earlier
+direct path, not to the owned driver or the facade built on it.
+
+### Owned text facade host gate (2026-09-14)
+
+`crates/text/tests/facade.rs` drives the real `GgufProcessor`, a real GGUF tokenizer
+built from synthetic byte-level metadata, the real token driver and the real facade
+over a scripted fixture `GenerationExecutor`. Only the device is substituted, so the
+preprocessing, delivery, batching and shutdown paths under test are production ones.
+
+Fourteen tests pass:
+
+- concurrent callers on cloned handles, plus the async submission path;
+- a decode failure settling exactly one request while its peer completes;
+- invalid UTF-8 reported with its offending token;
+- a terminal flush replacing an incomplete trailing code point exactly once;
+- cancellation returning a `Cancelled` terminal while buffered deltas stay readable;
+- oversized prompt/message/prompt-token inputs rejected before admission, with the
+  same handle still serving afterwards (permit refund on the failure path);
+- ordered per-item batch outcomes with a rejected input between healthy ones;
+- a pull-counting iterator proving batch lookahead stays inside the window;
+- dropping a batch abandoning delivery without stranding the owner;
+- shutdown closing admission while reporting success;
+- zero preprocessing workers rejected at assembly;
+- a stalled consumer not blocking a peer request.
+
+Required checks at this revision, each with captured exit 0:
+
+```sh
+python3 tools/check-boundaries.py
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked --features cuda -- -D warnings
+```
+
+**Device gate pending for this layer too:** `crates/text/tests/text_lifecycle.rs` was
+migrated to the owned facade and the per-item batch contract (replacing the
+whole-input preparation atomicity test), and it compiles under the CUDA feature, but
+it has not run on a GPU. `TextOwner::load` and the Qwen executor are unchanged
+arithmetic; this gate still needs a reachable device:
+
+```sh
+ENGINE_QWEN_GGUF=/absolute/path/model.gguf \
+cargo test --release -p ribn-text --features cuda --test text_lifecycle --locked \
+  -- --ignored --test-threads=1
+```
+
+Matched direct-versus-handle frontend overhead on the real GPU path is still unmeasured;
+the only measured host comparison remains the token-driver benchmark above.
+
 
 ## Synthetic CPU benchmark
 
@@ -242,8 +278,9 @@ cargo run -p ribn-cli --features cuda -- run \
 `local` retains the previous correctness frontend. Both currently target the
 existing Qwen text artifact path, not arbitrary GGUF architectures. Compare token
 fixtures rather than raw stdout: `run` streams bytes without an added newline,
-whereas `local` prints a finalized string. A token limit can truncate a UTF-8
-code point in the raw streaming output.
+whereas `local` prints a finalized string. A token limit that cuts a UTF-8 code point
+now ends the stream with one replacement character, because the facade flushes an
+incomplete trailing code point at its terminal event.
 
 ## Ground-up alignment cost and isolation
 
