@@ -124,10 +124,12 @@ found text-boundary gaps, not a reason to replace the token driver. Its findings
 resolved by the owned text facade; the [text contract](resource-protocol.md#text-application-facade)
 is now implemented and host-qualified.
 
-1. **Still open.** Restore SSH, verify device availability and serialize the two runtime
-   CUDA gates, then the CUDA-backed text lifecycle test. Keep the driver unqualified
-   until they pass; do not infer a network root cause from disco success and TCP
-   timeouts.
+1. **Done (2026-09-14).** Desktop was reachable and idle; the checkout was pulled and
+   the pinned artifact hash re-verified. Serialized gates, all exit 0: runtime 2/2
+   (199.11 s, including the stalled/abandoned-peer driver test), text lifecycle 5/5
+   (95.83 s), and a new multi-request determinism test 1/1 (19.52 s). The concurrency
+   example ran four callers end to end. Evidence:
+   [runtime contract](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
 2. **Done.** The text contract landed before dependent code: a bounded preprocessing
    pool with its own shutdown owner, per-item settlement instead of whole-input
    preparation atomicity, UTF-8/terminal precedence, typed error sources, and
@@ -153,17 +155,22 @@ owned `TextStream`, and ordered bounded-window `TextBatch`. Twenty-one host test
 with a real GGUF tokenizer, the real driver and a scripted fixture device, including
 per-item overload under full permit retention, bound-checking at the retention
 boundary, owner-failure delivery and a dead preprocessing pool that fails callers
-instead of queueing them; the CUDA lifecycle tests were migrated but are unrun.
-Evidence:
+instead of queueing them. Six CUDA-backed tests pass on the device, including
+multi-request determinism. Evidence:
 [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
 Remaining before closing this slice:
 
-- run the CUDA-backed text lifecycle tests and matched direct-versus-handle frontend
-  measurements on a reachable GPU; the current numbers cover only the host driver path;
+- measure matched direct-versus-handle frontend overhead on the GPU path; the device
+  gates now cover correctness, not comparative cost;
+- decide the chat stop-token set. Only the artifact's `eos_token_id` is added today, so
+  a Qwen chat turn that ends with `<|im_end|>`-class markers can run to the token limit
+  and leak marker text into output. This is pre-existing stop policy, not a slice-2
+  regression, and it interacts with the reasoning controls that also remain unexposed;
 - bound CLI file/stdin ingestion with a limited read before claiming it is bounded;
 - thread-affine non-Send construction, if a real backend requires it, needs a separate
-  factory contract.
+  factory contract;
+- re-run the gates once the chat stop policy changes, since it alters termination.
 
 Exit: device-qualified frontend behavior, saturation/race/shutdown evidence on both
 paths, no orphan requests, and matched frontend overhead measurements. The loaded owner

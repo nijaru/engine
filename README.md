@@ -69,9 +69,9 @@ universal interfaces for every inference workload.
 
 `ribn::driver` adds a low-level owned token interface: one execution worker, cloneable
 handles, bounded request permits and streams, and explicit shutdown/retry. Blocking
-and async access use the same engine. The driver is host-tested but **not yet
-GPU-qualified**; it accepts encoded input only and does not bound raw text
-preprocessing. See its [contract](docs/resource-protocol.md#owned-ar-driver-contract)
+and async access use the same engine. The driver is host-tested and GPU-qualified
+on the RTX 4090 for the recorded runtime and text gates; it accepts encoded input only
+and does not bound raw text preprocessing. See its [contract](docs/resource-protocol.md#owned-ar-driver-contract)
 and [qualification](benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
 
 `crates/batch` (`ribn-batch`) is a second **design-validation** runtime for non-AR
@@ -97,8 +97,10 @@ chat-message and token-ID input, tokenization/chat-template handling under expli
 byte bounds, a bounded preprocessing pool, incremental UTF-8 decoding, owned
 concurrent streaming, and ordered bounded-window offline batching. `TextModel` is a
 cloneable handle over an owned token execution worker and `TextOwner` controls
-shutdown. Its behavior is host-qualified; `TextOwner::load` is still Qwen/GGUF/CUDA
-assembly, and the CUDA-backed lifecycle and numerical gates are unrun.
+shutdown. Its behavior is host-qualified and the CUDA-backed lifecycle, cancellation and
+multi-request determinism gates pass on the RTX 4090; `TextOwner::load` is still
+Qwen/GGUF/CUDA assembly. Chat stop policy is still `eos_token_id` only, so chat
+special markers can appear in output (tracked in the roadmap).
 
 A sequential encoder->AR pressure test now passes prepared state in-process and
 correlates it with the correct AR request even when handoffs are installed out of

@@ -62,7 +62,9 @@ token bytes); the driver keeps its own encoded-input envelope.
 
 Boundaries and rationale: [resource contract](resource-protocol.md#text-application-facade).
 Host evidence: [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
-The CUDA-backed lifecycle and numerical gates remain unrun on a device.
+The CUDA-backed lifecycle, cancellation and multi-request determinism tests pass on the
+RTX 4090 serially; see the [runtime contract
+evidence](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
 ## Owned token access
 
@@ -79,9 +81,10 @@ available for retry. Idle/output-blocked workers park; device/deferred-admission
 uses a timed fallback. The [resource contract](resource-protocol.md#owned-ar-driver-contract)
 owns bounds, wakeup ordering, error scope and terminal semantics.
 
-The driver has host lifecycle coverage and a compiled but unrun Qwen CUDA test; it is
-not yet GPU-qualified. It does not preprocess raw input, decode text or supply bounded
-offline text batching. See [qualification](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
+The driver has host lifecycle coverage and passes its Qwen CUDA runtime gate on the
+RTX 4090, including the stalled and abandoned peer test. It still does not preprocess
+raw input, decode text or supply bounded offline text batching; the text facade above it
+does. See [qualification](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
 
 ## Slice-2 boundary audit (2026-09-14, `84a146a`)
 

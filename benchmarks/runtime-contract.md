@@ -143,8 +143,15 @@ separate scheduling simulation. No model arithmetic changed.
 [Matched direct/driver measurements](runtime-alignment/README.md#owned-token-driver-7005fad)
 record the observed host cost and raw CSV, not inference throughput.
 
-**Device gate pending:** desktop qualification and checkout synchronization could not
-run because Tailscale was stopped and `ssh desktop` failed hostname resolution.
+**Device gate passed (2026-09-14, `dc511bd` + later):** desktop was reachable and idle
+(RTX 4090, driver 615.71.09, GPU 0% / 33 MiB before the run). The checkout was pulled to
+the tested revision and the pinned artifact verified by SHA-256 before running. Both
+runtime tests passed serially, exit 0: **2/2 in 199.11 s**, including
+`owned_driver_preserves_reference_with_stalled_and_abandoned_peers`. Private log:
+`desktop:/tmp/gate1.log`. This qualifies the owned driver for the tested device path.
+
+Superseded blocker (kept for history): desktop qualification and checkout synchronization
+could not run because Tailscale was stopped and `ssh desktop` failed hostname resolution.
 `owned_driver_preserves_reference_with_stalled_and_abandoned_peers` in the existing
 Qwen CUDA runtime test is compiled but unrun. Do not infer GPU qualification from host
 success. Once desktop is idle/reachable, run both runtime gates serialized:
@@ -212,10 +219,30 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --features cuda -- -D warnings
 ```
 
-**Device gate pending for this layer too:** `crates/text/tests/text_lifecycle.rs` was
-migrated to the owned facade and the per-item batch contract (replacing the
-whole-input preparation atomicity test), and it compiles under the CUDA feature, but
-it has not run on a GPU. `TextOwner::load` and the Qwen executor are unchanged
+**Device gate passed (2026-09-14):** the migrated lifecycle tests ran serially on the
+RTX 4090 with the pinned artifact, exit 0: **5/5 in 95.83 s**
+(`an_invalid_token_fails_only_its_own_batch_member`,
+`an_unpreparable_batch_input_settles_only_its_own_item`,
+`cancellation_is_request_local`, `dropping_a_stream_does_not_poison_a_later_batch`,
+`repeated_abandonment_stays_bounded`). Private log: `desktop:/tmp/gate2.log`.
+
+A further device test, `repeated_requests_are_deterministic_and_coherent`, covers what
+those gates could not: four identical requests to one owner must reproduce identical
+text (greedy sampling has no legitimate reason to change), which catches cross-request
+delivery, shared state or a stale continuation. It passed, **1/1 in 19.52 s**, and the
+example ran four concurrent callers, an abandoned stream and explicit shutdown
+successfully. Private log: `desktop:/tmp/det2.log`.
+
+Observed model behavior, **not** a pipeline defect: with greedy sampling and only
+`eos_token_id` in the stop list, this artifact can emit chat special markers
+(`<|endoftext|>`, `<|im_start|>`) as ordinary text and run to the token limit instead of
+stopping at the turn marker. Repeated suffix prompts ("... Caller 3.") also degenerate
+into a repeated-token loop. Both are prompt/policy behavior: identical requests stayed
+deterministic across indices, and the same prompt at request index 0 and request index 6
+produced identical coherent output. An earlier read of this as index-dependent
+corruption was wrong. See the roadmap's chat stop-policy item.
+
+Superseded status (kept for history): this layer's device gate was unrun. `TextOwner::load` and the Qwen executor are unchanged
 arithmetic; this gate still needs a reachable device:
 
 ```sh
@@ -225,8 +252,9 @@ cargo test --release -p ribn-text --features cuda --test text_lifecycle --locked
 ```
 
 `crates/text/examples/concurrent_text.rs` exercises concurrent callers, an abandoned
-live stream and explicit shutdown against a loaded model. It compiles under the CUDA
-feature and is **unrun**, so it is a usage example, not qualification.
+live stream and explicit shutdown against a loaded model. It ran successfully on the
+RTX 4090 (four callers, exit 0). It is a usage example and a diagnostic, not a
+qualification gate.
 
 Matched direct-versus-handle frontend overhead on the real GPU path is still unmeasured;
 the only measured host comparison remains the token-driver benchmark above.
