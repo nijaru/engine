@@ -39,6 +39,14 @@ FORBIDDEN = {
         "ribn-text",
         "ribn-cli",
     },
+    "bert": {
+        "engine-core",
+        "engine-gguf",
+        "engine-qwen",
+        "ribn",
+        "ribn-text",
+        "ribn-cli",
+    },
     "batch": {
         "engine-core",
         "engine-gguf",

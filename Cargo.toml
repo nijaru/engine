@@ -4,6 +4,7 @@ members = [
     "crates/safetensors",
     "crates/hf",
     "crates/batch",
+    "crates/bert",
     "crates/core",
     "crates/runtime",
     "crates/text",

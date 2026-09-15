@@ -14,6 +14,8 @@ mod cuda;
 #[cfg(feature = "cuda")]
 mod decode;
 #[cfg(feature = "cuda")]
+mod encoder_ops;
+#[cfg(feature = "cuda")]
 mod model_ops;
 #[cfg(feature = "cuda")]
 mod quantized;
@@ -34,6 +36,9 @@ pub use cuda::{
     CudaF32Weight, CudaQuantizedWeight, CudaReferenceDispatcher, CudaRuntimeError, CudaWeightError,
     CudaWeightStore,
 };
+
+#[cfg(feature = "cuda")]
+pub use encoder_ops::{CudaEncoderKernelError, CudaEncoderOps};
 
 #[cfg(feature = "cuda")]
 pub use model_ops::{CudaModelKernelError, CudaQwen35Ops};

@@ -77,6 +77,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-bert"
+version = "0.0.0"
+dependencies = [
+ "cudarc",
+ "engine-nvidia",
+ "ribn-foundation",
+ "ribn-hf",
+ "serde_json",
+]
+
+[[package]]
 name = "engine-core"
 version = "0.0.0"
 

@@ -1,0 +1,29 @@
+[package]
+name = "engine-bert"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["dep:cudarc", "dep:engine-nvidia", "engine-nvidia/cuda"]
+
+[dependencies]
+ribn-hf = { path = "../hf" }
+ribn-foundation = { path = "../foundation" }
+serde_json = "1.0.151"
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
+engine-nvidia = { path = "../nvidia", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0.151"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
