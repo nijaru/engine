@@ -51,7 +51,9 @@ impl TextError {
         }
     }
 
-    /// Whether this failure belongs to one request rather than the owner.
+    /// Whether this request's own content caused the failure, so retrying the
+    /// same input cannot help. Admission and owner failures are excluded: they
+    /// are capacity or lifecycle conditions, not invalid input.
     #[must_use]
     pub const fn is_request_local(&self) -> bool {
         matches!(

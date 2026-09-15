@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use engine_gguf::{GgufTokenizer, MetadataValue, byte_token_symbol};
-use ribn::driver::{Driver, DriverConfig};
+use ribn::driver::{Driver, DriverConfig, DriverError};
 use ribn::{
     Admission, BatchItem, Engine, EngineConfig, ExecutionError, ExecutorInfo, FinishReason,
     GenerationExecutor, GenerationLimits, GenerationOptions, RequestId, SchedulePolicy, SequenceId,
@@ -229,6 +229,12 @@ struct Harness {
 
 impl Harness {
     fn start(limits: ProcessorLimits, config: TextConfig) -> Self {
+        Self::with_events(limits, config, 32)
+    }
+
+    /// The global event budget divided by the per-request mailbox limit sets the
+    /// driver's request permits, so it also bounds how many requests can be live.
+    fn with_events(limits: ProcessorLimits, config: TextConfig, events: usize) -> Self {
         let plan = Arc::new(Plan::default());
         let engine = Engine::new(
             Fixture::new(plan.clone()),
@@ -236,7 +242,7 @@ impl Harness {
                 max_active_requests: 4,
                 max_queued_requests: 4,
                 max_queued_input_tokens: 4096,
-                max_buffered_events: 32,
+                max_buffered_events: events,
                 max_events_per_request: 4,
             },
             SchedulePolicy {
@@ -733,4 +739,112 @@ fn invalid_assembly_settings_are_rejected() {
         panic!("zero preprocessing workers must be rejected");
     };
     assert!(matches!(error, TextError::InvalidInput(_)));
+}
+
+#[test]
+fn a_decode_failure_inside_a_batch_settles_only_that_item() {
+    let harness = Harness::default_start();
+    harness.plan.script(b'A', &[2000, u32::from(b'x'), EOS]);
+    harness.plan.script(b'B', &[u32::from(b'k'), EOS]);
+
+    let results = harness.model.generate_batch(vec![
+        ribn_text::TextRequest::new(TextInput::prompt("A"), options()),
+        ribn_text::TextRequest::new(TextInput::prompt("B"), options()),
+    ]);
+    assert_eq!(results.len(), 2);
+    assert!(matches!(
+        results[0].as_ref().expect_err("out-of-vocabulary token"),
+        TextError::Decode { token: 2000, .. }
+    ));
+    assert_eq!(
+        results[1]
+            .as_ref()
+            .expect("the peer item is unaffected")
+            .text,
+        "k"
+    );
+}
+
+#[test]
+fn shared_handle_overload_is_reported_per_item() {
+    // Eight global events over a four-event mailbox leaves two request permits.
+    let harness = Harness::with_events(
+        limits(),
+        TextConfig {
+            preprocessing_workers: 2,
+            batch_window: 2,
+        },
+        8,
+    );
+    harness.plan.script(b'A', &[u32::from(b'a'); 40]);
+    harness.plan.script(b'B', &[u32::from(b'k'), EOS]);
+
+    // Two stalled consumers retain both permits: their output is never read, so
+    // neither request can reach a terminal.
+    let held = [
+        harness
+            .model
+            .stream_blocking(
+                TextInput::prompt("A"),
+                GenerationOptions {
+                    max_output_tokens: 32,
+                    ..GenerationOptions::default()
+                },
+            )
+            .expect("first held stream"),
+        harness
+            .model
+            .stream_blocking(
+                TextInput::prompt("A"),
+                GenerationOptions {
+                    max_output_tokens: 32,
+                    ..GenerationOptions::default()
+                },
+            )
+            .expect("second held stream"),
+    ];
+
+    // A third request reports overload for itself, not as an owner failure.
+    let error = harness
+        .model
+        .generate_blocking(TextInput::prompt("B"), options())
+        .expect_err("all permits are retained");
+    assert!(matches!(
+        error,
+        TextError::Admission(DriverError::Overloaded)
+    ));
+    assert!(
+        !error.is_request_local(),
+        "overload is a capacity condition, not invalid input"
+    );
+
+    // The same holds per batch item rather than failing a whole batch.
+    let results = harness.model.generate_batch(vec![
+        ribn_text::TextRequest::new(TextInput::prompt("B"), options()),
+        ribn_text::TextRequest::new(TextInput::prompt("B"), options()),
+    ]);
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Err(TextError::Admission(DriverError::Overloaded))))
+    );
+
+    // Releasing the stalled consumers returns the permits.
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match harness
+            .model
+            .generate_blocking(TextInput::prompt("B"), options())
+        {
+            Ok(response) => {
+                assert_eq!(response.text, "k");
+                break;
+            }
+            Err(TextError::Admission(DriverError::Overloaded)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("model stopped serving after overload: {error}"),
+        }
+    }
 }

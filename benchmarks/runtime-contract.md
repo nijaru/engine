@@ -168,7 +168,7 @@ built from synthetic byte-level metadata, the real token driver and the real fac
 over a scripted fixture `GenerationExecutor`. Only the device is substituted, so the
 preprocessing, delivery, batching and shutdown paths under test are production ones.
 
-Fourteen tests pass:
+Sixteen tests pass (40 consecutive suite runs, no failures):
 
 - concurrent callers on cloned handles, plus the async submission path;
 - a decode failure settling exactly one request while its peer completes;
@@ -177,7 +177,11 @@ Fourteen tests pass:
 - cancellation returning a `Cancelled` terminal while buffered deltas stay readable;
 - oversized prompt/message/prompt-token inputs rejected before admission, with the
   same handle still serving afterwards (permit refund on the failure path);
-- ordered per-item batch outcomes with a rejected input between healthy ones;
+- ordered per-item batch outcomes with a rejected input between healthy ones, and a
+  decode failure inside a batch settling only that item;
+- shared-handle overload: with every permit retained by stalled consumers, a third
+  request and each batch item report `DriverError::Overloaded` for themselves, and
+  the permits return once the consumers release;
 - a pull-counting iterator proving batch lookahead stays inside the window;
 - dropping a batch abandoning delivery without stranding the owner;
 - shutdown closing admission while reporting success;

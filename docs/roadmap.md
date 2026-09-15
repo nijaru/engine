@@ -140,8 +140,8 @@ is now implemented and host-qualified.
    incomplete UTF-8 on a normal terminal. Driver-level tests retain shutdown retry
    ownership.
 4. **Done.** Eager batching and its atomic-preparation test were replaced together. A
-   pull-counting iterator proves bounded lookahead, and per-item failures — including a
-   rejected input between healthy ones — leave peers unaffected.
+   pull-counting iterator proves bounded lookahead, and per-item failures — an invalid
+   input, a decode error and saturated admission — leave peers unaffected.
 5. **Partially done.** CLI cutover, explicit shutdown and host/CUDA-feature checks are
    complete, and collect-result exclusions are documented. Matched frontend overhead
    and the affected device gates still need a reachable GPU. CLI file/stdin ingestion
@@ -149,8 +149,9 @@ is now implemented and host-qualified.
 
 Text facade status: `ribn-text` now provides cloneable `TextModel` handles over one
 owned driver, `TextOwner` shutdown, bounded preprocessing, typed `TextError` sources,
-owned `TextStream`, and ordered bounded-window `TextBatch`. Fourteen host tests pass
-with a real GGUF tokenizer, the real driver and a scripted fixture device; the CUDA
+owned `TextStream`, and ordered bounded-window `TextBatch`. Sixteen host tests pass
+(40 consecutive suite runs) with a real GGUF tokenizer, the real driver and a scripted
+fixture device, including per-item overload under full permit retention; the CUDA
 lifecycle tests were migrated but are unrun. Evidence:
 [runtime contract](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
