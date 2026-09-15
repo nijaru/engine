@@ -20,10 +20,13 @@ struct Arguments {
     prompt: String,
     tokens: u32,
     callers: usize,
+    sequences: Option<usize>,
 }
 
 fn usage() -> String {
-    "concurrent_text [model.gguf] [--prompt <text>] [--tokens <n>] [--callers <n>]".to_owned()
+    "concurrent_text [model.gguf] [--prompt <text>] [--tokens <n>] [--callers <n>] \
+     [--sequences <n>]"
+        .to_owned()
 }
 
 fn parse() -> Result<Arguments, String> {
@@ -33,6 +36,7 @@ fn parse() -> Result<Arguments, String> {
     let mut prompt = "Explain a mutex.".to_owned();
     let mut tokens = 64_u32;
     let mut callers = 4_usize;
+    let mut sequences = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -53,6 +57,15 @@ fn parse() -> Result<Arguments, String> {
                     .parse()
                     .map_err(|_| usage())?;
             }
+            "--sequences" => {
+                sequences = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(usage)?
+                        .parse()
+                        .map_err(|_| usage())?,
+                );
+            }
             _ if argument.starts_with("--") => return Err(usage()),
             other => other.clone_into(&mut model),
         }
@@ -71,6 +84,7 @@ fn parse() -> Result<Arguments, String> {
         prompt,
         tokens,
         callers,
+        sequences,
     })
 }
 
@@ -85,7 +99,13 @@ fn main() -> Result<(), String> {
     let arguments = parse()?;
     println!("loading {}", arguments.model);
     let started = Instant::now();
-    let (mut owner, memory) = TextOwner::load(&arguments.model, LoadOptions::default())
+    let options = LoadOptions {
+        max_sequences: arguments
+            .sequences
+            .unwrap_or(LoadOptions::default().max_sequences),
+        ..LoadOptions::default()
+    };
+    let (mut owner, memory) = TextOwner::load(&arguments.model, options)
         .map_err(|error| format!("load failed: {error}"))?;
     println!(
         "ready in {:.1?}: {} bytes reserved for sequence state, {} device bytes free",
