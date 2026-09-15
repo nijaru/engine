@@ -196,7 +196,8 @@ No force-kill timeout may release device-visible memory.
 
 ## Text application facade
 
-Status: implemented at the host boundary; the CUDA device gate is unrun. The one
+Status: implemented; host-qualified, with the CUDA lifecycle, cancellation and
+multi-request determinism gates passing on the RTX 4090. The one
 accepted deviation from the first draft is that this layer does **not** own an
 architecture registry or a second worker: it owns text preprocessing, incremental
 decoding and offline batching above the owned token driver. It holds no scheduler,

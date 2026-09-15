@@ -1,6 +1,6 @@
 # Current implementation
 
-Observed baseline: `7005fad` (owned driver host-qualified; device gate pending). This is a code map, not a second target design.
+Observed baseline: `0ddb914` (owned driver and text facade device-qualified on the RTX 4090). This is a code map, not a second target design.
 [Inference engine design](inference-engine-design.md) owns the target;
 [resource protocol](resource-protocol.md) owns contracts;
 [roadmap](roadmap.md) owns implementation order and exit evidence.

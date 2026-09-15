@@ -3,8 +3,9 @@
 Date: 2026-09-11 (America/Los_Angeles)
 Status: historical decision at `47878859`; CUDA integration experimental
 
-The current target and implemented boundaries are in [ground-up design](ground-up-design.md)
-and [architecture](architecture.md). Names below describe the first redesign:
+The current target and implemented boundaries are in
+[inference engine design](inference-engine-design.md) and [architecture](architecture.md);
+[ground-up design](ground-up-design.md) is a superseded pointer. Names below describe the first redesign:
 `PreparedModel` is now `GenerationExecutor`, `QwenPrepared` is `QwenCuda`, the
 CLI is `ribn`, Qwen interpretation no longer lives in GGUF, and output now uses
 per-request mailboxes. This document is retained as decision history, not a

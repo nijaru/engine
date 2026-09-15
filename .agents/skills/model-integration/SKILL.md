@@ -32,8 +32,9 @@ real implementation and roadmap gate, not transcription of a speculative sketch.
 ## Review ownership before performance
 
 - Trace request ownership through input errors, admission, abandonment, completion
-  and retries. Exercise dropped stream → later request/batch and partial batch-input
-  failure; cleanup must not leave orphan events or free in-flight resources.
+  and retries. Exercise a dropped stream followed by a later request or batch, and a
+  batch whose input fails to prepare: it settles only its own item while admitted
+  peers stay owned. Cleanup must not leave orphan events or free in-flight resources.
 - Verify count and byte bounds with mixed successes/rejections and stalled consumers.
   For shared device pools, reservations follow live allocations beyond result dequeue.
 - Verify preparation can negotiate feasible work and ordinary backpressure without

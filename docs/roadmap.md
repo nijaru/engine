@@ -110,12 +110,11 @@ error and cancellation semantics are in the [resource contract](resource-protoco
 Nineteen actual-driver host tests pass, including 100 consecutive suite runs and
 mutation checks for retirement charges, wakeups and queued acknowledgement teardown.
 Required host checks pass. [Direct/driver host cost](../benchmarks/runtime-alignment/README.md#owned-token-driver-7005fad)
-is measured; it is not model throughput. The new CUDA driver test is **unrun**:
-desktop SSH remains unavailable. On 2026-09-14 Tailscale was restarted and disco
-pings succeeded, but system DNS failed and TCP/22 timed out via the tailnet IP.
-The cause is unverified; no GPU availability was established. Sync and run the pending
-[device gate](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad)
-before calling the driver GPU-qualified.
+is measured; it is not model throughput. The CUDA device gate **passed on 2026-09-14**:
+2/2 in 199.11 s on the idle RTX 4090 with the pinned artifact, including
+`owned_driver_preserves_reference_with_stalled_and_abandoned_peers`. See the
+[device evidence](../benchmarks/runtime-contract.md#owned-token-driver-host-gate-7005fad).
+Driver-level matched direct-versus-handle cost remains host-only.
 
 #### Audit alignment order (2026-09-14)
 

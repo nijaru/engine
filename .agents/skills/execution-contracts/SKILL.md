@@ -1,6 +1,6 @@
 ---
 name: execution-contracts
-description: Use when changing Ribn request lifecycle, concurrent handles, readiness, resource preparation or device handoff ownership; not for kernel-only tuning or ordinary model parameter mappings.
+description: Use when changing Ribn request lifecycle, concurrent handles, readiness, resource preparation, device handoff ownership or text-facade delivery and bounds; not for kernel-only tuning or ordinary model parameter mappings.
 ---
 
 # Execution contract changes
