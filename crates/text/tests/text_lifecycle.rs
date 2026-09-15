@@ -224,20 +224,25 @@ fn cancellation_is_request_local() {
     drop(loaded.owner);
 }
 
-/// Distinct prompts must produce distinct, coherent text across sequential
-/// requests to one owner. Earlier gates only asserted that tokens arrived, so a
-/// degrading continuation could pass them.
+/// Repeated identical requests must be deterministic and coherent. Greedy
+/// sampling with one immutable prompt has no legitimate reason to change, so a
+/// divergence or a repetition loop means shared state, cross-request delivery or
+/// a stale continuation slipped through the gates that only assert arrivals.
 #[test]
 #[ignore = "requires the pinned Qwen GGUF and a CUDA device"]
-fn sequential_requests_stay_coherent() {
+fn repeated_requests_are_deterministic_and_coherent() {
     let loaded = load();
+    let prompt = "Name one primary color.";
     let mut responses = Vec::new();
     for index in 0..4 {
         let response = loaded
             .model
             .generate_blocking(
-                TextInput::prompt(format!("Name one primary color. Variant {index}.")),
-                options(),
+                TextInput::prompt(prompt),
+                GenerationOptions {
+                    max_output_tokens: 16,
+                    ..GenerationOptions::default()
+                },
             )
             .expect("generate");
         eprintln!(
@@ -256,16 +261,16 @@ fn sequential_requests_stay_coherent() {
             .len();
         assert!(
             distinct > 3 && text.split_whitespace().count() >= 2,
-            "request {index} is degenerate, not language: {text:?}"
+            "request {index} is a repetition loop, not language: {text:?}"
         );
     }
-    let texts = responses
-        .iter()
-        .map(|response| response.text.trim())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        texts.len(),
-        responses.len(),
-        "distinct prompts must not collapse onto identical output"
-    );
+
+    let first = responses[0].text.trim();
+    for (index, response) in responses.iter().enumerate().skip(1) {
+        assert_eq!(
+            response.text.trim(),
+            first,
+            "identical request {index} diverged from request 0"
+        );
+    }
 }
