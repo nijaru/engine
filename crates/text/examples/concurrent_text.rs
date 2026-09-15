@@ -137,27 +137,38 @@ fn main() -> Result<(), String> {
         drop(abandoned);
     }
 
+    // Distinct, semantically different questions per caller: identical output for
+    // different questions would mean requests share each other's input or output.
+    const QUESTIONS: [&str; 6] = [
+        "Name one primary color.",
+        "Name one planet.",
+        "Name one fruit.",
+        "Name one country.",
+        "Name one musical instrument.",
+        "Name one number between one and nine.",
+    ];
     let mut handles = Vec::with_capacity(arguments.callers);
     for caller in 0..arguments.callers {
         let model = model.clone();
-        let prompt = format!("{} Caller {}.", arguments.prompt, caller + 1);
+        let question = QUESTIONS[caller % QUESTIONS.len()];
+        let prompt = format!("{} {}", question, arguments.prompt);
         let options = options(arguments.tokens);
         handles.push(std::thread::spawn(move || {
             let started = Instant::now();
             let response = model
                 .generate_blocking(TextInput::prompt(prompt), options)
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>((caller, response, started.elapsed()))
+            Ok::<_, String>((caller, question, response, started.elapsed()))
         }));
     }
 
     for handle in handles {
-        let (caller, response, elapsed) = handle
+        let (caller, question, response, elapsed) = handle
             .join()
             .map_err(|_| "caller thread panicked".to_owned())?
             .map_err(|error| format!("caller failed: {error}"))?;
         println!(
-            "caller {caller}: {} tokens in {:.1?} ({:?})",
+            "caller {caller} ("{question}"): {} tokens in {:.1?} ({:?})",
             response.tokens.len(),
             elapsed,
             response.reason
