@@ -1,7 +1,7 @@
 //! Byte-BPE tokenization and embedded text chat templates.
 use crate::{
-    GgufError, MetadataValue, optional_u32, required_i32_array, required_string,
-    required_string_array, required_u32,
+    GgufError, MetadataValue, optional_u32, optional_u32_array, required_i32_array,
+    required_string, required_string_array, required_u32,
 };
 use engine_core::{PromptFormat, PromptPolicy, SpecialTokenPolicy};
 use regex::Regex;
@@ -75,14 +75,25 @@ pub struct GgufTokenizer {
     tokens: Vec<String>,
     merges: Vec<String>,
     token_types: Vec<i32>,
+    /// Vocabulary spellings that encode as their own ID, longest first so that
+    /// scanning at a position is greedy.
+    special_markers: Vec<(String, u32)>,
     bos_token_id: u32,
     eos_token_id: u32,
+    /// Additional declared EOS IDs from `tokenizer.ggml.eos_token_ids`.
+    additional_eos_token_ids: Vec<u32>,
     padding_token_id: Option<u32>,
     token_ids: BTreeMap<String, u32>,
     merge_ranks: BTreeMap<(String, String), u32>,
 }
 
 const QWEN35_PRETOKENIZER: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s+";
+
+/// GGUF token type for tokens that carry structure rather than content.
+const TOKEN_TYPE_CONTROL: i32 = 3;
+/// GGUF token type for markup the vocabulary treats as one token, such as a
+/// tool-call or thinking tag.
+const TOKEN_TYPE_USER_DEFINED: i32 = 4;
 
 fn byte_is_direct(byte: u8) -> bool {
     (33..=126).contains(&byte) || (161..=172).contains(&byte) || (174..=255).contains(&byte)
@@ -168,6 +179,37 @@ fn build_merge_ranks(merges: &[String]) -> Result<BTreeMap<(String, String), u32
     Ok(ranks)
 }
 
+fn build_special_markers(
+    tokens: &[String],
+    token_types: &[i32],
+) -> Result<Vec<(String, u32)>, GgufError> {
+    let mut markers = Vec::new();
+    for (index, (token, token_type)) in tokens.iter().zip(token_types).enumerate() {
+        if *token_type != TOKEN_TYPE_CONTROL && *token_type != TOKEN_TYPE_USER_DEFINED {
+            continue;
+        }
+        let token_id = u32::try_from(index).map_err(|_| {
+            GgufError::InvalidTokenizer("vocabulary is too large for a u32 token ID")
+        })?;
+        markers.push((token.clone(), token_id));
+    }
+    // Greedy scanning takes the longest spelling at a position, so sort by
+    // descending length and keep vocabulary order within a length.
+    markers.sort_by_key(|(marker, _)| std::cmp::Reverse(marker.len()));
+    Ok(markers)
+}
+
+/// Additional declared EOS IDs, excluding the primary ID and duplicates.
+fn additional_eos_token_ids(primary: u32, declared: Vec<u32>) -> Vec<u32> {
+    let mut additional: Vec<u32> = Vec::with_capacity(declared.len());
+    for token_id in declared {
+        if token_id != primary && !additional.contains(&token_id) {
+            additional.push(token_id);
+        }
+    }
+    additional
+}
+
 impl GgufTokenizer {
     #[must_use]
     pub fn model(&self) -> &str {
@@ -207,6 +249,39 @@ impl GgufTokenizer {
     #[must_use]
     pub const fn eos_token_id(&self) -> u32 {
         self.eos_token_id
+    }
+
+    /// Stop IDs the artifact declares for every request: its primary EOS plus
+    /// any additional distinct IDs from `tokenizer.ggml.eos_token_ids`.
+    #[must_use]
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let mut stops = Vec::with_capacity(1 + self.additional_eos_token_ids.len());
+        stops.push(self.eos_token_id);
+        stops.extend_from_slice(&self.additional_eos_token_ids);
+        stops
+    }
+
+    /// Stop IDs for a chat request whose prompt is `prompt_tokens`.
+    ///
+    /// The declared EOS IDs always stop. So does every control token the prompt
+    /// itself contains: those are the delimiters the chat template rendered for
+    /// this conversation, so a model that emits one is ending or restarting a
+    /// turn rather than writing text. Grounding and vision markers are control
+    /// tokens too, so they stop exactly when the conversation used them, and a
+    /// raw prompt without template structure adds nothing.
+    #[must_use]
+    pub fn chat_stop_token_ids(&self, prompt_tokens: &[u32]) -> Vec<u32> {
+        let mut stops = self.stop_token_ids();
+        for token_id in prompt_tokens {
+            let is_control = usize::try_from(*token_id)
+                .ok()
+                .and_then(|index| self.token_types.get(index))
+                .is_some_and(|token_type| *token_type == TOKEN_TYPE_CONTROL);
+            if is_control && !stops.contains(token_id) {
+                stops.push(*token_id);
+            }
+        }
+        stops
     }
 
     #[must_use]
@@ -267,7 +342,8 @@ impl GgufTokenizer {
 
     /// Decode GPT-2/BPE token IDs back to UTF-8 text.
     ///
-    /// Special-marker tokens are returned literally, which lets callers keep
+    /// Control tokens contribute no bytes: they are structure, not text. Other
+    /// special markers are returned literally, which lets callers keep
     /// stop-marker handling explicit while still supporting chat prompt and
     /// generated-text round trips.
     ///
@@ -320,13 +396,18 @@ impl GgufTokenizer {
         out: &mut Vec<u8>,
         max_bytes: usize,
     ) -> Result<(), GgufError> {
+        let index = usize::try_from(token_id).map_err(|_| GgufError::TokenizerEncoding {
+            detail: format!("token ID {token_id} does not fit this platform"),
+        })?;
+        // A control token is structure, not text: it contributes no bytes, so a
+        // marker the model emits never reaches user-visible output. Consumers
+        // that need it read the token ID that accompanies the decoded text.
+        if self.token_types.get(index).copied() == Some(TOKEN_TYPE_CONTROL) {
+            return Ok(());
+        }
         let token = self
             .tokens
-            .get(
-                usize::try_from(token_id).map_err(|_| GgufError::TokenizerEncoding {
-                    detail: format!("token ID {token_id} does not fit this platform"),
-                })?,
-            )
+            .get(index)
             .ok_or_else(|| GgufError::TokenizerEncoding {
                 detail: format!("token ID {token_id} is outside the vocabulary"),
             })?;
@@ -464,19 +545,21 @@ impl GgufTokenizer {
     /// # Errors
     /// Returns tokenizer or special-token errors.
     pub fn encode_rendered(&self, rendered: &str) -> Result<Vec<u32>, GgufError> {
-        const SPECIAL_MARKERS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"];
         let mut encoded = Vec::new();
         let mut cursor = 0;
         while cursor < rendered.len() {
-            let next = SPECIAL_MARKERS
+            // The longest spelling wins at a position, so a marker sharing a
+            // prefix with another still encodes as a single token.
+            let next = self
+                .special_markers
                 .iter()
-                .filter_map(|marker| {
+                .filter_map(|(marker, token_id)| {
                     rendered[cursor..]
-                        .find(marker)
-                        .map(|index| (index, *marker))
+                        .find(marker.as_str())
+                        .map(|index| (index, marker.as_str(), *token_id))
                 })
-                .min_by_key(|(index, _)| *index);
-            let Some((relative_index, marker)) = next else {
+                .min_by_key(|(index, marker, _)| (*index, std::cmp::Reverse(marker.len())));
+            let Some((relative_index, marker, token_id)) = next else {
                 encoded.extend(self.encode(&rendered[cursor..])?);
                 break;
             };
@@ -484,11 +567,6 @@ impl GgufTokenizer {
             if marker_start > cursor {
                 encoded.extend(self.encode(&rendered[cursor..marker_start])?);
             }
-            let token_id = self.token_ids.get(marker).copied().ok_or_else(|| {
-                GgufError::TokenizerEncoding {
-                    detail: format!("chat special token {marker:?} is absent from the vocabulary"),
-                }
-            })?;
             encoded.push(token_id);
             cursor = marker_start + marker.len();
         }
@@ -565,6 +643,12 @@ impl GgufTokenizer {
         }
         let token_ids = build_token_ids(&tokens)?;
         let merge_ranks = build_merge_ranks(&merges)?;
+        let special_markers = build_special_markers(&tokens, &token_types)?;
+        let eos_token_id = required_u32(metadata, "tokenizer.ggml.eos_token_id")?;
+        let additional_eos_token_ids = additional_eos_token_ids(
+            eos_token_id,
+            optional_u32_array(metadata, "tokenizer.ggml.eos_token_ids")?,
+        );
         let chat_template = metadata
             .get("tokenizer.chat_template")
             .map(|value| {
@@ -582,8 +666,10 @@ impl GgufTokenizer {
             tokens,
             merges,
             token_types,
+            special_markers,
             bos_token_id: required_u32(metadata, "tokenizer.ggml.bos_token_id")?,
-            eos_token_id: required_u32(metadata, "tokenizer.ggml.eos_token_id")?,
+            eos_token_id,
+            additional_eos_token_ids,
             padding_token_id: optional_u32(metadata, "tokenizer.ggml.padding_token_id")?,
             token_ids,
             merge_ranks,
@@ -771,21 +857,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn declared_stop_ids_include_the_metadata_array() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_owned(),
+            MetadataValue::String("gpt2".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.pre".to_owned(),
+            MetadataValue::String("qwen35".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            MetadataValue::Array(
+                ["a", "b", "ab"]
+                    .into_iter()
+                    .map(|token| MetadataValue::String(token.to_owned()))
+                    .collect(),
+            ),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_owned(),
+            MetadataValue::Array(Vec::new()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_owned(),
+            MetadataValue::Array(vec![MetadataValue::I32(1); 3]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.bos_token_id".to_owned(),
+            MetadataValue::U32(0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_id".to_owned(),
+            MetadataValue::U32(1),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_ids".to_owned(),
+            MetadataValue::Array(vec![
+                MetadataValue::U32(2),
+                MetadataValue::U32(1),
+                MetadataValue::U32(2),
+            ]),
+        );
+
+        let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("tokenizer metadata");
+        assert_eq!(
+            tokenizer.stop_token_ids(),
+            vec![1, 2],
+            "the artifact's declared IDs come first, without duplicates"
+        );
+    }
+
+    #[test]
+    fn rendered_markers_encode_as_the_longest_special_token() {
+        let mut tokens = (0..=255_u8)
+            .map(|byte| byte_token_symbol(byte).to_string())
+            .collect::<Vec<_>>();
+        let mut token_types = vec![1_i32; tokens.len()];
+        for (spelling, token_type) in [
+            ("<|turn|>", TOKEN_TYPE_CONTROL),
+            ("<|turn|>x", TOKEN_TYPE_CONTROL),
+            ("<|call|>", TOKEN_TYPE_USER_DEFINED),
+        ] {
+            tokens.push(spelling.to_owned());
+            token_types.push(token_type);
+        }
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_owned(),
+            MetadataValue::String("gpt2".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.pre".to_owned(),
+            MetadataValue::String("qwen35".to_owned()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_owned(),
+            MetadataValue::Array(tokens.into_iter().map(MetadataValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_owned(),
+            MetadataValue::Array(Vec::new()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_owned(),
+            MetadataValue::Array(token_types.into_iter().map(MetadataValue::I32).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.bos_token_id".to_owned(),
+            MetadataValue::U32(254),
+        );
+        metadata.insert(
+            "tokenizer.ggml.eos_token_id".to_owned(),
+            MetadataValue::U32(1),
+        );
+
+        let tokenizer = GgufTokenizer::from_metadata(&metadata).expect("tokenizer metadata");
+        assert_eq!(
+            tokenizer.encode_rendered("<|turn|>x").expect("marker"),
+            vec![257],
+            "the longest spelling wins at a position"
+        );
+        assert_eq!(
+            tokenizer.encode_rendered("<|turn|>").expect("marker"),
+            vec![256]
+        );
+        assert_eq!(
+            tokenizer.encode_rendered("<|call|>").expect("marker"),
+            vec![258],
+            "content markup also survives as its own token"
+        );
+        assert_eq!(tokenizer.decode(&[256]).expect("control decoding"), "");
+        assert_eq!(
+            tokenizer.decode(&[258]).expect("markup decoding"),
+            "<|call|>"
+        );
+        assert_eq!(
+            tokenizer.chat_stop_token_ids(&[256, 258, 42]),
+            vec![1, 256],
+            "only control delimiters the prompt used are added"
+        );
+    }
+
     fn tokenizer(template: &str) -> GgufTokenizer {
         let tokens = (0..=255_u8)
             .map(|byte| byte_token_symbol(byte).to_string())
             .collect::<Vec<_>>();
+        let token_types = vec![1; 256];
         GgufTokenizer {
             model: "gpt2".into(),
             pretokenizer: "qwen35".into(),
             chat_template: Some(template.into()),
             token_ids: build_token_ids(&tokens).unwrap(),
+            special_markers: build_special_markers(&tokens, &token_types).unwrap(),
             tokens,
             merges: Vec::new(),
             merge_ranks: BTreeMap::new(),
-            token_types: vec![1; 256],
+            token_types,
             bos_token_id: 0,
             eos_token_id: 1,
+            additional_eos_token_ids: Vec::new(),
             padding_token_id: None,
         }
     }

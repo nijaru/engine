@@ -18,6 +18,6 @@ pub use cuda::{LoadOptions, MemoryReport};
 pub use error::TextError;
 pub use input::{Message, TextInput};
 pub use model::{TextBatch, TextConfig, TextModel, TextOwner, TextRequest, TextResponse};
-pub use process::{GgufProcessor, ProcessorLimits, TextProcessor};
+pub use process::{EncodedInput, GgufProcessor, ProcessorLimits, TextProcessor};
 pub use ribn::{FinishReason, GenerationOptions, Sampling, Usage};
 pub use stream::{TextEvent, TextStream};

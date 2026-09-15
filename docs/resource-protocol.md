@@ -211,6 +211,17 @@ another served requests. `TextConfig` carries preprocessing worker count and bat
 window; `ProcessorLimits` carries the text byte bounds. CUDA/GGUF assembly is
 `TextOwner::load`, and it is the only part that needs a device.
 
+Stop IDs come from the artifact, never from a model-name list. Every request carries
+the artifact's declared EOS IDs, and a chat request also carries each control token its
+**own** rendered prompt used: those are the delimiters that conversation's template
+rendered, so a model emitting one is ending or restarting a turn rather than writing
+text. Grounding and vision markers are control tokens too, which is why they stop
+exactly when a conversation used them and a raw prompt adds nothing. Control tokens
+decode to no bytes, so an emitted marker never reaches user-visible output, while
+user-defined content markup such as a thinking or tool-call tag stays visible. Every
+delivered event carries its token ID, so a structured consumer loses nothing to the
+text policy. Caller-supplied stop tokens are added to this set, not replaced by it.
+
 Implementation status and host evidence: [architecture](architecture.md#owned-text-facade)
 and [runtime evidence](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 

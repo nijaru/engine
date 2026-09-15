@@ -1061,6 +1061,35 @@ fn optional_u32(
         .transpose()
 }
 
+fn optional_u32_array(
+    metadata: &BTreeMap<String, MetadataValue>,
+    key: &'static str,
+) -> Result<Vec<u32>, GgufError> {
+    let Some(value) = metadata.get(key) else {
+        return Ok(Vec::new());
+    };
+    let MetadataValue::Array(values) = value else {
+        return Err(GgufError::MetadataTypeMismatch {
+            key: key.to_owned(),
+        });
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| GgufError::MetadataTypeMismatch {
+                    key: key.to_owned(),
+                })
+                .and_then(|value| {
+                    u32::try_from(value).map_err(|_| GgufError::MetadataTypeMismatch {
+                        key: key.to_owned(),
+                    })
+                })
+        })
+        .collect()
+}
+
 fn required_u64(
     metadata: &BTreeMap<String, MetadataValue>,
     key: &'static str,

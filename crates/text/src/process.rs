@@ -86,6 +86,43 @@ impl ProcessorLimits {
     }
 }
 
+/// Tokenized input plus the stop IDs the request must honor.
+///
+/// The processor reports both together because the stop set depends on the
+/// encoded prompt: a chat request stops at the conversation delimiters its own
+/// rendered prompt contains. The caller's explicit stop tokens are added to
+/// these, never replaced by them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedInput {
+    tokens: Vec<u32>,
+    stop_tokens: Vec<u32>,
+}
+
+impl EncodedInput {
+    #[must_use]
+    pub const fn new(tokens: Vec<u32>, stop_tokens: Vec<u32>) -> Self {
+        Self {
+            tokens,
+            stop_tokens,
+        }
+    }
+
+    #[must_use]
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    #[must_use]
+    pub fn stop_tokens(&self) -> &[u32] {
+        &self.stop_tokens
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u32>, Vec<u32>) {
+        (self.tokens, self.stop_tokens)
+    }
+}
+
 /// Model-specific text preparation and incremental decoding.
 ///
 /// Implementations are shared across preprocessing workers and consuming
@@ -94,12 +131,13 @@ pub trait TextProcessor: Send + Sync + 'static {
     #[must_use]
     fn limits(&self) -> ProcessorLimits;
 
-    /// Format and tokenize one input. Called only after admission.
+    /// Format and tokenize one input, reporting the stop IDs the request must
+    /// honor. Called only after admission.
     ///
     /// # Errors
     /// Returns a request-local error for an invalid, oversized, unrenderable or
     /// untokenizable input.
-    fn encode(&self, input: TextInput) -> Result<Vec<u32>, TextError>;
+    fn encode(&self, input: TextInput) -> Result<EncodedInput, TextError>;
 
     /// Replace `out` with one token's decoded bytes.
     ///
@@ -107,9 +145,6 @@ pub trait TextProcessor: Send + Sync + 'static {
     /// Returns a request-local error for an unknown token, an unsupported
     /// vocabulary symbol, or a token over the decoded byte bound.
     fn decode_token_into(&self, token: u32, out: &mut Vec<u8>) -> Result<(), TextError>;
-
-    #[must_use]
-    fn eos_token_id(&self) -> u32;
 }
 
 /// GGUF tokenizer and chat template with enforced text bounds.
@@ -145,10 +180,11 @@ impl TextProcessor for GgufProcessor {
         self.limits
     }
 
-    fn encode(&self, input: TextInput) -> Result<Vec<u32>, TextError> {
+    fn encode(&self, input: TextInput) -> Result<EncodedInput, TextError> {
         // The retention boundary checks the same rule before queuing; this keeps
         // the processor authoritative for direct callers.
         self.limits.check_input(&input)?;
+        let chat = matches!(&input, TextInput::Chat(_));
         let tokens = match input {
             TextInput::Tokens(tokens) => tokens,
             TextInput::Prompt(text) => {
@@ -177,17 +213,21 @@ impl TextProcessor for GgufProcessor {
                 tokens.len(),
             ));
         }
-        Ok(tokens)
+        // A chat turn ends at the artifact's declared EOS IDs and at the
+        // delimiters its own prompt used; raw prompts and token inputs carry no
+        // template structure to delimit.
+        let stop_tokens = if chat {
+            self.tokenizer.chat_stop_token_ids(&tokens)
+        } else {
+            self.tokenizer.stop_token_ids()
+        };
+        Ok(EncodedInput::new(tokens, stop_tokens))
     }
 
     fn decode_token_into(&self, token: u32, out: &mut Vec<u8>) -> Result<(), TextError> {
         self.tokenizer
             .decode_token_into(token, out, self.limits.max_decoded_token_bytes)
             .map_err(|source| TextError::Decode { token, source })
-    }
-
-    fn eos_token_id(&self) -> u32 {
-        self.tokenizer.eos_token_id()
     }
 }
 
@@ -399,10 +439,11 @@ fn prepare(
     mut options: GenerationOptions,
     permit: RequestPermit,
 ) -> Result<Prepared, TextError> {
-    let tokens = processor.encode(input)?;
-    let eos = processor.eos_token_id();
-    if !options.stop_tokens.contains(&eos) {
-        options.stop_tokens.push(eos);
+    let (tokens, stop_tokens) = processor.encode(input)?.into_parts();
+    for stop in stop_tokens {
+        if !options.stop_tokens.contains(&stop) {
+            options.stop_tokens.push(stop);
+        }
     }
     Ok(Prepared {
         request: TokenRequest::new(tokens, options),

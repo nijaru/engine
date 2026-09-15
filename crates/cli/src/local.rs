@@ -173,11 +173,12 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         SpecialTokenPolicy::None,
     ));
     let request = RequestSpec::new(request_id, model, semantics);
+    let stop_tokens = tokenizer.chat_stop_token_ids(&prompt_tokens);
     serving
         .admit(request, state, Arc::from(prompt_tokens))
         .map_err(|error| error.to_string())?;
 
-    let output_tokens = generate(&mut serving, request_id, tokenizer.eos_token_id())?;
+    let output_tokens = generate(&mut serving, request_id, &stop_tokens)?;
     let bytes = tokenizer
         .decode_bytes(&output_tokens)
         .map_err(|error| error.to_string())?;
@@ -295,7 +296,7 @@ fn allocate_state(
 fn generate<P, B, S>(
     serving: &mut ServingRuntime<P, B, S>,
     request: RequestId,
-    eos_token: u32,
+    stop_tokens: &[u32],
 ) -> Result<Vec<u32>, String>
 where
     P: ModelProvider,
@@ -307,18 +308,18 @@ where
         let completed = serving
             .poll_completions()
             .map_err(|error| error.to_string())?;
-        let mut reached_eos = false;
+        let mut reached_stop = false;
         while let Some(generated) = serving.pop_generated_token() {
             if generated.request() != request {
                 return Err("direct inference received output for another request".to_owned());
             }
-            if generated.token() == eos_token {
-                reached_eos = true;
-            } else if !reached_eos {
+            if stop_tokens.contains(&generated.token()) {
+                reached_stop = true;
+            } else if !reached_stop {
                 output.push(generated.token());
             }
         }
-        if reached_eos && serving.scheduler().counts().terminal() == 0 {
+        if reached_stop && serving.scheduler().counts().terminal() == 0 {
             serving.finish(request).map_err(|error| error.to_string())?;
         }
         if serving.scheduler().counts().terminal() > 0 {

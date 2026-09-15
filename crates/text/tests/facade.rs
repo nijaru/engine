@@ -20,8 +20,8 @@ use ribn::{
     StepCompletion, StepKind, SubmissionId, TokenRequest,
 };
 use ribn_text::{
-    GgufProcessor, Message, ProcessorLimits, TextConfig, TextError, TextInput, TextModel,
-    TextOwner, TextProcessor,
+    EncodedInput, GgufProcessor, Message, ProcessorLimits, TextConfig, TextError, TextInput,
+    TextModel, TextOwner, TextProcessor,
 };
 
 /// The fixture vocabulary maps token id `n` to raw byte `n`, so tests can script
@@ -49,6 +49,7 @@ fn processor_with_template(limits: ProcessorLimits, template: &str) -> Arc<dyn T
         .map(|byte| MetadataValue::String(byte_token_symbol(byte).to_string()))
         .collect::<Vec<_>>();
     tokens.push(MetadataValue::String("a".repeat(20)));
+    tokens.push(MetadataValue::String(TURN_MARKER.to_owned()));
     let mut metadata = BTreeMap::new();
     metadata.insert(
         "tokenizer.ggml.model".to_owned(),
@@ -68,7 +69,12 @@ fn processor_with_template(limits: ProcessorLimits, template: &str) -> Arc<dyn T
     );
     metadata.insert(
         "tokenizer.ggml.token_type".to_owned(),
-        MetadataValue::Array((0..257).map(|_| MetadataValue::I32(1)).collect()),
+        MetadataValue::Array(
+            (0..257)
+                .map(|_| MetadataValue::I32(1))
+                .chain(std::iter::once(MetadataValue::I32(3)))
+                .collect(),
+        ),
     );
     metadata.insert(
         "tokenizer.ggml.bos_token_id".to_owned(),
@@ -92,6 +98,11 @@ fn processor_with_template(limits: ProcessorLimits, template: &str) -> Arc<dyn T
 
 const CHAT_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}{% endfor %}";
 
+/// The fixture's control token: template structure rather than text.
+const TURN_MARKER: &str = "<|turn|>";
+/// Vocabulary ID of [`TURN_MARKER`], directly after [`LONG_TOKEN`].
+const TURN: u32 = 257;
+
 /// Delegates to a real processor but unwinds on one sentinel input, standing in
 /// for a processor bug. A test uses it to check that a dead pool reports failures
 /// instead of leaving callers queued forever.
@@ -104,7 +115,7 @@ impl TextProcessor for PanickingProcessor {
         self.inner.limits()
     }
 
-    fn encode(&self, input: TextInput) -> Result<Vec<u32>, TextError> {
+    fn encode(&self, input: TextInput) -> Result<EncodedInput, TextError> {
         if matches!(&input, TextInput::Prompt(text) if text == "panic") {
             panic!("fixture processor panic");
         }
@@ -113,10 +124,6 @@ impl TextProcessor for PanickingProcessor {
 
     fn decode_token_into(&self, token: u32, out: &mut Vec<u8>) -> Result<(), TextError> {
         self.inner.decode_token_into(token, out)
-    }
-
-    fn eos_token_id(&self) -> u32 {
-        self.inner.eos_token_id()
     }
 }
 
@@ -721,6 +728,43 @@ fn prompt_token_bound_is_enforced_after_tokenization() {
             actual: 5,
         }
     ));
+}
+
+#[test]
+fn chat_stops_follow_the_prompt_and_raw_inputs_add_only_declared_ids() {
+    let processor = processor_with_template(
+        limits(),
+        "<|turn|>{% for m in messages %}{{ m.content }}{% endfor %}",
+    );
+    let chat = processor
+        .encode(TextInput::Chat(vec![Message::new("user", "hi")]))
+        .expect("chat encoding");
+    assert!(
+        chat.tokens().contains(&TURN),
+        "the template's delimiter must encode as its own token"
+    );
+    assert!(
+        chat.stop_tokens().contains(&TURN),
+        "a delimiter this conversation used ends the turn"
+    );
+    assert!(chat.stop_tokens().contains(&EOS));
+
+    let prompt = processor
+        .encode(TextInput::prompt("hi"))
+        .expect("prompt encoding");
+    assert_eq!(
+        prompt.stop_tokens(),
+        [EOS],
+        "a raw prompt has no template structure to delimit"
+    );
+    let tokens = processor
+        .encode(TextInput::Tokens(vec![TURN, 1]))
+        .expect("token encoding");
+    assert_eq!(
+        tokens.stop_tokens(),
+        [EOS],
+        "already-encoded input adds no template delimiters"
+    );
 }
 
 #[test]
