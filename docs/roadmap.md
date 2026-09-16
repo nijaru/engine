@@ -301,13 +301,56 @@ Do not implement a universal cost vector or operation graph as a prerequisite.
 
 Implement dynamic KV plus recurrent-state ownership, valid prefix reuse, eviction and
 preemption before speculative reconciliation. Compare unified token-budget scheduling
-with current queues using actual resource costs and mixed-arrival workloads.
+with current queues using actual resource costs and mixed-arrival workloads. The
+contract they must satisfy is [AR continuation resources](resource-protocol.md#ar-continuation-resources);
+this list is the order it is implemented in. Each step lands green and device-checked,
+because a continuation change silently corrupts output when it is wrong.
 
-A second real decoder and real VLM/processor must integrate with model/processor,
-backend, registration and tests—not family branches in cancellation, routing or
-protocols. A genuinely new mechanism may require a focused shared-contract change.
-A sequential encoder-decoder and small iterative model then test composition beyond
-AR without forcing every encoder into its own stage.
+- **4a. Continuation capacity is per request (done 2026-09-15, `323f258`).** A
+  declaration is a shape plus a bound; a request materializes the capacity it can reach
+  (prompt plus output budget) and is charged for that, not for the model's context. The
+  prototype reserved full maximum context for every admitted sequence, so a short request
+  spent the same device bytes as a long one and concurrency was bounded by context, not
+  by demand. Insufficient capacity is now waitable backpressure (`Admission::Deferred`)
+  rather than a request failure, while a demand the authority can never grant stays
+  request-local rejection. Evidence: host tests for bound acceptance, over-bound and
+  shape rejection, capacity waiting and infeasible demand; device qualification on the
+  pinned Qwen artifact at `323f258` — three concurrent requests run inside a 500 MiB
+  authority that holds fewer than two context-sized charges (849 MiB) and each still
+  produces the exact reference output, alongside the unchanged AR driver and text
+  lifecycle gates.
+
+  The measurement also sizes 4b for this model: the pinned hybrid's 16 full-attention
+  layers cost 16.8 MiB of KV at a 257-token reach and 275 MiB at 4096 tokens, while its
+  recurrent state costs a fixed 149.6 MiB per sequence. A per-request charge is therefore
+  166.8 MiB against a 424.6 MiB context-sized one, and the recurrent state — not the KV —
+  dominates continuation memory. Reusable hybrid boundaries cannot checkpoint that state
+  at every block; 4b must decide the coarsest boundary that still pays.
+- **4b. Block-granular continuation with a reusable prefix cache.** Continuation is
+  allocated in fixed token blocks with content-derived identity, growth reserves blocks
+  as the accepted range advances and settles them at the committed boundary, and a block
+  shared by several sequences is owned once by the cache. For a hybrid model a reusable
+  boundary additionally requires its recurrent checkpoint, so a KV-only match is not a
+  match. Evidence: parity with and without a reused prefix, identical output for a shared
+  prefix across sequences, and a constrained-pool run where reuse admits work that
+  per-sequence allocation cannot.
+- **4c. Eviction and preemption.** Unreferenced cached blocks are evicted
+  least-recently-used; a live sequence whose growth cannot be granted is preempted by
+  recomputation before any host swap tier exists. Evidence: constrained-pool
+  qualification of eviction, recompute identification of that sequence's own charge,
+  cancellation under saturation, and no leaked charge after either path.
+- **4d. Scheduling comparison with real costs.** With per-step preparation reporting
+  actual demand, compare a unified token budget against the current prefill/decode
+  queues on mixed-arrival, mixed-length workloads and report which is which: prefill and
+  decode remain execution distinctions either way. Evidence: matched repeated
+  measurements with the same artifact and numerical policy, plus the policy choice and
+  its losing case recorded here.
+- **4e. Composition.** A second real decoder and a real VLM/processor integrate through
+  model/processor, backend, registration and tests—not family branches in cancellation,
+  routing or protocols. A sequential encoder-decoder and a small iterative model then
+  test composition beyond AR without forcing every encoder into its own stage. Evidence:
+  independent numerical references and, for the encoders, the existing slice-3
+  qualification path.
 
 Exit: independent numerical references, constrained resources, continuation and
 cancellation qualification; documented shared changes and their concrete necessity.

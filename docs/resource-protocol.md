@@ -7,10 +7,12 @@ contradictory claim/reservation sketches with the ownership rules below. The
 
 ## Current boundary
 
-At `14d0290`, `GenerationExecutor` combines admission, submission and completion.
-Qwen reserves its full continuation capacity at admission and executes the offered
-range. `poll` returns one positive `StepCompletion` per row. `None` means submitted
-work remains pending, not a settled request waiting for a resource.
+`GenerationExecutor` combines admission, submission and completion. Since roadmap 4a,
+Qwen reserves the continuation capacity its own request can reach instead of the
+model's whole context (see [AR continuation resources](#ar-continuation-resources));
+it still reserves that capacity once, at admission, and executes the offered range.
+`poll` returns one positive `StepCompletion` per row. `None` means submitted work
+remains pending, not a settled request waiting for a resource.
 
 The incomplete completion-time `Blocked` enum was removed: it had no readiness source
 or parking and could immediately resubmit unchanged work. Positive partial-prefill
@@ -173,6 +175,62 @@ release that no drain can prove keeps its storage and its charge until one can.
 Do not add public generic `PreparedSubmission`, `PoolClaim` or lease traits yet. The
 first representation should be concrete enough to be exercised by a real encoder, and
 generalized only when a second consumer demonstrates the same shape.
+
+## AR continuation resources
+
+Status: the declared-shape/concrete-capacity split and capacity backpressure are
+implemented for the Qwen path (2026-09-15, roadmap 4a, device-qualified at `323f258`).
+Paged block reuse, eviction and preemption are accepted design and remain
+unimplemented; this section states the contract they must satisfy.
+
+Continuation is the state a sequence must keep to continue: full-attention KV,
+sliding-window KV, recurrent matrices and convolution history, and hybrid combinations
+of them. It is owned per sequence until a cache owns it, and it is charged to the same
+byte authority as every other device reservation on that device.
+
+1. **A declaration is a shape and a bound.** A model declares each continuation
+   component's shape and maximum capacity. A concrete state materializes a capacity
+   within that bound, and validation accepts any concrete capacity whose shape matches
+   the declaration. Reserving less is the point: capacity that a request cannot reach is
+   not reserved. The bound is a hard limit, not a suggestion.
+2. **Capacity is a reservation request.** Requested capacity is derived from the request
+   (prompt plus output budget, or the accepted range for growth), granted by the
+   authority, and charged as granted. Growing continuation is a new reservation
+   transaction; it never edits the declaration and never borrows unreserved capacity.
+   Insufficient capacity is ordinary backpressure and an indivisible demand larger than
+   the authority can ever grant is request-local rejection, delivered without waiting.
+   The engine re-offers waiting work each step, so the readiness protocol is a bounded
+   recheck rather than a registered epoch; 4b replaces it with a real registration
+   against the authority.
+3. **One owner holds storage and its charge.** A backend materializes device storage for
+   the lease it was granted, and the same owner releases both together. A lease is never
+   duplicated to share storage: storage shared between sequences is owned once (by the
+   cache or another owner) and handed out as a reference, so the charge is counted once
+   and reference counting does not duplicate accounting.
+4. **A sequence's continuation is a bundle with per-component validity.** A prefix is
+   reusable only when every component the model requires at that boundary is present and
+   valid — for a hybrid model, KV without the matching recurrent checkpoint is not a
+   continuation. A partial match is not partially usable; it advances only to the last
+   boundary where all required components agree.
+5. **Commit reports the valid boundary.** After completion, the runtime advances the
+   sequence's committed prefix to what the model actually validated, not to what was
+   enqueued. Persistent growth that was charged as prepared work settles into
+   continuation ownership at that boundary; temporary work returns to its pool.
+6. **Release follows proven completion.** Dropping continuation is logical until the
+   device may have finished reading it. A release the backend cannot prove keeps its
+   storage and its charge, on the same retirement path as any other uncertain device
+   work. Cancellation is intent and does not by itself release continuation.
+7. **Eviction and preemption are different owners.** Cache eviction returns
+   unreferenced storage to the authority; preemption takes continuation from a live
+   sequence. Preemption by recomputation drops that sequence's continuation, returns the
+   request to waiting with its tokens, and rebuilds state by replay. Cancellation,
+   preemption and eviction must each be observable as a distinct outcome, because they
+   imply different work and different accounting.
+
+The engine owns which sequence holds which committed prefix and the policy decisions
+(admission, eviction, preemption, priority). The model/backend owns layout, block or
+page granularity, checkpoint materialization and kernel-facing indexing. The authority
+owns bytes. None of these three charges the same reservation again.
 
 ## Owned AR driver contract
 
@@ -429,6 +487,10 @@ master weights and quantized serving weights to share an allocation.
 - A real asynchronous encoder: aggregate resource pressure, partial enqueue failure,
   abandonment of new persistent growth, consumer stalls, failed handoffs and delayed
   producer/consumer completion without premature reuse or leaked reservations.
+- AR continuation: per-request capacity within the declared bound, capacity exhaustion
+  as waitable backpressure rather than a fault or an unbounded deferral, reuse only at a
+  boundary whose every component is valid, eviction of unreferenced storage, preemption
+  by recomputation, and cancellation that leaves no continuation charge behind.
 - Snapshot draining and replacement, incompatible adapter/processor state, and later
   explicit overlap accounting before supporting concurrent versions.
 

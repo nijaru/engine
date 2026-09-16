@@ -459,16 +459,48 @@ commit/update, release, cache lookup/reuse, eviction and preemption. The schedul
 needs capacity/cost information, while physical tensor/page/checkpoint layouts
 remain model/backend-owned.
 
-A semantic prefix may have several continuation components. SGLang's Unified Radix
-Cache is a useful reference: one logical prefix tree can coordinate Full, SWA and
-Mamba components while each component owns its allocation/eviction details and a
-prefix match advances only when all required validators pass. Ribn does not need
-its exact tree or page layout, but it should preserve that invariant.
+**Declared shape versus concrete capacity.** A model declares the *shape* of each
+continuation component and the *maximum* capacity it can hold; a request's
+continuation materializes a concrete capacity within that bound. Declaring the
+maximum is a schema, not a reservation: a short request must not pay for context it
+cannot reach before finishing. Growing capacity is a reservation transaction, not an
+edit of the declaration.
+
+**Prefix reuse.** A semantic prefix may have several continuation components. SGLang's
+Unified Radix Cache is a useful reference: one logical prefix tree can coordinate
+Full, SWA and Mamba components while each component owns its allocation/eviction
+details and a prefix match advances only when all required validators pass. Ribn does
+not need that exact tree or page layout, but it should preserve that invariant.
+
+Concretely, Ribn starts from block-granular reuse keyed by token content rather than a
+token-granular radix tree: continuation is allocated in fixed token blocks, a block's
+identity is its parent block identity plus its token IDs, an unreferenced block is
+evictable in least-recently-used order, and a block shared by several sequences is
+owned by the cache with one charge. Token-granular sharing buys shorter matches at the
+cost of a more complex tree; adopt it only with measurements showing the block size,
+not the policy, is the limit.
 
 For hybrid models such as the current Qwen path, reusable full-attention KV without
-the matching recurrent state is not a valid continuation. Recurrent checkpoints,
+the matching recurrent state is not a valid continuation. A reusable boundary
+therefore carries a recurrent checkpoint when the model has recurrent components, and
+a match that cannot supply one is not a match. Recurrent checkpoints,
 copy-on-write/materialization cost, and cache pressure are first-class resource
 concerns.
+
+They are also the binding cost rather than a detail: the first hybrid qualified in Ribn
+spends 149.6 MiB of recurrent state per sequence against 16.8 MiB of KV at a 257-token
+reach (roadmap 4a measurement), so checkpointing that state at every candidate boundary
+would cost far more than the KV it protects. Checkpoints must be sparse and the cache
+must be allowed to answer "not reusable" — with the prompt replayed through the
+recurrent layers — when the match does not reach a checkpoint boundary.
+
+**Contention.** Cache eviction and request preemption are different policies. Eviction
+returns unreferenced cached storage to its pool. Preemption takes storage from a live
+sequence, and Ribn starts with recomputation — drop the sequence's continuation, return
+the request to waiting, and replay its tokens — because a preempted sequence can rebuild
+its own state without a second storage tier. Swapping continuation to host memory is a
+later option for cases where recomputation cost, not capacity, is the binding
+constraint.
 
 ## Host/device execution design
 
