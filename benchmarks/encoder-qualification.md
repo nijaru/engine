@@ -1,11 +1,12 @@
 # BERT encoder device qualification
 
 Date: 2026-09-15
-Status: hardware-qualified at `fda8001` for the fixture geometry, for the
-pool-backed runtime wiring, and for the encoder's own retirement cycle behind an
-injected post-enqueue failure. Adversarial lifecycle qualification — delayed completion
-with a lagging consumer, cancellation before and after enqueue and a failed handoff — is
-roadmap slice 3c.
+Status: hardware-qualified at `3fc3b2f` for the fixture geometry, the pool-backed
+runtime wiring (slices 3b.2–3c), the encoder's own retirement cycle behind an injected
+post-enqueue failure, cancellation before and after enqueue, and a lagging consumer
+beside a healthy peer. One slice-3 criterion remains unprovable rather than unqualified:
+downstream workspace headroom needs a downstream stage sharing the pool, which arrives
+with slice 4.
 
 Result: the device encoder reproduces an independent Hugging Face `transformers`
 reference for all four fixture cases, worst absolute deviation `4.77e-7` on hidden
@@ -98,6 +99,15 @@ the parity cases:
   than the model's position embeddings is rejected as `SequenceTooLong`, and a
   sequence whose envelope exceeds the whole pool is rejected as
   `RetainedOutputTooLarge`; the healthy request queued behind each one still runs.
+- **Cancellation releases nothing it does not hold, and never lets go of what it
+  does.** Cancelling a request that is waiting for capacity executes nothing and leaves
+  the sibling's charge untouched; cancelling a request whose result was already retained
+  hands that result and its charge to the encoder through `retire`, and the charge is
+  released only by a proven drain.
+- **A lagging consumer does not block a peer.** Two runtimes share one pool while the
+  first never awaits or releases its result: the peer is admitted as soon as it consumes
+  its own, the lagging charge is untouched, and consuming the lagging result releases
+  exactly that envelope.
 - **A rejected work submission keeps its charge and refuses new work.** With the
   encoder's completion event deliberately not recorded after the forward pass was
   launched, and the following drain reported as unprovable, the encoder holds one

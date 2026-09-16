@@ -148,7 +148,7 @@ internals, other runtime families and device gates were not audited.
 | `ribn-safetensors`, `crates/safetensors` | Validated artifact tensor views, no model semantics |
 | `ribn-hf`, `crates/hf` | Local config and shard resolution/cache, no architecture selection |
 | `ribn-foundation`, `crates/foundation` | Provisional parameter/materialization/topology metadata plus the shared byte-pool authority: owning leases, allocation identity and a release epoch for capacity readiness |
-| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, publishing a pool-epoch capacity registration for callers that park, and handing each reservation to the executor that materializes its storage |
+| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, publishing a pool-epoch capacity registration for callers that park, handing each reservation to the executor that materializes its storage, and delivering cancellation through the ordinary terminal queue |
 | `ribn-cli`, `crates/cli` | `inspect`, experimental `run`, legacy `local` comparison frontend |
 
 `tools/check-boundaries.py` checks production dependency direction. Update the checker
@@ -174,11 +174,15 @@ independent Hugging Face reference for its fixture geometry
 ([evidence](../benchmarks/encoder-qualification.md)). It also runs through
 `ribn-batch`: the pool bounds how many requests execute, a device-resident result keeps
 its charge after it leaves the runtime, and permanent request-local infeasibility is
-rejected while peers progress. A submission that fails after reaching the device keeps
+rejected while peers progress, a lagging consumer holds its own charge without blocking
+a peer, and cancelling a request either runs nothing (while it waits) or returns its
+result and charge to the encoder. A submission that fails after reaching the device keeps
 its storage and the charge covering it in the encoder's quarantine until a drain proves
-completion, and one that never reached the device releases everything. Delayed
-completion under a lagging consumer, cancellation and failed handoff are still roadmap
-slice 3.
+completion, and one that never reached the device releases everything. A device that is
+simply slow cannot be scheduled deterministically at this geometry, so delayed completion
+is qualified by the properties that matter — nothing waits for completion before handing a
+result over, and a result is only read after its consumer awaits the dependency — rather
+than by timing a stalled kernel.
 
 Not implemented: general architecture resolution, real media processors, cancellation
 for asynchronous non-AR device ownership, dynamic hybrid continuation allocation,

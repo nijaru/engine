@@ -104,7 +104,14 @@ result; document their limit and offer incremental consumption for large workloa
 
 Cancellation must remain deliverable when the ordinary submission queue is full.
 Use per-request cancellation intent plus a wakeup, or a separately bounded control
-path whose capacity follows admitted requests—not an unbounded emergency queue.
+path whose capacity follows admitted requests—not an unbounded emergency queue. The
+concrete non-AR form (2026-09-15) is intent recorded on the waiting request itself: a
+cancelled request keeps its FIFO place and reports cancellation instead of executing,
+so the intent occupies no additional structure and cannot be lost to a full terminal
+queue. Cancelling a request whose result is already retained gives that result — and
+the charge covering it — back to the executor through the same retirement path a
+malformed completion uses; the runtime never releases device storage or its charge by
+itself.
 
 ## Encoder preparation and prepared resources
 
@@ -114,12 +121,14 @@ The concrete representation is deliberately not generic: `ribn-foundation`'s
 accepted ranges, capacity registration, result retention and the enqueue-failure
 contract, and `engine-bert` supplies the concrete shape decisions
 (`crates/bert/src/request.rs`), its device result and its retirement list
-(`crates/bert/src/executor.rs`, `crates/bert/src/cuda.rs`). What remains is device
-qualification of the failure paths (roadmap 3c: delayed completion, cancellation
-before and after enqueue, failed handoff) and two recorded limits: a request's whole
-envelope stays charged until its result is dropped, so completed temporary storage is
-not released early, and a release that no drain can prove keeps its storage and its
-charge until one can.
+(`crates/bert/src/executor.rs`, `crates/bert/src/cuda.rs`). Roadmap 3c qualified the failure
+paths on device (constrained pool, cancellation before and after enqueue, a lagging
+consumer beside a healthy peer, permanent rejection with peer progress, charges
+surviving dequeue) except for one criterion whose precondition does not exist yet:
+downstream workspace headroom needs a real downstream stage sharing the pool, which
+slice 4 introduces. Two limits are recorded: a request's whole envelope stays charged
+until its result is dropped, so completed temporary storage is not released early, and a
+release that no drain can prove keeps its storage and its charge until one can.
 
 1. **One authority, owning byte leases.** The first concrete authority is a shared byte
    pool that grants an owning, non-duplicable lease per reservation. Moving a lease

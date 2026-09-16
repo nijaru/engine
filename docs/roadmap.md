@@ -264,15 +264,33 @@ The first concrete representation is deliberately not generic. Increments:
   completion; device evidence for the encoder's own retirement cycle in
   [encoder qualification](../benchmarks/encoder-qualification.md). Failure injection
   exists because only an OOM or a device fault reaches that path in production.
-- **3c.** Device qualification on the idle RTX 4090: constrained pool, delayed completion,
-  cancellation before and after enqueue, failed handoff, consumer stall with a healthy
-  peer, and a permanently oversized input rejected while peers progress. Charges survive
-  dequeue until safe reuse, and downstream workspace stays available under producer
-  pressure. 3b.2 qualifies the constrained pool, envelope, pooled-dequeue and
-  oversized-rejection cases only, and only in a short serialized run; 3b.3 adds the
-  retirement cycle behind an injected post-enqueue failure, not a real one. Delayed
-  completion with a genuinely lagging consumer, cancellation before and after enqueue
-  and a failed handoff are still unqualified on device.
+- **3c (done 2026-09-15, `3fc3b2f`).** The non-AR runtime had no cancellation path, so this
+  increment added the one its exit criteria require. `BatchRuntime::cancel` records intent
+  against a live request: a waiting request keeps its FIFO place and is reported instead
+  of executed, so no second cleanup list is needed and the intent stays deliverable
+  while the terminal count bound is full; a request whose result is already retained
+  hands that result, and the charge covering it, back through `BatchExecutor::retire`.
+  `Terminal::Cancelled`/`StepOutcome::Cancelled` are the notifications, the accepted
+  range stops before a cancelled request, and the runtime never releases device storage
+  or its charge on its own. Device qualification at `3fc3b2f` (7 encoder tests plus 3
+  parity tests, serialized on an idle RTX 4090) covers the constrained shared pool with
+  the real device envelope, a lagging consumer that holds its charge while a peer keeps
+  progressing, cancellation before enqueue (waiting for capacity) and after enqueue
+  (a retained result handed to the executor, which is what a handoff the runtime cannot
+  make looks like), a handoff the consumer simply never takes (charges surviving dequeue
+  until that consumer releases them and then released together), permanent rejection both
+  by model shape and by pool capacity with a peer progressing, and the encoder's own
+  retirement cycle behind an injected post-enqueue failure. See
+  [encoder qualification](../benchmarks/encoder-qualification.md).
+
+  Two caveats are recorded rather than claimed. A *slow device* cannot be scheduled
+  deterministically at this geometry, so "delayed completion" is qualified as the
+  property that matters — no runtime or submission path waits for completion before
+  handing a result over, a result whose completion is not established can only be read
+  after the consumer awaits the dependency, and a lagging consumer never blocks a
+  peer — instead of by timing a stalled kernel. "Downstream workspace stays available"
+  is not yet provable: no downstream stage shares this pool until slice 4 wires the AR
+  path to it, and the sibling-progress case is what stands in for it today.
 
 Exit: constrained shared pool, delayed completion, cancellation, failed handoff,
 consumer stall and permanent oversized-input rejection with healthy peer progress.
