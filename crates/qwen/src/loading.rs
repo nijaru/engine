@@ -6,7 +6,8 @@ use crate::{QwenGguf, QwenLayerKind as GgufQwenLayerKind};
 use cudarc::driver::{CudaContext, CudaStream};
 use engine_core::{
     BackendCapabilities, BackendFeatures, BackendId, BackendKind, DataType, DeviceId,
-    ExecutionPhase, ExecutionPlan, ExecutionStage, ModelProvider, PolicyVersion, WeightBinding,
+    ExecutionPhase, ExecutionPlan, ExecutionStage, ModelProvider, PolicyVersion, StateRequirement,
+    WeightBinding,
 };
 use engine_nvidia::NvidiaBackend;
 use engine_nvidia::{
@@ -40,6 +41,11 @@ pub struct QwenLoadOptions {
     /// Optional upper bound for staged weights. Automatic mode uses observed
     /// free device memory minus request-state reservations and headroom.
     pub weight_budget_bytes: Option<u64>,
+    /// Continuation bytes the loaded execution may charge in total. `None` keeps the
+    /// conservative reservation for `max_sequences` sequences that each reach the
+    /// whole context, which is a loading-time policy, not what a request is charged:
+    /// since roadmap 4a a request is charged for the tokens it can actually reach.
+    pub continuation_capacity_bytes: Option<u64>,
     /// Explicit reserve for preparation/workspace allocations and other users.
     /// This is not a proof that every future CUDA allocation will succeed.
     pub headroom_bytes: u64,
@@ -53,6 +59,7 @@ impl Default for QwenLoadOptions {
             max_sequences: 1,
             prefill_chunk_members: Some(DEFAULT_PREFILL_CHUNK_MEMBERS),
             weight_budget_bytes: None,
+            continuation_capacity_bytes: None,
             headroom_bytes: 512 << 20,
         }
     }
@@ -100,18 +107,15 @@ pub(crate) fn load(
     )
     .map_err(model_error)?;
     let device = DeviceId::new(options.device);
-    let reserved_sequence_bytes = state::capacity(
-        provider.description().state_requirements(),
-        options.max_sequences,
-    )
-    .ok_or_else(|| ExecutionError::new("Qwen state reservation overflow"))?;
+    let continuation_capacity_bytes =
+        continuation_capacity(provider.description().state_requirements(), &options)?;
     let context = CudaContext::new(usize::from(options.device)).map_err(model_error)?;
     let stream = context.default_stream();
     let free_before_preparation_bytes =
         u64::try_from(context.mem_get_info().map_err(model_error)?.0).map_err(model_error)?;
-    let available = free_before_preparation_bytes.checked_sub(reserved_sequence_bytes)
+    let available = free_before_preparation_bytes.checked_sub(continuation_capacity_bytes)
         .and_then(|bytes| bytes.checked_sub(options.headroom_bytes))
-        .ok_or_else(|| ExecutionError::new(format!("Qwen state requires {reserved_sequence_bytes} bytes plus {} bytes headroom, but only {free_before_preparation_bytes} bytes are free", options.headroom_bytes)))?;
+        .ok_or_else(|| ExecutionError::new(format!("Qwen state requires {continuation_capacity_bytes} bytes plus {} bytes headroom, but only {free_before_preparation_bytes} bytes are free", options.headroom_bytes)))?;
     let weight_budget_bytes = options.weight_budget_bytes.unwrap_or(available);
     if weight_budget_bytes == 0 || weight_budget_bytes > available {
         return Err(ExecutionError::new(format!(
@@ -144,9 +148,9 @@ pub(crate) fn load(
     stream.synchronize().map_err(model_error)?;
     let free_after_preparation_bytes =
         u64::try_from(context.mem_get_info().map_err(model_error)?.0).map_err(model_error)?;
-    if free_after_preparation_bytes < reserved_sequence_bytes {
+    if free_after_preparation_bytes < continuation_capacity_bytes {
         return Err(ExecutionError::new(format!(
-            "prepared Qwen leaves {free_after_preparation_bytes} free bytes, below its {reserved_sequence_bytes}-byte sequence reservation"
+            "prepared Qwen leaves {free_after_preparation_bytes} free bytes, below its {continuation_capacity_bytes}-byte continuation capacity"
         )));
     }
     let (backend, plan) = prepare_execution(&provider, &context, dispatcher, device)?;
@@ -163,7 +167,7 @@ pub(crate) fn load(
         backend,
         info,
         plan,
-        state::manager(device, reserved_sequence_bytes),
+        state::manager(device, continuation_capacity_bytes),
         vocabulary_size,
     );
     Ok((
@@ -171,10 +175,31 @@ pub(crate) fn load(
         MemoryReport {
             free_before_preparation_bytes,
             weight_budget_bytes,
-            reserved_sequence_bytes,
+            reserved_sequence_bytes: continuation_capacity_bytes,
             free_after_preparation_bytes,
         },
     ))
+}
+
+/// Continuation bytes this loaded execution may charge in total.
+///
+/// The default keeps the conservative loading-time reservation for `max_sequences`
+/// sequences that each reach the whole context. It is a policy for how much device
+/// memory the weights may not use, not what a request is charged: a request is charged
+/// for the tokens it can actually reach (roadmap 4a).
+fn continuation_capacity(
+    requirements: &[StateRequirement],
+    options: &QwenLoadOptions,
+) -> Result<u64, ExecutionError> {
+    let reserved = state::capacity(requirements, options.max_sequences)
+        .ok_or_else(|| ExecutionError::new("Qwen state reservation overflow"))?;
+    let capacity = options.continuation_capacity_bytes.unwrap_or(reserved);
+    if capacity == 0 {
+        return Err(ExecutionError::new(
+            "Qwen continuation capacity must be nonzero",
+        ));
+    }
+    Ok(capacity)
 }
 
 fn prepare_execution(

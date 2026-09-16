@@ -7,8 +7,8 @@ use engine_core::{
     ModelRegionId, PolicyVersion, StateRequirement, WeightBinding,
 };
 use ribn::{
-    Engine, EngineConfig, Event, GenerationExecutor, GenerationLimits, GenerationOptions,
-    RequestId, SchedulePolicy,
+    Engine, EngineConfig, Event, FinishReason, GenerationExecutor, GenerationLimits,
+    GenerationOptions, RequestId, SchedulePolicy,
 };
 
 use super::*;
@@ -22,6 +22,8 @@ struct Control {
     releases: usize,
     admissions: Vec<SequenceId>,
     batches: Vec<Vec<(ExecutionPhase, u32, u32)>>,
+    /// Concrete KV token capacity of each row's state, as the backend received it.
+    kv_capacities: Vec<u32>,
 }
 
 struct Backend {
@@ -43,6 +45,11 @@ impl ComputeBackend for Backend {
     ) -> Result<BackendSubmissionId, BackendError> {
         self.validate_execution(plan, batch, states)?;
         let mut control = self.control.lock().unwrap();
+        control.kv_capacities.extend(
+            states
+                .iter()
+                .filter_map(|state| state.kv().map(|kv| kv.spec().block_tokens())),
+        );
         control.batches.push(
             batch
                 .segments()
@@ -132,14 +139,20 @@ impl GenerationExecutor for Model {
     }
 }
 
-fn model(control: Arc<Mutex<Control>>) -> Model {
+/// The fixture's declared KV bound is 64 tokens (`1 * 1 * 2 * 64 * 2 * 2` bytes).
+const FIXTURE_CONTEXT_TOKENS: u32 = 64;
+
+fn fixture_requirements() -> Vec<StateRequirement> {
+    vec![StateRequirement::FullAttentionKv(
+        KvStateSpec::new(1, 1, 2, FIXTURE_CONTEXT_TOKENS, DataType::F16).unwrap(),
+    )]
+}
+
+fn model_with_capacity(control: Arc<Mutex<Control>>, capacity: u64) -> Model {
     let device = DeviceId::new(0);
     let model = ModelId::new("Qwen adapter fixture").unwrap();
     let backend = BackendId::new("host-fixture").unwrap();
-    let requirements = vec![StateRequirement::FullAttentionKv(
-        KvStateSpec::new(1, 1, 2, 64, DataType::F16).unwrap(),
-    )];
-    let capacity = state::capacity(&requirements, 2).unwrap();
+    let requirements = fixture_requirements();
     let plan = ExecutionPlan::new(
         model.clone(),
         backend.clone(),
@@ -183,8 +196,15 @@ fn model(control: Arc<Mutex<Control>>) -> Model {
 }
 
 fn engine(control: Arc<Mutex<Control>>) -> Engine {
+    engine_with_capacity(
+        control,
+        state::capacity(&fixture_requirements(), 2).unwrap(),
+    )
+}
+
+fn engine_with_capacity(control: Arc<Mutex<Control>>, capacity: u64) -> Engine {
     Engine::new(
-        model(control),
+        model_with_capacity(control, capacity),
         EngineConfig {
             max_active_requests: 2,
             max_queued_requests: 2,
@@ -350,4 +370,81 @@ fn adapter_shutdown_drains_a_pending_batch_before_release() {
     engine.shutdown().unwrap();
     assert_eq!(engine.status().requests, 0);
     assert_eq!(control.lock().unwrap().releases, 1);
+}
+
+/// Drive the engine until every request has settled, collecting its events.
+fn drive(engine: &mut Engine) -> Vec<Event> {
+    let mut events = Vec::new();
+    for _ in 0..32 {
+        engine.step().unwrap();
+        while let Some(event) = engine.pop_event() {
+            events.push(event);
+        }
+        if engine.status().requests == 0 {
+            break;
+        }
+    }
+    events
+}
+
+#[test]
+fn continuation_state_capacity_follows_the_request_not_the_declared_bound() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut engine = engine(control.clone());
+    engine.enqueue(request(vec![1, 2, 3])).unwrap();
+    let events = drive(&mut engine);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Finished { .. }))
+            .count(),
+        1
+    );
+    // The fixture declares a 64-token bound; a 3-token prompt with a 3-token budget
+    // can only reach 6, so every row the backend ran worked on that capacity.
+    let capacities = control.lock().unwrap().kv_capacities.clone();
+    assert!(!capacities.is_empty() && capacities.iter().all(|&tokens| tokens == 6));
+}
+
+#[test]
+fn insufficient_continuation_capacity_waits_for_a_release_instead_of_failing() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    // `1 * 1 * 2 * 6 * 2 * 2` bytes: exactly one six-token sequence fits, so the
+    // peer waits for its release rather than being refused.
+    let mut engine = engine_with_capacity(control.clone(), 48);
+    engine.enqueue(request(vec![1, 2, 3])).unwrap();
+    engine.enqueue(request(vec![4, 5, 6])).unwrap();
+    engine.step().unwrap();
+    assert_eq!(engine.status().active_sequences, 1);
+    assert_eq!(control.lock().unwrap().kv_capacities, vec![6]);
+    // Releasing the first sequence's continuation admits the peer, which then
+    // completes normally: backpressure, not request-local rejection.
+    let events = drive(&mut engine);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Finished { .. }))
+            .count(),
+        2
+    );
+    let capacities = control.lock().unwrap().kv_capacities.clone();
+    assert!(!capacities.is_empty() && capacities.iter().all(|&tokens| tokens == 6));
+}
+
+#[test]
+fn continuation_demand_above_the_authority_is_rejected_without_waiting() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    // Less than one six-token sequence can ever fit, so no release admits it.
+    let mut engine = engine_with_capacity(control.clone(), 47);
+    engine.enqueue(request(vec![1, 2, 3])).unwrap();
+    engine.step().unwrap();
+    let events = drive(&mut engine);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Finished {
+            reason: FinishReason::Failed(diagnostic),
+            ..
+        } if diagnostic.to_string().contains("continuation bytes")
+    )));
+    assert!(control.lock().unwrap().kv_capacities.is_empty());
 }

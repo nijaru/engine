@@ -410,11 +410,14 @@ impl ExecutionPlan {
         {
             return Err(PlanError::SegmentPhaseMismatch);
         }
-        if segment
-            .state_requirements()
-            .iter()
-            .any(|requirement| !self.state_requirements.contains(requirement))
-        {
+        // A segment states the concrete capacity it works on; the plan declares the
+        // shape and the maximum that capacity may reach.
+        if segment.state_requirements().iter().any(|concrete| {
+            !self
+                .state_requirements
+                .iter()
+                .any(|declaration| concrete.within(*declaration))
+        }) {
             return Err(PlanError::SegmentStateUndeclared);
         }
         Ok(())

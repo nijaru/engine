@@ -495,11 +495,12 @@ pub trait ModelProvider: Send + Sync {
         }) {
             return Err(ModelError::UnknownRegion(region));
         }
-        if let Some(requirement) = plan.state_requirements().iter().find(|requirement| {
+        if let Some(requirement) = plan.state_requirements().iter().find(|declaration| {
             !self
                 .description()
                 .state_requirements()
-                .contains(requirement)
+                .iter()
+                .any(|known| declaration.within(*known))
         }) {
             return Err(ModelError::UndeclaredState(*requirement));
         }

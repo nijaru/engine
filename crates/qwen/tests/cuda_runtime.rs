@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use engine_qwen::{QwenCuda, QwenLoadOptions};
+use engine_core::{ModelProvider, StateRequirement};
+use engine_qwen::{QwenCuda, QwenGguf, QwenLoadOptions};
 use ribn::{
     Engine, EngineConfig, Event, FinishReason, GenerationExecutor, GenerationOptions,
     SchedulePolicy, TokenRequest,
@@ -268,6 +269,126 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
                 "concurrency {concurrency}"
             );
         }
+    }
+    engine.shutdown().unwrap();
+}
+
+/// Continuation bytes the declared schema needs for `sequences` requests that each
+/// reach `tokens` tokens.
+fn continuation_demand(requirements: &[StateRequirement], tokens: u32, sequences: usize) -> u64 {
+    let per_sequence = requirements
+        .iter()
+        .map(|requirement| {
+            requirement
+                .with_capacity(tokens)
+                .unwrap()
+                .byte_size()
+                .unwrap()
+        })
+        .sum::<u64>();
+    per_sequence * u64::try_from(sequences).unwrap()
+}
+
+/// A request is charged for the tokens it can reach, not for the model's context.
+///
+/// The declared continuation bound is four times what any request here reaches, and
+/// the authority is sized for exactly three request-sized charges. Three sequences
+/// therefore hold continuation at once, which a context-sized charge — larger than the
+/// whole authority — could never do.
+#[test]
+#[ignore = "requires an idle CUDA GPU; run serially with --test-threads=1"]
+fn continuation_capacity_admits_concurrent_requests_a_context_charge_cannot() {
+    const CONCURRENCY: usize = 3;
+    let model = std::env::var("RIBN_MODEL").expect("RIBN_MODEL GGUF path");
+    let fixture = std::env::var("RIBN_REFERENCE").expect("RIBN_REFERENCE fixture path");
+    let reference = reference(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
+    let max_output_tokens = u32::try_from(reference.output.len()).unwrap();
+    let reachable = prompt_tokens + max_output_tokens;
+    let declared_bound = 4 * reachable;
+    // Read the declared state schema without touching the device.
+    let requirements = QwenGguf::open_with_kv_block_tokens(&model, declared_bound)
+        .unwrap()
+        .description()
+        .state_requirements()
+        .to_vec();
+    let capacity = continuation_demand(&requirements, reachable, CONCURRENCY);
+    let context_charge = continuation_demand(&requirements, declared_bound, 1);
+    assert!(
+        context_charge > capacity,
+        "one context-sized charge ({context_charge} bytes) must exceed the whole \
+         authority ({capacity} bytes) for this to discriminate"
+    );
+    let prepared = QwenCuda::load_gguf(
+        model,
+        QwenLoadOptions {
+            context_tokens: declared_bound,
+            max_sequences: CONCURRENCY,
+            continuation_capacity_bytes: Some(capacity),
+            ..QwenLoadOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.memory_report().reserved_sequence_bytes, capacity);
+    let mut engine = Engine::new(
+        prepared,
+        EngineConfig {
+            max_active_requests: CONCURRENCY,
+            max_queued_requests: 0,
+            max_queued_input_tokens: u64::from(prompt_tokens) * CONCURRENCY as u64,
+            max_buffered_events: CONCURRENCY * 4,
+            max_events_per_request: 64,
+        },
+        SchedulePolicy::default(),
+    )
+    .unwrap();
+    let requests = (0..CONCURRENCY)
+        .map(|_| {
+            engine
+                .enqueue(TokenRequest::new(
+                    reference.prompt.clone(),
+                    GenerationOptions {
+                        max_output_tokens,
+                        ..GenerationOptions::default()
+                    },
+                ))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    engine.step().unwrap();
+    assert_eq!(
+        engine.status().active_sequences,
+        CONCURRENCY,
+        "every request reaches less than its own context, so all of them hold \
+         continuation at once"
+    );
+    let mut outputs = requests
+        .iter()
+        .map(|&request| (request, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    let mut finished = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while finished.len() < CONCURRENCY {
+        assert!(Instant::now() < deadline, "Qwen qualification stalled");
+        engine.step().unwrap();
+        while let Some(event) = engine.pop_event() {
+            match event {
+                Event::Token { request, token } => {
+                    outputs.get_mut(&request).unwrap().push(token);
+                }
+                Event::Finished {
+                    request, reason, ..
+                } => {
+                    assert!(finished.insert(request, reason).is_none());
+                }
+            }
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(engine.status().active_sequences, 0);
+    for request in requests {
+        assert_eq!(finished[&request], FinishReason::Length);
+        assert_eq!(outputs[&request], reference.output);
     }
     engine.shutdown().unwrap();
 }

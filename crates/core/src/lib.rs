@@ -163,6 +163,39 @@ mod tests {
         )
         .expect("valid segment");
         assert!(plan.validate_segment(&segment).is_ok());
+        // A segment states the concrete capacity it works on, so reaching less of the
+        // context than the declaration allows is valid while exceeding it is not.
+        let concrete = ExecutionSegment::new(
+            segment.request(),
+            ExecutionPhase::Decode,
+            1,
+            1,
+            32,
+            description
+                .state_requirements()
+                .iter()
+                .map(|requirement| requirement.with_capacity(8).expect("concrete capacity"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("valid segment");
+        assert!(plan.validate_segment(&concrete).is_ok());
+        let exceeding = ExecutionSegment::new(
+            segment.request(),
+            ExecutionPhase::Decode,
+            1,
+            1,
+            32,
+            description
+                .state_requirements()
+                .iter()
+                .map(|requirement| requirement.with_capacity(32).expect("over-bound capacity"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("valid segment");
+        assert_eq!(
+            plan.validate_segment(&exceeding),
+            Err(PlanError::SegmentStateUndeclared)
+        );
         let wrong_phase = ExecutionSegment::new(
             segment.request(),
             ExecutionPhase::Encoder,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use engine_core::{
     BackendSubmissionId, ComputeBackend, ExecutionBatch, ExecutionBatchEvent, ExecutionPhase,
     ExecutionPlan, ExecutionSegment, ExecutionTokenInput, InferenceStateSet, LogicalStateManager,
-    RequestId, SamplingParams, StateManager,
+    RequestId, SamplingParams, StateError, StateLocation, StateManager, StateRequirement,
 };
 use ribn::{
     Admission, BatchItem, ExecutionError, ExecutorInfo, SequenceId, StepCompletion, StepKind,
@@ -15,11 +15,18 @@ use crate::state;
 
 struct Sequence {
     state: Option<InferenceStateSet>,
+    /// The continuation capacity this sequence actually reaches, derived from the
+    /// plan's declared schema. Each segment states it, so the physical owner can
+    /// check the exact state it was given instead of the model's maximum.
+    requirements: Arc<[StateRequirement]>,
     prompt: Option<Arc<[u32]>>,
     prompt_len: u32,
     next: Option<u32>,
     sampling: SamplingParams,
 }
+
+/// A reserved continuation and the concrete requirements that describe it.
+type ReservedContinuation = (InferenceStateSet, Arc<[StateRequirement]>);
 
 struct Pending {
     id: BackendSubmissionId,
@@ -107,12 +114,19 @@ impl<B: ComputeBackend> QwenExecution<B> {
         if self.sequences.len() >= self.info.limits.max_sequences {
             return Ok(Admission::Deferred);
         }
-        let state = state::allocate(&mut self.manager, self.plan.state_requirements())
-            .map_err(model_error)?;
+        // Declaring maximum context is a schema; reserving it is not required. A
+        // sequence can never continue past its own prompt plus output budget, so
+        // that is the capacity it materializes and the bytes it is charged for.
+        let reachable = u32::try_from(request.tokens.len()).expect("validated prompt length")
+            + request.options.max_output_tokens;
+        let Some((state, requirements)) = self.reserve_continuation(reachable)? else {
+            return Ok(Admission::Deferred);
+        };
         self.sequences.insert(
             id,
             Sequence {
                 state: Some(state),
+                requirements,
                 prompt: Some(Arc::clone(&request.tokens)),
                 prompt_len: u32::try_from(request.tokens.len()).expect("validated prompt length"),
                 next: None,
@@ -120,6 +134,40 @@ impl<B: ComputeBackend> QwenExecution<B> {
             },
         );
         Ok(Admission::Ready)
+    }
+
+    /// Derive this request's continuation capacity and reserve it.
+    ///
+    /// `Ok(None)` means the authority cannot grant the demand *yet*, which is ordinary
+    /// backpressure: releasing another sequence's continuation can admit this one, so
+    /// waiting is correct. An error means the demand can never fit the authority, so it
+    /// is request-local rejection, reported without waiting.
+    fn reserve_continuation(
+        &mut self,
+        reachable: u32,
+    ) -> Result<Option<ReservedContinuation>, ExecutionError> {
+        let requirements = self
+            .plan
+            .state_requirements()
+            .iter()
+            .map(|declaration| declaration.with_capacity(reachable).map_err(model_error))
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let required = state::capacity(&requirements, 1)
+            .ok_or_else(|| ExecutionError::new("Qwen continuation demand overflows"))?;
+        let capacity = self
+            .manager
+            .capacity_bytes(StateLocation::Device(self.manager.device()))
+            .ok_or_else(|| ExecutionError::new("Qwen continuation has no device authority"))?;
+        if required > capacity {
+            return Err(ExecutionError::new(format!(
+                "Qwen needs {required} continuation bytes, above the {capacity}-byte authority"
+            )));
+        }
+        match state::allocate(&mut self.manager, &requirements) {
+            Ok(state) => Ok(Some((state, Arc::from(requirements)))),
+            Err(StateError::CapacityExceeded { .. }) => Ok(None),
+            Err(error) => Err(model_error(error)),
+        }
     }
 
     fn segment(&self, item: &BatchItem) -> Result<ExecutionSegment, ExecutionError> {
@@ -187,7 +235,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
             1,
             item.token_budget,
             item.prefix,
-            self.plan.shared_state_requirements(),
+            Arc::clone(&sequence.requirements),
         )
         .map_err(model_error)?
         .with_token_input(input)

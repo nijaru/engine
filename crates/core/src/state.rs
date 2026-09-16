@@ -87,6 +87,24 @@ impl KvStateSpec {
         self.dtype
     }
 
+    /// The same shape with a different token capacity.
+    ///
+    /// A declaration states a shape and the most this component can hold; a concrete
+    /// sequence materializes the capacity its own work can reach. This is the only
+    /// way to derive that concrete requirement, so capacity is never edited in place.
+    ///
+    /// # Errors
+    /// Returns [`StateSpecError::ZeroDimension`] when `block_tokens` is zero.
+    pub fn with_capacity(self, block_tokens: u32) -> Result<Self, StateSpecError> {
+        Self::new(
+            self.layer_count,
+            self.kv_heads,
+            self.head_dim,
+            block_tokens,
+            self.dtype,
+        )
+    }
+
     #[must_use]
     pub fn byte_size(self) -> Option<u64> {
         let elements = u64::from(self.layer_count)
@@ -266,6 +284,43 @@ impl StateRequirement {
         match self {
             Self::FullAttentionKv(spec) => spec.byte_size(),
             Self::Recurrent(spec) => spec.byte_size(),
+        }
+    }
+
+    /// This requirement with a concrete continuation capacity of `tokens`.
+    ///
+    /// A declaration covers a maximum capacity, so one declared schema derives the
+    /// concrete requirement of any sequence that reaches no further than `tokens`.
+    /// Recurrent state is a fixed-size summary of the whole prefix and has no
+    /// capacity dimension, so it is returned unchanged.
+    ///
+    /// # Errors
+    /// Returns [`StateSpecError::ZeroDimension`] when `tokens` is zero.
+    pub fn with_capacity(self, tokens: u32) -> Result<Self, StateSpecError> {
+        match self {
+            Self::FullAttentionKv(spec) => Ok(Self::FullAttentionKv(spec.with_capacity(tokens)?)),
+            Self::Recurrent(spec) => Ok(Self::Recurrent(spec)),
+        }
+    }
+
+    /// Whether this concrete requirement fits `declaration`.
+    ///
+    /// Same component with a matching shape and no more capacity than the declared
+    /// maximum is covered. A declaration is a schema plus a bound, so concrete state
+    /// that reaches less of the context is valid, while a different shape, dtype or an
+    /// exceeding capacity is not.
+    #[must_use]
+    pub fn within(self, declaration: Self) -> bool {
+        match (self, declaration) {
+            (Self::FullAttentionKv(concrete), Self::FullAttentionKv(declared)) => {
+                concrete.layer_count == declared.layer_count
+                    && concrete.kv_heads == declared.kv_heads
+                    && concrete.head_dim == declared.head_dim
+                    && concrete.dtype == declared.dtype
+                    && concrete.block_tokens <= declared.block_tokens
+            }
+            (Self::Recurrent(concrete), Self::Recurrent(declared)) => concrete == declared,
+            _ => false,
         }
     }
 }
@@ -510,6 +565,15 @@ impl InferenceStateSet {
         self.states
             .iter()
             .any(|state| state.requirement() == requirement)
+    }
+
+    /// The concrete requirements this state satisfies, in state order.
+    #[must_use]
+    pub fn requirements(&self) -> Vec<StateRequirement> {
+        self.states
+            .iter()
+            .map(InferenceState::requirement)
+            .collect()
     }
 }
 
@@ -838,6 +902,51 @@ mod tests {
             .allocate_kv(spec, StateLocation::Device(DeviceId::new(0)))
             .expect("allocation");
         InferenceStateSet::try_new(Some(kv), None).expect("set")
+    }
+
+    fn recurrent_requirement() -> StateRequirement {
+        let matrix = RecurrentMatrixShape::new(2, 4, 4).expect("matrix");
+        let convolution = ConvolutionStateShape::new(8, 3).expect("convolution");
+        StateRequirement::Recurrent(
+            RecurrentStateSpec::new(2, matrix, convolution, DataType::F16, DataType::F32)
+                .expect("recurrent spec"),
+        )
+    }
+
+    #[test]
+    fn a_declaration_covers_the_concrete_capacity_its_sequences_can_reach() {
+        let declared = StateRequirement::FullAttentionKv(
+            KvStateSpec::new(2, 4, 8, 64, DataType::F16).expect("declared spec"),
+        );
+        let concrete = declared.with_capacity(16).expect("concrete spec");
+        assert!(concrete.within(declared));
+        assert_eq!(
+            concrete.byte_size(),
+            declared.byte_size().map(|bytes| bytes / 4)
+        );
+        // Capacity above the bound, a different shape and a different dtype are all
+        // still that model's declaration, just not one this state satisfies.
+        assert!(!declared.within(concrete));
+        assert!(!concrete.within(declared.with_capacity(8).expect("narrower")));
+        let wider = StateRequirement::FullAttentionKv(
+            KvStateSpec::new(2, 4, 8, 64, DataType::F32).expect("wider dtype"),
+        );
+        assert!(!concrete.within(wider));
+        let deeper = StateRequirement::FullAttentionKv(
+            KvStateSpec::new(3, 4, 8, 64, DataType::F16).expect("deeper"),
+        );
+        assert!(!concrete.within(deeper));
+        // A recurrent summary has no capacity dimension: it is the same requirement
+        // however far the sequence reached, and it never covers a KV declaration.
+        let recurrent = recurrent_requirement();
+        assert_eq!(recurrent.with_capacity(16).expect("unchanged"), recurrent);
+        assert!(!recurrent.within(declared));
+        assert!(!concrete.within(recurrent));
+        assert!(recurrent.within(recurrent));
+        assert!(matches!(
+            declared.with_capacity(0),
+            Err(StateSpecError::ZeroDimension)
+        ));
     }
 
     #[test]
