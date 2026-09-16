@@ -128,6 +128,9 @@ pub enum EncoderCompletion {
         request: RequestId,
         rejection: Rejection<EncoderConstraint>,
     },
+    /// The request was cancelled before delivery. No device state and no charge are
+    /// retained for it; a result that already existed went back to the encoder.
+    Cancelled { request: RequestId },
 }
 
 impl EncoderCompletion {
@@ -143,6 +146,7 @@ impl EncoderCompletion {
                 lease,
             }),
             Terminal::Rejected(rejection) => Self::Rejected { request, rejection },
+            Terminal::Cancelled => Self::Cancelled { request },
         }
     }
 }

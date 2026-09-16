@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use engine_bert::{CudaBertEncoder, EncoderCompletion, EncoderConstraint, EncoderRequest};
-use ribn_batch::{BatchConfig, BatchRuntime, BlockReason, Rejection, StepOutcome};
+use ribn_batch::{BatchConfig, BatchRuntime, BlockReason, CancelOutcome, Rejection, StepOutcome};
 use ribn_foundation::BytePool;
 
 fn fixture() -> PathBuf {
@@ -208,4 +208,89 @@ fn a_request_larger_than_the_whole_pool_is_rejected_while_a_peer_progresses() {
     result.synchronize().expect("synchronize");
     let output = result.read().expect("read");
     assert!(output.pooled.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+#[ignore = "requires an idle CUDA GPU; run serially with --test-threads=1"]
+fn cancelling_a_request_that_is_waiting_for_capacity_runs_nothing() {
+    let encoder = encoder();
+    let envelope = encoder.request_bytes(4).expect("envelope");
+    // A sibling holds the whole pool, so the request can only wait.
+    let pool = BytePool::new(envelope).shared();
+    let held = pool.reserve(envelope).expect("sibling reservation");
+    let mut runtime = BatchRuntime::new(encoder, Arc::clone(&pool), config()).expect("runtime");
+    let request = runtime
+        .submit(EncoderRequest::single_segment(vec![4, 1, 9, 3]))
+        .expect("request");
+    assert!(matches!(
+        runtime.step().expect("blocked step"),
+        StepOutcome::Blocked(BlockReason::Pool { .. })
+    ));
+
+    assert_eq!(runtime.cancel(request), CancelOutcome::Queued);
+    assert_eq!(pool.granted(), envelope, "the sibling keeps its charge");
+    assert_eq!(
+        runtime.step().expect("cancelling step"),
+        StepOutcome::Cancelled { request }
+    );
+    let completion =
+        EncoderCompletion::from_completed(runtime.pop_completed().expect("cancellation entry"));
+    let EncoderCompletion::Cancelled { request: cancelled } = completion else {
+        panic!("a cancelled request never executes");
+    };
+    assert_eq!(cancelled, request);
+    assert_eq!(runtime.executor().quarantined_requests(), 0);
+
+    drop(held);
+    assert_eq!(
+        runtime.step().expect("idle step"),
+        StepOutcome::Idle,
+        "a cancelled request is never executed"
+    );
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+#[ignore = "requires an idle CUDA GPU; run serially with --test-threads=1"]
+fn cancelling_a_retained_result_leaves_its_charge_with_its_storage() {
+    let encoder = encoder();
+    let envelope = encoder.request_bytes(4).expect("envelope");
+    let pool = BytePool::new(2 * envelope).shared();
+    let mut runtime = BatchRuntime::new(encoder, Arc::clone(&pool), config()).expect("runtime");
+    let request = runtime
+        .submit(EncoderRequest::single_segment(vec![4, 1, 9, 3]))
+        .expect("request");
+    assert_eq!(
+        runtime.step().expect("step"),
+        StepOutcome::Executed { results: 1 }
+    );
+    assert_eq!(pool.granted(), envelope);
+
+    assert_eq!(runtime.cancel(request), CancelOutcome::Discarded);
+    // The runtime hands the result and its charge to the encoder, so the two never
+    // separate: either the encoder still holds both, or a proven drain released both.
+    let quarantined = runtime.executor().quarantined_requests();
+    let held_charge = runtime.executor().quarantined_charge();
+    let expected_charge = if quarantined == 0 { 0 } else { envelope };
+    assert_eq!(held_charge, expected_charge);
+    assert_eq!(
+        pool.granted(),
+        expected_charge,
+        "storage and the charge covering it are never separated"
+    );
+
+    let completion =
+        EncoderCompletion::from_completed(runtime.pop_completed().expect("cancellation entry"));
+    assert!(
+        matches!(completion, EncoderCompletion::Cancelled { .. }),
+        "the cancellation is delivered through the ordinary terminal queue"
+    );
+
+    // Whatever the drain did, the charge must not outlive the storage.
+    runtime
+        .executor_mut()
+        .drain_retirement()
+        .expect("drain after cancellation");
+    assert_eq!(runtime.executor().quarantined_requests(), 0);
+    assert_eq!(pool.granted(), 0);
 }

@@ -258,6 +258,10 @@ pub enum Terminal<O, C> {
     Output(O),
     /// The request could not execute.
     Rejected(Rejection<C>),
+    /// The request was cancelled, either while it was still waiting or after it had
+    /// produced output the caller no longer wants. Nothing is retained: a result that
+    /// already existed went back to the executor with the charge covering it.
+    Cancelled,
 }
 
 /// One terminal entry awaiting consumption, in completion order.
@@ -293,7 +297,7 @@ impl<O, C> Completed<O, C> {
     ///
     /// Handing the result to another owner means handing over the lease too:
     /// dropping it releases pool bytes that owner's storage still needs.
-    /// Rejections carry no lease.
+    /// Rejections and cancellations carry no lease.
     #[must_use]
     pub fn into_parts(self) -> (Terminal<O, C>, Option<PoolLease>) {
         (self.outcome, self.lease)
@@ -313,10 +317,16 @@ impl<O, C> Completed<O, C> {
 
     /// Bytes this entry retains until the caller consumes it.
     ///
-    /// Rejections retain nothing and report zero.
+    /// Rejections and cancellations retain nothing and report zero.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         self.lease.as_ref().map_or(0, PoolLease::bytes)
+    }
+
+    /// Whether this request was cancelled instead of finishing.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self.outcome, Terminal::Cancelled)
     }
 
     /// The completed output, when this request executed rather than failing.
@@ -324,7 +334,7 @@ impl<O, C> Completed<O, C> {
     pub const fn output(&self) -> Option<&O> {
         match &self.outcome {
             Terminal::Output(output) => Some(output),
-            Terminal::Rejected(_) => None,
+            Terminal::Rejected(_) | Terminal::Cancelled => None,
         }
     }
 }
@@ -340,6 +350,9 @@ pub enum StepOutcome<C> {
     Blocked(BlockReason<C>),
     /// The head request was rejected, and its terminal entry was delivered.
     Rejected { request: RequestId },
+    /// The head request was cancelled before it ran, and its terminal entry was
+    /// delivered.
+    Cancelled { request: RequestId },
 }
 
 /// Coarse execution boundary for non-autoregressive request batching.
@@ -440,6 +453,10 @@ struct Queued<I> {
     request: RequestId,
     input: I,
     parameter_version: ParameterVersion,
+    /// Cancellation intent. A cancelled request stays in place so it keeps its FIFO
+    /// position and no second cleanup list is needed; it is reported instead of
+    /// executed once it reaches the head.
+    cancelled: bool,
 }
 
 /// What the queue head resolved to before any execution or reservation happened.
@@ -451,6 +468,9 @@ enum Resolved<C> {
     Idle,
     Blocked(BlockReason<C>),
     Rejected {
+        request: RequestId,
+    },
+    Cancelled {
         request: RequestId,
     },
     /// Per-request retention reservations for the executor's selected prefix.
@@ -516,8 +536,55 @@ impl<E: BatchExecutor> BatchRuntime<E> {
             request,
             input,
             parameter_version: self.executor.parameter_version(),
+            cancelled: false,
         });
         Ok(request)
+    }
+
+    /// Cancel one live request.
+    ///
+    /// Cancellation is intent, not device completion. A request that is still waiting
+    /// reports cancellation instead of running, which releases nothing because nothing
+    /// was reserved for it. A request whose result is already retained gives that
+    /// result back to the executor, together with the charge covering it, and reports
+    /// cancellation instead; the runtime never releases device storage or its charge on
+    /// its own. Either outcome is delivered through the ordinary terminal queue, so a
+    /// caller does not need a second path to learn a cancellation happened.
+    pub fn cancel(&mut self, request: RequestId) -> CancelOutcome {
+        if let Some(queued) = self
+            .queue
+            .iter_mut()
+            .find(|queued| queued.request == request)
+        {
+            queued.cancelled = true;
+            return CancelOutcome::Queued;
+        }
+        let Some(index) = self
+            .terminal
+            .iter()
+            .position(|entry| entry.request() == request)
+        else {
+            return CancelOutcome::Unknown;
+        };
+        let Some(entry) = self.terminal.remove(index) else {
+            return CancelOutcome::Unknown;
+        };
+        let parameter_version = entry.parameter_version();
+        let (outcome, lease) = entry.into_parts();
+        // A retained device result cannot be dropped by the runtime: the storage may
+        // still be running, and its charge must stay with it. The executor that
+        // materialized it is the only owner that can wait for completion.
+        if let (Terminal::Output(output), Some(lease)) = (outcome, lease) {
+            self.executor
+                .retire(vec![JobOutput::new(request, output, lease)]);
+        }
+        self.terminal.push_back(Completed {
+            request,
+            parameter_version,
+            outcome: Terminal::Cancelled,
+            lease: None,
+        });
+        CancelOutcome::Discarded
     }
 
     /// Resolve what to do with the queue head, then execute at most one batch.
@@ -537,6 +604,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
             Resolved::Idle => return Ok(StepOutcome::Idle),
             Resolved::Blocked(reason) => return Ok(StepOutcome::Blocked(reason)),
             Resolved::Rejected { request } => return Ok(StepOutcome::Rejected { request }),
+            Resolved::Cancelled { request } => return Ok(StepOutcome::Cancelled { request }),
             Resolved::Ready { items } => items,
         };
 
@@ -601,6 +669,29 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     /// Resolve the queue head without executing anything.
     fn resolve_head(&mut self) -> Result<Resolved<E::Constraint>, RuntimeError<E::Error>> {
         let version = self.executor.parameter_version();
+        // Cancellation intent is resolved before any shape, capacity or selection work:
+        // a cancelled request must not reserve capacity, wait for a pool, or be offered
+        // to the executor as runnable work.
+        if self.queue.front().is_some_and(|front| front.cancelled) {
+            if self.terminal.len() >= self.config.max_retained_results {
+                // The terminal count bound applies to cancellations exactly as it does
+                // to rejections: the intent is already recorded, so consuming one entry
+                // delivers it.
+                return Ok(Resolved::Blocked(BlockReason::RetainedResults));
+            }
+            let Some(cancelled) = self.queue.pop_front() else {
+                return Err(RuntimeError::QueueInvariant);
+            };
+            self.terminal.push_back(Completed {
+                request: cancelled.request,
+                parameter_version: cancelled.parameter_version,
+                outcome: Terminal::Cancelled,
+                lease: None,
+            });
+            return Ok(Resolved::Cancelled {
+                request: cancelled.request,
+            });
+        }
         let head_retention = match self.queue.front() {
             None => return Ok(Resolved::Idle),
             Some(front) => {
@@ -626,7 +717,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
             .queue
             .iter()
             .take(self.executor.max_batch_items())
-            .take_while(|queued| queued.parameter_version == version)
+            .take_while(|queued| queued.parameter_version == version && !queued.cancelled)
             .map(|queued| &queued.input)
             .collect::<Vec<_>>();
         match self.executor.select_batch(&candidates) {
@@ -840,6 +931,20 @@ impl CapacityWait {
     pub fn released(&self) -> bool {
         self.pool.epoch() != self.epoch
     }
+}
+
+/// How one [`BatchRuntime::cancel`] ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutcome {
+    /// The request was still waiting; it will report cancellation rather than run.
+    /// No reservation existed for it, so nothing was released.
+    Queued,
+    /// The request had a retained result. That result and the charge covering it went
+    /// back to the executor, and the entry now reports cancellation.
+    Discarded,
+    /// No live request has this identity: it was never submitted, was already
+    /// consumed, or was cancelled earlier.
+    Unknown,
 }
 
 #[derive(Debug)]
