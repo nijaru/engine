@@ -92,9 +92,17 @@ impl Default for BatchConfig {
     }
 }
 
+/// One request handed to an executor, with the reservation covering its storage.
+///
+/// The reservation is granted during preparation and moves to the executor at
+/// submission. From then on the executor owns it: it attaches the charge to whatever
+/// storage it materializes for that request, and releases it only when nothing can
+/// have reached the device. A reservation that outlives an enqueue failure keeps
+/// covering the storage the device may still access.
 pub struct Job<I> {
     request: RequestId,
     input: I,
+    lease: PoolLease,
 }
 
 impl<I> Job<I> {
@@ -108,21 +116,40 @@ impl<I> Job<I> {
         &self.input
     }
 
+    /// The reservation this request was granted.
     #[must_use]
-    pub fn into_input(self) -> I {
-        self.input
+    pub const fn lease(&self) -> &PoolLease {
+        &self.lease
+    }
+
+    /// Split into the request identity, its input and the reservation the executor
+    /// now owns.
+    #[must_use]
+    pub fn into_parts(self) -> (RequestId, I, PoolLease) {
+        (self.request, self.input, self.lease)
     }
 }
 
+/// One result handed back to the runtime, with the reservation covering its storage.
+///
+/// The executor returns the charge inside the same value that carries the result, so
+/// the runtime never has to guess which reservation belongs to which output. Output
+/// the runtime cannot commit is handed back through [`BatchExecutor::retire`]
+/// instead of being released here.
 pub struct JobOutput<O> {
     request: RequestId,
     output: O,
+    lease: PoolLease,
 }
 
 impl<O> JobOutput<O> {
     #[must_use]
-    pub fn new(request: RequestId, output: O) -> Self {
-        Self { request, output }
+    pub fn new(request: RequestId, output: O, lease: PoolLease) -> Self {
+        Self {
+            request,
+            output,
+            lease,
+        }
     }
 
     #[must_use]
@@ -135,9 +162,18 @@ impl<O> JobOutput<O> {
         &self.output
     }
 
+    /// The reservation covering this result's storage.
     #[must_use]
-    pub fn into_output(self) -> O {
-        self.output
+    pub const fn lease(&self) -> &PoolLease {
+        &self.lease
+    }
+
+    /// Split into the request identity, its result and the reservation that covers
+    /// it. The two must stay together: releasing the lease while the result's
+    /// storage is readable is what the pool's accounting must never allow.
+    #[must_use]
+    pub fn into_parts(self) -> (RequestId, O, PoolLease) {
+        (self.request, self.output, self.lease)
     }
 }
 
@@ -339,24 +375,63 @@ pub trait BatchExecutor {
     /// submits work.
     fn retained_bytes(&self, input: &Self::Input) -> u64;
 
+    /// Enqueue one prepared batch and return its results.
+    ///
+    /// Each job carries the reservation covering that request's storage. The
+    /// executor owns those reservations from this call on: it attaches each charge to
+    /// the storage it materializes and returns the two together in
+    /// [`JobOutput`].
+    ///
     /// # Errors
-    /// Returns the concrete executor error when the selected batch cannot execute.
+    /// The returned [`EnqueueError`] must distinguish a refusal that never touched the
+    /// device from work that may already be in flight. After a device-visible
+    /// mutation the executor keeps ownership of everything it may have enqueued —
+    /// storage and charge together — and releases only what provably never reached
+    /// the device. Returning an error is not permission to release uncertain storage.
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error>;
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>>;
+
+    /// Take back output the runtime cannot commit.
+    ///
+    /// The runtime calls this when an executor's returned output does not match the
+    /// work it submitted, so no result can be delivered. The executor owns the
+    /// storage and the charge carried by every returned value again; it must keep
+    /// both until completion is established, exactly as after a failed enqueue.
+    /// Dropping them here would release device memory the device may still write.
+    fn retire(&mut self, outputs: Vec<JobOutput<Self::Output>>);
+}
+
+/// Why a batch could not be enqueued, and what the executor still owns.
+///
+/// The distinction is the point: it tells the caller whether device work may exist for
+/// a batch whose results will never be delivered.
+#[derive(Debug)]
+pub enum EnqueueError<E> {
+    /// Nothing reached the device. Every reservation the executor was handed is
+    /// released and nothing needs retiring.
+    Refused(E),
+    /// A device-visible mutation happened before the failure, so some work may be in
+    /// flight. The executor retains the storage and the reservations for everything
+    /// it may have enqueued; only a proven completion may release them.
+    Uncertain(E),
+}
+
+impl<E> EnqueueError<E> {
+    /// The executor's own error, whichever ownership state it left behind.
+    #[must_use]
+    pub fn into_inner(self) -> E {
+        match self {
+            Self::Refused(error) | Self::Uncertain(error) => error,
+        }
+    }
 }
 
 struct Queued<I> {
     request: RequestId,
     input: I,
     parameter_version: ParameterVersion,
-}
-
-/// One executed batch and the reservations that cover its retained outputs.
-struct Executed<O> {
-    outputs: Vec<JobOutput<O>>,
-    leases: Vec<PoolLease>,
 }
 
 /// What the queue head resolved to before any execution or reservation happened.
@@ -498,24 +573,20 @@ impl<E: BatchExecutor> BatchRuntime<E> {
 
         let items = leases.len();
         let version = self.executor.parameter_version();
-        // Submission may reach the device before failing, so the reservations
-        // travel into the error: nothing releases pool bytes covering state the
-        // device may still access until completion is known.
+        // The reservation granted for each accepted request travels into its job, so
+        // an executor that fails after reaching the device owns that charge along with
+        // the storage it covers instead of handing it back inside an error.
         let executed = self.execute_selected(items, leases)?;
-        let results = executed.outputs.len();
-        self.terminal
-            .extend(
-                executed
-                    .outputs
-                    .into_iter()
-                    .zip(executed.leases)
-                    .map(|(output, lease)| Completed {
-                        request: output.request(),
-                        parameter_version: version,
-                        outcome: Terminal::Output(output.into_output()),
-                        lease: Some(lease),
-                    }),
-            );
+        let results = executed.len();
+        self.terminal.extend(executed.into_iter().map(|output| {
+            let (request, output, lease) = output.into_parts();
+            Completed {
+                request,
+                parameter_version: version,
+                outcome: Terminal::Output(output),
+                lease: Some(lease),
+            }
+        }));
         Ok(StepOutcome::Executed { results })
     }
 
@@ -593,15 +664,16 @@ impl<E: BatchExecutor> BatchRuntime<E> {
 
     /// Drain `items` queued requests and run them as one batch.
     ///
-    /// `leases` are the reservations made for those items. A failure after the
-    /// executor was called returns them to the caller instead of dropping them,
-    /// because dropping would release pool bytes that may still cover device
-    /// storage.
+    /// `leases` are the reservations made for those items, one per queued request in
+    /// the same order. They travel into the jobs, so the executor owns every
+    /// reservation it was handed from the moment it is called: a failure after a
+    /// device-visible mutation keeps the charge with the storage rather than
+    /// returning it here.
     fn execute_selected(
         &mut self,
         items: usize,
         leases: Vec<PoolLease>,
-    ) -> Result<Executed<E::Output>, RuntimeError<E::Error>> {
+    ) -> Result<Vec<JobOutput<E::Output>>, RuntimeError<E::Error>> {
         let mut queued = Vec::with_capacity(items);
         while queued.len() < items {
             let Some(next) = self.queue.pop_front() else {
@@ -612,18 +684,27 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         let expected = queued.iter().map(|item| item.request).collect::<Vec<_>>();
         let jobs = queued
             .into_iter()
-            .map(|item| Job {
+            .zip(leases)
+            .map(|(item, lease)| Job {
                 request: item.request,
                 input: item.input,
+                lease,
             })
             .collect();
         let outputs = match self.executor.execute(jobs) {
             Ok(outputs) => outputs,
-            Err(source) => {
+            Err(EnqueueError::Refused(source)) => {
                 return Err(RuntimeError::Executor {
                     requests: expected,
                     source,
-                    leases,
+                });
+            }
+            // The executor keeps the storage and the charge; the runtime reports
+            // which requests it will never deliver, and retains nothing itself.
+            Err(EnqueueError::Uncertain(source)) => {
+                return Err(RuntimeError::Uncertain {
+                    requests: expected,
+                    source,
                 });
             }
         };
@@ -633,12 +714,17 @@ impl<E: BatchExecutor> BatchRuntime<E> {
                 .zip(expected.iter())
                 .any(|(output, request)| output.request() != *request)
         {
+            let returned = outputs.len();
+            // Nothing here can be committed, and the storage behind each output may
+            // still be live: hand it back to the owner that can wait for completion
+            // instead of dropping it into a free list.
+            self.executor.retire(outputs);
             return Err(RuntimeError::MalformedCompletion {
                 requests: expected,
-                leases,
+                returned,
             });
         }
-        Ok(Executed { outputs, leases })
+        Ok(outputs)
     }
 
     /// Consume the oldest terminal entry and hand over its reservation.
@@ -762,18 +848,30 @@ pub enum RuntimeError<E> {
         candidates: usize,
     },
     QueueInvariant,
+    /// The executor returned output that does not match the work it was given, so
+    /// nothing can be committed. Its storage and charge were handed back through
+    /// [`BatchExecutor::retire`].
     MalformedCompletion {
+        /// Requests this call submitted.
         requests: Vec<RequestId>,
-        /// Reservations covering state the executor may already hold. Keep them
-        /// until completion is known; dropping them releases pool bytes that may
-        /// still cover device storage.
-        leases: Vec<PoolLease>,
+        /// Results the executor returned for them.
+        returned: usize,
     },
+    /// The executor refused the batch before any device access, so no result will be
+    /// delivered and nothing is retained.
     Executor {
+        /// Requests this call submitted.
         requests: Vec<RequestId>,
         source: E,
-        /// Reservations covering state the executor may already hold.
-        leases: Vec<PoolLease>,
+    },
+    /// The executor failed after a device-visible mutation, so some work may be in
+    /// flight. The executor retains ownership of everything it may have enqueued,
+    /// together with those reservations; the runtime delivers nothing for these
+    /// requests. Release waits on a completion only the executor can establish.
+    Uncertain {
+        /// Requests this call submitted.
+        requests: Vec<RequestId>,
+        source: E,
     },
     /// The shared byte pool is closed, so no new submission is accepted.
     PoolClosed,
@@ -805,12 +903,16 @@ impl<E: fmt::Display> fmt::Display for RuntimeError<E> {
             Self::QueueInvariant => {
                 f.write_str("batch runtime queue changed while draining a selected batch")
             }
-            Self::MalformedCompletion { requests, .. } => write!(
+            Self::MalformedCompletion { requests, returned } => write!(
                 f,
-                "batch executor returned malformed completion metadata for {} requests",
+                "batch executor returned {returned} results for {} submitted requests",
                 requests.len()
             ),
             Self::Executor { source, .. } => source.fmt(f),
+            Self::Uncertain { source, .. } => write!(
+                f,
+                "batch executor failed after reaching the device and retains the work: {source}"
+            ),
             Self::PoolClosed => f.write_str("shared byte pool is closed"),
         }
     }
@@ -850,6 +952,10 @@ mod tests {
         busy: bool,
         bytes_per_token: u64,
         over_select: bool,
+        /// Return fewer results than the runtime submitted.
+        short_return: bool,
+        /// Outputs handed back by the runtime after a malformed completion.
+        retired_outputs: usize,
         max_batch_items: usize,
     }
 
@@ -862,6 +968,8 @@ mod tests {
                 busy: false,
                 bytes_per_token: 1,
                 over_select: false,
+                short_return: false,
+                retired_outputs: 0,
                 max_batch_items: 2,
             }
         }
@@ -920,17 +1028,27 @@ mod tests {
         fn execute(
             &mut self,
             batch: Vec<Job<Self::Input>>,
-        ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+        ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
             self.batches
                 .push(batch.iter().map(|job| job.input().len()).collect());
-            Ok(batch
+            let mut outputs = batch
                 .into_iter()
                 .map(|job| {
-                    let request = job.request();
-                    let sum = job.into_input().into_iter().sum();
-                    JobOutput::new(request, sum)
+                    let (request, input, lease) = job.into_parts();
+                    JobOutput::new(request, input.into_iter().sum(), lease)
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            if self.short_return {
+                // A contract violation: one submitted request gets no result.
+                outputs.pop();
+            }
+            Ok(outputs)
+        }
+
+        fn retire(&mut self, outputs: Vec<JobOutput<Self::Output>>) {
+            // This fixture's output owns no storage; the hand-back is what the test
+            // observes.
+            self.retired_outputs += outputs.len();
         }
     }
 
@@ -938,8 +1056,32 @@ mod tests {
         BytePool::new(1 << 20).shared()
     }
 
-    /// An executor that always fails after the runtime has reserved for it.
-    struct FailingEncoder;
+    /// An executor that fails after the runtime has reserved for it.
+    ///
+    /// Its output owns no storage, so the reservations it takes back are the only
+    /// resource at stake: the test watches when they return to the pool.
+    struct FailingEncoder {
+        /// Whether the failure happened after device-visible work.
+        after_device: bool,
+        /// Reservations the executor still owns after its failure.
+        quarantined: Vec<PoolLease>,
+        /// Outputs handed back by the runtime.
+        retired_outputs: usize,
+    }
+
+    impl FailingEncoder {
+        fn new(after_device: bool) -> Self {
+            Self {
+                after_device,
+                quarantined: Vec::new(),
+                retired_outputs: 0,
+            }
+        }
+
+        fn release_quarantined(&mut self) {
+            self.quarantined.clear();
+        }
+    }
 
     impl BatchExecutor for FailingEncoder {
         type Input = Vec<u32>;
@@ -965,9 +1107,25 @@ mod tests {
 
         fn execute(
             &mut self,
-            _batch: Vec<Job<Self::Input>>,
-        ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
-            Err(Constraint::WorkspaceBusy)
+            batch: Vec<Job<Self::Input>>,
+        ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
+            if self.after_device {
+                // The reservation stays here: the device may still hold storage this
+                // failure created.
+                self.quarantined
+                    .extend(batch.into_iter().map(|job| job.into_parts().2));
+                Err(EnqueueError::Uncertain(Constraint::WorkspaceBusy))
+            } else {
+                // Nothing reached the device, so every reservation is released.
+                drop(batch);
+                Err(EnqueueError::Refused(Constraint::WorkspaceBusy))
+            }
+        }
+
+        fn retire(&mut self, outputs: Vec<JobOutput<Self::Output>>) {
+            self.retired_outputs += outputs.len();
+            self.quarantined
+                .extend(outputs.into_iter().map(|output| output.into_parts().2));
         }
     }
 
@@ -1209,19 +1367,33 @@ mod tests {
         ));
         drop(runtime);
 
-        // A submission that fails after reaching the executor must not free its
-        // reservation: the executor may still hold state the device can read.
+        // A submission that fails after reaching the device keeps its reservation with
+        // the executor: releasing it here would free pool bytes covering storage the
+        // device may still read.
         let pool = BytePool::new(1 << 19).shared();
-        let mut runtime = BatchRuntime::new(FailingEncoder, pool, config()).expect("runtime");
+        let mut runtime = BatchRuntime::new(FailingEncoder::new(true), Arc::clone(&pool), config())
+            .expect("runtime");
         runtime.submit(vec![1]).expect("request");
         let error = runtime.step().expect_err("executor failure");
-        match error {
-            RuntimeError::Executor { leases, .. } => {
-                assert_eq!(leases.len(), 1);
-                assert_eq!(leases[0].bytes(), 1);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(error, RuntimeError::Uncertain { .. }),
+            "a device-visible failure is uncertain, got {error:?}"
+        );
+        assert_eq!(pool.granted(), 1, "the executor keeps the charge");
+        assert_eq!(runtime.executor().quarantined.len(), 1);
+
+        // Only a proven drain releases it, and no error ever carried the lease back.
+        runtime.executor_mut().release_quarantined();
+        assert_eq!(pool.granted(), 0);
+
+        // A refusal before device access releases every reservation instead.
+        let pool = BytePool::new(1 << 19).shared();
+        let mut runtime =
+            BatchRuntime::new(FailingEncoder::new(false), Arc::clone(&pool), config())
+                .expect("runtime");
+        runtime.submit(vec![1]).expect("request");
+        assert!(matches!(runtime.step(), Err(RuntimeError::Executor { .. })));
+        assert_eq!(pool.granted(), 0);
     }
 
     #[test]
@@ -1393,5 +1565,23 @@ mod tests {
                 candidates: 1
             })
         ));
+    }
+
+    #[test]
+    fn a_short_completion_is_handed_back_to_the_executor() {
+        let mut runtime = runtime();
+        runtime.executor_mut().short_return = true;
+        runtime.submit(vec![1]).expect("first request");
+        runtime.submit(vec![2]).expect("second request");
+        assert!(matches!(
+            runtime.step(),
+            Err(RuntimeError::MalformedCompletion { returned: 1, .. })
+        ));
+        assert_eq!(runtime.executor().retired_outputs, 1);
+        assert_eq!(
+            runtime.retained_results(),
+            0,
+            "nothing may be committed after a malformed completion"
+        );
     }
 }

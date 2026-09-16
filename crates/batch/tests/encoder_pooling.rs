@@ -3,7 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ribn_batch::{
-    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, EnqueueError, Job, JobOutput,
+    StepOutcome,
 };
 use ribn_foundation::{BytePool, ParameterVersion};
 
@@ -148,22 +149,27 @@ impl BatchExecutor for ReferenceEncoder {
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
         let batch_tokens = batch.iter().map(|job| job.input().len()).sum::<usize>();
         if batch_tokens > self.max_batch_tokens {
-            return Err(EncoderError::BatchTooLarge {
+            // A host fixture: a refusal never reached a device.
+            return Err(EnqueueError::Refused(EncoderError::BatchTooLarge {
                 tokens: batch_tokens,
                 limit: self.max_batch_tokens,
-            });
+            }));
         }
         batch
             .into_iter()
             .map(|job| {
-                let request = job.request();
-                let output = self.encode(job.input())?;
-                Ok(JobOutput::new(request, output))
+                let (request, input, lease) = job.into_parts();
+                let output = self.encode(&input).map_err(EnqueueError::Refused)?;
+                Ok(JobOutput::new(request, output, lease))
             })
             .collect()
+    }
+
+    fn retire(&mut self, _outputs: Vec<JobOutput<Self::Output>>) {
+        // This fixture's output owns no storage, so retirement is an ordinary drop.
     }
 }
 

@@ -104,6 +104,11 @@ fn the_shared_pool_bounds_how_many_requests_execute() {
     };
     result.synchronize().expect("synchronize");
     assert!(result.read().is_ok());
+    assert_eq!(
+        runtime.executor().quarantined_requests(),
+        0,
+        "a successful run must not leave the encoder holding device work"
+    );
 }
 
 #[test]

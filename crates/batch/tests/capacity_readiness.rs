@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ribn_batch::{
-    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, BlockReason, Job, JobOutput,
-    StepOutcome,
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, BlockReason, EnqueueError, Job,
+    JobOutput, StepOutcome,
 };
 use ribn_foundation::{BytePool, ParameterVersion};
 
@@ -48,14 +48,18 @@ impl BatchExecutor for Envelope {
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
         Ok(batch
             .into_iter()
             .map(|job| {
-                let request = job.request();
-                JobOutput::new(request, job.into_input())
+                let (request, input, lease) = job.into_parts();
+                JobOutput::new(request, input, lease)
             })
             .collect())
+    }
+
+    fn retire(&mut self, _outputs: Vec<JobOutput<Self::Output>>) {
+        // This fixture's output owns no storage, so retirement is an ordinary drop.
     }
 }
 

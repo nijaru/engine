@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ribn_batch::{
-    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, EnqueueError, Job, JobOutput,
+    StepOutcome,
 };
 use ribn_foundation::BytePool;
 use ribn_foundation::{ParameterVersion, ScalarType};
@@ -156,14 +157,19 @@ impl BatchExecutor for PackageEncoder {
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
         batch
             .into_iter()
             .map(|job| {
-                let request = job.request();
-                Ok(JobOutput::new(request, self.encode(job.input())?))
+                let (request, input, lease) = job.into_parts();
+                let output = self.encode(&input).map_err(EnqueueError::Refused)?;
+                Ok(JobOutput::new(request, output, lease))
             })
             .collect()
+    }
+
+    fn retire(&mut self, _outputs: Vec<JobOutput<Self::Output>>) {
+        // This fixture's output owns no storage, so retirement is an ordinary drop.
     }
 }
 

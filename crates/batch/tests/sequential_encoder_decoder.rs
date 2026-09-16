@@ -8,7 +8,8 @@ use ribn::{
     StepCompletion, SubmissionId, TokenRequest,
 };
 use ribn_batch::{
-    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, Job, JobOutput, StepOutcome,
+    BatchConfig, BatchExecutor, BatchRuntime, BatchSelection, EnqueueError, Job, JobOutput,
+    StepOutcome,
 };
 use ribn_foundation::{BytePool, ParameterVersion};
 
@@ -45,14 +46,18 @@ impl BatchExecutor for Encoder {
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
         Ok(batch
             .into_iter()
             .map(|job| {
-                let request = job.request();
-                JobOutput::new(request, Arc::<[u32]>::from(job.into_input()))
+                let (request, input, lease) = job.into_parts();
+                JobOutput::new(request, Arc::<[u32]>::from(input), lease)
             })
             .collect())
+    }
+
+    fn retire(&mut self, _outputs: Vec<JobOutput<Self::Output>>) {
+        // This fixture's output owns no storage, so retirement is an ordinary drop.
     }
 }
 

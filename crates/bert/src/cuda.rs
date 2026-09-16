@@ -16,12 +16,13 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream};
 use engine_nvidia::{CudaEncoderKernelError, CudaEncoderOps};
+use ribn_foundation::PoolLease;
 use ribn_hf::LocalModelPackage;
 
 use crate::config::{BertConfig, ConfigError};
@@ -54,6 +55,9 @@ pub enum EncoderError {
     Driver(String),
     /// The request itself can never run on this encoder, whatever is released.
     InvalidRequest(EncoderConstraint),
+    /// The device failed and completion could not be established, so the encoder
+    /// keeps quarantined work and refuses new submissions until it can.
+    Faulted(String),
 }
 
 impl fmt::Display for EncoderError {
@@ -65,6 +69,10 @@ impl fmt::Display for EncoderError {
             Self::Kernels(error) => write!(f, "encoder kernels: {error}"),
             Self::Driver(message) => write!(f, "encoder driver: {message}"),
             Self::InvalidRequest(constraint) => write!(f, "encoder request: {constraint}"),
+            Self::Faulted(message) => write!(
+                f,
+                "encoder is faulted and retains quarantined device work: {message}"
+            ),
         }
     }
 }
@@ -109,6 +117,7 @@ pub struct CudaBertEncoder {
     config: BertConfig,
     max_batch_items: usize,
     prepared: Arc<Prepared>,
+    retirement: Mutex<Retirement>,
 }
 
 impl CudaBertEncoder {
@@ -186,6 +195,7 @@ impl CudaBertEncoder {
             config,
             max_batch_items: DEFAULT_MAX_BATCH_ITEMS,
             prepared: Arc::new(Prepared { ops, blas, weights }),
+            retirement: Mutex::new(Retirement::default()),
         })
     }
 
@@ -236,15 +246,46 @@ impl CudaBertEncoder {
     /// recorded after the last of them. Nothing is read back here, so the caller
     /// decides when to wait.
     ///
+    /// A failure that leaves device work running keeps that storage in the encoder's
+    /// retirement list, because no caller may free storage it cannot prove complete.
+    /// The caller that holds a shared-pool reservation should use
+    /// [`Self::enqueue`] instead, so the charge covering that storage travels with
+    /// it.
+    ///
     /// # Errors
-    /// Returns [`EncoderError`] for an invalid request or a CUDA/cuBLAS failure.
+    /// Returns [`EncoderError`] for an invalid request, a CUDA/cuBLAS failure, or a
+    /// faulted encoder.
     pub fn submit(&self, request: &EncoderRequest) -> Result<EncoderSubmission, EncoderError> {
-        let shape = crate::request::shape_of(&self.config, request)?;
+        match self.enqueue(request) {
+            Ok(submission) => Ok(submission),
+            Err(failure) => Err(self.retire_failure(failure, None)),
+        }
+    }
+
+    /// Enqueue one request, reporting what the attempt left behind on failure.
+    ///
+    /// The caller owns the reservation covering this request's storage, so it — not
+    /// this method — pairs the two when the failure returned storage that may still
+    /// be running.
+    pub(crate) fn enqueue(
+        &self,
+        request: &EncoderRequest,
+    ) -> Result<EncoderSubmission, EnqueueFailure> {
+        if let Some(fault) = self.fault() {
+            return Err(EnqueueFailure::refused(EncoderError::Faulted(fault)));
+        }
+        let shape = crate::request::shape_of(&self.config, request).map_err(|constraint| {
+            EnqueueFailure::refused(EncoderError::InvalidRequest(constraint))
+        })?;
         let stream = self.stream();
-        let upload_tokens = |values: &[u32]| -> Result<CudaSlice<u32>, EncoderError> {
+        // Buffers released here are safe: a dropped device buffer is either freed in
+        // stream order or freed after an explicit drain, so nothing is returned to the
+        // allocator while the device can still write it. The charge is a different
+        // question, and that is what the retirement list answers.
+        let upload_tokens = |values: &[u32]| -> Result<CudaSlice<u32>, EnqueueFailure> {
             stream
                 .clone_htod(values)
-                .map_err(|error| EncoderError::Driver(error.to_string()))
+                .map_err(|error| EnqueueFailure::refused(EncoderError::Driver(error.to_string())))
         };
         let mask: Vec<i32> = request.attention_mask.clone();
         let mut submission = EncoderSubmission {
@@ -253,40 +294,159 @@ impl CudaBertEncoder {
             shape,
             tokens: upload_tokens(&request.token_ids)?,
             types: upload_tokens(&request.token_type_ids)?,
-            mask: stream
-                .clone_htod(&mask)
-                .map_err(|error| EncoderError::Driver(error.to_string()))?,
-            hidden: alloc(stream, shape.hidden_values())?,
-            query: alloc(stream, shape.hidden_values())?,
-            key: alloc(stream, shape.hidden_values())?,
-            value: alloc(stream, shape.hidden_values())?,
-            context: alloc(stream, shape.hidden_values())?,
-            projection: alloc(stream, shape.hidden_values())?,
-            intermediate: alloc(stream, shape.intermediate_values())?,
-            first_row: alloc(stream, shape.hidden())?,
-            pooled: alloc(stream, shape.hidden())?,
+            mask: stream.clone_htod(&mask).map_err(|error| {
+                EnqueueFailure::refused(EncoderError::Driver(error.to_string()))
+            })?,
+            hidden: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            query: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            key: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            value: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            context: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            projection: alloc(stream, shape.hidden_values()).map_err(EnqueueFailure::refused)?,
+            intermediate: alloc(stream, shape.intermediate_values())
+                .map_err(EnqueueFailure::refused)?,
+            first_row: alloc(stream, shape.hidden()).map_err(EnqueueFailure::refused)?,
+            pooled: alloc(stream, shape.hidden()).map_err(EnqueueFailure::refused)?,
             completion: None,
         };
-        let run = submission.run().and_then(|()| {
-            submission.completion = Some(
-                stream
-                    .record_event(None)
-                    .map_err(|error| EncoderError::Driver(error.to_string()))?,
-            );
-            Ok(())
-        });
-        match run {
-            Ok(()) => Ok(submission),
-            Err(error) => {
-                // A partially enqueued request owns device storage the stream may
-                // still be writing, so drain before the buffers are dropped. The
-                // executor-owned retirement handshake replaces this best-effort
-                // step; until then a device fault here leaves the storage's pool
-                // charge with the caller rather than releasing it early.
-                let _ = stream.synchronize();
-                Err(error)
-            }
+        // From here the submission is complete and owns live device state: a failure
+        // returns it so its owner can keep it until completion is proven.
+        if let Err(error) = submission.run() {
+            return Err(EnqueueFailure::partial(error, submission));
         }
+        #[cfg(test)]
+        if tests::take_injected_enqueue_failure() {
+            // A real device only reaches this path on an OOM or a device fault, which a
+            // qualification run cannot schedule; the injection keeps the retirement
+            // path itself testable on device.
+            return Err(EnqueueFailure::partial(
+                EncoderError::Driver("injected post-enqueue failure".to_owned()),
+                submission,
+            ));
+        }
+        match stream.record_event(None) {
+            Ok(event) => {
+                submission.completion = Some(event);
+                Ok(submission)
+            }
+            Err(error) => Err(EnqueueFailure::partial(
+                EncoderError::Driver(error.to_string()),
+                submission,
+            )),
+        }
+    }
+
+    /// Keep storage a failed enqueue may still be running, with its reservation.
+    ///
+    /// A proven drain is the only thing that releases either, so this drains
+    /// opportunistically and records a fault when it cannot. The caller gets its own
+    /// error back unchanged.
+    pub(crate) fn retire_failure(
+        &self,
+        failure: EnqueueFailure,
+        lease: Option<PoolLease>,
+    ) -> EncoderError {
+        let EnqueueFailure { error, storage } = failure;
+        if let Some(submission) = storage {
+            self.quarantine(*submission, lease);
+            let _ = self.drain_retirement();
+        }
+        error
+    }
+
+    /// Establish completion of every quarantined request and release what is proven
+    /// done.
+    ///
+    /// A successful drain is the only evidence that permits release. While it fails,
+    /// the encoder keeps the storage and the charge and refuses new submissions:
+    /// releasing a charge early would let another owner reserve bytes the device is
+    /// still holding, and the storage behind an outstanding stream-ordered free has
+    /// not returned to the allocator either.
+    ///
+    /// # Errors
+    /// Returns the device error that prevented completion.
+    pub fn drain_retirement(&self) -> Result<usize, EncoderError> {
+        let (pending, faulted) = {
+            let retirement = self.retirement();
+            (retirement.quarantined.len(), retirement.fault.is_some())
+        };
+        if pending == 0 && !faulted {
+            return Ok(0);
+        }
+        #[cfg(test)]
+        if tests::take_injected_drain_failure() {
+            let message = "injected drain failure".to_owned();
+            self.retirement().fault = Some(message.clone());
+            return Err(EncoderError::Driver(message));
+        }
+        if let Err(error) = self.stream().synchronize() {
+            let message = error.to_string();
+            self.retirement().fault = Some(message);
+            return Err(EncoderError::Driver(error.to_string()));
+        }
+        let mut retirement = self.retirement();
+        let drained = retirement.quarantined.len();
+        retirement.quarantined.clear();
+        retirement.fault = None;
+        Ok(drained)
+    }
+
+    /// Requests whose device work is still held by this encoder.
+    #[must_use]
+    pub fn quarantined_requests(&self) -> usize {
+        self.retirement().quarantined.len()
+    }
+
+    /// Device bytes this encoder still holds for work that may not have completed.
+    #[must_use]
+    pub fn quarantined_bytes(&self) -> u64 {
+        self.retirement()
+            .quarantined
+            .iter()
+            .map(|entry| entry.submission.device_bytes())
+            .sum()
+    }
+
+    /// Shared-pool bytes this encoder still holds for quarantined work.
+    ///
+    /// A quarantined request keeps the reservation that was granted for it, so this
+    /// equals its device bytes whenever a shared pool granted one. It is zero on the
+    /// standalone submission path, which has no pool to account to.
+    #[must_use]
+    pub fn quarantined_charge(&self) -> u64 {
+        self.retirement()
+            .quarantined
+            .iter()
+            .filter_map(|entry| entry.lease.as_ref())
+            .fold(0_u64, |total, lease| total.saturating_add(lease.bytes()))
+    }
+
+    /// Whether the device failed and this encoder still holds quarantined work.
+    #[must_use]
+    pub fn is_faulted(&self) -> bool {
+        self.retirement().fault.is_some()
+    }
+
+    /// The fault that stopped this encoder from accepting work, when it has one.
+    #[must_use]
+    pub fn fault(&self) -> Option<String> {
+        self.retirement().fault.clone()
+    }
+
+    /// Keep one live submission, and the charge covering it, until a proven drain.
+    pub(crate) fn quarantine(&self, submission: EncoderSubmission, lease: Option<PoolLease>) {
+        self.retirement()
+            .quarantined
+            .push(Quarantined { submission, lease });
+    }
+
+    fn retirement(&self) -> std::sync::MutexGuard<'_, Retirement> {
+        // The retirement list holds no arithmetic that can panic while locked, so
+        // recovering the guard keeps one failed device from becoming a permanent
+        // panic for every later release attempt.
+        self.retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Run one request to completion and read its results.
@@ -298,6 +458,62 @@ impl CudaBertEncoder {
         let submission = self.submit(request)?;
         submission.synchronize()?;
         submission.read()
+    }
+}
+
+/// Device work the encoder may still hold after a failed or uncommittable
+/// submission.
+///
+/// Release waits on a proven stream drain, not on the fact that an error was
+/// reported: the storage may still be running, and the reservoir covering it is not
+/// free until the device has reached the stream-ordered free of that storage.
+#[derive(Default)]
+struct Retirement {
+    quarantined: Vec<Quarantined>,
+    /// Set when a drain failed; new submissions are refused until one succeeds.
+    fault: Option<String>,
+}
+
+/// One quarantined request: its device storage and the charge covering it.
+///
+/// The charge is absent only on the standalone submission path, which has no shared
+/// pool to account to. Whenever a reservation exists, the two stay here together.
+struct Quarantined {
+    submission: EncoderSubmission,
+    lease: Option<PoolLease>,
+}
+
+/// Why one request could not be enqueued, and what the encoder still owns.
+pub(crate) struct EnqueueFailure {
+    error: EncoderError,
+    /// Device storage the failed attempt already created. It may still be running,
+    /// so its owner must keep it — with the reservation covering it — until a proven
+    /// drain. Boxed because a submission owns a whole activation workspace and this
+    /// travels as an error.
+    storage: Option<Box<EncoderSubmission>>,
+}
+
+impl EnqueueFailure {
+    /// A failure that left no owned storage: validation, allocation or upload.
+    fn refused(error: EncoderError) -> Self {
+        Self {
+            error,
+            storage: None,
+        }
+    }
+
+    /// A failure after the request's device state existed and was already enqueued.
+    fn partial(error: EncoderError, storage: EncoderSubmission) -> Self {
+        Self {
+            error,
+            storage: Some(Box::new(storage)),
+        }
+    }
+
+    /// Whether the attempt created device storage that is still owned.
+    #[must_use]
+    pub(crate) const fn owns_storage(&self) -> bool {
+        self.storage.is_some()
     }
 }
 
@@ -606,4 +822,103 @@ fn alloc(stream: &Arc<CudaStream>, values: usize) -> Result<CudaSlice<f32>, Enco
     stream
         .alloc_zeros::<f32>(values)
         .map_err(|error| EncoderError::Driver(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ribn_foundation::BytePool;
+
+    /// Countdown of submissions whose enqueue is deliberately failed after the
+    /// forward pass was already launched.
+    ///
+    /// Only a device fault or an allocation failure reaches this path in production,
+    /// and neither can be scheduled on demand, so the retirement cycle around it is
+    /// injected rather than assumed.
+    static INJECTED_ENQUEUE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Countdown of drains that are deliberately reported as unprovable.
+    static INJECTED_DRAIN_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn take_injected_enqueue_failure() -> bool {
+        take(&INJECTED_ENQUEUE_FAILURES)
+    }
+
+    pub(super) fn take_injected_drain_failure() -> bool {
+        take(&INJECTED_DRAIN_FAILURES)
+    }
+
+    fn take(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../batch/tests/fixtures/bert-tiny")
+    }
+
+    fn encoder() -> CudaBertEncoder {
+        CudaBertEncoder::load(fixture(), 0).expect("prepare encoder")
+    }
+
+    /// A quarantine that cannot be released must keep the charge covering it, refuse
+    /// new work, and return to service once a drain proves completion.
+    #[test]
+    #[ignore = "requires an idle CUDA GPU; run serially with --test-threads=1"]
+    fn an_unprovable_drain_keeps_the_charge_and_refuses_new_work() {
+        let encoder = encoder();
+        let request = EncoderRequest::single_segment(vec![4, 1, 9, 3]);
+        let envelope = encoder.request_bytes(request.sequence()).expect("envelope");
+        let pool = BytePool::new(envelope).shared();
+        let lease = pool.reserve(envelope).expect("reservation");
+
+        // The forward pass runs, then the submission fails and the drain that would
+        // release it cannot be proven.
+        INJECTED_ENQUEUE_FAILURES.store(1, Ordering::SeqCst);
+        INJECTED_DRAIN_FAILURES.store(1, Ordering::SeqCst);
+        let failure = encoder
+            .enqueue(&request)
+            .expect_err("injected post-enqueue failure");
+        assert!(failure.owns_storage());
+        let error = encoder.retire_failure(failure, Some(lease));
+        assert!(matches!(error, EncoderError::Driver(_)));
+
+        assert_eq!(encoder.quarantined_requests(), 1);
+        assert_eq!(encoder.quarantined_bytes(), envelope);
+        assert_eq!(
+            encoder.quarantined_charge(),
+            envelope,
+            "the charge covering quarantined storage must stay with it"
+        );
+        assert_eq!(
+            pool.granted(),
+            envelope,
+            "a rejected work submission must not free bytes the device still covers"
+        );
+        assert!(encoder.is_faulted());
+        assert!(
+            matches!(encoder.submit(&request), Err(EncoderError::Faulted(_))),
+            "a faulted encoder refuses new work"
+        );
+        assert!(
+            encoder.drain_retirement().is_ok(),
+            "the injected drain failure was spent, so the device can be proven complete"
+        );
+
+        assert_eq!(encoder.quarantined_requests(), 0);
+        assert_eq!(encoder.quarantined_charge(), 0);
+        assert_eq!(pool.granted(), 0, "a proven drain releases the charge");
+        assert!(!encoder.is_faulted());
+        assert_eq!(encoder.drain_retirement().expect("idle drain"), 0);
+        assert!(
+            encoder.submit(&request).is_ok(),
+            "the encoder is usable again"
+        );
+    }
 }

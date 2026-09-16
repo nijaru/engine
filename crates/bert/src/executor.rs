@@ -7,12 +7,18 @@
 //! and incomplete, and the consumer receives it with its pool charge and its
 //! producer completion dependency attached.
 //!
+//! The executor is also where a shared-pool reservation and its storage stay
+//! together. Each accepted request arrives with the charge covering it; a request
+//! whose enqueue fails keeps that charge with the storage it already created, so the
+//! runtime never receives a reservation back to release on its own.
+//!
 //! `engine-bert` may depend on `ribn-batch` for the same reason `engine-qwen`
 //! depends on `ribn`: a model crate implements the runtime's executor seam instead
 //! of owning a second scheduler.
 
 use ribn_batch::{
-    BatchExecutor, BatchSelection, Completed, Job, JobOutput, Rejection, RequestId, Terminal,
+    BatchExecutor, BatchSelection, Completed, EnqueueError, Job, JobOutput, Rejection, RequestId,
+    Terminal,
 };
 use ribn_foundation::{ParameterVersion, PoolLease};
 
@@ -57,27 +63,48 @@ impl BatchExecutor for CudaBertEncoder {
 
     /// Enqueue every accepted request without waiting for the device.
     ///
-    /// A failure after an earlier request reached the device drains the stream
-    /// before those buffers are dropped. That best-effort drain is deliberately not
-    /// the final design: the executor-owned retirement handshake replaces it, and
-    /// the runtime keeps the reservations in its error until then.
+    /// Each job carries the reservation covering its storage. A request that fails
+    /// before its device state exists releases its reservation here, because no
+    /// storage covers it; a request that fails after keeps both, and the runtime is
+    /// told the outcome is uncertain rather than clean.
     fn execute(
         &mut self,
         batch: Vec<Job<Self::Input>>,
-    ) -> Result<Vec<JobOutput<Self::Output>>, Self::Error> {
-        let mut outputs = Vec::with_capacity(batch.len());
+    ) -> Result<Vec<JobOutput<Self::Output>>, EnqueueError<Self::Error>> {
+        let mut enqueued = Vec::with_capacity(batch.len());
         for job in batch {
-            let request = job.request();
-            let input = job.into_input();
-            match self.submit(&input) {
-                Ok(submission) => outputs.push(JobOutput::new(request, submission)),
-                Err(error) => {
-                    let _ = self.stream().synchronize();
-                    return Err(error);
+            let (request, input, lease) = job.into_parts();
+            match self.enqueue(&input) {
+                Ok(submission) => enqueued.push(JobOutput::new(request, submission, lease)),
+                Err(failure) => {
+                    // Anything already on the device keeps its storage and charge; the
+                    // failing request keeps its reservation only if it created storage.
+                    let uncertain = !enqueued.is_empty() || failure.owns_storage();
+                    let error = self.retire_failure(failure, Some(lease));
+                    self.retire(enqueued);
+                    let _ = self.drain_retirement();
+                    return Err(if uncertain {
+                        EnqueueError::Uncertain(error)
+                    } else {
+                        EnqueueError::Refused(error)
+                    });
                 }
             }
         }
-        Ok(outputs)
+        Ok(enqueued)
+    }
+
+    /// Keep output the runtime cannot commit, with the charge covering it.
+    ///
+    /// The runtime calls this when the returned results do not match its work, so
+    /// nothing may be delivered. Storage and charge wait here for a proven drain
+    /// instead of returning to the pool while the device may still write them.
+    fn retire(&mut self, outputs: Vec<JobOutput<Self::Output>>) {
+        for output in outputs {
+            let (_, submission, lease) = output.into_parts();
+            self.quarantine(submission, Some(lease));
+        }
+        let _ = self.drain_retirement();
     }
 }
 
