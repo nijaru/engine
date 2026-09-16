@@ -108,17 +108,18 @@ path whose capacity follows admitted requests—not an unbounded emergency queue
 
 ## Encoder preparation and prepared resources
 
-Status: implemented for the first real encoder (2026-09-15, roadmap slice 3b.2). The
-concrete representation is deliberately not generic: `ribn-foundation`'s
+Status: implemented for the first real encoder (2026-09-15, roadmap slices 3b.2–3b.3).
+The concrete representation is deliberately not generic: `ribn-foundation`'s
 `BytePool`/`PoolLease`/`AllocationId` is the authority, `ribn-batch` owns reservation,
-accepted ranges, capacity registration and result retention, and `engine-bert`
-supplies the concrete shape decisions (`crates/bert/src/request.rs`) and its device
-result (`crates/bert/src/executor.rs`). Two parts of this contract are still open:
-roadmap 3b.3 replaces the error-carried leases with an executor-owned retirement
-handshake for partial enqueue, and 3c qualifies delayed completion, cancellation
-before and after enqueue and failed handoff on the device. A request's whole envelope
-stays charged until its result is dropped, so completed temporary storage is not
-released early yet.
+accepted ranges, capacity registration, result retention and the enqueue-failure
+contract, and `engine-bert` supplies the concrete shape decisions
+(`crates/bert/src/request.rs`), its device result and its retirement list
+(`crates/bert/src/executor.rs`, `crates/bert/src/cuda.rs`). What remains is device
+qualification of the failure paths (roadmap 3c: delayed completion, cancellation
+before and after enqueue, failed handoff) and two recorded limits: a request's whole
+envelope stays charged until its result is dropped, so completed temporary storage is
+not released early, and a release that no drain can prove keeps its storage and its
+charge until one can.
 
 1. **One authority, owning byte leases.** The first concrete authority is a shared byte
    pool that grants an owning, non-duplicable lease per reservation. Moving a lease
@@ -147,7 +148,12 @@ released early yet.
 5. **Partial enqueue.** An enqueue failure distinguishes clean rejection before device
    access from uncertain partial submission. After any device-visible mutation the
    executor retains completion ownership of everything that may have been enqueued; a
-   caller is never given ownership back as though nothing happened.
+   caller is never given ownership back as though nothing happened. Concretely, a
+   granted reservation travels into the submission with the request it covers, so a
+   failure returns either "nothing was created, every reservation released" or "the
+   executor keeps the storage and the charge". The distinction is part of the reported
+   error, an enqueue error carries no reservation, and output the runtime cannot commit
+   is handed back to the executor rather than released by the runtime.
 6. **Producer/consumer completion ownership.** A device-resident result carries its
    representation, model identity, pool charge and a producer completion dependency. The
    consumer waits on that dependency before reading. [Cross-runtime device

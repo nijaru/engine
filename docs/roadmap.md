@@ -243,15 +243,36 @@ The first concrete representation is deliberately not generic. Increments:
   consumer beside a healthy peer, and a rejected oversized request with a progressing
   peer. A failed submit drains the stream before its buffers drop; that best-effort step
   is replaced by 3b.3's handshake.
-- **3b.3.** Executor-owned retirement for partial enqueue, replacing error-carried
-  leases with a completion handshake once a real submission can fail after reaching the
-  device.
+- **3b.3 (done 2026-09-15).** Partial-enqueue ownership is the executor's, and the
+  error-carried lease placeholder is gone. `ribn-batch`'s `Job` carries the reservation
+  granted for its request, so the charge travels with the storage the executor
+  materializes; `BatchExecutor::execute` reports `EnqueueError::Refused` (nothing
+  reached the device) or `Uncertain` (a device-visible mutation happened), and the new
+  required `retire` hands output the runtime cannot commit back to the executor.
+  `RuntimeError::Executor`/`Uncertain` carry requests and a source, never reservations,
+  and `MalformedCompletion` reports what came back instead of holding a charge.
+  `engine-bert`'s encoder owns a retirement list holding each quarantined submission
+  with the reservation covering it: `submit` keeps a fully constructed submission there
+  after a failed enqueue, `drain_retirement` is the only release, and when the drain
+  fails the encoder records a fault and refuses new submissions until one succeeds.
+  Dropping a device buffer was never the hazard — cudarc frees in stream order or drains
+  first — so the reason to hold the charge is accounting: a stream-ordered free has not
+  returned the memory to the allocator, and releasing early would let another owner
+  reserve bytes the device is still holding. Evidence: host tests over the real runtime
+  and pool for clean refusal, uncertain failure (charge kept with the executor, released
+  only by a proven drain), uncommittable output handed back, and a mocked device
+  completion; device evidence for the encoder's own retirement cycle in
+  [encoder qualification](../benchmarks/encoder-qualification.md). Failure injection
+  exists because only an OOM or a device fault reaches that path in production.
 - **3c.** Device qualification on the idle RTX 4090: constrained pool, delayed completion,
   cancellation before and after enqueue, failed handoff, consumer stall with a healthy
   peer, and a permanently oversized input rejected while peers progress. Charges survive
   dequeue until safe reuse, and downstream workspace stays available under producer
   pressure. 3b.2 qualifies the constrained pool, envelope, pooled-dequeue and
-  oversized-rejection cases only, and only in a short serialized run.
+  oversized-rejection cases only, and only in a short serialized run; 3b.3 adds the
+  retirement cycle behind an injected post-enqueue failure, not a real one. Delayed
+  completion with a genuinely lagging consumer, cancellation before and after enqueue
+  and a failed handoff are still unqualified on device.
 
 Exit: constrained shared pool, delayed completion, cancellation, failed handoff,
 consumer stall and permanent oversized-input rejection with healthy peer progress.

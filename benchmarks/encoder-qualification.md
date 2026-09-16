@@ -1,16 +1,19 @@
 # BERT encoder device qualification
 
 Date: 2026-09-15
-Status: hardware-qualified at `f544f9c` for the fixture geometry and for the
-pool-backed runtime wiring. Adversarial lifecycle qualification — delayed completion,
-cancellation before and after enqueue, failed handoff and partial-enqueue retirement —
-is roadmap slice 3c.
+Status: hardware-qualified at `fda8001` for the fixture geometry, for the
+pool-backed runtime wiring, and for the encoder's own retirement cycle behind an
+injected post-enqueue failure. Adversarial lifecycle qualification — delayed completion
+with a lagging consumer, cancellation before and after enqueue and a failed handoff — is
+roadmap slice 3c.
 
 Result: the device encoder reproduces an independent Hugging Face `transformers`
 reference for all four fixture cases, worst absolute deviation `4.77e-7` on hidden
 states and `1.77e-8` on pooled output — fp32 accumulation-order agreement, not a
 tolerance grant. The same build runs the encoder through `ribn-batch` under a
-constrained shared pool and hands each result to its consumer device-resident.
+constrained shared pool, hands each result to its consumer device-resident, and keeps a
+quarantined submission together with the pool charge covering it until a drain proves
+completion.
 
 ## What this qualifies
 
@@ -95,6 +98,14 @@ the parity cases:
   than the model's position embeddings is rejected as `SequenceTooLong`, and a
   sequence whose envelope exceeds the whole pool is rejected as
   `RetainedOutputTooLarge`; the healthy request queued behind each one still runs.
+- **A rejected work submission keeps its charge and refuses new work.** With the
+  encoder's completion event deliberately not recorded after the forward pass was
+  launched, and the following drain reported as unprovable, the encoder holds one
+  quarantined submission whose device bytes and pool charge are equal and still
+  reserved, refuses new submissions with `EncoderError::Faulted`, and returns to
+  service once a drain succeeds and releases exactly that charge. Fault injection is
+  the only way to reach this path on demand: production reaches it on an OOM or a
+  device fault, and a qualification run can schedule neither.
 
 Host evidence for the same contract (constrained pool, deferred completion that must
 be awaited before reading, charge surviving dequeue, a stalled consumer beside a
@@ -113,10 +124,13 @@ which exercise the real `BatchRuntime` and `BytePool` against a fixture device.
 - The masked case covers key masking, not a fully masked query row; that row is
   defined to produce zeros rather than NaN, which the fixture does not exercise.
 - Runtime wiring is exercised, not qualified under stress. Delayed completion with a
-  genuinely lagging consumer, cancellation before and after enqueue, a failed
-  handoff, and retirement after a partial enqueue are roadmap slice 3c; the failed
-  submit path currently drains the stream best-effort instead of owning a retirement
-  handshake.
+  genuinely lagging consumer, cancellation before and after enqueue, and a failed
+  handoff are roadmap slice 3c; the uncertain-failure path is qualified behind fault
+  injection rather than a natural device failure.
+- Half-constructed submissions are the one case the retirement list cannot hold: a
+  failure during buffer creation returns no storage, and the buffers drop. Freeing is
+  still ordered (cudarc frees in stream order or drains first), but the charge returns
+  before the device has necessarily reached that free.
 - The whole request envelope stays charged until its result is dropped. Releasing
   completed temporary storage early (the activations after the last kernel) is not
   implemented, so peak pool demand is the request's full footprint rather than its

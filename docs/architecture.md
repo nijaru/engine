@@ -142,13 +142,13 @@ internals, other runtime families and device gates were not audited.
 | `ribn-text`, `crates/text` | Shared text preprocessing/decoding, cloneable owned facade, ordered bounded-window batching; only CUDA assembly is device-gated |
 | `engine-qwen`, `crates/qwen` | Qwen configuration, GGUF interpretation, execution adapter |
 | `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution, including the encoder primitives |
-| `engine-bert`, `crates/bert` | BERT encoder semantics: configuration, parameter mapping, host shape acceptance and device byte envelope, device forward, per-request completion, and the batching runtime's executor binding |
+| `engine-bert`, `crates/bert` | BERT encoder semantics: configuration, parameter mapping, host shape acceptance and device byte envelope, device forward, per-request completion, the batching runtime's executor binding, and the quarantine that keeps storage and its charge together until a drain proves completion |
 | `engine-core`, `crates/core` | Legacy runtime, batch/state, weight and device contracts still consumed by production code |
 | `engine-gguf`, `crates/gguf` | GGUF metadata/tensor access and tokenizer support |
 | `ribn-safetensors`, `crates/safetensors` | Validated artifact tensor views, no model semantics |
 | `ribn-hf`, `crates/hf` | Local config and shard resolution/cache, no architecture selection |
 | `ribn-foundation`, `crates/foundation` | Provisional parameter/materialization/topology metadata plus the shared byte-pool authority: owning leases, allocation identity and a release epoch for capacity readiness |
-| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, and publishing a pool-epoch capacity registration for callers that park |
+| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, publishing a pool-epoch capacity registration for callers that park, and handing each reservation to the executor that materializes its storage |
 | `ribn-cli`, `crates/cli` | `inspect`, experimental `run`, legacy `local` comparison frontend |
 
 `tools/check-boundaries.py` checks production dependency direction. Update the checker
@@ -174,11 +174,13 @@ independent Hugging Face reference for its fixture geometry
 ([evidence](../benchmarks/encoder-qualification.md)). It also runs through
 `ribn-batch`: the pool bounds how many requests execute, a device-resident result keeps
 its charge after it leaves the runtime, and permanent request-local infeasibility is
-rejected while peers progress. Delayed completion under a lagging consumer,
-cancellation, failed handoff and partial-enqueue retirement are still roadmap slice 3.
+rejected while peers progress. A submission that fails after reaching the device keeps
+its storage and the charge covering it in the encoder's quarantine until a drain proves
+completion, and one that never reached the device releases everything. Delayed
+completion under a lagging consumer, cancellation and failed handoff are still roadmap
+slice 3.
 
 Not implemented: general architecture resolution, real media processors, cancellation
-and executor-owned retirement for asynchronous non-AR device ownership, dynamic hybrid
-continuation allocation, executable weight replacement, a second hardware backend or
-distributed execution. Metadata that accepts several devices is not distributed
-execution support.
+for asynchronous non-AR device ownership, dynamic hybrid continuation allocation,
+executable weight replacement, a second hardware backend or distributed execution.
+Metadata that accepts several devices is not distributed execution support.

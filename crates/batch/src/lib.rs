@@ -44,6 +44,14 @@
 //! (`is_complete`/`synchronize`/`read` in the executor's own type) and its
 //! [`PoolLease`], so a consumer that stalls keeps the bytes charged and a consumer
 //! that takes the result takes the charge with it.
+//!
+//! A granted reservation travels into the submission with the request it covers, and
+//! the executor owns it from there. That is what makes a failure unambiguous: the
+//! executor either released a reservation nothing was ever built for, or it still
+//! holds that reservation together with the storage the device may be writing. The
+//! runtime reports which happened ([`EnqueueError`]) and never hands a reservation
+//! back to a caller that did not create the storage underneath it. Output the runtime
+//! cannot commit is returned through [`BatchExecutor::retire`] for the same reason.
 
 use std::collections::VecDeque;
 use std::error::Error;
