@@ -222,13 +222,27 @@ The first concrete representation is deliberately not generic. Increments:
   [encoder qualification](../benchmarks/encoder-qualification.md). The path is fp32
   and fixture-geometry only; a production-size encoder must be re-qualified at its own
   geometry.
-- **3b.2.** Wire that encoder to the pool authority: reserve its real device envelope
-  under a lease, report accepted ranges from concrete shapes, park capacity-waiting
-  work on the pool epoch with registration-and-recheck, and hand off a device-resident
-  pooled result whose consumer must await the producer's completion dependency. The
-  encoder submission already exposes the pieces the runtime needs — a device byte
-  envelope, a queryable completion event and a read that requires completion first — so
-  this step is a runtime contract, not new model work.
+- **3b.2 (done 2026-09-15).** The device encoder runs through the batching runtime
+  rather than a second scheduler. `engine-bert` decides its accepted range and its
+  byte envelope on the host (`crates/bert/src/request.rs`: concrete shapes, structured
+  request-local constraints), implements `ribn-batch`'s executor seam
+  (`crates/bert/src/executor.rs`: `select_batch` accepts the executable prefix,
+  `retained_bytes` reports `request_bytes`, `execute` enqueues without waiting), and
+  hands a completion to its consumer as an `EncoderResult` that owns the device storage
+  and the pool charge covering it together, behind an explicit producer completion
+  dependency. `EncoderSubmission` no longer borrows its encoder — its prepared
+  resources are shared — so a result outlives the submitting call, and
+  `device_bytes` counts the allocations that exist rather than restating the
+  prediction. `ribn-batch` publishes `CapacityWait`, a registration over the pool's
+  release epoch, so a parking caller registers before attempting and rechecks after a
+  bounded park while the pool still publishes no wakeup. Evidence: the encoder's
+  parity, envelope and pool-bound device run in
+  [encoder qualification](../benchmarks/encoder-qualification.md), plus host lifecycle
+  tests over the real `BatchRuntime`/`BytePool` for constrained capacity, deferred
+  completion that must be awaited before reading, a charge surviving dequeue, a stalled
+  consumer beside a healthy peer, and a rejected oversized request with a progressing
+  peer. A failed submit drains the stream before its buffers drop; that best-effort step
+  is replaced by 3b.3's handshake.
 - **3b.3.** Executor-owned retirement for partial enqueue, replacing error-carried
   leases with a completion handshake once a real submission can fail after reaching the
   device.
@@ -236,7 +250,8 @@ The first concrete representation is deliberately not generic. Increments:
   cancellation before and after enqueue, failed handoff, consumer stall with a healthy
   peer, and a permanently oversized input rejected while peers progress. Charges survive
   dequeue until safe reuse, and downstream workspace stays available under producer
-  pressure.
+  pressure. 3b.2 qualifies the constrained pool, envelope, pooled-dequeue and
+  oversized-rejection cases only, and only in a short serialized run.
 
 Exit: constrained shared pool, delayed completion, cancellation, failed handoff,
 consumer stall and permanent oversized-input rejection with healthy peer progress.

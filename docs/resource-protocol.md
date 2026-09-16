@@ -108,10 +108,17 @@ path whose capacity follows admitted requests—not an unbounded emergency queue
 
 ## Encoder preparation and prepared resources
 
-Status: accepted direction; the concrete representation is being established with the
-first real encoder execution. This resolves the questions slice 3 must settle before
-dependent code exists. It does not yet implement them: `ribn-batch` still accounts for
-retained bytes locally, and no device-backed encoder executes.
+Status: implemented for the first real encoder (2026-09-15, roadmap slice 3b.2). The
+concrete representation is deliberately not generic: `ribn-foundation`'s
+`BytePool`/`PoolLease`/`AllocationId` is the authority, `ribn-batch` owns reservation,
+accepted ranges, capacity registration and result retention, and `engine-bert`
+supplies the concrete shape decisions (`crates/bert/src/request.rs`) and its device
+result (`crates/bert/src/executor.rs`). Two parts of this contract are still open:
+roadmap 3b.3 replaces the error-carried leases with an executor-owned retirement
+handshake for partial enqueue, and 3c qualifies delayed completion, cancellation
+before and after enqueue and failed handoff on the device. A request's whole envelope
+stays charged until its result is dropped, so completed temporary storage is not
+released early yet.
 
 1. **One authority, owning byte leases.** The first concrete authority is a shared byte
    pool that grants an owning, non-duplicable lease per reservation. Moving a lease

@@ -1,13 +1,16 @@
 # BERT encoder device qualification
 
 Date: 2026-09-15
-Status: hardware-qualified at `11b3b6b` for the fixture geometry only. The prepared
-resource layer above this path is not implemented yet; see roadmap slice 3.
+Status: hardware-qualified at `b634c52` for the fixture geometry and for the
+pool-backed runtime wiring. Adversarial lifecycle qualification — delayed completion,
+cancellation before and after enqueue, failed handoff and partial-enqueue retirement —
+is roadmap slice 3c.
 
 Result: the device encoder reproduces an independent Hugging Face `transformers`
 reference for all four fixture cases, worst absolute deviation `4.77e-7` on hidden
 states and `1.77e-8` on pooled output — fp32 accumulation-order agreement, not a
-tolerance grant.
+tolerance grant. The same build runs the encoder through `ribn-batch` under a
+constrained shared pool and hands each result to its consumer device-resident.
 
 ## What this qualifies
 
@@ -72,6 +75,32 @@ its device-byte envelope and can be read repeatedly after completion, and reques
 outside the model's vocabulary/type/position range are refused before touching the
 device with the encoder still usable afterwards.
 
+## Runtime wiring
+
+`crates/bert/tests/encoder_runtime.rs` runs the same encoder as a `ribn-batch`
+executor. All three tests pass in the command above, in the same serialized run as
+the parity cases:
+
+- **The shared pool bounds execution.** With a pool sized to exactly two requests'
+  envelopes and three queued requests, one step executes two and the next reports
+  `Blocked(Pool { requested, available: 0 })`. The envelope the pool was charged for
+  equals the storage that actually exists: `EncoderSubmission::device_bytes` counts
+  the live buffers and is asserted against `CudaBertEncoder::request_bytes`, so a
+  prediction that under-reports the device footprint fails here.
+- **A device-resident result keeps its charge across dequeue.** Taking a completion
+  out of the runtime leaves the pool charged until the result is dropped: a stalled
+  consumer blocks a sibling, and releasing one result admits exactly one queued
+  request. The consumer establishes completion before reading.
+- **Permanent infeasibility is rejected while a peer progresses.** A sequence longer
+  than the model's position embeddings is rejected as `SequenceTooLong`, and a
+  sequence whose envelope exceeds the whole pool is rejected as
+  `RetainedOutputTooLarge`; the healthy request queued behind each one still runs.
+
+Host evidence for the same contract (constrained pool, deferred completion that must
+be awaited before reading, charge surviving dequeue, a stalled consumer beside a
+healthy peer) is in `crates/batch/tests/{capacity_readiness,device_result_handoff}.rs`,
+which exercise the real `BatchRuntime` and `BytePool` against a fixture device.
+
 ## Limits
 
 - One tiny fixture geometry. A production-size encoder must be re-qualified at its
@@ -83,6 +112,15 @@ device with the encoder still usable afterwards.
   serving comparison follows from it.
 - The masked case covers key masking, not a fully masked query row; that row is
   defined to produce zeros rather than NaN, which the fixture does not exercise.
-- The prepared-resource behaviour this encoder exists to determine — pooled device
-  leases, capacity waiting, cancellation, failed handoff — is not implemented yet and
-  is therefore not qualified here.
+- Runtime wiring is exercised, not qualified under stress. Delayed completion with a
+  genuinely lagging consumer, cancellation before and after enqueue, a failed
+  handoff, and retirement after a partial enqueue are roadmap slice 3c; the failed
+  submit path currently drains the stream best-effort instead of owning a retirement
+  handshake.
+- The whole request envelope stays charged until its result is dropped. Releasing
+  completed temporary storage early (the activations after the last kernel) is not
+  implemented, so peak pool demand is the request's full footprint rather than its
+  settled footprint.
+- Batching means several single-request submissions enqueued on one stream, not one
+  padded device batch. A fused batch would need its own numerical and throughput
+  qualification.

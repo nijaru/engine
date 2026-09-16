@@ -142,13 +142,13 @@ internals, other runtime families and device gates were not audited.
 | `ribn-text`, `crates/text` | Shared text preprocessing/decoding, cloneable owned facade, ordered bounded-window batching; only CUDA assembly is device-gated |
 | `engine-qwen`, `crates/qwen` | Qwen configuration, GGUF interpretation, execution adapter |
 | `engine-nvidia`, `crates/nvidia` | CUDA storage/state, kernels and physical execution, including the encoder primitives |
-| `engine-bert`, `crates/bert` | BERT encoder semantics: configuration, parameter mapping, device forward and per-request completion |
+| `engine-bert`, `crates/bert` | BERT encoder semantics: configuration, parameter mapping, host shape acceptance and device byte envelope, device forward, per-request completion, and the batching runtime's executor binding |
 | `engine-core`, `crates/core` | Legacy runtime, batch/state, weight and device contracts still consumed by production code |
 | `engine-gguf`, `crates/gguf` | GGUF metadata/tensor access and tokenizer support |
 | `ribn-safetensors`, `crates/safetensors` | Validated artifact tensor views, no model semantics |
 | `ribn-hf`, `crates/hf` | Local config and shard resolution/cache, no architecture selection |
 | `ribn-foundation`, `crates/foundation` | Provisional parameter/materialization/topology metadata plus the shared byte-pool authority: owning leases, allocation identity and a release epoch for capacity readiness |
-| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget |
+| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, and publishing a pool-epoch capacity registration for callers that park |
 | `ribn-cli`, `crates/cli` | `inspect`, experimental `run`, legacy `local` comparison frontend |
 
 `tools/check-boundaries.py` checks production dependency direction. Update the checker
@@ -171,11 +171,14 @@ numerically unqualified for promotion.
 A second model family now executes on the device: `engine-bert` runs a BERT-style
 encoder with masked attention and a pooler, numerically qualified against an
 independent Hugging Face reference for its fixture geometry
-([evidence](../benchmarks/encoder-qualification.md)). It does not yet reserve its
-device bytes from a shared pool, park on capacity, or hand off a pooled result under a
-completion dependency; that is roadmap slice 3.
+([evidence](../benchmarks/encoder-qualification.md)). It also runs through
+`ribn-batch`: the pool bounds how many requests execute, a device-resident result keeps
+its charge after it leaves the runtime, and permanent request-local infeasibility is
+rejected while peers progress. Delayed completion under a lagging consumer,
+cancellation, failed handoff and partial-enqueue retirement are still roadmap slice 3.
 
-Not implemented: general architecture resolution, real media processors, asynchronous
-non-AR device ownership, dynamic hybrid continuation allocation, executable weight
-replacement, a second hardware backend or distributed execution. Metadata that
-accepts several devices is not distributed execution support.
+Not implemented: general architecture resolution, real media processors, cancellation
+and executor-owned retirement for asynchronous non-AR device ownership, dynamic hybrid
+continuation allocation, executable weight replacement, a second hardware backend or
+distributed execution. Metadata that accepts several devices is not distributed
+execution support.
