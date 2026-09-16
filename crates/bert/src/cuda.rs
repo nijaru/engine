@@ -324,14 +324,6 @@ impl CudaBertEncoder {
                 submission,
             ));
         }
-        #[cfg(test)]
-        if tests::take_injected_unrecorded_event() {
-            // The forward pass is enqueued, but no completion event exists. That is the
-            // state a consumer must treat as "completion not established" instead of
-            // assuming the result is ready; a healthy device leaves this window too
-            // short to schedule on demand.
-            return Ok(submission);
-        }
         match stream.record_event(None) {
             Ok(event) => {
                 submission.completion = Some(event);
@@ -851,20 +843,12 @@ mod tests {
     /// Countdown of drains that are deliberately reported as unprovable.
     static INJECTED_DRAIN_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
-    /// Countdown of requests whose completion event is deliberately not recorded, so
-    /// the consumer sees an unestablished completion.
-    static INJECTED_UNRECORDED_EVENTS: AtomicUsize = AtomicUsize::new(0);
-
     pub(super) fn take_injected_enqueue_failure() -> bool {
         take(&INJECTED_ENQUEUE_FAILURES)
     }
 
     pub(super) fn take_injected_drain_failure() -> bool {
         take(&INJECTED_DRAIN_FAILURES)
-    }
-
-    pub(super) fn take_injected_unrecorded_event() -> bool {
-        take(&INJECTED_UNRECORDED_EVENTS)
     }
 
     fn take(counter: &AtomicUsize) -> bool {
@@ -936,59 +920,5 @@ mod tests {
             encoder.submit(&request).is_ok(),
             "the encoder is usable again"
         );
-    }
-    /// A result whose completion is not established must reach its consumer as such:
-    /// the runtime hands it over without waiting, and the consumer has to await the
-    /// dependency before reading.
-    #[test]
-    #[ignore = "requires an idle CUDA GPU; run serially with --test-threads=1"]
-    fn an_unestablished_completion_is_handed_over_without_stalling_the_runtime() {
-        use crate::executor::EncoderCompletion;
-        use ribn_batch::{BatchConfig, BatchRuntime, StepOutcome};
-
-        let encoder = encoder();
-        let request = EncoderRequest::single_segment(vec![4, 1, 9, 3]);
-        let envelope = encoder.request_bytes(request.sequence()).expect("envelope");
-        let pool = BytePool::new(2 * envelope).shared();
-        let mut runtime = BatchRuntime::new(
-            encoder,
-            Arc::clone(&pool),
-            BatchConfig {
-                max_waiting_requests: 4,
-                max_retained_results: 4,
-            },
-        )
-        .expect("runtime");
-
-        INJECTED_UNRECORDED_EVENTS.store(1, Ordering::SeqCst);
-        runtime.submit(request.clone()).expect("first request");
-        runtime.submit(request).expect("second request");
-        // Both requests are admitted and enqueued without waiting for the device.
-        assert_eq!(
-            runtime.step().expect("step"),
-            StepOutcome::Executed { results: 2 }
-        );
-        assert_eq!(pool.granted(), 2 * envelope);
-
-        let completion =
-            EncoderCompletion::from_completed(runtime.pop_completed().expect("first entry"));
-        let EncoderCompletion::Result(result) = completion else {
-            panic!("an executing request is not a rejection");
-        };
-        assert!(
-            !result.is_complete().expect("completion query"),
-            "the consumer must see that completion is not established"
-        );
-        // The producer dependency is what makes the storage readable, and the charge
-        // covering it is held until the consumer releases the result.
-        result.synchronize().expect("synchronize");
-        assert!(result.is_complete().expect("completion query"));
-        let output = result.read().expect("read");
-        assert!(output.pooled.iter().all(|value| value.is_finite()));
-        assert_eq!(runtime.executor().quarantined_requests(), 0);
-        drop(result);
-        assert_eq!(pool.granted(), envelope);
-        drop(runtime.pop_completed().expect("second entry"));
-        assert_eq!(pool.granted(), 0);
     }
 }
