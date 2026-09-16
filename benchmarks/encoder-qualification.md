@@ -1,7 +1,7 @@
 # BERT encoder device qualification
 
 Date: 2026-09-15
-Status: hardware-qualified at `b634c52` for the fixture geometry and for the
+Status: hardware-qualified at `f544f9c` for the fixture geometry and for the
 pool-backed runtime wiring. Adversarial lifecycle qualification — delayed completion,
 cancellation before and after enqueue, failed handoff and partial-enqueue retirement —
 is roadmap slice 3c.
