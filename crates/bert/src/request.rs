@@ -293,21 +293,22 @@ pub fn select(
     candidates: &[&EncoderRequest],
 ) -> BatchSelection<EncoderConstraint> {
     let mut items = 0_usize;
+    let mut defect = None;
     for candidate in candidates {
-        if validate(config, candidate).is_err() {
-            break;
+        match validate(config, candidate) {
+            Ok(()) => items += 1,
+            Err(constraint) => {
+                defect = Some(constraint);
+                break;
+            }
         }
-        items += 1;
     }
     // A defect in the head is permanent and reported now; the same defect further
     // along the candidate set only stops the accepted range.
-    if items == 0
-        && let Some(head) = candidates.first()
-        && let Err(constraint) = validate(config, head)
-    {
-        return BatchSelection::Rejected(constraint);
+    match defect {
+        Some(constraint) if items == 0 => BatchSelection::Rejected(constraint),
+        _ => BatchSelection::Ready { items },
     }
-    BatchSelection::Ready { items }
 }
 
 #[cfg(test)]
