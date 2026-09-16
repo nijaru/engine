@@ -305,19 +305,25 @@ fn continuation_capacity_admits_concurrent_requests_a_context_charge_cannot() {
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
     let max_output_tokens = u32::try_from(reference.output.len()).unwrap();
     let reachable = prompt_tokens + max_output_tokens;
-    let declared_bound = 4 * reachable;
+    let declared_bound = 16 * reachable;
     // Read the declared state schema without touching the device.
     let requirements = QwenGguf::open_with_kv_block_tokens(&model, declared_bound)
         .unwrap()
         .description()
         .state_requirements()
         .to_vec();
-    let capacity = continuation_demand(&requirements, reachable, CONCURRENCY);
+    let request_charge = continuation_demand(&requirements, reachable, 1);
+    let capacity = request_charge * u64::try_from(CONCURRENCY).unwrap();
     let context_charge = continuation_demand(&requirements, declared_bound, 1);
     assert!(
-        context_charge > capacity,
-        "one context-sized charge ({context_charge} bytes) must exceed the whole \
-         authority ({capacity} bytes) for this to discriminate"
+        context_charge > request_charge,
+        "a request charge ({request_charge} bytes) must be smaller than the context charge \
+         ({context_charge} bytes) for this to discriminate"
+    );
+    assert!(
+        2 * context_charge > capacity,
+        "the authority ({capacity} bytes) must hold fewer than two context-sized charges \
+         ({context_charge} bytes each) for the concurrency claim to be about capacity"
     );
     let prepared = QwenCuda::load_gguf(
         model,
