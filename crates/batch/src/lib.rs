@@ -32,6 +32,18 @@
 //! results. `step` reports [`BlockReason::RetainedResults`] or
 //! [`BlockReason::Pool`] only when not even one request fits, which is the caller's
 //! signal to consume retained entries or wait for capacity to come back.
+//!
+//! The pool publishes a release epoch rather than a wakeup, so capacity waiting is
+//! registration-and-recheck: a caller registers with [`BatchRuntime::capacity_wait`]
+//! before attempting, parks for a bounded interval while the registration is
+//! unchanged, and retries. The parking mechanism stays with the caller that owns it;
+//! this runtime only supplies the readiness source and the recheck.
+//!
+//! Output is executor-defined and may be device-resident. A result that completes
+//! asynchronously carries its own producer completion dependency
+//! (`is_complete`/`synchronize`/`read` in the executor's own type) and its
+//! [`PoolLease`], so a consumer that stalls keeps the bytes charged and a consumer
+//! that takes the result takes the charge with it.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -164,8 +176,10 @@ pub enum BlockReason<C> {
     /// capacity. The caller must consume retained entries, or wait for a sibling
     /// runtime to release its own, before more work can run.
     ///
-    /// Read [`BatchRuntime::pool`]'s epoch when this is reported and retry after it
-    /// changes instead of polling capacity blindly.
+    /// Register with [`BatchRuntime::capacity_wait`] *before* attempting, park for a
+    /// bounded interval while [`CapacityWait::released`] is false, then retry. The
+    /// pool has no notification, so an unbounded park can miss the release that
+    /// would have admitted this work.
     Pool {
         /// Bytes the head request needs reserved before it can run.
         requested: u64,
@@ -650,6 +664,24 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         self.terminal.len()
     }
 
+    /// Register for the next capacity release from the pool this runtime reserves
+    /// from.
+    ///
+    /// [`BlockReason::Pool`] is a wakeup contract rather than a failure. Take a
+    /// registration *before* attempting, park for a bounded interval, and retry
+    /// [`Self::step`] while [`CapacityWait::released`] stays false. The pool
+    /// publishes no notification, so the bound is what keeps a release that lands
+    /// between the attempt and the park from being lost; registration alone never
+    /// means the next reservation will be granted, because a sibling may take the
+    /// released bytes first.
+    #[must_use]
+    pub fn capacity_wait(&self) -> CapacityWait {
+        CapacityWait {
+            pool: Arc::clone(&self.pool),
+            epoch: self.pool.epoch(),
+        }
+    }
+
     /// Bytes this runtime's retained entries currently hold in the shared pool.
     ///
     /// A sibling runtime's leases are not counted here; read [`Self::pool`] for the
@@ -681,6 +713,38 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     #[must_use]
     pub fn executor_mut(&mut self) -> &mut E {
         &mut self.executor
+    }
+}
+
+/// Registration for a capacity wait against the shared pool's release epoch.
+///
+/// The pool publishes an epoch, not a wakeup, so a runtime that parks on capacity
+/// owns registration-and-recheck: register before attempting, park for a bounded
+/// interval while the registration is unchanged, then recheck and retry. Holding the
+/// pool in the registration keeps a wait from being checked against a different
+/// authority.
+#[derive(Clone, Debug)]
+pub struct CapacityWait {
+    pool: Arc<BytePool>,
+    epoch: u64,
+}
+
+impl CapacityWait {
+    /// The release epoch this registration observed.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether the pool has released bytes since this registration.
+    ///
+    /// A true result means "retry the attempt", never "the reservation will be
+    /// granted": another waiter may already have taken the released bytes. A false
+    /// result after a release means the registration is older than that release, so
+    /// the caller should re-register before parking again.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.pool.epoch() != self.epoch
     }
 }
 

@@ -162,7 +162,7 @@ fn submission_reports_real_completion_and_geometry() {
     let request = EncoderRequest::single_segment(vec![4, 1, 9, 3]);
     let bytes = encoder.request_bytes(sequence).expect("geometry");
     assert!(bytes > 0);
-    let mut submission = encoder.submit(&request).expect("submit");
+    let submission = encoder.submit(&request).expect("submit");
     assert_eq!(submission.device_bytes(), bytes);
     submission.synchronize().expect("synchronize");
     assert!(submission.is_complete().expect("completion"));

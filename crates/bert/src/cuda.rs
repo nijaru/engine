@@ -3,12 +3,16 @@
 //! One encoder owns its prepared weights and a CUDA stream. A request is submitted
 //! as an owned [`EncoderSubmission`]: the device buffers it needs stay alive with
 //! it, and its recorded completion event is the single ordering point covering
-//! every kernel and copy of that request. Reading a result therefore requires
-//! completion, which is exactly the producer-side dependency a downstream consumer
-//! must respect before it touches the storage.
+//! every kernel and copy of that request. A submission therefore outlives any
+//! borrow of the encoder and can be handed to a consumer that must respect that
+//! producer dependency before it reads or reuses the storage.
 //!
 //! Projections are dense GEMMs and run on cuBLAS. The remaining per-row and
 //! elementwise work runs on `engine-nvidia`'s encoder primitives.
+//!
+//! Which shapes this encoder can execute, and how many device bytes each of them
+//! holds, are host decisions in [`crate::request`]; this module materializes them
+//! rather than re-deriving them.
 
 use std::fmt;
 use std::path::Path;
@@ -21,28 +25,15 @@ use engine_nvidia::{CudaEncoderKernelError, CudaEncoderOps};
 use ribn_hf::LocalModelPackage;
 
 use crate::config::{BertConfig, ConfigError};
+use crate::request::{EncoderConstraint, EncoderRequest, EncoderShape};
 use crate::weights::{Dense as HostDense, HostWeights, LayerNorm as HostLayerNorm, WeightError};
 
-/// One encoder request: token ids, their segment ids and a per-position key mask.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EncoderRequest {
-    pub token_ids: Vec<u32>,
-    pub token_type_ids: Vec<u32>,
-    /// One flag per position; a zero flag removes that position as a key.
-    pub attention_mask: Vec<i32>,
-}
-
-impl EncoderRequest {
-    /// A single-segment request whose every position is attendable.
-    #[must_use]
-    pub fn single_segment(token_ids: Vec<u32>) -> Self {
-        Self {
-            token_type_ids: vec![0; token_ids.len()],
-            attention_mask: vec![1; token_ids.len()],
-            token_ids,
-        }
-    }
-}
+/// Requests one accepted range may contain when the deployment does not say.
+///
+/// This is deployment policy, not a model property: it caps how much of one batch
+/// the encoder enqueues at once. The shared pool remains the byte bound, and the
+/// runtime shrinks the accepted range further when it cannot reserve the envelopes.
+pub const DEFAULT_MAX_BATCH_ITEMS: usize = 16;
 
 /// Encoder results for one request.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,7 +52,8 @@ pub enum EncoderError {
     Package(String),
     Kernels(CudaEncoderKernelError),
     Driver(String),
-    InvalidRequest(String),
+    /// The request itself can never run on this encoder, whatever is released.
+    InvalidRequest(EncoderConstraint),
 }
 
 impl fmt::Display for EncoderError {
@@ -72,7 +64,7 @@ impl fmt::Display for EncoderError {
             Self::Package(message) => write!(f, "encoder package: {message}"),
             Self::Kernels(error) => write!(f, "encoder kernels: {error}"),
             Self::Driver(message) => write!(f, "encoder driver: {message}"),
-            Self::InvalidRequest(message) => write!(f, "encoder request: {message}"),
+            Self::InvalidRequest(constraint) => write!(f, "encoder request: {constraint}"),
         }
     }
 }
@@ -106,12 +98,17 @@ impl From<CudaEncoderKernelError> for EncoderError {
     }
 }
 
+impl From<EncoderConstraint> for EncoderError {
+    fn from(constraint: EncoderConstraint) -> Self {
+        Self::InvalidRequest(constraint)
+    }
+}
+
 /// A prepared BERT encoder on one CUDA device.
 pub struct CudaBertEncoder {
     config: BertConfig,
-    ops: CudaEncoderOps,
-    blas: CudaBlas,
-    weights: DeviceWeights,
+    max_batch_items: usize,
+    prepared: Arc<Prepared>,
 }
 
 impl CudaBertEncoder {
@@ -187,10 +184,19 @@ impl CudaBertEncoder {
         };
         Ok(Self {
             config,
-            ops,
-            blas,
-            weights,
+            max_batch_items: DEFAULT_MAX_BATCH_ITEMS,
+            prepared: Arc::new(Prepared { ops, blas, weights }),
         })
+    }
+
+    /// Set how many requests one accepted range may contain.
+    ///
+    /// Zero is not usable: the batching runtime refuses an executor that cannot run
+    /// one item.
+    #[must_use]
+    pub fn with_max_batch_items(mut self, items: usize) -> Self {
+        self.max_batch_items = items;
+        self
     }
 
     #[must_use]
@@ -198,37 +204,42 @@ impl CudaBertEncoder {
         &self.config
     }
 
+    /// Requests one accepted range may contain.
+    #[must_use]
+    pub const fn max_batch_items(&self) -> usize {
+        self.max_batch_items
+    }
+
     /// The stream every submission of this encoder runs on.
     #[must_use]
     pub fn stream(&self) -> &Arc<CudaStream> {
-        self.ops.stream()
+        self.prepared.ops.stream()
     }
 
-    /// Bytes one prepared request holds on the device until it is released.
+    /// Bytes one request of `sequence` positions holds on the device until released.
     ///
     /// This is the request's real envelope: staging plus every activation the
-    /// forward pass keeps alive. It is what a shared pool must cover before the
-    /// work is admitted.
+    /// forward pass keeps alive. It is what a shared pool must cover before the work
+    /// is admitted, and [`EncoderSubmission::device_bytes`] reports the same
+    /// quantity from the allocations that actually exist.
     ///
     /// # Errors
-    /// Returns [`EncoderError::InvalidRequest`] for a sequence this encoder cannot
-    /// execute.
+    /// Returns [`EncoderError`] for a sequence this encoder cannot execute.
     pub fn request_bytes(&self, sequence: usize) -> Result<u64, EncoderError> {
-        let geometry = self.geometry(sequence)?;
-        Ok(geometry.workspace_bytes)
+        Ok(crate::request::shape(&self.config, sequence)?.device_bytes())
     }
 
     /// Enqueue one request and return its owned device state.
     ///
-    /// The returned submission owns every device buffer the request uses and a
-    /// completion event recorded after the last of them. Nothing is read back
-    /// here, so the caller decides when to wait.
+    /// The returned submission owns every device buffer the request uses, the
+    /// prepared resources they were launched against, and a completion event
+    /// recorded after the last of them. Nothing is read back here, so the caller
+    /// decides when to wait.
     ///
     /// # Errors
     /// Returns [`EncoderError`] for an invalid request or a CUDA/cuBLAS failure.
-    pub fn submit(&self, request: &EncoderRequest) -> Result<EncoderSubmission<'_>, EncoderError> {
-        let geometry = self.geometry(request.token_ids.len())?;
-        validate_ids(request, &self.config)?;
+    pub fn submit(&self, request: &EncoderRequest) -> Result<EncoderSubmission, EncoderError> {
+        let shape = crate::request::shape_of(&self.config, request)?;
         let stream = self.stream();
         let upload_tokens = |values: &[u32]| -> Result<CudaSlice<u32>, EncoderError> {
             stream
@@ -237,31 +248,45 @@ impl CudaBertEncoder {
         };
         let mask: Vec<i32> = request.attention_mask.clone();
         let mut submission = EncoderSubmission {
-            encoder: self,
-            geometry,
+            layer_norm_eps: self.config.layer_norm_eps,
+            prepared: Arc::clone(&self.prepared),
+            shape,
             tokens: upload_tokens(&request.token_ids)?,
             types: upload_tokens(&request.token_type_ids)?,
             mask: stream
                 .clone_htod(&mask)
                 .map_err(|error| EncoderError::Driver(error.to_string()))?,
-            hidden: alloc(stream, geometry.hidden_values)?,
-            query: alloc(stream, geometry.hidden_values)?,
-            key: alloc(stream, geometry.hidden_values)?,
-            value: alloc(stream, geometry.hidden_values)?,
-            context: alloc(stream, geometry.hidden_values)?,
-            projection: alloc(stream, geometry.hidden_values)?,
-            intermediate: alloc(stream, geometry.intermediate_values)?,
-            first_row: alloc(stream, geometry.hidden)?,
-            pooled: alloc(stream, geometry.hidden)?,
+            hidden: alloc(stream, shape.hidden_values())?,
+            query: alloc(stream, shape.hidden_values())?,
+            key: alloc(stream, shape.hidden_values())?,
+            value: alloc(stream, shape.hidden_values())?,
+            context: alloc(stream, shape.hidden_values())?,
+            projection: alloc(stream, shape.hidden_values())?,
+            intermediate: alloc(stream, shape.intermediate_values())?,
+            first_row: alloc(stream, shape.hidden())?,
+            pooled: alloc(stream, shape.hidden())?,
             completion: None,
         };
-        submission.run()?;
-        submission.completion = Some(
-            stream
-                .record_event(None)
-                .map_err(|error| EncoderError::Driver(error.to_string()))?,
-        );
-        Ok(submission)
+        let run = submission.run().and_then(|()| {
+            submission.completion = Some(
+                stream
+                    .record_event(None)
+                    .map_err(|error| EncoderError::Driver(error.to_string()))?,
+            );
+            Ok(())
+        });
+        match run {
+            Ok(()) => Ok(submission),
+            Err(error) => {
+                // A partially enqueued request owns device storage the stream may
+                // still be writing, so drain before the buffers are dropped. The
+                // executor-owned retirement handshake replaces this best-effort
+                // step; until then a device fault here leaves the storage's pool
+                // charge with the caller rather than releasing it early.
+                let _ = stream.synchronize();
+                Err(error)
+            }
+        }
     }
 
     /// Run one request to completion and read its results.
@@ -270,40 +295,25 @@ impl CudaBertEncoder {
     /// Returns [`EncoderError`] for an invalid request, an execution failure, or a
     /// readback failure.
     pub fn encode(&self, request: &EncoderRequest) -> Result<EncoderOutput, EncoderError> {
-        let mut submission = self.submit(request)?;
+        let submission = self.submit(request)?;
         submission.synchronize()?;
         submission.read()
     }
+}
 
-    /// Validate a request's shape without touching the device.
-    fn geometry(&self, sequence: usize) -> Result<Geometry, EncoderError> {
-        if sequence == 0 {
-            return Err(EncoderError::InvalidRequest(
-                "sequence length must be positive".to_owned(),
-            ));
-        }
-        if sequence > self.config.max_position_embeddings {
-            return Err(EncoderError::InvalidRequest(format!(
-                "sequence length {sequence} exceeds the model's {} position embeddings",
-                self.config.max_position_embeddings
-            )));
-        }
-        let hidden = self.config.hidden_size;
-        let hidden_values = sequence * hidden;
-        let intermediate_values = sequence * self.config.intermediate_size;
-        // Staging plus the activations the forward pass keeps alive.
-        let float_values = 6 * hidden_values + intermediate_values + 2 * hidden;
-        let bytes = float_values * size_of::<f32>() + 3 * sequence * size_of::<u32>();
-        Ok(Geometry {
-            sequence,
-            hidden,
-            heads: self.config.num_attention_heads,
-            hidden_values,
-            intermediate_values,
-            workspace_bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-        })
-    }
+/// Prepared device state shared by every submission of one encoder.
+///
+/// A submission outlives any borrow of its encoder, because it is handed to a
+/// consumer that may read it long after the submitting call returned. The kernel
+/// functions, cuBLAS handle and weights it launches against are therefore shared
+/// rather than borrowed, and it keeps them alive for as long as it owns storage.
+struct Prepared {
+    ops: CudaEncoderOps,
+    blas: CudaBlas,
+    weights: DeviceWeights,
+}
 
+impl Prepared {
     /// Dense projection `weight · input + bias` for `rows` rows.
     ///
     /// The checkpoint stores `weight` row-major as `[output, input]`, which is
@@ -343,9 +353,10 @@ impl CudaBertEncoder {
 }
 
 /// One request's device state, owned until the submission is dropped.
-pub struct EncoderSubmission<'a> {
-    encoder: &'a CudaBertEncoder,
-    geometry: Geometry,
+pub struct EncoderSubmission {
+    layer_norm_eps: f32,
+    prepared: Arc<Prepared>,
+    shape: EncoderShape,
     tokens: CudaSlice<u32>,
     types: CudaSlice<u32>,
     mask: CudaSlice<i32>,
@@ -361,11 +372,35 @@ pub struct EncoderSubmission<'a> {
     completion: Option<CudaEvent>,
 }
 
-impl EncoderSubmission<'_> {
-    /// Bytes this submission holds on the device.
+impl EncoderSubmission {
+    /// The concrete shape this submission was launched with.
     #[must_use]
-    pub const fn device_bytes(&self) -> u64 {
-        self.geometry.workspace_bytes
+    pub const fn shape(&self) -> EncoderShape {
+        self.shape
+    }
+
+    /// Bytes this submission actually holds on the device.
+    ///
+    /// Counted from the buffers that exist rather than from the prediction, so a
+    /// device test can prove that the envelope a pool was charged for equals the
+    /// storage it covers.
+    #[must_use]
+    pub fn device_bytes(&self) -> u64 {
+        let floats = self.hidden.len()
+            + self.query.len()
+            + self.key.len()
+            + self.value.len()
+            + self.context.len()
+            + self.projection.len()
+            + self.intermediate.len()
+            + self.first_row.len()
+            + self.pooled.len();
+        let ids = self.tokens.len() + self.types.len() + self.mask.len();
+        let bytes = floats.checked_mul(size_of::<f32>()).and_then(|bytes| {
+            ids.checked_mul(size_of::<u32>())
+                .and_then(|ids| bytes.checked_add(ids))
+        });
+        u64::try_from(bytes.unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
     }
 
     /// Whether every kernel and copy of this submission has completed.
@@ -390,8 +425,9 @@ impl EncoderSubmission<'_> {
     ///
     /// # Errors
     /// Returns [`EncoderError::Driver`] when the stream reports a device failure.
-    pub fn synchronize(&mut self) -> Result<(), EncoderError> {
-        self.encoder
+    pub fn synchronize(&self) -> Result<(), EncoderError> {
+        self.prepared
+            .ops
             .stream()
             .synchronize()
             .map_err(|error| EncoderError::Driver(error.to_string()))
@@ -399,13 +435,14 @@ impl EncoderSubmission<'_> {
 
     /// Read this submission's results.
     ///
-    /// The caller must have established completion first; a read that races the
-    /// device would return storage the device may still be writing.
+    /// The caller must have established completion first ([`Self::is_complete`] or
+    /// [`Self::synchronize`]); a read that races the device would return storage the
+    /// device may still be writing.
     ///
     /// # Errors
     /// Returns [`EncoderError::Driver`] when a copy fails.
     pub fn read(&self) -> Result<EncoderOutput, EncoderError> {
-        let stream = self.encoder.stream();
+        let stream = self.prepared.ops.stream();
         let hidden = stream
             .clone_dtoh(&self.hidden)
             .map_err(|error| EncoderError::Driver(error.to_string()))?;
@@ -420,42 +457,41 @@ impl EncoderSubmission<'_> {
 
     /// Enqueue the whole forward pass on this encoder's stream.
     fn run(&mut self) -> Result<(), EncoderError> {
-        let encoder = self.encoder;
-        let config = encoder.config;
-        let geometry = self.geometry;
-        let ops = &encoder.ops;
+        let prepared = Arc::clone(&self.prepared);
+        let shape = self.shape;
+        let ops = &prepared.ops;
 
         ops.embedding_sum(
             &self.tokens,
             &self.types,
-            &encoder.weights.word_embeddings,
-            &encoder.weights.position_embeddings,
-            &encoder.weights.token_type_embeddings,
-            geometry.hidden,
+            &prepared.weights.word_embeddings,
+            &prepared.weights.position_embeddings,
+            &prepared.weights.token_type_embeddings,
+            shape.hidden(),
             &mut self.hidden,
         )?;
         ops.layer_norm_rows(
             &self.hidden,
-            &encoder.weights.embedding_norm.weight,
-            &encoder.weights.embedding_norm.bias,
-            geometry.hidden,
-            config.layer_norm_eps,
+            &prepared.weights.embedding_norm.weight,
+            &prepared.weights.embedding_norm.bias,
+            shape.hidden(),
+            self.layer_norm_eps,
             &mut self.query,
         )?;
         std::mem::swap(&mut self.hidden, &mut self.query);
 
-        for layer in &encoder.weights.layers {
-            encoder.project(
+        for layer in &prepared.weights.layers {
+            prepared.project(
                 &layer.query,
                 &self.hidden,
-                geometry.sequence,
+                shape.sequence(),
                 &mut self.query,
             )?;
-            encoder.project(&layer.key, &self.hidden, geometry.sequence, &mut self.key)?;
-            encoder.project(
+            prepared.project(&layer.key, &self.hidden, shape.sequence(), &mut self.key)?;
+            prepared.project(
                 &layer.value,
                 &self.hidden,
-                geometry.sequence,
+                shape.sequence(),
                 &mut self.value,
             )?;
             ops.attention_context(
@@ -463,14 +499,14 @@ impl EncoderSubmission<'_> {
                 &self.key,
                 &self.value,
                 &self.mask,
-                geometry.hidden,
-                geometry.heads,
+                shape.hidden(),
+                shape.heads(),
                 &mut self.context,
             )?;
-            encoder.project(
+            prepared.project(
                 &layer.attention_output,
                 &self.context,
-                geometry.sequence,
+                shape.sequence(),
                 &mut self.projection,
             )?;
             ops.add_in_place(&mut self.projection, &self.hidden)?;
@@ -478,22 +514,22 @@ impl EncoderSubmission<'_> {
                 &self.projection,
                 &layer.attention_norm.weight,
                 &layer.attention_norm.bias,
-                geometry.hidden,
-                config.layer_norm_eps,
+                shape.hidden(),
+                self.layer_norm_eps,
                 &mut self.hidden,
             )?;
 
-            encoder.project(
+            prepared.project(
                 &layer.intermediate,
                 &self.hidden,
-                geometry.sequence,
+                shape.sequence(),
                 &mut self.intermediate,
             )?;
             ops.gelu_erf(&mut self.intermediate)?;
-            encoder.project(
+            prepared.project(
                 &layer.output,
                 &self.intermediate,
-                geometry.sequence,
+                shape.sequence(),
                 &mut self.projection,
             )?;
             ops.add_in_place(&mut self.projection, &self.hidden)?;
@@ -501,20 +537,20 @@ impl EncoderSubmission<'_> {
                 &self.projection,
                 &layer.output_norm.weight,
                 &layer.output_norm.bias,
-                geometry.hidden,
-                config.layer_norm_eps,
+                shape.hidden(),
+                self.layer_norm_eps,
                 &mut self.hidden,
             )?;
         }
 
         // The pooler reads the first position only, so copy that row and project it
         // as a single-row input instead of running the head over every position.
-        encoder
-            .stream()
-            .memcpy_dtod(&self.hidden.slice(..geometry.hidden), &mut self.first_row)
+        let stream = prepared.ops.stream();
+        stream
+            .memcpy_dtod(&self.hidden.slice(..shape.hidden()), &mut self.first_row)
             .map_err(|error| EncoderError::Driver(error.to_string()))?;
-        encoder.project(
-            &encoder.weights.pooler,
+        prepared.project(
+            &prepared.weights.pooler,
             &self.first_row,
             1,
             &mut self.pooled,
@@ -524,24 +560,14 @@ impl EncoderSubmission<'_> {
     }
 }
 
-impl fmt::Debug for EncoderSubmission<'_> {
+impl fmt::Debug for EncoderSubmission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EncoderSubmission")
-            .field("sequence", &self.geometry.sequence)
-            .field("device_bytes", &self.geometry.workspace_bytes)
+            .field("sequence", &self.shape.sequence())
+            .field("device_bytes", &self.device_bytes())
             .field("complete", &self.is_complete().unwrap_or(false))
             .finish_non_exhaustive()
     }
-}
-
-#[derive(Clone, Copy)]
-struct Geometry {
-    sequence: usize,
-    hidden: usize,
-    heads: usize,
-    hidden_values: usize,
-    intermediate_values: usize,
-    workspace_bytes: u64,
 }
 
 struct DeviceDense {
@@ -580,29 +606,4 @@ fn alloc(stream: &Arc<CudaStream>, values: usize) -> Result<CudaSlice<f32>, Enco
     stream
         .alloc_zeros::<f32>(values)
         .map_err(|error| EncoderError::Driver(error.to_string()))
-}
-
-fn validate_ids(request: &EncoderRequest, config: &BertConfig) -> Result<(), EncoderError> {
-    if request.token_type_ids.len() != request.token_ids.len()
-        || request.attention_mask.len() != request.token_ids.len()
-    {
-        return Err(EncoderError::InvalidRequest(
-            "token, token-type and mask lengths must agree".to_owned(),
-        ));
-    }
-    for token in &request.token_ids {
-        if usize::try_from(*token).map_or(true, |token| token >= config.vocab_size) {
-            return Err(EncoderError::InvalidRequest(format!(
-                "token id {token} is outside the model's vocabulary"
-            )));
-        }
-    }
-    for token_type in &request.token_type_ids {
-        if usize::try_from(*token_type).map_or(true, |kind| kind >= config.type_vocab_size) {
-            return Err(EncoderError::InvalidRequest(format!(
-                "token type id {token_type} is outside the model's type vocabulary"
-            )));
-        }
-    }
-    Ok(())
 }
