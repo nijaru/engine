@@ -300,17 +300,15 @@ fn cancelling_a_retained_result_leaves_its_charge_with_its_storage() {
 fn a_lagging_consumer_holds_its_charge_while_a_peer_still_progresses() {
     let envelope = encoder().request_bytes(4).expect("envelope");
     // Room for one result per runtime, so the lagging consumer is what holds the
-    // peer back rather than the pool being unable to run anything.
+    // pool, not the pool being unable to run anything at all.
     let pool = BytePool::new(2 * envelope).shared();
     let mut lagging =
         BatchRuntime::new(encoder(), Arc::clone(&pool), config()).expect("lagging runtime");
     let mut peer = BatchRuntime::new(encoder(), Arc::clone(&pool), config()).expect("peer runtime");
+    let request = || EncoderRequest::single_segment(vec![4, 1, 9, 3]);
 
-    lagging
-        .submit(EncoderRequest::single_segment(vec![4, 1, 9, 3]))
-        .expect("lagging request");
-    peer.submit(EncoderRequest::single_segment(vec![4, 1, 9, 3]))
-        .expect("peer request");
+    lagging.submit(request()).expect("lagging request");
+    peer.submit(request()).expect("peer request");
     assert_eq!(
         lagging.step().expect("lagging step"),
         StepOutcome::Executed { results: 1 }
@@ -321,22 +319,24 @@ fn a_lagging_consumer_holds_its_charge_while_a_peer_still_progresses() {
     );
     assert_eq!(pool.granted(), 2 * envelope);
 
-    // The lagging runtime never awaits its result or releases it, so the pool is
-    // fully committed and a third request cannot start anywhere.
-    lagging
-        .submit(EncoderRequest::single_segment(vec![4, 1, 9, 3]))
-        .expect("lagging request");
-    assert_eq!(
-        lagging.step().expect("blocked step"),
-        StepOutcome::Blocked(BlockReason::Pool {
-            requested: envelope,
-            available: 0
-        })
-    );
+    // Neither consumer has consumed anything, so one more request per runtime waits
+    // for capacity whichever runtime asks first.
+    lagging.submit(request()).expect("lagging request");
+    peer.submit(request()).expect("peer request");
+    for runtime in [&mut lagging, &mut peer] {
+        assert_eq!(
+            runtime.step().expect("blocked step"),
+            StepOutcome::Blocked(BlockReason::Pool {
+                requested: envelope,
+                available: 0
+            })
+        );
+    }
     assert_eq!(pool.available(), 0);
 
-    // Consuming the peer's result admits exactly that one request: the lagging
-    // consumer keeps its own charge, and progress does not require its cooperation.
+    // The peer consumes its result, which admits exactly one request: its own. The
+    // lagging consumer keeps its charge, and progress does not require its
+    // cooperation.
     drop(peer.pop_completed().expect("peer entry"));
     assert_eq!(pool.granted(), envelope);
     assert_eq!(
@@ -344,15 +344,22 @@ fn a_lagging_consumer_holds_its_charge_while_a_peer_still_progresses() {
         StepOutcome::Executed { results: 1 }
     );
     assert_eq!(pool.granted(), 2 * envelope);
+    assert_eq!(
+        lagging.step().expect("lagging step"),
+        StepOutcome::Blocked(BlockReason::Pool {
+            requested: envelope,
+            available: 0
+        }),
+        "the lagging consumer still holds its own charge"
+    );
 
-    // The lagging consumer's result is still intact and still charged: nothing
-    // released it while it waited.
+    // Its result is intact and still charged: nothing released it while it waited.
     let entry = lagging.pop_completed().expect("lagging entry");
     let completion = EncoderCompletion::from_completed(entry);
-    assert!(matches!(completion, EncoderCompletion::Result(_)));
     let EncoderCompletion::Result(result) = completion else {
         panic!("the lagging result is an output");
     };
+    assert_eq!(result.device_bytes(), envelope);
     result.synchronize().expect("synchronize");
     assert!(result.read().is_ok());
     drop(result);
