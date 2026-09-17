@@ -55,6 +55,7 @@ struct Sequence {
     prefix: u32,
     generated: u32,
     admitted: bool,
+    admission_wait: Option<crate::ReadinessWait>,
     work: WorkState,
     terminal: Option<FinishReason>,
     notified: bool,
@@ -264,6 +265,7 @@ impl Engine {
             prefix: 0,
             generated: 0,
             admitted: false,
+            admission_wait: None,
             work: WorkState::Idle,
             terminal: None,
             notified: false,
@@ -429,6 +431,14 @@ impl Engine {
                 .pop_front()
                 .expect("waiting queue was nonempty");
             let sequence = self.slots[index].as_ref().expect("waiting slot exists");
+            if sequence
+                .admission_wait
+                .as_ref()
+                .is_some_and(|wait| !wait.changed())
+            {
+                self.waiting.push_back(index);
+                continue;
+            }
             let input = sequence.input.as_ref().expect("waiting input exists");
             let admitted = self.model.as_mut().expect("engine owns model").admit(
                 sequence.request,
@@ -439,12 +449,19 @@ impl Engine {
                 Ok(Admission::Ready) => {
                     let sequence = self.slots[index].as_mut().expect("waiting slot exists");
                     sequence.admitted = true;
+                    sequence.admission_wait = None;
                     sequence.input = None;
                     self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
                     self.active += 1;
                     self.prefill.push_back(index);
                 }
-                Ok(Admission::Deferred) => self.waiting.push_back(index),
+                Ok(Admission::Deferred(wait)) => {
+                    self.slots[index]
+                        .as_mut()
+                        .expect("waiting slot exists")
+                        .admission_wait = Some(wait);
+                    self.waiting.push_back(index);
+                }
                 Err(error) => self.terminate(index, FinishReason::Failed(error)),
             }
         }
@@ -458,6 +475,7 @@ impl Engine {
         if sequence.input.take().is_some() {
             self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
         }
+        sequence.admission_wait = None;
         sequence.terminal = Some(reason);
         sequence.work = WorkState::Idle;
         self.terminal.push_back(index);

@@ -111,8 +111,12 @@ impl<B: ComputeBackend> QwenExecution<B> {
             request.options.sampling.top_k,
         )
         .map_err(model_error)?;
+        let wait = self
+            .manager
+            .capacity_wait(StateLocation::Device(self.manager.device()))
+            .ok_or_else(|| ExecutionError::new("Qwen continuation has no device authority"))?;
         if self.sequences.len() >= self.info.limits.max_sequences {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(wait));
         }
         // Declaring maximum context is a schema; reserving it is not required. A
         // sequence can never continue past its own prompt plus output budget, so
@@ -120,7 +124,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
         let reachable = u32::try_from(request.tokens.len()).expect("validated prompt length")
             + request.options.max_output_tokens;
         let Some((state, requirements)) = self.reserve_continuation(reachable)? else {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(wait));
         };
         self.sequences.insert(
             id,
@@ -162,6 +166,16 @@ impl<B: ComputeBackend> QwenExecution<B> {
             return Err(ExecutionError::new(format!(
                 "Qwen needs {required} continuation bytes, above the {capacity}-byte authority"
             )));
+        }
+        // Check the whole bundle before allocating any component. Otherwise a
+        // failed recurrent allocation could roll back newly reserved KV and publish
+        // a release that wakes this same waiter despite no net capacity change.
+        let used = self
+            .manager
+            .used_bytes(StateLocation::Device(self.manager.device()))
+            .expect("validated device authority");
+        if required > capacity - used {
+            return Ok(None);
         }
         match state::allocate(&mut self.manager, &requirements) {
             Ok(state) => Ok(Some((state, Arc::from(requirements)))),

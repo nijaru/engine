@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+ribn-foundation = { path = "../foundation" }
 flume = { version = "0.12", default-features = false, features = ["async"] }
 
 [lints]

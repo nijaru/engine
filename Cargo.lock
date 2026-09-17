@@ -91,6 +91,9 @@ dependencies = [
 [[package]]
 name = "engine-core"
 version = "0.0.0"
+dependencies = [
+ "ribn-foundation",
+]
 
 [[package]]
 name = "engine-gguf"
@@ -298,6 +301,7 @@ name = "ribn"
 version = "0.0.0"
 dependencies = [
  "flume",
+ "ribn-foundation",
 ]
 
 [[package]]

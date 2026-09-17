@@ -642,6 +642,8 @@ pub struct LogicalStateManager {
     device_used_bytes: u64,
     host_used_bytes: u64,
     allocations: HashMap<StateId, AllocationRecord>,
+    device_readiness: ribn_foundation::Readiness,
+    host_readiness: ribn_foundation::Readiness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -662,6 +664,8 @@ impl LogicalStateManager {
             device_used_bytes: 0,
             host_used_bytes: 0,
             allocations: HashMap::new(),
+            device_readiness: ribn_foundation::Readiness::default(),
+            host_readiness: ribn_foundation::Readiness::default(),
         }
     }
 
@@ -677,6 +681,19 @@ impl LogicalStateManager {
                 Some(self.device_capacity_bytes)
             }
             StateLocation::Host => Some(self.host_capacity_bytes),
+            StateLocation::Device(_) => None,
+        }
+    }
+
+    /// Register before checking capacity. Only a successful release in this
+    /// location publishes readiness; a commit or failed release cannot admit work.
+    #[must_use]
+    pub fn capacity_wait(&self, location: StateLocation) -> Option<ribn_foundation::ReadinessWait> {
+        match location {
+            StateLocation::Device(device) if device == self.device => {
+                Some(self.device_readiness.register())
+            }
+            StateLocation::Host => Some(self.host_readiness.register()),
             StateLocation::Device(_) => None,
         }
     }
@@ -820,8 +837,10 @@ impl StateManager for LogicalStateManager {
         self.allocations.remove(&handle.id());
         if matches!(record.location, StateLocation::Device(_)) {
             self.device_used_bytes -= record.bytes;
+            self.device_readiness.publish();
         } else {
             self.host_used_bytes -= record.bytes;
+            self.host_readiness.publish();
         }
         Ok(())
     }

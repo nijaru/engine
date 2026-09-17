@@ -70,6 +70,23 @@ mod tests {
     }
 
     #[test]
+    fn capacity_readiness_tracks_successful_release_not_commit_or_invalid_release() {
+        let location = StateLocation::Device(DeviceId::new(0));
+        let mut manager = manager(DeviceId::new(0), 32);
+        let wait = manager.capacity_wait(location).unwrap();
+        let host_wait = manager.capacity_wait(StateLocation::Host).unwrap();
+        let mut state = allocate(&mut manager, &[kv(4)]).unwrap();
+        let old_handle = state.kv().unwrap().handle().clone();
+        manager.commit(&mut state, 1).unwrap();
+        assert!(!wait.changed());
+        assert!(manager.release(old_handle).is_err());
+        assert!(!wait.changed());
+        manager.release_set(&state).unwrap();
+        assert!(wait.changed());
+        assert!(!host_wait.changed());
+    }
+
+    #[test]
     fn allocation_and_bundle_validation_failures_restore_capacity() {
         let location = StateLocation::Device(DeviceId::new(0));
         let mut manager = manager(DeviceId::new(0), 32);

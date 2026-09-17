@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{RequestId, TokenRequest};
+use crate::{ReadinessWait, RequestId, TokenRequest};
 
 /// Engine-issued logical identity, not an allocation pointer or a cache layout.
 /// Models must not infer state contents from this value or from its prefix.
@@ -96,11 +96,13 @@ pub struct StepCompletion {
     pub tokens: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admission {
     Ready,
-    /// No sequence resources were retained. The engine may retry admission.
-    Deferred,
+    /// No sequence resources were retained. Register before checking the
+    /// blocking condition; the engine retries only when the source changes.
+    /// The driver observes this registration on its bounded poll interval.
+    Deferred(ReadinessWait),
 }
 
 /// Bounded retained diagnostic (at most 4096 UTF-8 bytes). Backend formatting

@@ -47,12 +47,14 @@ fn wait(mut condition: impl FnMut() -> bool) {
 struct Control {
     ready: AtomicBool,
     deferred: AtomicBool,
+    readiness: crate::Readiness,
     fail_poll: AtomicBool,
     panic_poll: AtomicBool,
     fail_sync: AtomicBool,
     fail_release: AtomicBool,
     polls: AtomicUsize,
     admitted: AtomicUsize,
+    attempts: AtomicUsize,
     released: AtomicUsize,
     synced: AtomicUsize,
     dropped: AtomicBool,
@@ -63,12 +65,14 @@ impl Default for Control {
         Self {
             ready: AtomicBool::new(true),
             deferred: AtomicBool::new(false),
+            readiness: crate::Readiness::default(),
             fail_poll: AtomicBool::new(false),
             panic_poll: AtomicBool::new(false),
             fail_sync: AtomicBool::new(false),
             fail_release: AtomicBool::new(false),
             polls: AtomicUsize::new(0),
             admitted: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
             released: AtomicUsize::new(0),
             synced: AtomicUsize::new(0),
             dropped: AtomicBool::new(false),
@@ -94,8 +98,10 @@ impl GenerationExecutor for Model {
         sequence: SequenceId,
         input: &TokenRequest,
     ) -> Result<Admission, ExecutionError> {
+        self.control.attempts.fetch_add(1, Ordering::SeqCst);
+        let wait = self.control.readiness.register();
         if self.control.deferred.load(Ordering::SeqCst) {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(wait));
         }
         if input.tokens[0] == 99 {
             return Err(ExecutionError::new("request-local rejection"));
@@ -580,6 +586,7 @@ fn cancelling_deferred_admission_wakes_without_a_device_batch() {
     control.deferred.store(true, Ordering::SeqCst);
     let (mut owner, handle) = setup(&control, Duration::from_secs(60));
     let mut stream = run(handle.stream(input(7, 1))).unwrap();
+    wait(|| control.attempts.load(Ordering::SeqCst) == 1);
     stream.cancel();
     assert!(matches!(
         collect(&mut stream).last(),
@@ -589,6 +596,35 @@ fn cancelling_deferred_admission_wakes_without_a_device_batch() {
         })
     ));
     assert_eq!(control.admitted.load(Ordering::SeqCst), 0);
+    owner.shutdown().unwrap();
+}
+
+#[test]
+fn registered_admission_rechecks_without_retry_and_observes_publication_before_park() {
+    let control = Arc::new(Control::default());
+    control.deferred.store(true, Ordering::SeqCst);
+    let (mut owner, handle) = setup(&control, Duration::from_millis(1));
+    let mut stream = run(handle.stream(input(7, 1))).unwrap();
+    wait(|| control.attempts.load(Ordering::SeqCst) == 1);
+    let (entered_tx, entered) = flume::bounded(1);
+    let (resume, resume_rx) = flume::bounded(1);
+    *handle.shared.before_wait.lock().unwrap() = Some((entered_tx, resume_rx));
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    // The worker has stepped again, but unchanged readiness must not retry
+    // model admission. Publish in the exact check-to-park gap, without waking it.
+    let attempts = control.attempts.load(Ordering::SeqCst);
+    control.deferred.store(false, Ordering::SeqCst);
+    control.readiness.publish();
+    resume.send(()).unwrap();
+    assert_eq!(attempts, 1);
+    assert!(matches!(
+        collect(&mut stream).last(),
+        Some(Event::Finished {
+            reason: FinishReason::Length,
+            ..
+        })
+    ));
+    assert_eq!(control.attempts.load(Ordering::SeqCst), 2);
     owner.shutdown().unwrap();
 }
 

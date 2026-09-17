@@ -334,6 +334,16 @@ because a continuation change silently corrupts output when it is wrong.
   match. Evidence: parity with and without a reused prefix, identical output for a shared
   prefix across sequences, and a constrained-pool run where reuse admits work that
   per-sequence allocation cannot.
+
+  First prerequisite: admission now retains an authority-owned readiness registration
+  and retries only after publication, not on every decode step. Qwen registers before
+  checking whole-bundle capacity; failed hybrid allocation must not roll back a partial
+  reservation and wake itself. Host regressions cover unchanged capacity, successful
+  versus failed release, publication before driver parking without an in-flight batch,
+  and cancellation of a registered wait. The driver still observes epochs with its
+  bounded timed fallback; there is no resource-to-worker notification yet. Block
+  allocation, growth preparation and prefix reuse remain unimplemented. Device
+  requalification is pending GPU availability.
 - **4c. Eviction and preemption.** Unreferenced cached blocks are evicted
   least-recently-used; a live sequence whose growth cannot be granted is preempted by
   recomputation before any host swap tier exists. Evidence: constrained-pool

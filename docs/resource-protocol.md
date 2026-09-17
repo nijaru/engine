@@ -19,8 +19,9 @@ or parking and could immediately resubmit unchanged work. Positive partial-prefi
 completion remains: it reports a contiguous consumed range, not permission to exceed
 physical capacity and not a pre-submit reservation. Ordinary resource waiting must
 arrive with a real preparation implementation and its readiness source, not another
-isolated completion enum. `Admission::Deferred` and device polling still rely on
-explicit driver steps; the current synchronous facade is not event-driven.
+isolated completion enum. Admission waits carry an authority-owned readiness registration. Direct callers
+recheck registrations when stepping; the driver uses its bounded timed fallback because
+readiness sources do not yet notify its wake channel. Device completion is also polled.
 
 Keep these invariants throughout replacement:
 
@@ -199,9 +200,16 @@ byte authority as every other device reservation on that device.
    transaction; it never edits the declaration and never borrows unreserved capacity.
    Insufficient capacity is ordinary backpressure and an indivisible demand larger than
    the authority can ever grant is request-local rejection, delivered without waiting.
-   The engine re-offers waiting work each step, so the readiness protocol is a bounded
-   recheck rather than a registered epoch; 4b replaces it with a real registration
-   against the authority.
+   Admission returns `Deferred(ReadinessWait)` registered before checking the blocking
+   condition. The runtime retains this registration on the waiting request, outside
+   runnable queues, and re-offers it only after the source changes. The capacity authority
+   publishes after a successful release, never after commit, failed release or allocation.
+   A change permits retry, not allocation: a peer may already have consumed the capacity.
+   A retry that still cannot fit registers again. Cancellation and shutdown remove the
+   wait with its request; no executor-owned waiter list is needed. The driver rechecks
+   epochs on its bounded poll interval when no device work is in flight, so a change
+   before parking is not lost. This is registered readiness with timed observation, not
+   notification-driven wakeup.
 3. **One owner holds storage and its charge.** A backend materializes device storage for
    the lease it was granted, and the same owner releases both together. A lease is never
    duplicated to share storage: storage shared between sequences is owned once (by the
@@ -287,8 +295,9 @@ explicit cancel and output-credit return without a second cancellation queue.
 - The worker never blocks sending output. Only it sends to each stream; it checks channel
   space before draining that runtime mailbox. Consumption wakes the execution owner.
 - An idle/output-blocked owner sleeps indefinitely on the wake channel. Pending device
-  completion and legacy `Admission::Deferred` use a configured nonzero timed-poll
-  fallback. This is not the future resource-readiness protocol. Synchronous backend
+  completion and registered admission waits use a configured nonzero timed-poll
+  fallback. Unchanged registrations are checked without rerunning model admission;
+  resource publication does not yet notify the worker's wake channel. Synchronous backend
   calls remain non-preemptible; wakeups cannot interrupt a blocked driver operation.
 - Request-local runtime admission failures remain `FinishReason::Failed`. Driver-level
   enqueue rejection retains its `EngineError` source. Execution-owner failure stops

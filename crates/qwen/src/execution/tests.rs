@@ -149,10 +149,17 @@ fn fixture_requirements() -> Vec<StateRequirement> {
 }
 
 fn model_with_capacity(control: Arc<Mutex<Control>>, capacity: u64) -> Model {
+    model_with_requirements(control, capacity, fixture_requirements())
+}
+
+fn model_with_requirements(
+    control: Arc<Mutex<Control>>,
+    capacity: u64,
+    requirements: Vec<StateRequirement>,
+) -> Model {
     let device = DeviceId::new(0);
     let model = ModelId::new("Qwen adapter fixture").unwrap();
     let backend = BackendId::new("host-fixture").unwrap();
-    let requirements = fixture_requirements();
     let plan = ExecutionPlan::new(
         model.clone(),
         backend.clone(),
@@ -427,8 +434,63 @@ fn insufficient_continuation_capacity_waits_for_a_release_instead_of_failing() {
             .count(),
         2
     );
-    let capacities = control.lock().unwrap().kv_capacities.clone();
-    assert!(!capacities.is_empty() && capacities.iter().all(|&tokens| tokens == 6));
+    let control = control.lock().unwrap();
+    assert!(!control.kv_capacities.is_empty());
+    assert!(control.kv_capacities.iter().all(|&tokens| tokens == 6));
+    // One admission for the first request, one failed capacity attempt for the
+    // peer, and one retry after release. Decode progress is not capacity readiness.
+    let attempts = control.admissions.len();
+    drop(control);
+    assert_eq!(attempts, 3);
+}
+
+#[test]
+fn failed_hybrid_reservation_does_not_publish_its_own_readiness() {
+    use engine_core::{ConvolutionStateShape, RecurrentMatrixShape, RecurrentStateSpec};
+    let control = Arc::new(Mutex::new(Control::default()));
+    let mut requirements = fixture_requirements();
+    // 64 recurrent bytes plus 48 KV bytes per request. A 176-byte pool
+    // leaves 64 bytes: enough for the peer's KV but not its recurrent state.
+    requirements.push(StateRequirement::Recurrent(
+        RecurrentStateSpec::new(
+            1,
+            RecurrentMatrixShape::new(1, 3, 4).unwrap(),
+            ConvolutionStateShape::new(2, 2).unwrap(),
+            DataType::F32,
+            DataType::F32,
+        )
+        .unwrap(),
+    ));
+    let mut model = model_with_requirements(control, 176, requirements);
+    let first = model
+        .0
+        .manager
+        .allocate_kv(
+            KvStateSpec::new(1, 1, 2, 14, DataType::F16).unwrap(),
+            StateLocation::Device(DeviceId::new(0)),
+        )
+        .unwrap();
+    let wait = model
+        .0
+        .manager
+        .capacity_wait(StateLocation::Device(DeviceId::new(0)))
+        .unwrap();
+    assert!(model.0.reserve_continuation(6).unwrap().is_none());
+    assert!(
+        !wait.changed(),
+        "failed bundle must not manufacture a release"
+    );
+    assert_eq!(
+        model
+            .0
+            .manager
+            .used_bytes(StateLocation::Device(DeviceId::new(0))),
+        Some(112)
+    );
+    model.0.manager.release(first.handle().clone()).unwrap();
+    assert!(wait.changed());
+    let (state, _) = model.0.reserve_continuation(6).unwrap().unwrap();
+    model.0.manager.release_set(&state).unwrap();
 }
 
 #[test]

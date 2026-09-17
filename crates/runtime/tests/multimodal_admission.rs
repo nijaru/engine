@@ -14,9 +14,8 @@
 //!
 //! What it establishes:
 //!
-//! - `Admission::Deferred` is a working per-request encoder gate. The engine retries
-//!   the request every step until the backend admits it, and no prompt token is
-//!   committed while it waits.
+//! - `Admission::Deferred` is a registered per-request encoder gate. The engine
+//!   retries after encoder publication; no prompt token is committed while it waits.
 //! - A backend can perform encoder work inside its own step and reuse the output
 //!   across requests, and the engine's loop neither duplicates nor loses that work.
 //! - A prefill row may accept *fewer* inputs than the engine offered
@@ -94,6 +93,7 @@ struct Control {
     encoded: Vec<ItemId>,
     /// Whether admission waits for the first item to be published.
     gate_admission: bool,
+    readiness: ribn::Readiness,
     /// Encoder compute one whole submission may spend, shared across its rows.
     step_budget: u32,
     /// Submissions that had to spend more than `step_budget`.
@@ -177,6 +177,7 @@ impl EncoderModel {
                     spent = spent.saturating_add(encoder.compute);
                     control.encoded.push(encoder.id);
                     control.published.insert(encoder.id);
+                    control.readiness.publish();
                 }
                 _ => {}
             }
@@ -241,7 +242,7 @@ impl GenerationExecutor for EncoderModel {
             && !control.published.contains(&first.id)
         {
             control.deferred += 1;
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(control.readiness.register()));
         }
         control.admitted += 1;
         self.items.insert(sequence, items);
@@ -396,7 +397,11 @@ fn deferred_admission_is_a_real_encoder_gate_that_the_engine_retries() {
     assert!(runtime.pop_event().is_none());
 
     // An external encoder publishing the item is what unblocks admission.
-    control.lock().unwrap().published.insert(ItemId(1));
+    {
+        let mut control = control.lock().unwrap();
+        control.published.insert(ItemId(1));
+        control.readiness.publish();
+    }
     let events = drain(&mut runtime);
     assert!(matches!(
         events.last(),

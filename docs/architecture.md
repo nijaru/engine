@@ -35,10 +35,15 @@ across those lifetimes; the text facade has no separate cleanup list. Discard su
 delivery without driving the runtime or establishing device completion. Completion
 returns positive `StepCompletion` rows, including shortened prefill ranges; the
 incomplete completion-time `Blocked` API was removed. Validation borrows all rows
-before moving them into commitment and retains batch-buffer capacity. Genuine
-resource parking/reactivation remains unimplemented.
+before moving them into commitment and retains batch-buffer capacity. Deferred
+admission retains a readiness registration on its waiting request; the engine only
+retries after the resource owner publishes a change. The driver observes these
+registrations with its bounded timed fallback, not resource notifications.
 
-Qwen admission reserves full configured continuation state. The adapter translates
+Qwen admission reserves continuation for the request's prompt plus output budget,
+not the full configured context. Its logical state authority publishes readiness only
+after successful release. Admission checks the whole hybrid bundle before reserving
+components so a failed attempt cannot wake itself through rollback. The adapter translates
 AR batch records into `engine-core` execution and state-manager types. It is not an
 additional scheduler, but it retains legacy coupling and per-step allocation.
 

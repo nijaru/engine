@@ -7,6 +7,7 @@
 mod parameter;
 mod plan;
 mod pool;
+mod readiness;
 mod topology;
 
 pub use parameter::{
@@ -15,6 +16,7 @@ pub use parameter::{
 };
 pub use plan::{ExecutionPlan, ModelIdentity, PlanError, RuntimeClass, StageId, StagePlacement};
 pub use pool::{AllocationId, BytePool, PoolLease, ReserveError};
+pub use readiness::{Readiness, ReadinessWait};
 pub use topology::{
     BackendId, ComputeDevice, DeviceId, DeviceLink, NodeId, ResourceTopology, TopologyError,
 };

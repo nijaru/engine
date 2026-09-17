@@ -19,6 +19,7 @@ struct Control {
     released: Vec<SequenceId>,
     batches: Vec<Vec<BatchItem>>,
     defer: bool,
+    readiness: ribn::Readiness,
     reject_admission: bool,
     fail_submit: bool,
     fail_poll: bool,
@@ -109,7 +110,7 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
             return Err(ExecutionError::new("unsupported request"));
         }
         if control.defer {
-            return Ok(Admission::Deferred);
+            return Ok(Admission::Deferred(control.readiness.register()));
         }
         assert!(self.states.insert(sequence, S::default()).is_none());
         control.admitted.push(sequence);
@@ -550,7 +551,11 @@ fn deferred_and_rejected_admission_do_not_own_sequence_allocations() {
     assert!(!runtime.step().unwrap().submitted);
     assert_eq!(runtime.status().active_sequences, 0);
     assert_eq!(runtime.status().waiting, 1);
-    control.lock().unwrap().defer = false;
+    {
+        let mut control = control.lock().unwrap();
+        control.defer = false;
+        control.readiness.publish();
+    }
     drain(&mut runtime);
     control.lock().unwrap().reject_admission = true;
     runtime.enqueue(request(1, 1)).unwrap();
