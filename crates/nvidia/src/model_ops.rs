@@ -421,10 +421,28 @@ extern "C" __global__ void rope_neox(
     values[offset + half] = x0 * sin_theta + x1 * cos_theta;
 }
 
-extern "C" __global__ void attn_score_gqa(
+// Logical token -> physical cache token. A sequence's KV is a block table over
+// the shared cache, so consecutive logical tokens can live in non-adjacent
+// physical blocks. The contiguous path folds to the identity at compile time.
+template <bool PAGED>
+__device__ __forceinline__ int kv_token(
+    const int* block_table,
+    int block_tokens,
+    int token
+) {
+    if (PAGED) {
+        return block_table[token / block_tokens] * block_tokens + token % block_tokens;
+    }
+    return token;
+}
+
+template <bool PAGED>
+__device__ __forceinline__ void attn_score_gqa_body(
     const float* q,
     const unsigned short* keys,
     const unsigned short* values,
+    const int* block_table,
+    int block_tokens,
     const float* gate_scratch,
     float* scores_scratch,
     float* output,
@@ -480,8 +498,9 @@ extern "C" __global__ void attn_score_gqa(
     float max_score = -3.402823466e+38f;
     float total = 0.0f;
     for (int token = 0; token < row_tokens; ++token) {
+        const int key_token = kv_token<PAGED>(block_table, block_tokens, token);
         const unsigned short* key =
-            keys + ((long long)token * kv_heads + kv_head) * head_dim;
+            keys + ((long long)key_token * kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < dims_per_lane && d < 16; ++d) {
             dot += q_vec[dim_base + d] * f16_bits_to_f32(key[dim_base + d]);
@@ -504,8 +523,9 @@ extern "C" __global__ void attn_score_gqa(
     const float inv_total = 1.0f / total;
     for (int token = 0; token < row_tokens; ++token) {
         const float weight = expf(scores[token] - max_score) * inv_total;
+        const int value_token = kv_token<PAGED>(block_table, block_tokens, token);
         const unsigned short* value =
-            values + ((long long)token * kv_heads + kv_head) * head_dim;
+            values + ((long long)value_token * kv_heads + kv_head) * head_dim;
         for (int d = 0; d < dims_per_lane && d < 16; ++d) {
             out_acc[d] += weight * f16_bits_to_f32(value[dim_base + d]);
         }
@@ -520,6 +540,50 @@ extern "C" __global__ void attn_score_gqa(
         const float sigmoid = 1.0f / (1.0f + expf(-gate[dim]));
         out[dim] = out_acc[d] * sigmoid;
     }
+}
+
+extern "C" __global__ void attn_score_gqa(
+    const float* q,
+    const unsigned short* keys,
+    const unsigned short* values,
+    const float* gate_scratch,
+    float* scores_scratch,
+    float* output,
+    int tokens,
+    int rows,
+    int scores_stride,
+    int q_heads,
+    int kv_heads,
+    int head_dim
+) {
+    attn_score_gqa_body<false>(
+        q, keys, values, 0, 0, gate_scratch, scores_scratch, output,
+        tokens, rows, scores_stride, q_heads, kv_heads, head_dim);
+}
+
+// Paged variant: `block_table[token / block_tokens]` holds the physical block
+// containing that logical token. The per-row arithmetic is the same device
+// body as the contiguous entry point; only the cache address differs, so a
+// sequence whose blocks happen to be adjacent produces identical results.
+extern "C" __global__ void attn_score_gqa_paged(
+    const float* q,
+    const unsigned short* keys,
+    const unsigned short* values,
+    const int* block_table,
+    int block_tokens,
+    const float* gate_scratch,
+    float* scores_scratch,
+    float* output,
+    int tokens,
+    int rows,
+    int scores_stride,
+    int q_heads,
+    int kv_heads,
+    int head_dim
+) {
+    attn_score_gqa_body<true>(
+        q, keys, values, block_table, block_tokens, gate_scratch, scores_scratch,
+        output, tokens, rows, scores_stride, q_heads, kv_heads, head_dim);
 }
 
 extern "C" __global__ void sigmoid_inplace(
@@ -1226,6 +1290,7 @@ pub struct CudaQwen35Ops {
     rope_neox: CudaFunction,
     sigmoid_inplace: CudaFunction,
     attn_score_gqa: CudaFunction,
+    attn_score_gqa_paged: CudaFunction,
     residual_add: CudaFunction,
     gdn_conv_silu: CudaFunction,
     l2_norm_heads: CudaFunction,
@@ -1242,6 +1307,99 @@ pub struct CudaQwen35Ops {
     q_gate_norm_batch: CudaFunction,
     strided_rms_norm_batch: CudaFunction,
     rope_neox_batch: CudaFunction,
+}
+
+/// Validated launch geometry shared by the attention entry points.
+struct AttentionLaunch {
+    tokens: u32,
+    rows: u32,
+    scores_stride: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    config: LaunchConfig,
+}
+
+/// Validate the geometry and scratch lengths every attention entry point needs.
+/// Each caller checks its own cache extent: contiguous tokens, or a paged
+/// pool addressed by a block table.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one validation mirrors the kernel's fixed model geometry"
+)]
+fn validate_attention_launch(
+    q: &CudaSlice<f32>,
+    gate_scratch: &CudaSlice<f32>,
+    scores_scratch: &CudaSlice<f32>,
+    output: &CudaSlice<f32>,
+    tokens: usize,
+    rows: usize,
+    scores_stride: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<AttentionLaunch, CudaModelKernelError> {
+    if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 || rows == 0 {
+        return Err(CudaModelKernelError::EmptyInput);
+    }
+    // Row `r` attends `tokens - rows + 1 + r` keys, so every row needs at
+    // least one token and the last row defines the cache extent.
+    if tokens < rows {
+        return Err(CudaModelKernelError::ShapeOverflow);
+    }
+    if !q_heads.is_multiple_of(kv_heads) {
+        return Err(CudaModelKernelError::ShapeOverflow);
+    }
+    // The warp-cooperative head split assumes whole 32-dim lane runs.
+    if !head_dim.is_multiple_of(32) {
+        return Err(CudaModelKernelError::ShapeOverflow);
+    }
+    let rows_heads = rows
+        .checked_mul(q_heads)
+        .ok_or(CudaModelKernelError::ShapeOverflow)?;
+    let row_elements = rows_heads
+        .checked_mul(head_dim)
+        .ok_or(CudaModelKernelError::ShapeOverflow)?;
+    let score_elements = rows_heads
+        .checked_mul(scores_stride)
+        .ok_or(CudaModelKernelError::ShapeOverflow)?;
+    if q.len() != row_elements
+        || gate_scratch.len() != 2 * row_elements
+        || output.len() != row_elements
+        || scores_scratch.len() < score_elements
+        || scores_stride < tokens
+    {
+        return Err(CudaModelKernelError::InputLength {
+            expected: row_elements,
+            actual: q.len(),
+        });
+    }
+    let tokens = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    let rows = u32::try_from(rows).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    let scores_stride =
+        u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    let q_heads = u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    let kv_heads = u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    let head_dim = u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+    // One warp per (row, q head); rows of a prefill chunk are consecutive
+    // positions of one sequence sharing the cache.
+    let warps = rows
+        .checked_mul(q_heads)
+        .ok_or(CudaModelKernelError::ShapeOverflow)?;
+    let config = LaunchConfig {
+        grid_dim: (warps.div_ceil(4), 1, 1),
+        block_dim: (4 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    Ok(AttentionLaunch {
+        tokens,
+        rows,
+        scores_stride,
+        q_heads,
+        kv_heads,
+        head_dim,
+        config,
+    })
 }
 
 impl CudaQwen35Ops {
@@ -1311,6 +1469,9 @@ impl CudaQwen35Ops {
         let attn_score_gqa = module
             .load_function("attn_score_gqa")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        let attn_score_gqa_paged = module
+            .load_function("attn_score_gqa_paged")
+            .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         let residual_add = module
             .load_function("residual_add")
             .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
@@ -1371,6 +1532,7 @@ impl CudaQwen35Ops {
             rope_neox,
             sigmoid_inplace,
             attn_score_gqa,
+            attn_score_gqa_paged,
             residual_add,
             gdn_conv_silu,
             l2_norm_heads,
@@ -1995,41 +2157,18 @@ impl CudaQwen35Ops {
         {
             return Err(CudaModelKernelError::ContextMismatch);
         }
-        if q_heads == 0 || kv_heads == 0 || head_dim == 0 || tokens == 0 || rows == 0 {
-            return Err(CudaModelKernelError::EmptyInput);
-        }
-        // Row `r` attends `tokens - rows + 1 + r` keys, so every row needs at
-        // least one token and the last row defines the cache extent.
-        if tokens < rows {
-            return Err(CudaModelKernelError::ShapeOverflow);
-        }
-        if !q_heads.is_multiple_of(kv_heads) {
-            return Err(CudaModelKernelError::ShapeOverflow);
-        }
-        // The warp-cooperative head split assumes whole 32-dim lane runs.
-        if !head_dim.is_multiple_of(32) {
-            return Err(CudaModelKernelError::ShapeOverflow);
-        }
-        let rows_heads = rows
-            .checked_mul(q_heads)
-            .ok_or(CudaModelKernelError::ShapeOverflow)?;
-        let row_elements = rows_heads
-            .checked_mul(head_dim)
-            .ok_or(CudaModelKernelError::ShapeOverflow)?;
-        let score_elements = rows_heads
-            .checked_mul(scores_stride)
-            .ok_or(CudaModelKernelError::ShapeOverflow)?;
-        if q.len() != row_elements
-            || gate_scratch.len() != 2 * row_elements
-            || output.len() != row_elements
-            || scores_scratch.len() < score_elements
-            || scores_stride < tokens
-        {
-            return Err(CudaModelKernelError::InputLength {
-                expected: row_elements,
-                actual: q.len(),
-            });
-        }
+        let launch = validate_attention_launch(
+            q,
+            gate_scratch,
+            scores_scratch,
+            output,
+            tokens,
+            rows,
+            scores_stride,
+            q_heads,
+            kv_heads,
+            head_dim,
+        )?;
         if keys.len() < tokens * kv_heads * head_dim || values.len() < tokens * kv_heads * head_dim
         {
             return Err(CudaModelKernelError::InputLength {
@@ -2037,26 +2176,6 @@ impl CudaQwen35Ops {
                 actual: keys.len().min(values.len()),
             });
         }
-        let tokens_u32 = u32::try_from(tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let rows_u32 = u32::try_from(rows).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let stride_u32 =
-            u32::try_from(scores_stride).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let q_heads_u32 =
-            u32::try_from(q_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let kv_heads_u32 =
-            u32::try_from(kv_heads).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        let head_dim_u32 =
-            u32::try_from(head_dim).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
-        // One warp per (row, q head); rows of a prefill chunk are consecutive
-        // positions of one sequence sharing the cache.
-        let warps = rows_u32
-            .checked_mul(q_heads_u32)
-            .ok_or(CudaModelKernelError::ShapeOverflow)?;
-        let config = LaunchConfig {
-            grid_dim: (warps.div_ceil(4), 1, 1),
-            block_dim: (4 * 32, 1, 1),
-            shared_mem_bytes: 0,
-        };
         // Safety: cudarc allocated all slices, geometry is validated, and
         // the launch keeps all pointers alive on the same stream.
         unsafe {
@@ -2068,13 +2187,117 @@ impl CudaQwen35Ops {
                 .arg(gate_scratch)
                 .arg(&mut *scores_scratch)
                 .arg(&mut *output)
-                .arg(&tokens_u32)
-                .arg(&rows_u32)
-                .arg(&stride_u32)
-                .arg(&q_heads_u32)
-                .arg(&kv_heads_u32)
-                .arg(&head_dim_u32)
-                .launch(config)
+                .arg(&launch.tokens)
+                .arg(&launch.rows)
+                .arg(&launch.scores_stride)
+                .arg(&launch.q_heads)
+                .arg(&launch.kv_heads)
+                .arg(&launch.head_dim)
+                .launch(launch.config)
+                .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `attn_score_gqa` over a block-table KV cache. `block_table` is a
+    /// device-resident `u32`-addressed table whose entry `t / block_tokens`
+    /// holds the physical block containing logical token `t`; the physical
+    /// token offset is `block * block_tokens + t % block_tokens`.
+    ///
+    /// `keys`/`values` are the shared cache, so their length is the whole
+    /// physical pool rather than the attending sequence's extent. The kernel
+    /// performs the same per-row arithmetic as [`Self::attn_score_gqa`], so a
+    /// sequence whose blocks are contiguous produces identical results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaModelKernelError`] when contexts, geometry, or launch
+    /// arguments are invalid. The caller owns block-table validity: every entry
+    /// referenced by `tokens` must name a physical block inside the pool.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch mirrors the kernel's fixed model geometry"
+    )]
+    pub fn attn_score_gqa_paged(
+        &self,
+        q: &CudaSlice<f32>,
+        keys: &CudaSlice<u16>,
+        values: &CudaSlice<u16>,
+        block_table: &CudaSlice<i32>,
+        block_tokens: usize,
+        gate_scratch: &CudaSlice<f32>,
+        scores_scratch: &mut CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        tokens: usize,
+        rows: usize,
+        scores_stride: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaModelKernelError> {
+        let context = self.stream.context();
+        if context.as_ref() != q.context().as_ref()
+            || context.as_ref() != keys.context().as_ref()
+            || context.as_ref() != values.context().as_ref()
+            || context.as_ref() != block_table.context().as_ref()
+            || context.as_ref() != gate_scratch.context().as_ref()
+            || context.as_ref() != scores_scratch.context().as_ref()
+            || context.as_ref() != output.context().as_ref()
+        {
+            return Err(CudaModelKernelError::ContextMismatch);
+        }
+        if block_tokens == 0 {
+            return Err(CudaModelKernelError::EmptyInput);
+        }
+        let launch = validate_attention_launch(
+            q,
+            gate_scratch,
+            scores_scratch,
+            output,
+            tokens,
+            rows,
+            scores_stride,
+            q_heads,
+            kv_heads,
+            head_dim,
+        )?;
+        let blocks = tokens.div_ceil(block_tokens);
+        let pool_tokens = block_table
+            .len()
+            .checked_mul(block_tokens)
+            .ok_or(CudaModelKernelError::ShapeOverflow)?;
+        if block_table.len() < blocks
+            || keys.len() < pool_tokens * kv_heads * head_dim
+            || values.len() < pool_tokens * kv_heads * head_dim
+        {
+            return Err(CudaModelKernelError::InputLength {
+                expected: blocks * kv_heads * head_dim,
+                actual: block_table.len(),
+            });
+        }
+        let block_tokens_u32 =
+            i32::try_from(block_tokens).map_err(|_| CudaModelKernelError::ShapeOverflow)?;
+        // Safety: cudarc allocated all slices, geometry is validated, the
+        // block table's entries are the caller's contract, and the launch keeps
+        // all pointers alive on the same stream.
+        unsafe {
+            self.stream
+                .launch_builder(&self.attn_score_gqa_paged)
+                .arg(q)
+                .arg(keys)
+                .arg(values)
+                .arg(block_table)
+                .arg(&block_tokens_u32)
+                .arg(gate_scratch)
+                .arg(&mut *scores_scratch)
+                .arg(&mut *output)
+                .arg(&launch.tokens)
+                .arg(&launch.rows)
+                .arg(&launch.scores_stride)
+                .arg(&launch.q_heads)
+                .arg(&launch.kv_heads)
+                .arg(&launch.head_dim)
+                .launch(launch.config)
                 .map_err(|error| CudaModelKernelError::Driver(error.to_string()))?;
         }
         Ok(())

@@ -343,7 +343,27 @@ because a continuation change silently corrupts output when it is wrong.
   and cancellation of a registered wait. The driver still observes epochs with its
   bounded timed fallback; there is no resource-to-worker notification yet. Block
   allocation, growth preparation and prefix reuse remain unimplemented. Device
-  requalification is pending GPU availability.
+  requalification passed at `c9253bc`: the three CUDA runtime gates passed serially
+  on the RTX 4090, including constrained admission and stalled/cancelled peers.
+
+  Implementation order within 4b:
+  1. Qualify block-table KV addressing against contiguous attention with unchanged
+     arithmetic, shuffled physical blocks, partial tails and causal multi-row prefill.
+     This backend primitive alone does not enable runtime paging or prefix reuse.
+  2. Replace contiguous sequence storage with backend-owned blocks and prepare aggregate
+     growth before launch. New reservations settle only at validated completion;
+     failed partial enqueue retains the old continuation and new growth together.
+  3. Integrate growth waiting outside runnable queues, refunding unused output credits.
+     Before admitting partial envelopes, resolve the all-active-growth deadlock:
+     several sequences may retain the entire pool while none can finish. Registered
+     readiness is insufficient; protected completion headroom or recomputation
+     preemption must accompany that change (even though preemption was listed in 4c).
+  4. Add snapshot-scoped content-keyed immutable blocks and sparse recurrent checkpoints.
+     Restore only a complete hybrid boundary, reserve a private writable recurrent
+     copy, and replay when no matching checkpoint exists. Checkpoint spacing and block
+     size remain measurement decisions, not global model semantics.
+  5. Run shared-prefix parity and constrained-pool admission through the real Qwen
+     executor, plus cancellation, abandoned preparation and failed-retirement gates.
 - **4c. Eviction and preemption.** Unreferenced cached blocks are evicted
   least-recently-used; a live sequence whose growth cannot be granted is preempted by
   recomputation before any host swap tier exists. Evidence: constrained-pool
