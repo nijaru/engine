@@ -47,6 +47,10 @@ components so a failed attempt cannot wake itself through rollback. The adapter 
 AR batch records into `engine-core` execution and state-manager types. It is not an
 additional scheduler, but it retains legacy coupling and per-step allocation.
 
+The backend can already address attention KV through a device block table, qualified
+against the contiguous path by bit equality; production Qwen does not use it yet, so the
+cache, block growth and hybrid validity rules above are still unimplemented.
+
 ## Owned text facade
 
 A request reserves a token permit before preprocessing, is prepared on a fixed,

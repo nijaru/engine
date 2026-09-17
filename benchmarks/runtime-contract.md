@@ -364,6 +364,49 @@ cutover evidence: add mixed inputs, constrained memory, repeated admissions,
 real cancellation/fallback combinations, and fault-path device evidence as
 specified in the roadmap.
 
+### Block-table KV addressing (2026-10-12, `ee689d7`)
+
+Slice 4b needs continuation that lives in fixed token blocks rather than one
+contiguous per-sequence cache, so attention must resolve each logical token
+through a block table. That addressing change is qualified separately from the
+cache, reuse policy and recurrent checkpoints it exists to enable, because a wrong
+token address corrupts output silently.
+
+The kernel now has one templated device body and two entry points. The contiguous
+entry point folds the block lookup away at compile time; the paged entry point
+resolves `block_table[token / block_tokens] * block_tokens + token % block_tokens`
+and runs the identical per-row arithmetic. Nothing else changed: no arithmetic was
+reordered, so results are compared by bit equality rather than a tolerance.
+
+Serialized on an idle RTX 4090 (driver 615.71.09), all exit 0:
+
+```sh
+cargo test --release -p engine-nvidia --features cuda --test paged_attention --locked \
+  -- --ignored --test-threads=1
+cargo test --release -p engine-nvidia --features cuda --test cuda_reference --locked \
+  -- --ignored --test-threads=1
+RIBN_MODEL=/absolute/path/model.gguf \
+RIBN_REFERENCE=$(pwd)/crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens \
+cargo test --release -p engine-qwen --features cuda --test cuda_runtime --locked \
+  -- --ignored --test-threads=1
+```
+
+- **paged attention 2/2** (0.98 s): scores and outputs are bit-identical to the
+  contiguous path for a shuffled block table and for the identity table, at tokens
+  {1, 4} (aligned block), 5 (partial tail block), 8 (exact block multiple), 7 with 3
+  causal prefill rows, and 10 with 10 rows. Geometry that cannot be satisfied is
+  rejected before launch: a table too short for the requested extent, and a zero
+  block size.
+- **CUDA reference 61/61** (412.80 s): the restructure of the contiguous entry point
+  into a templated body changed no observed behavior on the existing kernel suite.
+- **Qwen CUDA runtime 3/3** (231.54 s): the pinned Qwen3.8-27B UD-Q4_K_M artifact
+  (SHA-256 `322e194f…23482`) still matches its reference tokens, including the
+  constrained-authority and stalled/abandoned-peer gates, through the modified kernel.
+
+This qualifies addressing only. Production Qwen still uses one contiguous allocation
+per sequence and no block table: the cache, block growth, shared ownership and hybrid
+validity rules are unimplemented, and the paged path has no runtime consumer yet.
+
 ## Experimental CLI
 
 ```sh

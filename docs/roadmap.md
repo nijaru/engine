@@ -347,9 +347,15 @@ because a continuation change silently corrupts output when it is wrong.
   on the RTX 4090, including constrained admission and stalled/cancelled peers.
 
   Implementation order within 4b:
-  1. Qualify block-table KV addressing against contiguous attention with unchanged
-     arithmetic, shuffled physical blocks, partial tails and causal multi-row prefill.
-     This backend primitive alone does not enable runtime paging or prefix reuse.
+  1. **Done (2026-10-12, `ee689d7`).** Block-table KV addressing is qualified against
+     contiguous attention with unchanged arithmetic: scores and outputs are bit-identical
+     for shuffled and identity tables across aligned blocks, partial tails and causal
+     multi-row prefill, and unsatisfiable geometry is rejected before launch. The
+     contiguous entry point and the 61-test kernel suite are unchanged, and the pinned
+     Qwen device gate still passes. Evidence:
+     [block-table KV addressing](../benchmarks/runtime-contract.md#block-table-kv-addressing-2026-10-12-ee689d7).
+     This backend primitive alone enables no runtime paging or prefix reuse; production
+     Qwen still holds one contiguous allocation per sequence.
   2. Replace contiguous sequence storage with backend-owned blocks and prepare aggregate
      growth before launch. New reservations settle only at validated completion;
      failed partial enqueue retains the old continuation and new growth together.

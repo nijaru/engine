@@ -181,7 +181,9 @@ generalized only when a second consumer demonstrates the same shape.
 
 Status: the declared-shape/concrete-capacity split and capacity backpressure are
 implemented for the Qwen path (2026-09-15, roadmap 4a, device-qualified at `323f258`).
-Paged block reuse, eviction and preemption are accepted design and remain
+Block-table KV addressing is qualified in the backend (2026-10-12, `ee689d7`) but has
+no runtime consumer: production Qwen still holds one contiguous allocation per
+sequence. Paged block reuse, eviction and preemption are accepted design and remain
 unimplemented; this section states the contract they must satisfy.
 
 Continuation is the state a sequence must keep to continue: full-attention KV,
