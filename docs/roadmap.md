@@ -21,8 +21,9 @@ kernel timings and integration limits. Early upstream tooling is an opportunity 
 validate, not evidence of a performance advantage. The first representative probe
 (`39b44cb`) has device-to-device quantized-chain parity, repeated separately allocated
 GDN state parity, clean memcheck and mixed projection timings. Gate 2 is still open:
-independent state acceptance, full rejection coverage, preparation measurements and
-broader timings remain. See [partial gate-2 evidence](cuda-rust-migration.md#partial-gate-2-evidence-2026-09-22-39b44cb).
+full rejection coverage, preparation measurements and broader timings remain.
+Follow-up checks add independent GDN arithmetic acceptance, production head geometry,
+varied/reordered histories and clean initcheck/synccheck; this is not gate acceptance. See [partial gate-2 evidence](cuda-rust-migration.md#partial-gate-2-evidence-2026-09-22-39b44cb).
 
 Then proceed in this order:
 

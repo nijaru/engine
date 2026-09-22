@@ -3,6 +3,8 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 
+mod reference;
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -95,6 +97,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         (1_usize, 2_usize, 1_usize, 16_usize),
         (3, 4, 2, 32),
         (8, 4, 2, 128),
+        (3, 48, 16, 128),
+        (8, 48, 16, 128),
     ] {
         let state_len = heads * dim * dim;
         let offset = 2 * kh * dim;
@@ -103,37 +107,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut baseline = Vec::new();
         for m in 0..8 {
             let values: Vec<f32> = (0..if m < members { state_len } else { 1 })
-                .map(|i| (((i * 7 + m * 11) % 31) as f32 - 15.0) * 0.001)
+                .map(|i| {
+                    if m < members && m % 3 == 0 {
+                        0.0
+                    } else {
+                        (((i * 7 + m * 11) % 31) as f32 - 15.0) * 0.001
+                    }
+                })
                 .collect();
             matrices.push(DeviceBuffer::from_host(&stream, &values)?);
             baseline.push(oracle_stream.clone_htod(&values)?);
             initial.push(values);
         }
-        let q: Vec<f32> = (0..members * kh * dim)
-            .map(|i| ((i % 17) as f32 - 8.0) * 0.02)
+        let mut reference: Vec<Vec<_>> = initial[..members]
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .copied()
+                    .map(reference::Value::exact)
+                    .collect()
+            })
             .collect();
-        let k: Vec<f32> = (0..q.len())
-            .map(|i| ((i % 13) as f32 - 6.0) * 0.015)
-            .collect();
-        let v: Vec<f32> = (0..members * (offset + heads * dim))
-            .map(|i| ((i % 23) as f32 - 11.0) * 0.013)
-            .collect();
-        let decay: Vec<f32> = (0..members * heads)
-            .map(|i| 0.85 + (i % 7) as f32 * 0.01)
-            .collect();
-        let beta: Vec<f32> = (0..members * heads)
-            .map(|i| 0.1 + (i % 5) as f32 * 0.03)
-            .collect();
-        let qd = DeviceBuffer::from_host(&stream, &q)?;
-        let kd = DeviceBuffer::from_host(&stream, &k)?;
-        let vd = DeviceBuffer::from_host(&stream, &v)?;
-        let dd = DeviceBuffer::from_host(&stream, &decay)?;
-        let bd = DeviceBuffer::from_host(&stream, &beta)?;
-        let oq = oracle_stream.clone_htod(&q)?;
-        let ok = oracle_stream.clone_htod(&k)?;
-        let ov = oracle_stream.clone_htod(&v)?;
-        let od = oracle_stream.clone_htod(&decay)?;
-        let ob = oracle_stream.clone_htod(&beta)?;
         let mut out = DeviceBuffer::<f32>::zeroed(&stream, members * heads * dim)?;
         let mut oracle_out = oracle_stream.alloc_zeros::<f32>(members * heads * dim)?;
         let prepared = module.prepare_update(LaunchConfig1D::new(
@@ -141,7 +136,70 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             128,
             0,
         ))?;
-        for step in 0..8 {
+        let steps = if heads == 4 && members == 3 { 64 } else { 8 };
+        for step in 0..steps {
+            // Reorder live allocation owners, not their contents; references follow
+            // the same histories. Pads remain inactive throughout.
+            if step % 2 == 1 {
+                matrices.swap(0, members - 1);
+                baseline.swap(0, members - 1);
+                reference.swap(0, members - 1);
+            }
+            let mut q: Vec<f32> = (0..members * kh * dim)
+                .map(|i| (((i + step * 3) % 17) as f32 - 8.0) * 0.02)
+                .collect();
+            let mut k: Vec<f32> = (0..q.len())
+                .map(|i| (((i + step * 5) % 13) as f32 - 6.0) * 0.015)
+                .collect();
+            for vector in q.chunks_exact_mut(dim).chain(k.chunks_exact_mut(dim)) {
+                let norm = vector
+                    .iter()
+                    .map(|v| f64::from(*v).powi(2))
+                    .sum::<f64>()
+                    .sqrt() as f32;
+                for value in vector {
+                    *value /= norm;
+                }
+            }
+            let v: Vec<f32> = (0..members * (offset + heads * dim))
+                .map(|i| (((i + step * 7) % 23) as f32 - 11.0) * 0.013)
+                .collect();
+            let decay: Vec<f32> = (0..members * heads)
+                .map(|i| match (i + step) % 11 {
+                    0 => 0.0,
+                    1 => 1.0,
+                    _ => 0.85 + ((i + step) % 7) as f32 * 0.01,
+                })
+                .collect();
+            let beta: Vec<f32> = (0..members * heads)
+                .map(|i| match (i + step) % 7 {
+                    0 => 0.0,
+                    1 => 1.0,
+                    _ => 0.1 + ((i + step) % 5) as f32 * 0.03,
+                })
+                .collect();
+            let qd = DeviceBuffer::from_host(&stream, &q)?;
+            let kd = DeviceBuffer::from_host(&stream, &k)?;
+            let vd = DeviceBuffer::from_host(&stream, &v)?;
+            let dd = DeviceBuffer::from_host(&stream, &decay)?;
+            let bd = DeviceBuffer::from_host(&stream, &beta)?;
+            let oq = oracle_stream.clone_htod(&q)?;
+            let ok = oracle_stream.clone_htod(&k)?;
+            let ov = oracle_stream.clone_htod(&v)?;
+            let od = oracle_stream.clone_htod(&decay)?;
+            let ob = oracle_stream.clone_htod(&beta)?;
+            let independent = reference::Inputs {
+                heads,
+                key_heads: kh,
+                dim,
+                offset,
+                q: &q,
+                k: &k,
+                v: &v,
+                decay: &decay,
+                beta: &beta,
+            }
+            .advance(&mut reference);
             let [s0, s1, s2, s3, s4, s5, s6, s7] = matrices.as_mut_slice() else {
                 return Err("state slots".into());
             };
@@ -186,18 +244,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let actual = out.to_host_vec(&stream)?;
             let expected = oracle_stream.clone_dtoh(&oracle_out)?;
             compare(&actual, &expected, "output", members, dim, step)?;
+            compare_independent(&actual, &independent, "output", step)?;
             for m in 0..8 {
                 let actual = matrices[m].to_host_vec(&stream)?;
                 let expected = oracle_stream.clone_dtoh(&baseline[m])?;
                 compare(&actual, &expected, "state", members, dim, step)?;
+                if m < members {
+                    compare_independent(&actual, &reference[m], "state", step)?;
+                }
                 if m >= members && actual != initial[m] {
                     return Err("inactive state was mutated".into());
                 }
             }
         }
         println!(
-            "GDN m={members} heads={heads}/{kh} dim={dim}: 8 persistent steps, exact C++ state/output parity"
+            "GDN m={members} heads={heads}/{kh} dim={dim}: {steps} varied/reordered steps, exact C++ + independent f64 state/output acceptance"
         );
+    }
+    Ok(())
+}
+
+fn compare_independent(
+    actual: &[f32],
+    expected: &[reference::Value],
+    kind: &str,
+    step: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if actual.len() != expected.len() {
+        return Err("reference length mismatch".into());
+    }
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        if !expected.accepts(*actual) {
+            return Err(format!(
+                "GDN independent {kind} step={step} index={index}: {actual} outside {expected:?}"
+            )
+            .into());
+        }
     }
     Ok(())
 }

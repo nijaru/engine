@@ -8,7 +8,7 @@ file pins transitive dependencies. Toolkit selection inherits `../.cargo/config.
 On an idle qualification GPU:
 
 ```sh
-./run.sh                         # host assertions, device comparisons, memcheck
+./run.sh                         # host/device checks, memcheck/initcheck/synccheck
 BENCH=1 cargo oxide run           # seven alternating paired timing samples
 cargo clippy --locked --all-targets -- -D warnings
 ```
@@ -35,10 +35,18 @@ Implemented checks:
   device words are also checked separately, so compensating errors cannot pass.
 - Batched GDN with eight **separately allocated** pointer slots, not a single
   contiguous state tensor. Active `(M,VH,KH,D)` = `(1,2,1,16)`, `(3,4,2,32)`,
-  `(8,4,2,128)`. Eight ordered updates retain each allocation; every state/output
-  element must match C++ bits after every update and inactive pads stay unchanged.
-  The SIMT path assigns one thread per column/member. This makes no claim about
-  cuTile partitioning or performance, nor the full model's head geometry.
+  `(8,4,2,128)`, `(3,48,16,128)`, `(8,48,16,128)`. The `(3,4,2,32)` case runs
+  64 updates; others run eight. Inputs vary each step, q/k are normalized, gates
+  include zero/one endpoints, and initial states include zero and nonzero matrices.
+  Live allocation slots swap on odd steps; inactive pads remain unchanged.
+  Every state/output element must match C++ bits and a row-major f64 recurrence.
+  That reference propagates input-derived f32 rounding envelopes through the entire
+  history, without resets from device results. It permits ordinary FMA contraction,
+  not arbitrary reassociation, overflow or subnormal operand flushing. Its rsqrt
+  allowance follows the PTX specification, not observed error. Host tests cover
+  hand-calculated recurrence, head/member/offset indexing and fused cancellation.
+  These synthetic histories are not full-model numerical qualification or cuTile
+  partitioning/performance evidence.
 
 Numerical comparisons check finiteness. The binary exits unsuccessfully on mismatch;
 memcheck uses a nonzero error exit code. Kernels are private probe implementation,
@@ -50,14 +58,11 @@ existing execution owner's retirement contract.
 
 - Full malformed-buffer, member-count, geometry and context rejection tests, with
   unchanged output sentinels. Current geometry assertions only cover packing sizes.
-- Independent persistent-state reference acceptance and actual model head geometry;
-  differing inputs over repeated updates, reuse/reordering and cancellation/error
-  lifecycle qualification where applicable.
 - Packing/GDN timings and broader matched projection comparisons, including the
   specialized C++ single-row path. Current M=1 timings use the batched entrypoint.
 - Cold/warm preparation measurements and final generated-machine-code inspection.
-  Emitted PTX contains signed `dp4a`, but also local storage: PTX source alone cannot
-  establish final register allocation or measured occupancy.
+  Offline sm_89 ptxas/SASS inspection confirms integer dots and local loads/stores;
+  it is not inspection of the actual driver-JIT image or measured occupancy.
 - Gate 3 completion/cancellation/uncertain-enqueue ownership tests before integration.
 
 Numerical agreement on these fixtures is not full-model qualification or evidence

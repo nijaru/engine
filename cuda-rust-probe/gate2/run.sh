@@ -12,5 +12,12 @@ cargo oxide run
 # Verify the packed-dot instruction was actually emitted; this alone is not
 # numerical or performance evidence.
 grep -Eq '^[[:space:]]*dp4a.s32.s32[[:space:]]' gate2.ptx
-"$CUDA_TOOLKIT_PATH/bin/compute-sanitizer" --tool memcheck --leak-check full \
-    --error-exitcode 99 target/release/gate2
+for tool in memcheck initcheck synccheck; do
+    if [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; then
+        echo 'Refusing sanitizer run: another compute process holds the GPU.' >&2
+        exit 1
+    fi
+    args=(--tool "$tool" --error-exitcode 99)
+    if [[ "$tool" == memcheck ]]; then args+=(--leak-check full); fi
+    "$CUDA_TOOLKIT_PATH/bin/compute-sanitizer" "${args[@]}" target/release/gate2
+done

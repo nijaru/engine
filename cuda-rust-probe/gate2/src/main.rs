@@ -144,9 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     projection::run()?;
     state::run()?;
-    println!(
-        "Gate 2 OPEN: independent state acceptance, full rejection coverage, preparation and broader timings remain."
-    );
+    println!("Gate 2 OPEN: full rejection coverage, preparation and broader timings remain.");
     Ok(())
 }
 

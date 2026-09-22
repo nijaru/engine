@@ -211,11 +211,35 @@ C++ reduced those measured times. This is a bounded implementation experiment,
 not a compiler rewrite or proof of its low-level cause. Results remain mixed:
 Rust loses at M=1 and M=8. No performance promotion is justified.
 
-Remaining before a gate-2 verdict: complete rejection/sentinel coverage,
-independent state reference and representative model geometry, packing/GDN timings,
-matched single-row baseline, cold/warm preparation, and final generated-code
-inspection. cuTile state partitioning is not
-qualified by the SIMT implementation. Gate 3 remains unstarted.
+A subsequent same-date qualification increment adds an independent row-major f64
+GDN recurrence, with f32 rounding envelopes propagated through the whole history.
+The envelope accounts for addition/multiplication, ordinary FMA contraction, and
+[PTX's rsqrt relative-error bound](https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-rsqrt);
+it is input-derived, not fitted to measured differences. Its domain is finite
+normal/zero fixture inputs without overflow or arbitrary reassociation, not general
+subnormal operand flushing. Five host tests now pass, including hand-calculated
+state recurrence, multi-head/member/value-offset indexing and fused cancellation.
+Device acceptance passes for the previous shapes plus `(M,VH,KH,D)` =
+`(3,48,16,128)` and `(8,48,16,128)`, both with V_OFFSET=4096. Each case uses eight
+varied updates; `(3,4,2,32)` uses 64. Inputs include normalized q/k, gate endpoints,
+zero/nonzero initial states and swapped live allocation slots. Every state/output
+also remains bit-exact against C++; inactive pads remain unchanged. These are
+synthetic arithmetic histories, not full-model qualification.
+
+The updated `run.sh` passes memcheck (zero errors/leaks), initcheck and synccheck
+(zero errors each) on these fixtures. This does not prove global-memory race freedom
+or the gate-3 cancellation/uncertain-enqueue ownership contract. Root checks and probe
+clippy pass. Offline `ptxas -arch=sm_89 -v gate2.ptx` plus `cuobjdump --dump-sass`
+reports packing/projection/state at 23/37/36 registers and 0/72/64 stack bytes,
+respectively, with zero reported register spill bytes. Projection SASS contains
+integer dots and local loads/stores; state also contains a local load. Stack/local
+storage is not the same as register spilling. This offline artifact is not the
+actual driver-JIT image, and does not establish measured occupancy or a timing cause.
+
+Remaining before a gate-2 verdict: complete rejection/sentinel coverage, packing/GDN
+timings, matched single-row baseline, cold/warm preparation, and actual loaded-code
+inspection. cuTile state partitioning is not qualified by the SIMT implementation.
+Gate 3 remains unstarted.
 
 ### 3. Asynchronous serving integration
 
