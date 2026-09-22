@@ -80,11 +80,12 @@ pub(super) fn run(
 fn drive(
     engine: &mut Engine,
     config: DriverConfig,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     submissions: &Receiver<Submission>,
     shutdown: &Receiver<ShutdownReply>,
     wake: &Receiver<()>,
 ) -> Result<(), DriverError> {
+    let resource_waker = std::task::Waker::from(Arc::clone(shared));
     let mut routes = Vec::with_capacity(config.max_requests);
     loop {
         // Never drain after checking work and before sleeping: a racing notifier
@@ -127,14 +128,15 @@ fn drive(
         if progress || step.submitted || step.completed {
             continue;
         }
-        let status = engine.status();
-        let needs_poll = status.in_flight
-            || (status.waiting > 0
-                && status.active_sequences < engine.config().max_active_requests);
+        engine.arm_admission_waits(&resource_waker);
+        let needs_poll = engine.status().in_flight;
         #[cfg(test)]
-        if let Some((entered, resume)) = shared.before_wait.lock().unwrap().take() {
-            entered.send(()).unwrap();
-            resume.recv().unwrap();
+        {
+            let before_wait = shared.before_wait.lock().unwrap().take();
+            if let Some((entered, resume)) = before_wait {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
         }
         if needs_poll {
             let _ = wake.recv_timeout(config.poll_interval);

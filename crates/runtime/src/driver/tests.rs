@@ -599,6 +599,55 @@ fn cancelling_deferred_admission_wakes_without_a_device_batch() {
     owner.shutdown().unwrap();
 }
 
+// Stop an idle worker at the park boundary with no leftover setup notification.
+fn park_without_pending_wake(handle: &GenerationHandle) -> Sender<()> {
+    let (entered_tx, entered) = flume::bounded(1);
+    let (resume, resume_rx) = flume::bounded(1);
+    *handle.shared.before_wait.lock().unwrap() = Some((entered_tx, resume_rx));
+    handle.shared.notify();
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (parked_tx, parked) = flume::bounded(1);
+    let (unpark, unpark_rx) = flume::bounded(1);
+    *handle.shared.before_wait.lock().unwrap() = Some((parked_tx, unpark_rx));
+    // While paused, enqueue exactly one signal. The first recv consumes it;
+    // the next loop reaches the second barrier with an empty wake channel.
+    handle.shared.notify();
+    resume.send(()).unwrap();
+    parked.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(handle.shared.wake.is_empty());
+    unpark
+}
+
+#[test]
+fn resource_publication_wakes_deferred_admission_without_polling() {
+    let control = Arc::new(Control::default());
+    control.deferred.store(true, Ordering::SeqCst);
+    let (mut owner, handle) = setup(&control, Duration::from_secs(60));
+    let mut stream = run(handle.stream(input(7, 1))).unwrap();
+    wait(|| control.attempts.load(Ordering::SeqCst) == 1);
+    for previous_attempts in 1..=2 {
+        let resume = park_without_pending_wake(&handle);
+        assert_eq!(control.attempts.load(Ordering::SeqCst), previous_attempts);
+        // The first retry still cannot fit and must register for a second change.
+        if previous_attempts == 2 {
+            control.deferred.store(false, Ordering::SeqCst);
+        }
+        control.readiness.publish();
+        resume.send(()).unwrap();
+        // No frontend/device notification can substitute for the resource wake.
+        wait(|| control.attempts.load(Ordering::SeqCst) == previous_attempts + 1);
+    }
+    wait(|| control.admitted.load(Ordering::SeqCst) == 1);
+    assert!(matches!(
+        collect(&mut stream).last(),
+        Some(Event::Finished {
+            reason: FinishReason::Length,
+            ..
+        })
+    ));
+    owner.shutdown().unwrap();
+}
+
 #[test]
 fn registered_admission_rechecks_without_retry_and_observes_publication_before_park() {
     let control = Arc::new(Control::default());
@@ -609,9 +658,10 @@ fn registered_admission_rechecks_without_retry_and_observes_publication_before_p
     let (entered_tx, entered) = flume::bounded(1);
     let (resume, resume_rx) = flume::bounded(1);
     *handle.shared.before_wait.lock().unwrap() = Some((entered_tx, resume_rx));
+    handle.shared.notify();
     entered.recv_timeout(Duration::from_secs(3)).unwrap();
-    // The worker has stepped again, but unchanged readiness must not retry
-    // model admission. Publish in the exact check-to-park gap, without waking it.
+    // An unrelated wake steps the worker, but unchanged readiness must not retry
+    // model admission. Resource publication in the check-to-park gap must persist.
     let attempts = control.attempts.load(Ordering::SeqCst);
     control.deferred.store(false, Ordering::SeqCst);
     control.readiness.publish();

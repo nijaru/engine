@@ -37,8 +37,10 @@ returns positive `StepCompletion` rows, including shortened prefill ranges; the
 incomplete completion-time `Blocked` API was removed. Validation borrows all rows
 before moving them into commitment and retains batch-buffer capacity. Deferred
 admission retains a readiness registration on its waiting request; the engine only
-retries after the resource owner publishes a change. The driver observes these
-registrations with its bounded timed fallback, not resource notifications.
+retries after the resource owner publishes a change. Before parking, the driver arms
+one-shot notifications on its existing capacity-one wake channel and rechecks epochs
+to prevent lost wakeups. Cancelled registrations release their wakers; the source
+holds only weak subscriptions. Only device completion uses the timed polling fallback.
 
 Qwen admission reserves continuation for the request's prompt plus output budget,
 not the full configured context. Its logical state authority publishes readiness only

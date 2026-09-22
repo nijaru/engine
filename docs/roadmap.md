@@ -373,9 +373,13 @@ because a continuation change silently corrupts output when it is wrong.
   checking whole-bundle capacity; failed hybrid allocation must not roll back a partial
   reservation and wake itself. Host regressions cover unchanged capacity, successful
   versus failed release, publication before driver parking without an in-flight batch,
-  and cancellation of a registered wait. The driver still observes epochs with its
-  bounded timed fallback; there is no resource-to-worker notification yet. Block
-  allocation, growth preparation and prefix reuse remain unimplemented. Device
+  and cancellation of a registered wait. A host-qualified follow-up now arms one-shot
+  notifications on the existing bounded worker wake channel, removing idle admission
+  polling. Host tests cover publication before/after arming, concurrent arming,
+  cancellation/clone lifetime, reentrant notification and a 60-second polling interval
+  with prompt resource reactivation. Device completion still uses its timed fallback;
+  device requalification of this notification change is pending desktop availability.
+  Block allocation, growth preparation and prefix reuse remain unimplemented. Device
   requalification passed at `c9253bc`: the three CUDA runtime gates passed serially
   on the RTX 4090, including constrained admission and stalled/cancelled peers.
 

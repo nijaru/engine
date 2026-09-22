@@ -421,6 +421,17 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn arm_admission_waits(&mut self, waker: &std::task::Waker) {
+        for &index in &self.waiting {
+            if let Some(wait) = self.slots[index]
+                .as_mut()
+                .and_then(|slot| slot.admission_wait.as_mut())
+            {
+                wait.wake_on_change(waker);
+            }
+        }
+    }
+
     fn admit_waiters(&mut self) {
         for _ in 0..self.waiting.len() {
             if self.active >= self.config.max_active_requests {

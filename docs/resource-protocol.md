@@ -1,7 +1,7 @@
 # Resource, submission and snapshot protocol
 
 Status: accepted direction. Current completion/discard behavior is identified below;
-prepared resources, readiness and snapshot replacement are not implemented APIs. The 2026-09-13 review replaces
+prepared-resource negotiation and snapshot replacement are not implemented APIs. The 2026-09-13 review replaces
 contradictory claim/reservation sketches with the ownership rules below. The
 [roadmap](roadmap.md) owns implementation order and exit evidence.
 
@@ -19,9 +19,10 @@ or parking and could immediately resubmit unchanged work. Positive partial-prefi
 completion remains: it reports a contiguous consumed range, not permission to exceed
 physical capacity and not a pre-submit reservation. Ordinary resource waiting must
 arrive with a real preparation implementation and its readiness source, not another
-isolated completion enum. Admission waits carry an authority-owned readiness registration. Direct callers
-recheck registrations when stepping; the driver uses its bounded timed fallback because
-readiness sources do not yet notify its wake channel. Device completion is also polled.
+isolated completion enum. Admission waits carry an authority-owned readiness
+registration. Direct callers recheck registrations when stepping; the driver arms
+one-shot notifications on its capacity-one wake channel before parking. Device
+completion alone retains the bounded polling fallback.
 
 Keep these invariants throughout replacement:
 
@@ -208,10 +209,15 @@ byte authority as every other device reservation on that device.
    publishes after a successful release, never after commit, failed release or allocation.
    A change permits retry, not allocation: a peer may already have consumed the capacity.
    A retry that still cannot fit registers again. Cancellation and shutdown remove the
-   wait with its request; no executor-owned waiter list is needed. The driver rechecks
-   epochs on its bounded poll interval when no device work is in flight, so a change
-   before parking is not lost. This is registered readiness with timed observation, not
-   notification-driven wakeup.
+   wait with its request; no executor-owned waiter list is needed. Before parking,
+   the driver arms each retained wait with its existing capacity-one wake channel.
+   Arming rechecks the epoch: publication before subscription wakes immediately;
+   publication afterward sends a one-shot notification. Sources retain only weak
+   subscriptions, pruned on arming/publication; dropping a wait releases its waker.
+   A notification already racing cancellation may arrive but grants no resource and
+   cannot restore the cancelled request. Wake callbacks run outside source locks.
+   With no device work in flight the driver parks without a resource polling timer;
+   device completion retains its explicit bounded polling fallback.
 3. **One owner holds storage and its charge.** A backend materializes device storage for
    the lease it was granted, and the same owner releases both together. A lease is never
    duplicated to share storage: storage shared between sequences is owned once (by the

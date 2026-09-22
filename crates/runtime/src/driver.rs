@@ -131,6 +131,15 @@ struct Shared {
     before_wait: Mutex<Option<(Sender<()>, Receiver<()>)>>,
 }
 
+impl std::task::Wake for Shared {
+    fn wake(self: Arc<Self>) {
+        self.notify();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify();
+    }
+}
+
 impl Shared {
     fn notify(&self) {
         // Full means a persistent notification is already queued. Disconnection
