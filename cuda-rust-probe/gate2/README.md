@@ -1,7 +1,9 @@
-# Representative kernel probe (gate 2, incomplete)
+# Representative kernel probe (gate 2 candidate deferred)
 
 This isolated cuda-oxide executable is **not a production backend** and does not
-close migration gate 2. The C++ implementation and normal workspace are unchanged.
+close migration gate 2. The current candidate is deferred because matched single-row
+projection and GDN timings regress against C++; the migration document owns the
+verdict and re-entry conditions. The production backend remains unchanged.
 Use the pinned nightly and upstream revision in this directory; the checked-in lock
 file pins transitive dependencies. Toolkit selection inherits `../.cargo/config.toml`.
 
@@ -9,19 +11,32 @@ On an idle qualification GPU:
 
 ```sh
 ./run.sh                         # host/device checks, memcheck/initcheck/synccheck
-BENCH=1 cargo oxide run           # seven alternating paired timing samples
+BENCH=1 cargo oxide run           # packing/projection/GDN paired timings
+PREP_BENCH=pack target/release/gate2       # module + entrypoint preparation
+PREP_BENCH=projection target/release/gate2
+PREP_BENCH=state target/release/gate2
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
 `run.sh` refuses to start while another compute process is present. Reserve the GPU
 operationally as well: this occupancy check is not an exclusive lock. `BENCH=1` alone
 does not check occupancy. Timings use CUDA events across 100 launches per sample;
-they exclude preparation and transfers but can include host launch gaps.
+they exclude preparation and transfers but can include host launch gaps. GDN timing
+adds 700 identical-input updates on each side, followed by another C++ bit comparison;
+these extra updates are not included in the independent f64 qualification.
+
+Preparation modes create one context pair and print eight fresh-wrapper construction
+times (first plus seven repeats). Run each mode in seven fresh processes, both with
+`CUDA_CACHE_DISABLE=1` and with populated default caches. Context creation and Rust AOT
+build time are excluded; C++ compilation/loading is included. The state constructors
+have different bundle scopes, so this is not whole-model startup comparison. Like
+`BENCH`, preparation modes require an explicit occupancy check. `run.sh` clears both
+modes to ensure qualification cannot be skipped.
 
 Implemented checks:
 
 - Exact Q8_1 words versus scalar host quantization and the existing C++ packer:
-  1, 3, 4, 5, 8 and 129 blocks; zero blocks, signed half-integer ties, differing
+  1, 3, 4, 5, 8, 129, 160, 480 and 1280 blocks; zero blocks, signed half-integer ties, differing
   scales and partial final CTAs. Host assertions cover empty/partial/u32-overflow
   input geometry and literal tie-rounding bytes. Finite input and half-representable
   headers remain preconditions, not device-side rejection claims.
@@ -58,10 +73,10 @@ existing execution owner's retirement contract.
 
 - Full malformed-buffer, member-count, geometry and context rejection tests, with
   unchanged output sentinels. Current geometry assertions only cover packing sizes.
-- Packing/GDN timings and broader matched projection comparisons, including the
-  specialized C++ single-row path. Current M=1 timings use the batched entrypoint.
-- Cold/warm preparation measurements and final generated-machine-code inspection.
-  Offline sm_89 ptxas/SASS inspection confirms integer dots and local loads/stores;
+- Resolve the measured kernel regressions before reopening promotion. Packing/GDN,
+  specialized C++ single-row and preparation timings now have recorded evidence.
+- Actual loaded-machine-code inspection. Offline sm_89 ptxas/SASS inspection confirms
+  integer dots and local loads/stores;
   it is not inspection of the actual driver-JIT image or measured occupancy.
 - Gate 3 completion/cancellation/uncertain-enqueue ownership tests before integration.
 

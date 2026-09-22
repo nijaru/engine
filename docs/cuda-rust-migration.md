@@ -10,9 +10,15 @@ Vendor libraries remain valid implementation choices. “Rust-first” does not 
 
 ## Current priority (2026-09-22)
 
-Gate 2 is the next bounded implementation task. Gate 1's smoke/interop result is not
-representative kernel or model qualification. Recheck host availability and pinned
-versions before device work; preserve existing artifacts and serialize GPU runs.
+The current gate-2 candidate is **deferred, not accepted** after the bounded
+[representative timing comparison](#gate-2-candidate-deferred-2026-09-22). Correctness
+progress does not offset its single-row projection and GDN regressions. Do not start
+gate 3 or expand kernel coverage on this candidate. Continue the roadmap's 4b/4c path
+on the qualified backend; this is not a rejection of the CUDA Rust direction.
+
+Reopen with evidence from a focused source specialization or upstream change that
+addresses the measured regressions, then finish the outstanding rejection and loaded-
+code checks before promotion. Preserve pinned versions, artifacts and serialized runs.
 
 If gate 2 passes, take one qualified slice through gate 3's existing execution owner,
 including completion, cancellation and uncertain-failure retention. Keep the qualified
@@ -236,10 +242,72 @@ integer dots and local loads/stores; state also contains a local load. Stack/loc
 storage is not the same as register spilling. This offline artifact is not the
 actual driver-JIT image, and does not establish measured occupancy or a timing cause.
 
-Remaining before a gate-2 verdict: complete rejection/sentinel coverage, packing/GDN
-timings, matched single-row baseline, cold/warm preparation, and actual loaded-code
-inspection. cuTile state partitioning is not qualified by the SIMT implementation.
-Gate 3 remains unstarted.
+The broader timing/preparation follow-up below supersedes this increment's open
+measurement items. Full rejection/sentinel coverage, actual driver-loaded-code
+inspection and cuTile state partitioning remain unqualified. Gate 3 remains unstarted.
+
+#### Gate-2 candidate deferred (2026-09-22)
+
+The same pinned host/toolchain now measures packing, projection against both C++
+entrypoints, and GDN through the existing C++ operations owner. Seven alternating
+paired samples each contain 100 launches on preallocated resident buffers, with CUDA
+events excluding preparation/transfers. Short intervals can include host launch gaps.
+GDN timing repeats the final input 700 times; both states still match C++ bits afterward,
+but the independent f64 qualification covers the varied histories, not those extra
+700 timing updates. These are isolated kernels, not serving throughput results.
+
+Microseconds per launch, median [min, max]:
+
+| Operation/shape | Rust | C++ |
+| --- | --- | --- |
+| Packing, 160 blocks | 1.820 [1.812, 1.838] | 1.770 [1.765, 1.772] |
+| Packing, 480 blocks | 1.831 [1.825, 1.839] | 1.812 [1.809, 1.820] |
+| Packing, 1280 blocks | 1.976 [1.967, 1.982] | 1.904 [1.867, 1.905] |
+| Projection 5120×5120, M=1, C++ batch | 48.842 [48.831, 48.871] | 46.715 [46.705, 46.756] |
+| Projection 5120×5120, M=1, C++ single | 48.722 [48.691, 48.852] | 25.006 [24.996, 25.078] |
+| Projection 5120×5120, M=3 | 62.788 [62.700, 62.884] | 72.469 [72.448, 72.488] |
+| Projection 5120×5120, M=8 | 158.812 [158.761, 158.874] | 149.363 [149.288, 149.432] |
+| GDN M=1, VH/KH/D=2/1/16 | 5.601 [5.591, 5.608] | 4.045 [4.044, 4.052] |
+| GDN M=3, VH/KH/D=4/2/32 | 9.329 [9.325, 9.339] | 6.346 [6.338, 6.352] |
+| GDN M=8, VH/KH/D=4/2/128 | 31.764 [31.764, 31.785] | 20.274 [20.256, 20.289] |
+| GDN M=3, VH/KH/D=48/16/128 | 44.460 [44.443, 44.507] | 31.622 [31.601, 31.631] |
+| GDN M=8, VH/KH/D=48/16/128 | 45.771 [45.763, 45.852] | 33.609 [33.594, 33.649] |
+
+Preparation measures native wrapper construction: Rust embedded module load plus
+entrypoint preparation versus C++ constructor compilation/loading/function lookup.
+Contexts already exist; Rust AOT compilation and context initialization are excluded.
+Each of seven fresh processes performs one first construction plus seven repeats
+on the same context, dropping the wrapper after each measurement. Repeats are **not**
+per-request preparation on an already-retained wrapper. The C++ state constructor
+prepares the full Qwen operations bundle, whereas Rust loads the probe bundle: these
+numbers cannot establish a whole-model startup speedup.
+
+Median milliseconds (7 first-call / 49 repeat observations per row and cache mode):
+
+| Wrapper | Driver cache disabled: first / repeat | Populated default cache: first / repeat |
+| --- | --- | --- |
+| Rust packing | 29.961 / 26.120 | 0.496 / 0.094 |
+| C++ packing | 23.933 / 19.464 | 9.576 / 4.802 |
+| Rust projection | 29.896 / 26.086 | 0.483 / 0.095 |
+| C++ projection | 136.152 / 50.806 | 10.392 / 0.068 |
+| Rust state | 29.952 / 26.091 | 0.516 / 0.101 |
+| C++ state | 580.873 / 577.572 | 16.340 / 10.873 |
+
+Reproduce with `BENCH=1 cargo oxide run`. For each component `pack`, `projection`,
+`state`, run `PREP_BENCH=<component> target/release/gate2` seven times in fresh processes,
+first with `CUDA_CACHE_DISABLE=1`, then with that variable unset after normal runs have
+populated the default cache. The mode prints every first/repeat sample. Check occupancy
+before every process. The normal `run.sh` clears benchmark modes so they cannot bypass
+qualification or accidentally time sanitized execution.
+
+**Decision:** defer this candidate rather than expand it into production or an
+open-ended compiler effort. The general Rust projection is about 1.95× the specialized
+C++ single-row time, and production-geometry GDN is about 1.36–1.41× the C++ time.
+The M=3 projection win and favorable cached preparation cases do not justify gate
+promotion across this scope. This diagnoses the current implementation, not CUDA Rust
+as a language or future upstream potential. Static single-row specialization is a
+concrete re-entry experiment; local-storage/occupancy explanations remain hypotheses,
+not measured causes. Keep the C++ path and continue inference-engine work.
 
 ### 3. Asynchronous serving integration
 

@@ -12,20 +12,15 @@ the initial Qwen/CUDA scope is not a narrower product strategy.
 
 ## Current execution order
 
-The next bounded task is [CUDA Rust gate 2](cuda-rust-migration.md#2-representative-quantized-and-stateful-execution),
-not a wholesale backend rewrite. The hardware/build/interop smoke gate is recorded as
-passed; representative quantized and stateful execution still needs qualification.
-Pin compatible toolchain/upstream revisions, preserve the independent references and
-qualified CUDA C++ comparison path, and report correctness, generated code, matched
-kernel timings and integration limits. Early upstream tooling is an opportunity to
-validate, not evidence of a performance advantage. The first representative probe
-(`39b44cb`) has device-to-device quantized-chain parity, repeated separately allocated
-GDN state parity, clean memcheck and mixed projection timings. Gate 2 is still open:
-full rejection coverage, preparation measurements and broader timings remain.
-Follow-up checks add independent GDN arithmetic acceptance, production head geometry,
-varied/reordered histories and clean initcheck/synccheck; this is not gate acceptance. See [partial gate-2 evidence](cuda-rust-migration.md#partial-gate-2-evidence-2026-09-22-39b44cb).
+The bounded CUDA Rust gate-2 experiment has a [defer verdict](cuda-rust-migration.md#gate-2-candidate-deferred-2026-09-22),
+not acceptance: independent arithmetic and sanitizer checks pass on the tested
+fixtures, but single-row projection and GDN regress against the qualified C++ path.
+Preparation measurements do not offset those kernel regressions. Do not start gate 3
+or expand this candidate into a compiler project. The migration owner records the
+remaining coverage gaps and concrete re-entry conditions.
 
-Then proceed in this order:
+**Next: slice 4b/4c's coherent constrained-memory continuation path on the qualified
+backend**, then slice 4d and minimal serving. Proceed in this order:
 
 1. If representative kernels qualify, integrate a bounded slice through the existing
    execution owner under migration gate 3. Do not add a second serving loop or change

@@ -256,12 +256,106 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("inactive state was mutated".into());
                 }
             }
+            if step + 1 == steps && std::env::var_os("BENCH").is_some() {
+                let (live, pads) = baseline.split_at_mut(members);
+                let mut refs: Vec<_> = live.iter_mut().collect();
+                crate::benchmark::paired(
+                    &format!("state m={members} heads={heads}/{kh} dim={dim}"),
+                    || {
+                        crate::benchmark::rust(&stream, || {
+                            let [s0, s1, s2, s3, s4, s5, s6, s7] = matrices.as_mut_slice() else {
+                                return Err("state slots".into());
+                            };
+                            module.update(
+                                &stream,
+                                &prepared,
+                                s0,
+                                s1,
+                                s2,
+                                s3,
+                                s4,
+                                s5,
+                                s6,
+                                s7,
+                                &qd,
+                                &kd,
+                                &vd,
+                                &dd,
+                                &bd,
+                                &mut out,
+                                heads as u32,
+                                kh as u32,
+                                dim as u32,
+                                offset as u32,
+                            )?;
+                            Ok(())
+                        })
+                    },
+                    || {
+                        crate::benchmark::cpp(&oracle_stream, || {
+                            oracle.gdn_state_update_batch(
+                                &mut refs,
+                                pads,
+                                &oq,
+                                &ok,
+                                &ov,
+                                &od,
+                                &ob,
+                                &mut oracle_out,
+                                heads,
+                                kh,
+                                dim,
+                                offset,
+                            )?;
+                            Ok(())
+                        })
+                    },
+                )?;
+                // Both sides advanced 700 more times on the same final input.
+                // This is an additional differential check, not f64 qualification.
+                compare(
+                    &out.to_host_vec(&stream)?,
+                    &oracle_stream.clone_dtoh(&oracle_out)?,
+                    "timed output",
+                    members,
+                    dim,
+                    step,
+                )?;
+                for (matrix, baseline) in matrices.iter().zip(&baseline) {
+                    compare(
+                        &matrix.to_host_vec(&stream)?,
+                        &oracle_stream.clone_dtoh(baseline)?,
+                        "timed state",
+                        members,
+                        dim,
+                        step,
+                    )?;
+                }
+            }
         }
         println!(
             "GDN m={members} heads={heads}/{kh} dim={dim}: {steps} varied/reordered steps, exact C++ + independent f64 state/output acceptance"
         );
     }
     Ok(())
+}
+
+pub fn preparation() -> crate::benchmark::Result {
+    let ctx = CudaContext::new(0)?;
+    let oracle_ctx = cudarc::driver::CudaContext::new(0)?;
+    let oracle_stream = oracle_ctx.default_stream();
+    crate::benchmark::preparation("rust_state", || {
+        // SAFETY: the binary owns the embedded kernel bundle.
+        let module = unsafe { kernels::load(&ctx)? };
+        std::hint::black_box(module.prepare_update(LaunchConfig1D::new(384, 128, 0))?);
+        Ok(module)
+    })?;
+    crate::benchmark::preparation("cpp_state", || {
+        Ok(engine_nvidia::CudaQwen35Ops::from_context(
+            &oracle_ctx,
+            oracle_stream.clone(),
+        )?)
+    })
 }
 
 fn compare_independent(

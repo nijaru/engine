@@ -4,6 +4,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread,
 use cuda_host::cuda_module;
 use half::f16;
 
+mod benchmark;
 mod projection;
 mod state;
 
@@ -99,6 +100,14 @@ fn reference(input: &[f32]) -> Result<Vec<u32>, &'static str> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(component) = std::env::var("PREP_BENCH") {
+        return match component.as_str() {
+            "pack" => preparation(),
+            "projection" => projection::preparation(),
+            "state" => state::preparation(),
+            _ => Err("PREP_BENCH must be pack, projection or state".into()),
+        };
+    }
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     // SAFETY: this binary owns the bundle compiled from kernels above.
@@ -106,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let oracle_context = cudarc::driver::CudaContext::new(0)?;
     let oracle_stream = oracle_context.default_stream();
     let oracle = engine_nvidia::CudaQ8_1Quantizer::new(oracle_stream.clone())?;
-    for blocks in [1_usize, 3, 4, 5, 8, 129] {
+    for blocks in [1_usize, 3, 4, 5, 8, 129, 160, 480, 1280] {
         let input: Vec<f32> = (0..blocks * 32)
             .map(|i| match i / 32 % 4 {
                 0 => 0.0,
@@ -141,11 +150,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         println!("Q8_1 blocks={blocks}: exact host + C++ parity");
+        if std::env::var_os("BENCH").is_some() && blocks >= 160 {
+            benchmark::paired(
+                &format!("packing blocks={blocks}"),
+                || {
+                    benchmark::rust(&stream, || {
+                        module.pack_q8(&stream, &prepared, &x, &mut y)?;
+                        Ok(())
+                    })
+                },
+                || {
+                    benchmark::cpp(&oracle_stream, || {
+                        oracle.execute(&oracle_x, &mut oracle_y)?;
+                        Ok(())
+                    })
+                },
+            )?;
+        }
     }
     projection::run()?;
     state::run()?;
-    println!("Gate 2 OPEN: full rejection coverage, preparation and broader timings remain.");
+    println!(
+        "Gate 2 NOT ACCEPTED: this candidate is deferred; see the migration evidence and remaining coverage gaps."
+    );
     Ok(())
+}
+
+fn preparation() -> benchmark::Result {
+    let ctx = CudaContext::new(0)?;
+    let oracle_ctx = cudarc::driver::CudaContext::new(0)?;
+    let oracle_stream = oracle_ctx.default_stream();
+    benchmark::preparation("rust_pack", || {
+        // SAFETY: the binary owns the embedded kernel bundle.
+        let module = unsafe { kernels::load(&ctx)? };
+        std::hint::black_box(module.prepare_pack_q8(LaunchConfig1D::new(40, 128, 0))?);
+        Ok(module)
+    })?;
+    benchmark::preparation("cpp_pack", || {
+        Ok(engine_nvidia::CudaQ8_1Quantizer::new(
+            oracle_stream.clone(),
+        )?)
+    })
 }
 
 #[cfg(test)]

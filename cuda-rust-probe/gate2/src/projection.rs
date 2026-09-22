@@ -253,16 +253,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("Q4_K k={k} n={n} m={members}: exact C++ + independent f64 parity");
             if std::env::var_os("BENCH").is_some() && k == 5120 {
-                for repetition in 0..7 {
-                    let mut rust_us = 0.0;
-                    let mut cpp_us = 0.0;
-                    // Alternate order to avoid consistently warming one variant first.
-                    for variant in [repetition % 2, 1 - repetition % 2] {
-                        if variant == 0 {
-                            let start = stream.record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT as u32,
-                            ))?;
-                            for _ in 0..100 {
+                for single in [false, true] {
+                    if single && members != 1 {
+                        continue;
+                    }
+                    let variant = if single { "single" } else { "batch" };
+                    crate::benchmark::paired(
+                        &format!("projection k={k} n={n} m={members} cpp={variant}"),
+                        || {
+                            crate::benchmark::rust(&stream, || {
                                 module.project(
                                     &stream,
                                     &prepared,
@@ -273,37 +272,51 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     n as u32,
                                     members as u32,
                                 )?;
-                            }
-                            let end = stream.record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT as u32,
-                            ))?;
-                            end.synchronize()?;
-                            rust_us = start.elapsed_ms(&end)? * 10.0;
-                        } else {
-                            let start = oracle_stream.record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                            ))?;
-                            for _ in 0..100 {
-                                oracle.execute_batch(
-                                    weight,
-                                    &oracle_input,
-                                    &mut oracle_output,
-                                    members,
-                                )?;
-                            }
-                            let end = oracle_stream.record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                            ))?;
-                            end.synchronize()?;
-                            cpp_us = start.elapsed_ms(&end)? * 10.0;
-                        }
+                                Ok(())
+                            })
+                        },
+                        || {
+                            crate::benchmark::cpp(&oracle_stream, || {
+                                if single {
+                                    oracle.execute(weight, &oracle_input, &mut oracle_output)?;
+                                } else {
+                                    oracle.execute_batch(
+                                        weight,
+                                        &oracle_input,
+                                        &mut oracle_output,
+                                        members,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )?;
+                    let timed = oracle_stream.clone_dtoh(&oracle_output)?;
+                    if actual
+                        .iter()
+                        .zip(&timed)
+                        .any(|(a, b)| a.to_bits() != b.to_bits())
+                    {
+                        return Err("timed projection oracle changed output".into());
                     }
-                    println!(
-                        "TIMING projection k={k} n={n} m={members} rep={repetition} rust_us={rust_us:.3} cpp_us={cpp_us:.3}"
-                    );
                 }
             }
         }
     }
     Ok(())
+}
+
+pub fn preparation() -> crate::benchmark::Result {
+    let ctx = CudaContext::new(0)?;
+    let oracle_ctx = cudarc::driver::CudaContext::new(0)?;
+    let oracle_stream = oracle_ctx.default_stream();
+    crate::benchmark::preparation("rust_projection", || {
+        // SAFETY: the binary owns the embedded kernel bundle.
+        let module = unsafe { kernels::load(&ctx)? };
+        std::hint::black_box(module.prepare_project(LaunchConfig1D::new(1280, 128, 0))?);
+        Ok(module)
+    })?;
+    crate::benchmark::preparation("cpp_projection", || {
+        Ok(engine_nvidia::CudaQ4KQ8_1Gemv::new(oracle_stream.clone())?)
+    })
 }
