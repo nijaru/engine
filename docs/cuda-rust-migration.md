@@ -178,7 +178,10 @@ Results:
 - Device-to-device Q8_1 → Q4_K matches C++ output bits and independently accumulated
   f64 packed arithmetic at `(K,N)` = `(256,1)`, `(768,5)`, `(4096,128)`,
   `(5120,5120)`, each with M=1/3/8. Signed packed dots, six-bit metadata,
-  minimum corrections, batch strides and whole-warp tails are exercised.
+  minimum corrections, batch strides and whole-warp tails are exercised. A follow-up
+  on the same date adds exact packed-word checking within this chain and the existing
+  input-derived bound against unquantized float-input arithmetic; all shapes pass
+  that additional check and memcheck remains clean.
 - GDN state/output bits match C++ over eight updates of independently allocated
   request matrices, including inactive-pad preservation, at the three geometries
   in the probe README. This is differential evidence, not yet independent GDN
@@ -211,8 +214,7 @@ Rust loses at M=1 and M=8. No performance promotion is justified.
 Remaining before a gate-2 verdict: complete rejection/sentinel coverage,
 independent state reference and representative model geometry, packing/GDN timings,
 matched single-row baseline, cold/warm preparation, and final generated-code
-inspection. The unquantized-input error bound from the existing Q4/Q8 reference
-also still needs to be exercised by this probe. cuTile state partitioning is not
+inspection. cuTile state partitioning is not
 qualified by the SIMT implementation. Gate 3 remains unstarted.
 
 ### 3. Asynchronous serving integration

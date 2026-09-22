@@ -179,10 +179,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 members as u32,
             )?;
             let actual = output.to_host_vec(&stream)?;
+            if device_input.to_host_vec(&stream)? != packed {
+                return Err("projection-chain packing differs from the host reference".into());
+            }
             let oracle_input = oracle_stream.clone_htod(&packed)?;
             let mut oracle_output = oracle_stream.alloc_zeros::<f32>(n * members)?;
             oracle.execute_batch(weight, &oracle_input, &mut oracle_output, members)?;
             let baseline = oracle_stream.clone_dtoh(&oracle_output)?;
+            if actual.len() != n * members || baseline.len() != n * members {
+                return Err("projection output length mismatch".into());
+            }
             if let Some(i) = actual
                 .iter()
                 .zip(&baseline)
@@ -200,6 +206,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for row in 0..n {
                     let mut reference = 0.0_f64;
                     let mut magnitude = 0.0_f64;
+                    let mut float_reference = 0.0_f64;
+                    let mut packing_error_bound = 0.0_f64;
                     for b in 0..k / 256 {
                         let block = &encoded[(row * (k / 256) + b) * 144..][..144];
                         for g in 0..8 {
@@ -209,19 +217,33 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let scale = f64::from(f16::from_bits(activation[0] as u16).to_f32());
                             let sum =
                                 f64::from(f16::from_bits((activation[0] >> 16) as u16).to_f32());
+                            let mut original_sum = 0.0_f64;
                             for i in 0..32 {
                                 let q = (block[16 + g / 2 * 32 + i] >> ((g % 2) * 4)) & 15;
                                 let x = ((activation[1 + i / 4] >> (8 * (i % 4))) as u8) as i8;
                                 let term = a * scale * f64::from(q) * f64::from(x);
                                 reference += term;
                                 magnitude += term.abs();
+                                let original = f64::from(input[m * k + b * 256 + g * 32 + i]);
+                                original_sum += original;
+                                float_reference += (a * f64::from(q) - minimum) * original;
+                                packing_error_bound += a.abs()
+                                    * f64::from(q)
+                                    * (scale * f64::from(x) - original).abs();
                             }
                             reference -= minimum * sum;
                             magnitude += (minimum * sum).abs();
+                            packing_error_bound += minimum.abs() * (sum - original_sum).abs();
                         }
                     }
                     let bound = magnitude * f64::from(f32::EPSILON) * 32.0 + 1e-5;
-                    if (f64::from(actual[m * n + row]) - reference).abs() > bound {
+                    if !reference.is_finite()
+                        || !float_reference.is_finite()
+                        || !packing_error_bound.is_finite()
+                        || (f64::from(actual[m * n + row]) - reference).abs() > bound
+                        || (f64::from(actual[m * n + row]) - float_reference).abs()
+                            > packing_error_bound + bound
+                    {
                         return Err(format!(
                             "Q4_K independent reference failed k={k} n={n} m={members} row={row}"
                         )

@@ -30,7 +30,9 @@ Implemented checks:
   `(K,N)` = `(256,1)`, `(768,5)`, `(4096,128)`, `(5120,5120)` at M=1,3,8.
   Rust output must match C++ f32 bits and a separate scalar f64 packed-dot result.
   The f64 bound is the existing Q4/Q8 test's magnitude × eps × 32 + 1e-5.
-  This does not yet reproduce that test's separate unquantized-input error bound.
+  A second independent check compares the original float-input projection against
+  its input-derived quantization-error bound plus that rounding allowance. Packed
+  device words are also checked separately, so compensating errors cannot pass.
 - Batched GDN with eight **separately allocated** pointer slots, not a single
   contiguous state tensor. Active `(M,VH,KH,D)` = `(1,2,1,16)`, `(3,4,2,32)`,
   `(8,4,2,128)`. Eight ordered updates retain each allocation; every state/output
