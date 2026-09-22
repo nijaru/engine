@@ -95,5 +95,7 @@ track builds and runs on CUDA 13.1, cuTile needs 13.2+ before it can target `sm_
 one published `cuda-core`, and `cuda-core`'s `simt` layer offers no non-owning `DeviceBuffer` — which is why
 the interop probe demonstrates ownership transfer while the tile probe demonstrates borrowing.
 
-Not yet covered here: Engine's own kernels — a quantized projection, a GDN state update — rather than probes,
-and a smoke test wired to the project's own fixtures. Those are migration gates 2 and 3.
+The separate [`gate2`](gate2/README.md) probe now exercises actual Q8_1 packing,
+Q4_K projection and persistent batched GDN state against the retained C++ path.
+Its numerical/performance coverage is still incomplete; gates 2 and 3 have not
+passed. See the [partial evidence](../docs/cuda-rust-migration.md#partial-gate-2-evidence-2026-09-22-39b44cb).

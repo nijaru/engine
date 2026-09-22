@@ -18,7 +18,11 @@ passed; representative quantized and stateful execution still needs qualificatio
 Pin compatible toolchain/upstream revisions, preserve the independent references and
 qualified CUDA C++ comparison path, and report correctness, generated code, matched
 kernel timings and integration limits. Early upstream tooling is an opportunity to
-validate, not evidence of a performance advantage.
+validate, not evidence of a performance advantage. The first representative probe
+(`39b44cb`) has device-to-device quantized-chain parity, repeated separately allocated
+GDN state parity, clean memcheck and mixed projection timings. Gate 2 is still open:
+independent state acceptance, full rejection coverage, preparation measurements and
+broader timings remain. See [partial gate-2 evidence](cuda-rust-migration.md#partial-gate-2-evidence-2026-09-22-39b44cb).
 
 Then proceed in this order:
 

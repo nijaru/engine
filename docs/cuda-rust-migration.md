@@ -148,6 +148,73 @@ or integration effects from algorithm changes. Qualify both quantized projection
 persistent state before promoting the gate; if one is blocked, retain that distinction
 rather than declaring the whole migration ready.
 
+#### Partial gate-2 evidence (2026-09-22, `39b44cb`)
+
+[`cuda-rust-probe/gate2`](../cuda-rust-probe/gate2/README.md) now runs real
+Rust-authored packing, projection and persistent-state kernels. **Gate 2 remains
+open; no production operation has been replaced.** The probe README enumerates
+covered shapes and remaining tests, rather than implying the smoke gate has grown
+into model qualification.
+
+Host: RTX 4090, driver 615.71.09, toolkit 13.3.73, sanitizer 2026.2.1.0;
+nightly-2026-08-28 (`rustc 1.100.0-nightly e457a7b0d`), cuda-oxide
+`26754ae52c26c097dc1c465a1e42c4c5d05a3d40`, cuda-core 0.3.1. The probe lock file
+pins dependencies; the normal workspace retains its own toolchain. The desktop
+checkout was `4d0a627` plus the exact probe sources committed as `39b44cb`.
+No other compute process occupied the GPU; existing SIMT artifacts were preserved.
+
+Commands from `cuda-rust-probe/gate2`, all exit 0:
+
+```sh
+./run.sh
+cargo clippy --locked --all-targets -- -D warnings
+BENCH=1 target/release/gate2
+```
+
+Results:
+
+- Two host assertions pass (packing geometry rejection and literal tie rounding).
+- Q8_1 matches every host/C++ packed word at 1/3/4/5/8/129 blocks.
+- Device-to-device Q8_1 → Q4_K matches C++ output bits and independently accumulated
+  f64 packed arithmetic at `(K,N)` = `(256,1)`, `(768,5)`, `(4096,128)`,
+  `(5120,5120)`, each with M=1/3/8. Signed packed dots, six-bit metadata,
+  minimum corrections, batch strides and whole-warp tails are exercised.
+- GDN state/output bits match C++ over eight updates of independently allocated
+  request matrices, including inactive-pad preservation, at the three geometries
+  in the probe README. This is differential evidence, not yet independent GDN
+  numerical acceptance or qualification at the full model's head geometry.
+- Memcheck: **0 errors, 0 bytes leaked in 0 allocations**. Emitted PTX contains
+  `dp4a.s32.s32`. Local storage is also present; final SASS/register/spill inspection
+  remains open. Do not infer occupancy or memory-traffic causes from these timings.
+- Root boundaries, formatting, workspace tests and default/CUDA-feature clippy pass.
+  The pinned device nightly warns about a pre-existing core `fetch_update`
+  deprecation; the normal workspace toolchain is unchanged.
+
+Matched projection timing: CUDA events around 100 launches per sample, seven paired
+samples with alternating variant order, preallocated buffers, resident encoded
+weights and packed input, no packing/transfers/preparation inside the interval.
+Both sides use the **batched** entrypoint, including M=1. Event intervals may include
+host launch gaps. Times are microseconds per launch, median [min, max]:
+
+| K=N=5120 | Rust | C++ |
+| --- | --- | --- |
+| M=1 | 48.693 [48.668, 48.705] | 46.600 [46.582, 46.610] |
+| M=3 | 63.406 [62.484, 67.063] | 77.639 [72.140, 77.670] |
+| M=8 | 158.474 [158.415, 158.987] | 149.217 [149.128, 149.431] |
+
+An initial translation without explicit unroll requests measured medians
+62.564/78.812/168.223 µs at M=1/3/8; requesting the same fixed-loop unrolling as
+C++ reduced those measured times. This is a bounded implementation experiment,
+not a compiler rewrite or proof of its low-level cause. Results remain mixed:
+Rust loses at M=1 and M=8. No performance promotion is justified.
+
+Remaining before a gate-2 verdict: complete rejection/sentinel coverage,
+independent state reference and representative model geometry, packing/GDN timings,
+matched single-row baseline, cold/warm preparation, and final generated-code
+inspection. The unquantized-input error bound from the existing Q4/Q8 reference
+also still needs to be exercised by this probe. cuTile state partitioning is not
+qualified by the SIMT implementation. Gate 3 remains unstarted.
+
 ### 3. Asynchronous serving integration
 
 Integrate the proven kernels into a real scheduler submission with existing kernels filling unmigrated operations. Prove completion polling, output commitment, in-flight cancellation with peer progress, fallback batch sizes, scratch reuse, partial enqueue failure, and retained resources after uncertain completion. Dropping a future must not silently release in-flight state.
