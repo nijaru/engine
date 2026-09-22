@@ -1,6 +1,6 @@
 # Engineering roadmap
 
-Status: ordered implementation and decision gates, updated 2026-09-14.
+Status: ordered implementation and decision gates, priority updated 2026-09-22.
 
 [Target design](inference-engine-design.md) owns architecture and API semantics;
 [resource protocol](resource-protocol.md) owns execution ownership. This document
@@ -9,6 +9,39 @@ training is a future execution system sharing demonstrated lower-level mechanism
 All v0 interfaces may change. Do not preserve a broken API for compatibility.
 These slices stage the [competitive product target](inference-engine-design.md#scope-and-success-criterion);
 the initial Qwen/CUDA scope is not a narrower product strategy.
+
+## Current execution order
+
+The next bounded task is [CUDA Rust gate 2](cuda-rust-migration.md#2-representative-quantized-and-stateful-execution),
+not a wholesale backend rewrite. The hardware/build/interop smoke gate is recorded as
+passed; representative quantized and stateful execution still needs qualification.
+Pin compatible toolchain/upstream revisions, preserve the independent references and
+qualified CUDA C++ comparison path, and report correctness, generated code, matched
+kernel timings and integration limits. Early upstream tooling is an opportunity to
+validate, not evidence of a performance advantage.
+
+Then proceed in this order:
+
+1. If representative kernels qualify, integrate a bounded slice through the existing
+   execution owner under migration gate 3. Do not add a second serving loop or change
+   resource ownership implicitly. A blocked migration does not block the existing
+   qualified backend or justify waiting for full kernel coverage.
+2. Finish slice 4b/4c's coherent constrained-memory continuation path: backend-owned
+   blocks, growth preparation and safe retirement, a progress policy preventing
+   all-active-growth deadlock, then valid hybrid prefix reuse and eviction/preemption.
+   Slice 4d measures scheduling choices on real mixed workloads.
+3. Bring forward slice 5's minimal serving protocol over the owned application API and
+   matched single-device serving qualification. It does not wait for all of slice 4e's
+   model/composition breadth or for complete CUDA Rust migration. Streaming, disconnect,
+   overload, cancellation, bounded memory and lifecycle checks remain required.
+4. Expand model coverage, migration and wider systems from measured results. Broad
+   product ambitions remain unchanged; architecture breadth is not the next acceptance
+   result.
+
+Keep kernel-language qualification separate from inference competitiveness. Both need
+integrated evidence; a faster isolated kernel or a successful Rust port does not prove
+better model serving. The numbered slices below retain their dependency contracts and
+historical evidence; this section owns which eligible work runs next.
 
 ## Engineering method
 
@@ -394,6 +427,11 @@ Replace legacy Qwen/core translation as its real consumers migrate. Delete unuse
 paths immediately; do not wait for every future runtime class to remove dead code.
 
 ### 5. Serving qualification and wider systems
+
+Bring the minimal single-device serving surface and comparison forward after the
+constrained-memory continuation/scheduling gates; slice 4e's broader composition and
+complete CUDA Rust migration are not prerequisites. Wider-backend/distributed claims
+still require their own gates below.
 
 Implement a documented protocol subset over the owned application API, not another
 execution loop. Test streaming, errors, disconnects, overload, health/readiness,

@@ -8,6 +8,24 @@ Focus on NVIDIA now. A second hardware backend should test the semantic boundary
 
 Vendor libraries remain valid implementation choices. “Rust-first” does not require rewriting cuBLAS or every third-party kernel. Full migration means replacing Engine-owned CUDA C++ kernels and their NVRTC authoring pipeline, and converging on one coherent NVIDIA resource/execution owner. It does not mean replacing the CUDA driver or NVIDIA's compilers with Engine code.
 
+## Current priority (2026-09-22)
+
+Gate 2 is the next bounded implementation task. Gate 1's smoke/interop result is not
+representative kernel or model qualification. Recheck host availability and pinned
+versions before device work; preserve existing artifacts and serialize GPU runs.
+
+If gate 2 passes, take one qualified slice through gate 3's existing execution owner,
+including completion, cancellation and uncertain-failure retention. Keep the qualified
+CUDA C++ oracle for operations not yet replaced. Do not make gates 4–5, complete Rust
+kernel coverage, or replacement of every host resource wrapper prerequisites for the
+minimal serving result in [the roadmap](roadmap.md#current-execution-order).
+
+A failed numerical/performance/integration gate should produce a bounded diagnosis and
+an explicit stop/defer decision, not an open-ended compiler or framework project. Ribn
+can continue on its qualified backend. Migration success and competitive inference are
+separate claims; test both. This ordering changes priority, not numerical tolerances,
+resource-lifetime contracts or the eventual one-owner migration target.
+
 ## Runtime integration update (2026-09-11)
 
 The model-neutral `ribn::GenerationExecutor` boundary now has a host-tested runtime
@@ -122,6 +140,13 @@ Prove the chain Q8_1 packing → Q4_K integer-dot projection using actual encode
 Separately prove a batched GDN state update, including distinct per-request persistent matrices, output strides, and repeated updates. Resolve how tile partitioning expresses those independently owned allocations; do not assume a contiguous output tensor represents the complete state boundary.
 
 Deliverable: numerical tests, generated-code inspection for packed integer dots, and matched kernel timings. A passing easy kernel alone is not the adoption gate.
+
+Record upstream/toolchain revisions, device, actual encoded layouts, tested shapes and
+rejection/tail cases, independent tolerances, cold/warm preparation, repeated timings,
+failures and unsupported scope. Use unchanged algorithms first to distinguish compiler
+or integration effects from algorithm changes. Qualify both quantized projection and
+persistent state before promoting the gate; if one is blocked, retain that distinction
+rather than declaring the whole migration ready.
 
 ### 3. Asynchronous serving integration
 
