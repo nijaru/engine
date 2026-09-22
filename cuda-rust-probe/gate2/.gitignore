@@ -1,0 +1,4 @@
+# cuda-oxide emits intermediate device compilation artifacts beside the crate.
+*.ll
+*.ptx
+*.cubin

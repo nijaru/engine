@@ -1,0 +1,17 @@
+[package]
+name = "gate2"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Isolate the device codegen nightly from the ordinary workspace.
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+cuda-core = "=0.3.1"
+half = "2.7"
+engine-core = { path = "../../crates/core" }
+engine-nvidia = { path = "../../crates/nvidia", features = ["cuda"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "cuda-13020", "dynamic-loading", "nvrtc"] }
