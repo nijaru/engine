@@ -6,13 +6,13 @@
 //! deliberately contains no trait objects and no generic storage type; a backend that
 //! materializes device memory for a lease keeps the two in one owner.
 //!
-//! Readiness is published as a release epoch, not as a wakeup mechanism. The runtime
-//! that parks waiting work owns registration-and-recheck against that epoch, so a
-//! release between a capacity check and parking cannot be lost.
+//! Capacity readiness uses the same registration and optional wake transport as
+//! other resource conditions. Register before checking capacity, then arm before
+//! parking; releases and closure publish after the accounting lock is released.
 
+use crate::{Readiness, ReadinessWait};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Identity of one granted allocation.
@@ -34,8 +34,8 @@ impl AllocationId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReserveError {
     /// The pool can grant this amount, but not while other leases are alive.
-    /// The caller may register for the pool's current epoch and retry after a
-    /// release; this is ordinary backpressure, not a request defect.
+    /// Register before attempting and retry after readiness changes; this is
+    /// ordinary backpressure, not a request defect.
     Exhausted {
         /// Bytes the caller asked for.
         requested: u64,
@@ -85,7 +85,7 @@ impl Error for ReserveError {}
 pub struct BytePool {
     capacity: u64,
     state: Mutex<PoolState>,
-    epoch: AtomicU64,
+    readiness: Readiness,
 }
 
 #[derive(Debug)]
@@ -106,7 +106,7 @@ impl BytePool {
                 next_allocation: 1,
                 closed: false,
             }),
-            epoch: AtomicU64::new(0),
+            readiness: Readiness::default(),
         }
     }
 
@@ -143,12 +143,12 @@ impl BytePool {
         self.lock().granted
     }
 
-    /// Current release epoch. It advances whenever a lease releases bytes, so a
-    /// runtime that parked on capacity can tell "something changed" from "the pool
-    /// is unchanged" without polling for a specific byte count.
+    /// Register before checking capacity. A release or closure changes the wait;
+    /// use [`ReadinessWait::wake_on_change`] to arm the caller's wake transport.
+    /// A change permits a retry, not a reservation: another owner may take capacity.
     #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+    pub fn capacity_wait(&self) -> ReadinessWait {
+        self.readiness.register()
     }
 
     /// Reserve `bytes` and return the owning lease.
@@ -188,8 +188,16 @@ impl BytePool {
 
     /// Refuse new reservations. Existing leases keep their charge and release
     /// normally, so shutdown does not pretend that live device state is free.
+    /// The transition publishes readiness so waiting callers can observe closure
+    /// without waiting for a lease to release. Repeated closure is a no-op.
     pub fn close(&self) {
-        self.lock().closed = true;
+        let mut state = self.lock();
+        let changed = !state.closed;
+        state.closed = true;
+        drop(state);
+        if changed {
+            self.readiness.publish();
+        }
     }
 
     /// Whether this pool still grants reservations.
@@ -202,9 +210,9 @@ impl BytePool {
         let mut state = self.lock();
         state.granted = state.granted.saturating_sub(bytes);
         drop(state);
-        // Publish after the bytes are actually available, so a waiter that observes
-        // this epoch and rechecks capacity never sees the old accounting.
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+        // Publish after updating accounting and unlocking: wake callbacks may
+        // inspect this pool or attempt another reservation immediately.
+        self.readiness.publish();
     }
 }
 
@@ -215,7 +223,6 @@ impl fmt::Debug for BytePool {
             .field("capacity", &self.capacity)
             .field("granted", &state.granted)
             .field("closed", &state.closed)
-            .field("epoch", &self.epoch.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -319,19 +326,66 @@ mod tests {
     }
 
     #[test]
-    fn epoch_advances_only_on_release() {
+    fn reservations_and_failed_attempts_do_not_publish_but_releases_do() {
         let pool = BytePool::new(256).shared();
-        let start = pool.epoch();
+        let start = pool.capacity_wait();
         let first = pool.reserve(128).unwrap();
-        assert_eq!(pool.epoch(), start);
+        assert!(!start.changed());
         let second = pool.reserve(128).unwrap();
-        assert_eq!(pool.epoch(), start);
+        assert!(!start.changed());
         assert!(pool.reserve(1).is_err());
+        assert!(!start.changed());
         drop(first);
-        let after_release = pool.epoch();
-        assert!(after_release > start);
+        assert!(start.changed());
+        let after_release = pool.capacity_wait();
         drop(second);
-        assert!(pool.epoch() > after_release);
+        assert!(after_release.changed());
+    }
+
+    #[test]
+    fn notifications_observe_accounting_without_holding_its_lock() {
+        use std::sync::mpsc;
+        use std::task::{Wake, Waker};
+        struct Observe {
+            pool: Arc<BytePool>,
+            observed: mpsc::SyncSender<(u64, bool)>,
+        }
+        impl Wake for Observe {
+            fn wake(self: Arc<Self>) {
+                let _ = self
+                    .observed
+                    .try_send((self.pool.available(), self.pool.is_closed()));
+            }
+        }
+        for closing in [false, true] {
+            let pool = BytePool::new(64).shared();
+            let held = pool.reserve(64).unwrap();
+            let mut wait = pool.capacity_wait();
+            let (observed, receiver) = mpsc::sync_channel(1);
+            let waker = Waker::from(Arc::new(Observe {
+                pool: pool.clone(),
+                observed,
+            }));
+            wait.wake_on_change(&waker);
+            let producer_pool = pool.clone();
+            let producer = std::thread::spawn(move || {
+                if closing {
+                    producer_pool.close();
+                    Some(held)
+                } else {
+                    drop(held);
+                    None
+                }
+            });
+            let observation = receiver
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(observation, (if closing { 0 } else { 64 }, closing));
+            let retained = producer.join().unwrap();
+            assert_eq!(pool.granted(), if closing { 64 } else { 0 });
+            drop(retained);
+            assert_eq!(pool.granted(), 0);
+        }
     }
 
     #[test]

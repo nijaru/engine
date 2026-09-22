@@ -33,11 +33,10 @@
 //! [`BlockReason::Pool`] only when not even one request fits, which is the caller's
 //! signal to consume retained entries or wait for capacity to come back.
 //!
-//! The pool publishes a release epoch rather than a wakeup, so capacity waiting is
-//! registration-and-recheck: a caller registers with [`BatchRuntime::capacity_wait`]
-//! before attempting, parks for a bounded interval while the registration is
-//! unchanged, and retries. The parking mechanism stays with the caller that owns it;
-//! this runtime only supplies the readiness source and the recheck.
+//! Capacity waiting shares [`ReadinessWait`] with other resource owners. Register
+//! with [`BatchRuntime::capacity_wait`] before attempting and arm a wake transport
+//! before parking. Releases and closure notify the caller; publication before arming
+//! is not lost. The caller still owns parking and retry; this runtime adds no worker.
 //!
 //! Output is executor-defined and may be device-resident. A result that completes
 //! asynchronously carries its own producer completion dependency
@@ -59,7 +58,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ribn_foundation::{AllocationId, BytePool, ParameterVersion, PoolLease, ReserveError};
+use ribn_foundation::{
+    AllocationId, BytePool, ParameterVersion, PoolLease, ReadinessWait, ReserveError,
+};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -220,10 +221,9 @@ pub enum BlockReason<C> {
     /// capacity. The caller must consume retained entries, or wait for a sibling
     /// runtime to release its own, before more work can run.
     ///
-    /// Register with [`BatchRuntime::capacity_wait`] *before* attempting, park for a
-    /// bounded interval while [`CapacityWait::released`] is false, then retry. The
-    /// pool has no notification, so an unbounded park can miss the release that
-    /// would have admitted this work.
+    /// Register with [`BatchRuntime::capacity_wait`] *before* attempting, then arm
+    /// [`ReadinessWait::wake_on_change`] before parking. Retry when the registration
+    /// changes; another waiter may have taken the released capacity first.
     Pool {
         /// Bytes the head request needs reserved before it can run.
         requested: u64,
@@ -849,22 +849,13 @@ impl<E: BatchExecutor> BatchRuntime<E> {
         self.terminal.len()
     }
 
-    /// Register for the next capacity release from the pool this runtime reserves
-    /// from.
-    ///
-    /// [`BlockReason::Pool`] is a wakeup contract rather than a failure. Take a
-    /// registration *before* attempting, park for a bounded interval, and retry
-    /// [`Self::step`] while [`CapacityWait::released`] stays false. The pool
-    /// publishes no notification, so the bound is what keeps a release that lands
-    /// between the attempt and the park from being lost; registration alone never
-    /// means the next reservation will be granted, because a sibling may take the
-    /// released bytes first.
+    /// Register before attempting work against this runtime's pool. For
+    /// [`BlockReason::Pool`], arm [`ReadinessWait::wake_on_change`] before parking;
+    /// a release or closure notifies the caller even if it preceded arming.
+    /// A changed registration permits retrying [`Self::step`], not a reservation.
     #[must_use]
-    pub fn capacity_wait(&self) -> CapacityWait {
-        CapacityWait {
-            pool: Arc::clone(&self.pool),
-            epoch: self.pool.epoch(),
-        }
+    pub fn capacity_wait(&self) -> ReadinessWait {
+        self.pool.capacity_wait()
     }
 
     /// Bytes this runtime's retained entries currently hold in the shared pool.
@@ -898,38 +889,6 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     #[must_use]
     pub fn executor_mut(&mut self) -> &mut E {
         &mut self.executor
-    }
-}
-
-/// Registration for a capacity wait against the shared pool's release epoch.
-///
-/// The pool publishes an epoch, not a wakeup, so a runtime that parks on capacity
-/// owns registration-and-recheck: register before attempting, park for a bounded
-/// interval while the registration is unchanged, then recheck and retry. Holding the
-/// pool in the registration keeps a wait from being checked against a different
-/// authority.
-#[derive(Clone, Debug)]
-pub struct CapacityWait {
-    pool: Arc<BytePool>,
-    epoch: u64,
-}
-
-impl CapacityWait {
-    /// The release epoch this registration observed.
-    #[must_use]
-    pub const fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// Whether the pool has released bytes since this registration.
-    ///
-    /// A true result means "retry the attempt", never "the reservation will be
-    /// granted": another waiter may already have taken the released bytes. A false
-    /// result after a release means the registration is older than that release, so
-    /// the caller should re-register before parking again.
-    #[must_use]
-    pub fn released(&self) -> bool {
-        self.pool.epoch() != self.epoch
     }
 }
 
@@ -1430,9 +1389,9 @@ mod tests {
             }),
             "a private per-runtime budget would have admitted this work"
         );
-        let epoch = pool.epoch();
+        let wait = pool.capacity_wait();
         drop(first.pop_completed().expect("first entry"));
-        assert!(pool.epoch() > epoch, "release advances the readiness epoch");
+        assert!(wait.changed(), "release publishes capacity readiness");
         assert_eq!(
             second.step().expect("sibling step after release"),
             StepOutcome::Executed { results: 1 }

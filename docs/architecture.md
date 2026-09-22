@@ -158,8 +158,8 @@ internals, other runtime families and device gates were not audited.
 | `engine-gguf`, `crates/gguf` | GGUF metadata/tensor access and tokenizer support |
 | `ribn-safetensors`, `crates/safetensors` | Validated artifact tensor views, no model semantics |
 | `ribn-hf`, `crates/hf` | Local config and shard resolution/cache, no architecture selection |
-| `ribn-foundation`, `crates/foundation` | Provisional parameter/materialization/topology metadata plus the shared byte-pool authority: owning leases, allocation identity and a release epoch for capacity readiness |
-| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, publishing a pool-epoch capacity registration for callers that park, handing each reservation to the executor that materializes its storage, and delivering cancellation through the ordinary terminal queue |
+| `ribn-foundation`, `crates/foundation` | Provisional parameter/materialization/topology metadata plus the shared byte-pool authority: owning leases, allocation identity and common `Readiness`/`ReadinessWait` notifications for byte-pool and AR capacity waits |
+| `ribn-batch`, `crates/batch` | Non-AR batching runtime with executor-owned shape constraints, reserving retained output through a shared byte pool instead of a private budget, returning the pool's common readiness registration for callers that park, handing each reservation to the executor that materializes its storage, and delivering cancellation through the ordinary terminal queue |
 | `ribn-cli`, `crates/cli` | `inspect`, experimental `run`, legacy `local` comparison frontend |
 
 `tools/check-boundaries.py` checks production dependency direction. Update the checker

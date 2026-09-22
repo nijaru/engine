@@ -146,9 +146,13 @@ release that no drain can prove keeps its storage and its charge until one can.
    of its queue; it never prepares an arbitrary iterator. Aggregate submission resources
    are budgeted across the whole prepared range, not reset per row.
 3. **Waiting versus rejection.** Waiting names both a condition and a readiness source.
-   For capacity the source is the pool's allocation epoch; readiness uses
-   registration-and-recheck so a release between the capacity check and parking cannot
-   be lost. Rejection is permanent request-local infeasibility — an indivisible input
+   Byte-pool and AR capacity waits share `ReadinessWait`: register before checking,
+   then arm the caller's wake transport before parking. Arming rechecks the
+   source epoch so a release between the capacity check and parking cannot be lost.
+   Pool closure also publishes, allowing a waiter to observe terminal refusal without
+   waiting for a live lease to release; closure does not refund those leases.
+   Callbacks run after the accounting lock is released. Rejection is permanent
+   request-local infeasibility — an indivisible input
    larger than the pool can ever grant, or an unsupported shape — and is delivered
    without waiting. A retry count never establishes impossibility. Waiting work parks
    outside runnable queues and does not stall healthy requests; while a backend provides

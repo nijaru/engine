@@ -266,9 +266,14 @@ The first concrete representation is deliberately not generic. Increments:
   dependency. `EncoderSubmission` no longer borrows its encoder — its prepared
   resources are shared — so a result outlives the submitting call, and
   `device_bytes` counts the allocations that exist rather than restating the
-  prediction. `ribn-batch` publishes `CapacityWait`, a registration over the pool's
-  release epoch, so a parking caller registers before attempting and rechecks after a
-  bounded park while the pool still publishes no wakeup. Evidence: the encoder's
+  prediction. Capacity waiting now returns the common `ReadinessWait`, replacing the
+  separate `CapacityWait`/`BytePool::epoch` protocol. Callers register before attempting
+  and arm their wake transport before parking; release or closure publishes after the
+  accounting lock is released. Closure wakes blocked callers without refunding live
+  leases. Host follow-up tests cover lost-wakeup interleavings, cancellation, sibling
+  retention through dequeue, stolen capacity requiring a second notification, and
+  callbacks that inspect accounting. Device requalification of this readiness change
+  is pending desktop availability. Evidence: the encoder's
   parity, envelope and pool-bound device run in
   [encoder qualification](../benchmarks/encoder-qualification.md), plus host lifecycle
   tests over the real `BatchRuntime`/`BytePool` for constrained capacity, deferred
