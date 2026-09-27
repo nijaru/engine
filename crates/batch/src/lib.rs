@@ -593,7 +593,7 @@ impl<E: BatchExecutor> BatchRuntime<E> {
     /// failure: retry only after the named condition changes. Consuming retained
     /// entries with [`Self::pop_completed`] releases their reservation, which is
     /// the wakeup for [`BlockReason::RetainedResults`]. A sibling runtime's release
-    /// advances the pool epoch, which is the wakeup for [`BlockReason::Pool`].
+    /// publishes capacity readiness for [`BlockReason::Pool`] after releasing its lease.
     ///
     /// # Errors
     /// Rejects a parameter-version change while queued work still targets the
