@@ -60,6 +60,7 @@ FORBIDDEN = {
     "core": {"engine-gguf", "engine-nvidia", "engine-qwen", "ribn", "ribn-text", "ribn-cli"},
     "gguf": {"engine-nvidia", "engine-qwen", "ribn", "ribn-text", "ribn-cli"},
     "qwen": {"ribn-text", "ribn-cli"},
+    "cli": {"engine-core", "engine-nvidia", "engine-qwen"},
 }
 
 
@@ -81,7 +82,15 @@ def main() -> int:
         invalid = dependency_names(manifest) & forbidden
         if invalid:
             errors.append(f"{path.relative_to(ROOT)}: reversed dependency: {sorted(invalid)}")
-    for obsolete in ("crates/core/src/nvidia.rs", "crates/gguf/src/qwen.rs"):
+    for obsolete in (
+        "crates/core/src/nvidia.rs",
+        "crates/gguf/src/qwen.rs",
+        "crates/cli/src/local.rs",
+        "crates/core/src/runtime.rs",
+        "crates/core/src/scheduler.rs",
+        "crates/core/src/serving.rs",
+        "crates/core/src/serving_runtime.rs",
+    ):
         if (ROOT / obsolete).exists():
             errors.append(f"{obsolete}: implementation is back in the wrong owner")
     if errors:

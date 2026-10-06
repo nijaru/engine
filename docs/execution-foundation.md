@@ -1,389 +1,79 @@
-# Shared execution foundation
+# Execution foundation: evidence and limits
 
-Date: 2026-09-12
-Status: experimental evidence; APIs are provisional, not target contracts.
+`ribn-foundation` owns shared byte-pool accounting, readiness notifications, parameter
+version labels and artifact scalar metadata. It contains no request, token, KV,
+autograd or optimizer policy. Physical storage remains backend-owned.
 
-The [target design](inference-engine-design.md) and
-[resource protocol](resource-protocol.md) supersede prescriptive sketches here.
-This document preserves experiments and their limits; the [roadmap](roadmap.md)
-alone owns next work. Metadata-level tests do not prove owning executable storage,
-training support or distributed execution.
+[Target design](inference-engine-design.md) owns architecture,
+[resource protocol](resource-protocol.md) owns execution contracts, and
+[roadmap](roadmap.md) owns sequencing. This document records counterexamples that
+still matter; it does not prescribe provisional APIs.
 
-Ribn is an inference engine. The lower-level compute and model infrastructure should,
-however, avoid unnecessary inference-only assumptions so that other execution systems
-could reuse it later. A future trainer is the main pressure test, not a current Ribn
-feature.
+## Storage ownership is not metadata
 
-The intended split is:
+The original parameter/materialization, resource-topology and prepared-placement
+experiments described versions, layouts and devices without owning executable
+storage. They had no production consumers. Those types and their self-contained
+validation tests have been removed rather than promoted into a framework. Core's
+unused residency/qualification labels and metadata-only file-provider/loader wrappers
+were also removed; actual format readers, Qwen mapping and qualification gates remain.
 
-```text
-                    model definitions / artifacts
-                              |
-                    shared model semantics
-                 parameters / operators / topology
-                              |
-                shared execution foundation
-     devices / buffers / views / streams / events
-     operator implementations / kernel selection
-     collectives / communication / topology
-     checkpoint + parameter I/O
-     parameter identity + versioning
-     placement / sharding primitives
-                              |
-             +----------------+----------------+
-             |                                 |
-       Ribn inference                    future trainer
-             |                                 |
-    AR / batch / iterative              autograd / backward
-    / session runtimes                  gradients / optimizer
-    continuation state                  activation lifetime
-    batching / serving                  training scheduler
-```
+Keep the distinctions they explored when a real consumer requires them:
 
-This is not a commitment to build a general tensor framework, compiler, autograd
-system, or training runtime. It is a dependency and ownership boundary.
+- logical parameters are separate from encoding, quantization, placement and storage;
+- a version label does not keep the weights that produced derived state alive;
+- model topology is separate from deployment topology;
+- future training may share storage/completion mechanisms without sharing inference
+  scheduling or physical materializations.
 
-## Invariants
+The test-only RMSNorm registry was also removed. Selecting a function pointer in a
+fixture does not qualify a production operator abstraction. Resolve supported kernels
+at preparation where practical, but derive any shared operation interface from real
+model/backend consumers.
 
-1. Inference-specific policy does not leak below the shared foundation. A device
-   buffer, parameter materialization, collective, or kernel must not require
-   `RequestId`, KV cache, token scheduling, HTTP, or serving concepts.
-2. Training-specific policy does not leak into Ribn inference. Shared tensors and
-   parameters do not acquire gradients, autograd tape, optimizer state, or loss
-   semantics merely to preserve future optionality.
-3. Logical model/parameter identity is separate from physical representation.
-4. An execution uses a coherent parameter version. State or prepared execution
-   that depends on parameters must not silently survive an incompatible update.
-5. Model semantics are separate from deployment topology. The same logical model
-   may be prepared for one local device, several local devices, or remote nodes.
-6. Backend-specific physical layouts and kernels remain free to specialize.
-7. Artifact representation is separate from both model semantics and prepared
-   execution. A checkpoint reader may expose names/shapes/bytes without deciding
-   what a tensor means or how it is materialized for a backend.
+## Artifact loading
 
-## Logical parameters and materializations
+`ribn-safetensors` validates bytes once and retains metadata/payload offsets;
+`ribn-hf` resolves local config and shard ownership without choosing model semantics.
+`engine-bert` interprets names and shapes above these adapters.
 
-A parameter is not a permanent device pointer or one checkpoint tensor. Conceptually:
+Repeated per-parameter shard reads and header parses were unnecessary loading costs.
+`LocalWeightSet` instead opens shards lazily and reuses validated artifacts. Its
+configurable LRU bound counts cached shards, **not peak bytes**: an incoming load and
+retained artifact clones can overlap eviction. Whole-file owned bytes remain the
+storage representation. A byte-aware or streaming loader still needs qualification
+before large-model HF loading claims.
 
-```text
-logical parameter
-  identity
-  logical shape
-        |
-        +-- materialization A: version 7 / bf16 / host / dense
-        +-- materialization B: version 7 / q4 packed / cuda:0
-        +-- materialization C: version 8 / fp8 / cuda shards 0..7
-```
+GGUF exposed a descriptor-lifetime problem: staging the pinned artifact once held
+888 file descriptors; readers opening lazily and closing at payload exhaustion reduced
+the sampled peak to 38. See [runtime evidence](../benchmarks/runtime-contract.md).
+This belongs to artifact access, not model semantics.
 
-The current `ribn-foundation` prototype therefore separates `ParameterId` and
-`ParameterVersion` from `ParameterMaterialization`. A materialization records scalar
-type, storage encoding, layout identity, and one or more physical storage/device
-parts. The exact types are deliberately incomplete; their job is to pressure-test
-the distinction before real quantization, sharding, hot-weight, adapter, and
-multi-backend paths determine the final contract.
+Unknown SafeTensors scalar types are preserved by name. Recognizing a dtype does not
+mean a backend can execute it. Remote HF resolution and tokenizer/processor package
+loading are not implemented.
 
-A future trainer might own FP32 master parameters, optimizer shards, and gradient
-state while an inference plan owns quantized or otherwise transformed serving
-materializations. Sharing logical identity does not require sharing physical layout.
+## Different execution regimes
 
-The SafeTensors/HF package pressure tests reinforce this split: an artifact exposes
-parameter names as bytes plus format metadata, the model integration decides each
-name's semantic role and logical parameter identity, and execution preparation later
-decides the backend-specific materialization. The test-only BERT integration now
-exercises this with an actual encoder architecture rather than only a toy embedding
-fixture.
+The real AR and non-AR runtimes have different units of progress. Encoder inputs and
+results are executor-defined; they do not need fake token requests or KV sequences.
 
-## Parameter versioning
+Variable-length encoder fixtures showed that request count alone cannot make a safe
+batch. `BatchExecutor::select_batch` chooses an executable FIFO prefix using concrete
+shape/cost constraints. Padded and ragged layouts can fit different amounts of the
+same work; this does not justify a universal cost vector. Impossible inputs reject
+locally while later requests progress.
 
-The useful invariant is not "loaded weights are immutable forever." It is:
+The real BERT device path subsequently established owning leases, completion
+dependencies, partial-enqueue retirement and cancellation through `ribn-batch`.
+A dequeued result keeps its charge until its owner safely releases storage. See
+[encoder qualification](../benchmarks/encoder-qualification.md) for tested geometry
+and failure paths. AR still uses a separate logical capacity authority; sharing one
+physical pool across AR and encoder execution remains unfinished.
 
-> Work that can affect observable results or reusable state executes against a
-> coherent parameter version.
+## Composition
 
-This matters for ordinary inference as well as RL/post-training:
-
-- hot weight replacement;
-- trainer-to-rollout synchronization;
-- LoRA or adapter changes;
-- prefix/continuation cache validity;
-- recurrent checkpoints;
-- prepared encoder/media state;
-- captured or compiled execution variants;
-- multi-rank deployments.
-
-The non-AR batch validation runtime pins queued work to the executor's parameter
-version and rejects execution after an uncoordinated version change. That is
-intentionally strict validation behavior, not yet the final hot-update protocol.
-A production design may drain, version-partition, double-buffer, or otherwise
-coordinate transitions.
-
-Derived state must carry equivalent compatibility. Sequential encoder->decoder tests
-prove in-process handoff identity and cancellation ownership, but a production
-encoder-state cache must also reject reuse across incompatible model/parameter/
-adapter or processor versions.
-
-## Artifact and package boundaries
-
-Two validation layers exist below model execution:
-
-- `ribn-safetensors` validates SafeTensors bytes and exposes tensor names, shape,
-  dtype, and borrowed payload bytes. It does not create `ParameterMaterialization`
-  values or assign model meaning.
-- `ribn-hf` resolves a local HF-style `config.json` and either a single
-  `model.safetensors` or a sharded `model.safetensors.index.json`. It preserves raw
-  config metadata and maps parameter names to shard files without choosing a model
-  architecture, runtime, processor, backend, or serving operation.
-
-The BERT pressure test now loads a small actual BERT architecture from this boundary
-and executes embeddings, multi-head self-attention, residual/LayerNorm, feed-forward
-and pooler semantics through `ribn-batch`. That is stronger evidence that format and
-package code can stay below model meaning. It is still a reference implementation,
-not production BERT support or a general model registry.
-
-It also exposed concrete loading costs that toy fixtures could hide. Repeatedly
-calling a per-parameter helper that reopens a SafeTensors shard would reread the same
-checkpoint bytes many times, and reparsing a shard header for every tensor lookup
-would rescan metadata describing the whole shard. `ribn-safetensors` therefore
-validates each artifact once, retaining the tensor metadata and payload offsets, so
-later lookups are index lookups rather than reparses. `ribn-hf::LocalWeightSet` owns
-the reuse above that: it opens each resolved shard lazily on first use, reuses it for
-later tensor views, and leaves unused shards unopened. Model-specific tensor aliases,
-expected shapes and semantic mapping remain above the package layer.
-
-GGUF tensor readers exposed the same class of cost from the other side. Opening a
-reader used to open the checkpoint file eagerly, and staging opens one reader per
-tensor, so the pinned 27B artifact held 888 descriptors at peak against a 1024
-soft limit; two concurrent loads in one process failed with `EMFILE`. A reader now
-opens on first read and releases the descriptor when the payload is exhausted, so
-opening many readers costs no descriptors and only in-flight reads hold one: the
-same load peaks at 38 descriptors. Exact-token device qualification was re-run
-against the changed reader, so the staged weights remain the reference artifact's.
-Consistent with the SafeTensors boundary, this is a property of artifact access:
-the model decides which tensors it needs, while the format adapter decides how a
-descriptor is held.
-
-The remaining scaling cost is residency, because a resident artifact owns its whole
-file. Mapping immutable local files would avoid that copy, but mapping requires an
-`unsafe` call that this workspace forbids, so owned bytes remain the only storage and
-residency is an explicit policy instead: `LocalWeightSet::weight_set_resident(n)`
-keeps at most `n` cached shards and evicts the least recently used one. This is a
-cache-entry bound, not a peak-memory bound: an incoming load can overlap eviction,
-and retained clones may keep old storage alive. Retaining
-everything stays available and remains the default, because it is the fastest policy
-for small models and the choice belongs to the loader. A future streaming or mapped
-reader is the natural next step before the HF path becomes the production loader for
-large checkpoints.
-
-Remote repository IDs/revisions, tokenizer/processor metadata, prepared backend
-storage and the general architecture resolver remain future work.
-
-SafeTensors also exposed one useful future-proofing detail: its dtype enum is
-non-exhaustive. The adapter therefore preserves unknown future dtypes by name rather
-than assuming Ribn's current scalar-type list is complete.
-
-## Resource topology and execution plans
-
-`ResourceTopology` is a small validation representation of nodes, compute devices,
-and optional device links. It is not a cluster scheduler. `ExecutionPlan` currently
-maps logical stage IDs to one or more devices plus a runtime-class identity and
-parameter version.
-
-The important property under test is:
-
-```text
-logical model semantics
-        +
-available resource topology
-        +
-execution policy
-        -> prepared execution plan
-```
-
-A local one-device plan should collapse to a direct runtime/device path with no RPC,
-serialization, or artificial worker hierarchy. Distributed placement, collectives,
-and state transfer are additive when the prepared plan actually needs them.
-External systems may allocate machines/devices; Ribn owns inference-local execution
-inside those resources.
-
-The current stage representation is intentionally weak and opaque. Do not stabilize
-a universal stage graph. Sequential encoder-decoder execution can justify a real
-stage boundary, while VLM/omni execution may need tightly coupled scheduling of
-encoder items and AR progress inside one composite runtime. See
-`pipeline-composition.md`.
-
-## Specialized runtimes above the foundation
-
-The first two runtime families are deliberately different:
-
-- `ribn` (`crates/runtime`) is the existing autoregressive token runtime. Tokens,
-  prefill/decode, continuation state, speculation, and AR scheduling belong here.
-- `ribn-batch` (`crates/batch`) is a minimal non-AR pressure test. Its executor owns
-  input/output types, tensor shapes, padding/ragged layout, device buffers, and can
-  shorten the oldest FIFO candidate set when concrete shape/memory/compute
-  constraints make the entire candidate batch unsuitable.
-
-The early variable-length reference encoder showed that request count alone is not
-enough to form a safe batch. The resulting `select_batch` hook deliberately exposes
-no universal cost unit: the executor sees its own inputs and returns either a FIFO
-prefix it can execute, a temporary block, or a rejected head request. Reordering,
-length bucketing, heterogeneous batching, and shared cost metadata remain
-unresolved until real workloads demonstrate that they belong in the common runtime.
-
-Admission has three distinct outcomes because "cannot fit right now" and "can never
-fit" need different handling. `Blocked` leaves the queue untouched and names the
-condition that must change before progress is possible; `Rejected` fails only the
-queue head and keeps later work moving. Neither is a runtime invariant failure, so a
-transient resource shortage cannot be mistaken for a broken executor.
-
-The runtime also accounts for waiting work and retained results separately. Waiting
-work is bounded by request count, while terminal entries the caller has not consumed
-are bounded by both a result count and a byte budget. `retained_bytes` lets the
-executor state what one retained output will hold, and the runtime reserves that
-before submitting work rather than discovering it afterwards. Batching is an
-optimization, so a selected batch shrinks to the largest prefix the retention budget
-can hold; the runtime reports `RetainedResults` or `RetainedOutputBytes` only when
-not even one request fits, which is the caller's signal to consume retained entries.
-Terminal rejections carry no payload and stay deliverable while the byte budget is
-exhausted. The byte budget is per runtime, so a deployment sharing one host or device
-pool across runtimes still needs one accounting authority per pool.
-
-The BERT architecture pressure test is the first substantially real model-semantic
-use of this path. It preserves the same executor-defined request/result boundary and
-runs actual BERT attention and feed-forward structure. Follow-up tests add attention
-masks and compare padded versus ragged batch cost: masked padding is semantically
-inert for real tokens, and the concrete executor can shorten a padded FIFO batch even
-when the same requests fit a ragged token budget. A further test proves that a
-sequence exceeding the token budget is rejected as a request-local failure while the
-work behind it still executes. No new common batching abstraction was required. The
-next useful pressure comes from real device memory/compute admission, asynchronous
-execution and optimized kernels rather than another synthetic cost type.
-
-`ribn-batch` is not yet an embedding API or the final encoder scheduler. In
-particular, cancellation, asynchronous device execution, shared-pool accounting,
-padding/mask policy, and optimized device batching remain unfinished.
-
-The second performance gap is a list of shared contracts rather than a missing model
-class. [Resource, submission and snapshot protocol](resource-protocol.md) records
-them: prepared submissions that reserve before execution, one accounting authority per
-shared pool, completion plus access ownership across runtime handoffs, and an owning
-model snapshot with separate semantic and physical compatibility. Every runtime in
-this document is affected by at least one of them, which is why they come first.
-
-Further runtime families should be introduced only when real execution regimes
-justify them. Iterative diffusion/flow work and full-duplex sessions are known
-pressure tests, not fixed enum variants.
-
-## Cross-runtime request and state identity
-
-Sequential encoder->decoder validation found one useful AR seam without introducing
-a universal pipeline payload: `GenerationExecutor::admit` receives both `RequestId`
-and `SequenceId`.
-
-They have different roles:
-
-- `RequestId` is stable for one request within the AR runtime and can correlate
-  model-owned prepared inputs, tracing, or other request-scoped state;
-- `SequenceId` is the executor continuation identity used for physical/state
-  ownership after admission.
-
-Tests run a batch encoder, keep its output in an `Arc`, install prepared states for
-two AR requests in reverse order, and prove each decoder request consumes the
-correct allocation without serialization or data copying. A missing prepared state
-fails only that request.
-
-Cancellation establishes the ownership transition without another generic cleanup
-interface. Before AR admission the producer/orchestrator still owns prepared state;
-after successful admission the executor's sequence state owns it and the ordinary
-`release` path reclaims it after cancellation/completion is established.
-
-This proves a useful **sequential handoff** mechanism. It does not mean every
-multimodal model should put an opaque prepared-input handle into `TokenRequest`, nor
-that AR `RequestId` is a universal top-level pipeline identity. Top-level
-application/orchestrator identity may remain distinct from each specialized runtime's
-internal request identity.
-
-A separate VLM pressure test now covers the coupled case at the scheduling boundary.
-It models model-prepared feature identity, prompt span, cache readiness, encoder
-compute cost and encoder-cache cost. The tests show that prompt progress can cross a
-cached feature with no encoder compute, can schedule an encoder item in the same
-iteration that consumes its prompt span, must stop before an uncached item when
-compute is unavailable, and can fail independently under encoder-cache pressure.
-This is evidence that coupled generation needs scheduler/resource cooperation and
-that encoder compute and cache are distinct concerns. It is **not** evidence for an
-arbitrary resource vector or a finalized production dependency descriptor. A real
-VLM integration should determine that seam.
-
-## Operators, kernels, and future training
-
-A small semantic-operation layer remains an experiment. If it proves useful, model
-code can describe an operation while preparation chooses an implementation for the
-actual backend/hardware. Forward implementations may be shared by inference and a
-future trainer; backward kernels would be training-side additions.
-
-The current test chooses a specialized or reference RMSNorm implementation once at
-preparation, then executes through a prepared function pointer without repeating
-support/registry lookup. This is only evidence for the dispatch pattern; it is not a
-production operator registry or IR.
-
-Do not require every optimized kernel to be reusable. Paged decode attention,
-quantized decode kernels, fused optimizers, and backward attention naturally serve
-different execution systems. Share operation semantics and backend infrastructure
-where useful; specialize hot paths freely.
-
-Likewise, device communication primitives and collectives may be shared, while
-inference and training use different higher-level parallel strategies.
-
-## Current validation status
-
-Implemented as provisional scaffolding:
-
-- dependency-free `ribn-foundation` parameter/version/materialization metadata;
-- node/device/link resource topology;
-- a prepared execution-plan representation that can place the same logical model
-  locally or across nodes, with stage decomposition and device placement tested as
-  separate decisions rather than as one combined change;
-- test-only preparation-time semantic RMSNorm implementation selection, with runtime
-  shape support queried per execution so a preparation-time choice is never taken as
-  proof that the same implementation serves every step's shape;
-- `ribn-batch`, a non-AR batching runtime with no token/prefix/KV concepts, reserving
-  retained output through the shared byte pool instead of a private per-runtime budget;
-- coherent parameter-version checks for queued non-AR work;
-- executor-informed variable-length batch sizing without a universal work unit;
-- SafeTensors format-level validation that retains tensor metadata and payload
-  offsets once, so later lookups are indexed rather than reparsed;
-- local HF-style config plus single/sharded SafeTensors package resolution,
-  including Hugging Face cache snapshots whose members are symlinks into that
-  repository's immutable `blobs` directory;
-- an actual BERT architecture reference path over that package boundary, including
-  embeddings, self-attention, residual/LayerNorm, FFN and pooler execution, with a
-  nondegenerate weight fixture whose expected values come from an independent
-  implementation rather than from this code;
-- `LocalWeightSet` lazily owns each resolved SafeTensors shard with a configurable
-  residency bound, leaving model semantics above the package layer;
-- BERT attention-mask semantics and padded-versus-ragged batch-cost pressure tests
-  pass without changing the common `ribn-batch` contract;
-- stable AR `RequestId` passed separately from `SequenceId` into executor admission;
-- a shared byte-pool authority in `ribn-foundation`: owning non-duplicable leases with
-  allocation identity, a release epoch for capacity readiness, over-grant refusal,
-  permanent-rejection reporting, and release on lease drop/shutdown;
-- sequential encoder->AR handoff, out-of-order correlation, request-local failure,
-  and cancellation ownership before/after admission;
-- VLM prompt-position dependency scheduling with separate encoder compute/cache
-  pressure as a test-only model of the coupled case, plus the same dependencies
-  driven through the real admission loop to establish which of those decisions the
-  request contract carries and which it does not;
-- partial-prefill reporting through that loop, with important limits: the fixture
-  budgets each row separately, not an aggregate submission; `Blocked` immediately
-  requeues rather than parking, and permanent infeasibility waits forever. This is
-  not a complete resource-negotiation or liveness proof. At `14d0290`, the incomplete
-  blocked outcome is removed. The fixture now shares an aggregate submission budget
-  and rejects impossible uncached items at admission, but temporary row-level waiting
-  still requires real preparation/readiness work.
-
-This validates that the broad boundary is implementable and has forced several
-interface changes. It does **not** validate that these exact types are sufficient or
-optimal. The next high-value pressure tests are real encoder device execution/resource
-admission, ordinary architecture resolution once another production model makes that
-boundary useful, a genuine encoder-decoder model, a real VLM/processor integration,
-an iterative non-AR runtime, more real semantic-op/backend implementations, and a
-second hardware backend.
+[Pipeline composition](pipeline-composition.md) retains the sequential and coupled
+counterexamples. They do not establish a universal stage graph, real multimodal model
+support or distributed execution. The next composition gate requires actual models,
+not more metadata-only fixtures.

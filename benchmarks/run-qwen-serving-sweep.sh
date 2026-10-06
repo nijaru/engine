@@ -41,7 +41,7 @@ benchmarks/collect-env.sh "$out_dir/env" >/dev/null
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$out_dir/sweep.txt"
 
-cargo build --release -p engine-nvidia --features cuda --example qwen_serving_bench 
+cargo build --release -p engine-qwen --features cuda --example qwen_serving_bench
 bench="target/release/examples/qwen_serving_bench"
 
 for concurrency in $concurrencies; do

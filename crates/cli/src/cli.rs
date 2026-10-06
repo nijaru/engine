@@ -57,7 +57,7 @@ pub(crate) fn parse(arguments: &[String], usage: &str) -> Result<RunOptions, Str
                     .parse::<u16>()
                     .map_err(|_| "--device expects a non-negative device ordinal".to_owned())?;
             }
-            other => return Err(format!("unknown local option {other:?}; usage: {usage}")),
+            other => return Err(format!("unknown run option {other:?}; usage: {usage}")),
         }
         index += 2;
     }

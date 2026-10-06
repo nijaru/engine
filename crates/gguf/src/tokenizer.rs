@@ -3,7 +3,6 @@ use crate::{
     GgufError, MetadataValue, optional_u32, optional_u32_array, required_i32_array,
     required_string, required_string_array, required_u32,
 };
-use engine_core::{PromptFormat, PromptPolicy, SpecialTokenPolicy};
 use regex::Regex;
 use std::collections::BTreeMap;
 
@@ -573,37 +572,6 @@ impl GgufTokenizer {
         Ok(encoded)
     }
 
-    /// Encode text according to an explicit request prompt policy. Plain text
-    /// remains separate from [`Self::encode_chat`], because a chat request must
-    /// carry message structure rather than being silently flattened.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GgufError::UnsupportedPromptFormat`] for an embedded chat
-    /// template and forwards ordinary tokenizer errors from [`Self::encode`].
-    pub fn encode_with_policy(
-        &self,
-        text: &str,
-        policy: PromptPolicy,
-    ) -> Result<Vec<u32>, GgufError> {
-        if policy.format() == PromptFormat::EmbeddedChatTemplate {
-            return Err(GgufError::UnsupportedPromptFormat(
-                "embedded chat templates require structured messages; use encode_chat",
-            ));
-        }
-        let mut encoded = self.encode(text)?;
-        match policy.special_tokens() {
-            SpecialTokenPolicy::None => {}
-            SpecialTokenPolicy::AddBos => encoded.insert(0, self.bos_token_id()),
-            SpecialTokenPolicy::AddEos => encoded.push(self.eos_token_id()),
-            SpecialTokenPolicy::AddBosAndEos => {
-                encoded.insert(0, self.bos_token_id());
-                encoded.push(self.eos_token_id());
-            }
-        }
-        Ok(encoded)
-    }
-
     fn bpe(&self, mut symbols: Vec<String>) -> Vec<String> {
         while symbols.len() > 1 {
             let mut best: Option<(u32, usize)> = None;
@@ -626,7 +594,7 @@ impl GgufTokenizer {
 
     /// Build a tokenizer from already-parsed GGUF tokenizer metadata.
     ///
-    /// This is the construction contract behind [`GgufFile::tokenizer`], and it
+    /// This is the construction contract behind [`crate::GgufFile::tokenizer`], and it
     /// lets a host validate tokenizer behavior without opening a model file.
     ///
     /// # Errors
@@ -772,22 +740,6 @@ mod tests {
         assert!(matches!(
             tokenizer.encode_chat(&messages, ChatTemplateOptions::default()),
             Err(GgufError::TokenizerEncoding { .. })
-        ));
-        assert_eq!(
-            tokenizer
-                .encode_with_policy(
-                    "ab",
-                    PromptPolicy::new(PromptFormat::PlainText, SpecialTokenPolicy::AddBosAndEos,),
-                )
-                .expect("explicit boundary tokens"),
-            vec![1, 2, 2]
-        );
-        assert!(matches!(
-            tokenizer.encode_with_policy(
-                "ab",
-                PromptPolicy::new(PromptFormat::EmbeddedChatTemplate, SpecialTokenPolicy::None,),
-            ),
-            Err(GgufError::UnsupportedPromptFormat(_))
         ));
     }
 

@@ -1,261 +1,71 @@
-# Pipeline composition and coupled execution
+# Pipeline composition: sequential and coupled execution
 
-Date: 2026-09-12
-Status: experimental evidence; boundaries remain provisional.
+These are host pressure tests, not implemented multimodal support or a production
+orchestrator. [Target design](inference-engine-design.md) owns architecture;
+[resource protocol](resource-protocol.md) owns device handoff and resource lifetimes.
 
-Use [target design](inference-engine-design.md) for architecture and
-[resource protocol](resource-protocol.md) for accepted ownership rules. This document
-retains counterexamples, not a second implementation contract. Roadmap gates override
-historical next-step suggestions below.
+A model component is not automatically a runtime stage. A stage boundary needs a
+real scheduling, ownership, placement or failure boundary. Single-runtime models
+should not traverse pass-through stage/worker/executor layers.
 
-Ribn should not turn every architectural component of a model into a top-level
-runtime stage. A stage boundary is justified by execution lifecycle, scheduling,
-resource ownership, placement, or failure/cancellation behavior—not merely because
-a model diagram contains two boxes.
+## Sequential encoder → decoder
 
-This distinction matters most for encoder + generation models.
+`crates/batch/tests/sequential_encoder_decoder.rs` hands encoder-produced `Arc` state
+to AR admission, keyed by `RequestId` rather than incidental FIFO order. Two handoffs
+installed in reverse order still reach the correct decoder requests without copying
+or serializing the allocation.
 
-## Sequential encoder-decoder
+`RequestId` correlates request-scoped prepared input. `SequenceId` identifies the
+continuation owner after admission; neither proves allocation lifetime.
 
-Some models have a naturally sequential boundary:
+- Before successful AR admission, the producer/composition owner retains retirement
+  responsibility, including cancellation and failed handoff.
+- After admission, sequence state owns the handoff and executor release reclaims it
+  only after completion is established.
+- Missing prepared state rejects that request, not its peers.
 
-```text
-input media / source tokens
-        |
-        v
-batch/encoder runtime
-        |
-        | prepared encoder state
-        v
-AR decoder runtime
-        |
-        v
-output tokens / text
-```
-
-An ASR- or translation-style encoder can often finish a whole input before decoding
-begins. In that case the shallow orchestrator can own the dependency between the two
-runtimes. If both stages are co-located, the prepared encoder state should remain in
-device memory; a logical stage boundary must not imply host serialization or RPC.
-
-The current pressure tests validate a narrow version of this boundary. A batch
-encoder produces `Arc`-owned prepared state. AR executor admission receives stable
-`RequestId` separately from internal `SequenceId`, takes ownership of the state for
-that request, and the tests prove handoff order does not determine which request
-receives which state.
-
-Cancellation also establishes a useful ownership rule without a new generic cleanup
-interface:
-
-- before AR admission, prepared state is still owned by its producer/orchestrator,
-  which reclaims it when the downstream request is cancelled;
-- after admission, ownership has moved to executor sequence state and the existing
-  executor `release` path reclaims it after cancellation/completion is established.
-
-This is validation of the ownership transition, not a finished orchestrator API. A
-real encoder-decoder model still needs to test device state, cross-attention layout,
-async completion, failure propagation, and version compatibility.
+The fixture proves correlation and an ownership transition. A real encoder-decoder
+model must still prove device completion dependencies, cross-attention layout,
+version/processor compatibility, cancellation and shared-pool downstream headroom.
+An `Arc` alone does not establish safe device reuse.
 
 ## Coupled multimodal generation
 
-A VLM or similar multimodal generator can be different. Encoder items may correspond
-to placeholder spans inside the generation prompt. Encoder work may be scheduled,
-cached, prefetched, or evicted independently while AR prefill advances through the
-prompt.
+An encoder item can correspond to a placeholder span partway through an AR prompt.
+Finishing every encoder as an external stage before prefill is therefore not the only
+useful composition. A whole-request opaque handle may also hide when a feature becomes
+relevant.
 
-Current serving systems demonstrate this coupling. vLLM V1 tracks multimodal feature
-items on the request, maintains a separate encoder-output cache, and accounts for an
-encoder-compute budget alongside token scheduling. TensorRT-LLM likewise exposes
-item-level multimodal encoder scheduling and optional encoder prefetching. These
-systems do not require every multimodal encoder to finish as a separate external
-pipeline stage before AR execution begins.
+`crates/runtime/tests/multimodal_dependencies.rs` is a pure scheduling counterexample.
+It models feature identity, prompt spans, readiness and separate encoder compute/cache
+costs, not images or processors. It demonstrates:
 
-References:
+- just-in-time encoder work at the prompt span that consumes it;
+- cached features consuming residency but no encoder compute;
+- unavailable compute shortening progress before an uncached item;
+- cache pressure being distinct from compute pressure;
+- later dependencies shortening a chunk after earlier ones were satisfied.
 
-- https://docs.vllm.ai/en/latest/api/vllm/v1/core/encoder_cache_manager/
-- https://docs.vllm.ai/en/latest/api/vllm/config/scheduler/
-- https://nvidia.github.io/TensorRT-LLM/llm-api/reference/MultimodalConfig.html
+`multimodal_admission.rs` exercises the real AR engine. An authority-backed deferred
+admission can wait for whole-request encoder readiness. A backend can do encoder
+work within its step and reuse published features. Positive shortened prefill can
+report less work than offered, within an aggregate submission budget, and only final
+prefill samples output. Impossible indivisible work rejects at admission.
 
-For Ribn this means a multimodal model may use a **coupled generation runtime** that
-coordinates two resource domains:
+The former completion-time `Blocked` result was removed: it named no readiness source
+and could immediately resubmit unchanged work. Partial completion is evidence of work
+already done, **not preparation**. The current API cannot park an already-admitted row
+at a temporarily unready leading dependency. This requires real pre-submit
+negotiation, not a zero-progress success result or `yield_now` loop.
 
-```text
-processed multimodal items
-        |                     prompt token progress
-        v                             |
-encoder batching/cache               |
-        |                             |
-        +------- prepared features ---+
-                      |
-                      v
-               AR model execution
-```
+The fixture's integer cost units do not define a production resource vector. Raw
+media and processing stay above token scheduling. A real VLM should determine the
+minimum model-prepared dependency seam the scheduler needs.
 
-The AR scheduler still must not understand images, audio, preprocessing libraries,
-or backend tensor classes. It may, however, need model-prepared dependency metadata
-such as feature identity, prompt span/position, readiness, and resource cost when
-those facts affect whether a prompt range can execute.
+## Remaining gate
 
-The current AR `Engine` deliberately hides prompt-prefix progress from an external
-orchestrator. That is desirable for ordinary staged execution, but it means a simple
-wrapper around the existing engine cannot efficiently decide when a prompt-positioned
-encoder item becomes relevant. Coupled VLM decisions therefore belong at a
-scheduler/resource boundary rather than in an external stage wrapper.
-
-## What the VLM pressure test proved
-
-`crates/runtime/tests/multimodal_dependencies.rs` models only scheduler-visible facts,
-not images or processor implementation details. Each prepared encoder dependency has
-an item identity, prompt span, encoder-compute cost, encoder-cache cost, and cached
-or uncached state. Token progress and encoder resources are budgeted independently.
-
-The test establishes several behaviors:
-
-- a future encoder item is not eagerly scheduled before the prompt range that needs
-  it;
-- an encoder item can be computed in the same scheduling iteration whose prompt
-  chunk reaches and consumes it;
-- cached encoder output can cross its placeholder span without spending encoder
-  compute budget;
-- insufficient encoder compute truncates prompt progress before the uncached item;
-- insufficient encoder cache capacity is a distinct failure/pressure mode from
-  insufficient encoder compute;
-- multiple prompt-positioned items can progressively truncate an otherwise valid AR
-  prefill chunk;
-- starting directly at an unready dependency stalls token progress until the
-  required encoder resource is available.
-
-This is enough to reject two premature designs:
-
-1. every encoder must finish as a top-level stage before AR prefill starts;
-2. one opaque whole-request multimodal handle is necessarily sufficient for
-   efficient scheduling.
-
-It is **not** enough to stabilize a production dependency descriptor. In particular,
-the test's compute/cache integer units are fixtures, not a proposed arbitrary
-resource vector. An actual VLM integration should determine whether the production
-seam is explicit per-item descriptors, a model/resource planner queried by the AR
-scheduler, or another small cooperative interface.
-
-### What the request contract can carry
-
-`crates/runtime/tests/multimodal_admission.rs` asks the same questions through the
-real `Engine` instead of a pure function, and the answers divide the list above.
-
-Carried by admission:
-
-- `Admission::Deferred` is a working per-request encoder gate: the engine retries the
-  request on later steps and commits no prompt token while it waits, so "do not start
-  before the encoder output exists" is expressible without a new interface;
-- a backend can perform encoder work inside its own step, and encoder output published
-  by anyone is reused rather than recomputed, across requests as well as across steps.
-
-Historical completion experiment (`6f0ebbf`, superseded by `14d0290`):
-
-- a prefill row may accept *fewer* inputs than the engine offered, so a backend stops
-  before a placeholder it cannot encode instead of overspending an encoder budget or
-  failing the submission. `StepOutcome::Progress` reports the range actually consumed,
-  sampled output belongs only to the row that finished the prompt, and the engine
-  commits exactly what was reported;
-- a row that can do nothing inside the step's limits reports `StepOutcome::Blocked`:
-  it commits no progress, stays runnable, does not fault its peers, and is observable
-  through `StepStatus::blocked`. A short or blocked step is ordinary, not an error.
-
-Limits of that historical experiment:
-
-- permanent infeasibility. A step budget smaller than one indivisible encoder item
-  makes the row block forever rather than fail: the engine has no *completion*-time
-  rejection, only admission-time failure. A request that can never proceed therefore
-  waits instead of reporting that;
-- actual waiting. `Blocked` names no readiness condition and the engine may resubmit
-  the same row inside that same `step`. Frontend `yield_now` does not park it;
-- aggregate encoder admission. The fixture resets compute budget per row, so its
-  single-request budget checks do not establish a submission-wide bound.
-
-At `14d0290`, completion-time `Blocked` is removed. The fixture now shares an
-aggregate submission budget and rejects permanently impossible uncached items during
-admission. It exercises positive shortened rows only; temporary inability to advance
-at a leading dependency remains unexpressible, not silently represented as success.
-Positive shortened progress does not itself solve pre-execution resource negotiation.
-
-Those are the concrete reasons the incremental `prepare`-then-`enqueue` contract in
-[the resource protocol](resource-protocol.md) still matters: negotiation happens after
-submission, so it can limit work but cannot refuse a batch, reserve capacity ahead of
-one, or reclaim declined capacity. This change deliberately settles none of that.
-
-## Do not choose an opaque request handle too early
-
-A single opaque "prepared multimodal input" handle would be easy to add to the
-current `TokenRequest`, but it is too early to make that the common contract.
-Efficient VLM execution can require per-item readiness and cache lifetime because
-different encoder items become relevant at different prompt positions.
-
-The whole-input sequential and prompt-positioned coupled cases have now both been
-pressure-tested. The next step is not another synthetic abstraction: integrate an
-actual VLM processor/model path and expose only the minimum scheduler/resource
-information that implementation demonstrably needs. Raw media stays above the
-runtime in the model processor/application layer.
-
-## Identity and cache validity
-
-Prepared encoder state is derived state. Reuse must account for the identities that
-can change its meaning, including at least the relevant model/parameter/adaptor
-version and processor/configuration identity. A hot weight update must not silently
-reuse stale encoder outputs.
-
-This is the same principle already used for continuation state: reusable state is
-valid only for the model state that produced it.
-
-## Orchestrator rule
-
-The top-level orchestrator remains shallow:
-
-- use it for genuine cross-runtime dependencies, cancellation, output ordering,
-  placement and backpressure;
-- keep tightly coupled scheduling inside a specialized/composite runtime when the
-  model benefits from joint resource decisions;
-- keep the single-stage path direct;
-- do not introduce Worker/Executor/Stage wrapper layers merely to make all models
-  fit one pipeline abstraction.
-
-Omni and media-generation models may therefore mix both approaches. A model can have
-several logical stages while one stage internally coordinates multiple tightly
-coupled components.
-
-## Validation status and next targets
-
-Completed sequential pressure tests:
-
-- batch-encoder -> AR request-state handoff;
-- handoff correlated by stable request identity rather than incidental FIFO order;
-- in-process state retains the same allocation in the fixture rather than being
-  serialized across the stage boundary;
-- cancellation before admission reclaims producer-owned state;
-- cancellation after admission reclaims executor-owned state through `release`;
-- missing prepared state fails only the affected AR request.
-
-Completed coupled pressure tests:
-
-- prompt-positioned encoder dependencies participate in AR prefill progress;
-- encoder computation can occur just in time for the prompt span that consumes it;
-- cached items bypass encoder compute but still represent cache residency;
-- encoder compute and cache are independent scheduling constraints;
-- later dependencies can shorten a chunk after earlier dependencies were satisfied;
-- submitted prefill rows can report a positive shortened range within a shared
-  encoder budget, when every offered row can advance; impossible uncached items are
-  rejected at admission. Temporary row-level waiting remains an unimplemented seam.
-
-Remaining before stabilizing composition contracts:
-
-- use an actual encoder-decoder architecture/checkpoint to validate real prepared
-  device-state and cross-attention semantics;
-- integrate an actual VLM processor/model and let its real feature tensors, prompt
-  positions, cache lifetime and device costs determine the production coupled
-  scheduler/resource seam;
-- establish pre-execution rejection and named readiness with the real resource
-  planner, rather than extending an incomplete completion-time blocking enum;
-- validate version compatibility and async failure propagation for both staged and
-  coupled derived state.
-
-The goal is not a universal pipeline graph. The goal is to preserve direct fast
-paths while giving genuinely heterogeneous models the coordination they require.
+Roadmap slice 4e requires a real second decoder and VLM/processor, followed by a
+sequential encoder-decoder and small iterative model. Qualify independent numerical
+references, derived-state compatibility, async failure propagation, cancellation and
+constrained-pool progress before stabilizing composition interfaces. Keep both staged
+and coupled execution available where the actual model justifies them.

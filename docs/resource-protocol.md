@@ -1,9 +1,9 @@
 # Resource, submission and snapshot protocol
 
-Status: accepted direction. Current completion/discard behavior is identified below;
-prepared-resource negotiation and snapshot replacement are not implemented APIs. The 2026-09-13 review replaces
-contradictory claim/reservation sketches with the ownership rules below. The
-[roadmap](roadmap.md) owns implementation order and exit evidence.
+Status: accepted direction. Encoder preparation and current AR completion/discard
+are implemented as identified below; AR growth preparation and snapshot replacement
+are not implemented APIs. The [roadmap](roadmap.md) owns implementation order and
+qualification gaps.
 
 ## Current boundary
 
@@ -54,6 +54,13 @@ Demand estimates are plain values. Reservations are owning, non-duplicable lease
 Moving a lease between owners does not reserve again. Physical storage and its
 charge live together; popping a result from a queue does not release its charge.
 Reference-counted sharing is valid where necessary, but must not duplicate accounting.
+
+A resident arena/slab owns its physical byte charge until it is actually retired.
+A block allocator separately tracks which slots may be reused. Releasing or evicting
+a slot returns occupancy to that allocator, not physical bytes to sibling runtimes:
+the backing allocation still exists. Accounting a live slab once and then charging
+its blocks again is equally wrong. Preparation must identify both the physical
+resident owner and the authority granting safe slot reuse.
 
 Abandoning prepared, unsubmitted work releases **all new** reservations, including
 uncommitted persistent growth. It does not release pre-existing continuation. Ordinary
@@ -133,6 +140,12 @@ downstream workspace headroom needs a real downstream stage sharing the pool, wh
 slice 4 introduces. Two limits are recorded: a request's whole envelope stays charged
 until its result is dropped, so completed temporary storage is not released early, and a
 release that no drain can prove keeps its storage and its charge until one can.
+Partial allocation/upload failure during submission construction is an additional
+source-traced gap: already-created buffers can drop into stream-ordered frees while
+no retained submission carries their charge. Post-enqueue qualification does not
+cover that path or prove global physical-byte availability after normal result Drop.
+These paths need completion-safe charge retirement before a hard cross-stream peak
+bound is claimed; safe ordering of device accesses alone is not physical release.
 
 1. **One authority, owning byte leases.** The first concrete authority is a shared byte
    pool that grants an owning, non-duplicable lease per reservation. Moving a lease
@@ -193,8 +206,11 @@ unimplemented; this section states the contract they must satisfy.
 
 Continuation is the state a sequence must keep to continue: full-attention KV,
 sliding-window KV, recurrent matrices and convolution history, and hybrid combinations
-of them. It is owned per sequence until a cache owns it, and it is charged to the same
-byte authority as every other device reservation on that device.
+of them. It is owned per sequence until a cache owns it. The target is one physical
+byte authority per shared device pool. Current Qwen logical accounting and encoder
+`BytePool` accounting remain separate; common readiness does not establish a shared
+capacity bound. Resident backing and reusable slot occupancy obey the distinction
+above.
 
 1. **A declaration is a shape and a bound.** A model declares each continuation
    component's shape and maximum capacity. A concrete state materializes a capacity
@@ -241,11 +257,30 @@ byte authority as every other device reservation on that device.
    storage and its charge, on the same retirement path as any other uncertain device
    work. Cancellation is intent and does not by itself release continuation.
 7. **Eviction and preemption are different owners.** Cache eviction returns
-   unreferenced storage to the authority; preemption takes continuation from a live
-   sequence. Preemption by recomputation drops that sequence's continuation, returns the
-   request to waiting with its tokens, and rebuilds state by replay. Cancellation,
-   preemption and eviction must each be observable as a distinct outcome, because they
-   imply different work and different accounting.
+   unreferenced slots for reuse, not a resident arena's bytes. Preemption takes
+   continuation from a live sequence only after completion-safe retirement. Cancellation,
+   preemption and eviction remain distinct outcomes because they imply different work
+   and accounting. Recompute requires one bounded owner of the prompt and committed
+   generated history. Its physical replay cursor is separate from externally committed
+   progress; replay must not duplicate output, usage or sampling. Survivor growth takes
+   precedence over victim readmission. Before partial-envelope admission, prove protected
+   completion headroom or a preemption policy that breaks all-active-growth deadlock.
+   A request whose own required state cannot fit rejects locally, not through endless
+   self-preemption.
+8. **Restore includes execution semantics.** A matching hash is not proof that every
+   ancestor KV block or hybrid checkpoint remains present. Restore only a complete valid
+   boundary and reserve a private writable recurrent copy. Initially that boundary must
+   be strictly before the final prompt sampling token; execute the remaining suffix to
+   produce logits. Re-consuming a token after restoring its post-token recurrent state
+   would advance state twice. Cached logits/output state is a separate deferred policy.
+9. **Growth negotiates before launch.** An AR preparation transaction accepts positive
+   ranges within the offered budgets, parks waiting rows with registered readiness, and
+   rejects permanently impossible rows locally. Selection is not submission: do not mark
+   omitted rows as in flight or encode shortage as a submit fault/zero-progress completion.
+   Refund omitted/shortened output reservations. Abandoning unsubmitted preparation
+   releases only new growth; uncertain enqueue retains it together with old continuation
+   until executor-owned settlement or quarantine. Aggregate demand, not per-row resets,
+   determines the accepted batch. The concrete representation remains a roadmap gate.
 
 The engine owns which sequence holds which committed prefix and the policy decisions
 (admission, eviction, preemption, priority). The model/backend owns layout, block or
@@ -306,11 +341,11 @@ explicit cancel and output-credit return without a second cancellation queue.
   it can race with an already-settled terminal. Dropping the stream suppresses delivery.
 - The worker never blocks sending output. Only it sends to each stream; it checks channel
   space before draining that runtime mailbox. Consumption wakes the execution owner.
-- An idle/output-blocked owner sleeps indefinitely on the wake channel. Pending device
-  completion and registered admission waits use a configured nonzero timed-poll
-  fallback. Unchanged registrations are checked without rerunning model admission;
-  resource publication does not yet notify the worker's wake channel. Synchronous backend
-  calls remain non-preemptible; wakeups cannot interrupt a blocked driver operation.
+- An idle/output-blocked owner sleeps on the wake channel. Registered admission waits
+  arm one-shot notifications before parking and recheck the source epoch; unchanged
+  registrations do not rerun model admission. Only pending device completion uses the
+  configured nonzero timed-poll fallback. Synchronous backend calls remain non-preemptible;
+  wakeups cannot interrupt a blocked driver operation.
 - Request-local runtime admission failures remain `FinishReason::Failed`. Driver-level
   enqueue rejection retains its `EngineError` source. Execution-owner failure stops
   admission, preserves events already handed to stream channels, then exposes an
@@ -369,7 +404,7 @@ user-defined content markup such as a thinking or tool-call tag stays visible. E
 delivered event carries its token ID, so a structured consumer loses nothing to the
 text policy. Caller-supplied stop tokens are added to this set, not replaced by it.
 
-Implementation status and host evidence: [architecture](architecture.md#owned-text-facade)
+Implementation status and host evidence: [architecture](architecture.md#text-generation)
 and [runtime evidence](../benchmarks/runtime-contract.md#owned-text-facade-host-gate-2026-09-14).
 
 ### Preprocessing ownership and bounds

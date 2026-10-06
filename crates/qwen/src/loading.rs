@@ -11,7 +11,7 @@ use engine_core::{
 };
 use engine_nvidia::NvidiaBackend;
 use engine_nvidia::{
-    CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, QwenLayerKind,
+    CudaQwen35Decode, CudaQwen35ServingDispatcher, CudaQwen35Weights, GemvMode, QwenLayerKind,
     StagedTensorSource, wrap_f32_stream,
 };
 use ribn::{ExecutionError, ExecutorInfo, GenerationLimits};
@@ -22,7 +22,7 @@ use crate::state;
 /// Same-sequence prefill chunk size this backend uses when a caller enables
 /// prefill chunking without naming a size.
 ///
-/// Eight is the largest qualified lane ([`engine_nvidia::MAX_BATCH_MEMBERS`]
+/// Eight is the largest qualified lane (the backend's `MAX_BATCH_MEMBERS` limit
 /// bounds it) and the size the prefill qualification measured, so it is both
 /// the fastest measured choice and the one with parity evidence.
 pub const DEFAULT_PREFILL_CHUNK_MEMBERS: usize = 8;
@@ -33,6 +33,9 @@ pub struct QwenLoadOptions {
     pub device: u16,
     pub context_tokens: u32,
     pub max_sequences: usize,
+    /// Backend-native projection mode. Warp is the existing qualified default;
+    /// scalar is the correctness oracle and integer-dot is explicitly lossy.
+    pub gemv_mode: GemvMode,
     /// Same-sequence prefill chunk size, or `None` for the serial prefill
     /// path. Enabled by default: the lane is backend-local, and its parity and
     /// serving-effect gates are recorded in
@@ -57,6 +60,7 @@ impl Default for QwenLoadOptions {
             device: 0,
             context_tokens: 4096,
             max_sequences: 1,
+            gemv_mode: GemvMode::default(),
             prefill_chunk_members: Some(DEFAULT_PREFILL_CHUNK_MEMBERS),
             weight_budget_bytes: None,
             continuation_capacity_bytes: None,
@@ -130,8 +134,9 @@ pub(crate) fn load(
         weight_budget_bytes,
     )?);
     let layer_kinds = layer_kinds(&provider)?;
-    let executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, 1.0e-6)
+    let mut executor = CudaQwen35Decode::new(&context, stream.clone(), staged, layer_kinds, 1.0e-6)
         .map_err(model_error)?;
+    executor.set_gemv_mode(options.gemv_mode);
     let dispatcher =
         CudaQwen35ServingDispatcher::new(&context, executor, stream.clone(), options.max_sequences)
             .map_err(model_error)?;

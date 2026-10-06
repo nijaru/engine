@@ -88,7 +88,9 @@ Add multimodal, MoE, speculation-specific, trace-replay, and distributed cases o
 
 ## Native Qwen serving sweep
 
-The first Engine-only serving qualification sweep exercises the real scheduler/runtime/backend boundary with the pinned Qwen3.8 GGUF path:
+The Qwen-owned `qwen_serving_bench` example exercises the production AR engine with
+the pinned Qwen GGUF path. It replaces the legacy core-runtime harness; historical
+measurements do not qualify the migrated harness or imply directly comparable timing:
 
 ```text
 ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
@@ -103,16 +105,23 @@ TOKENS=64 CONCURRENCIES="1 4 8" \
   bash benchmarks/run-qwen-serving-sweep.sh
 ```
 
-The script captures the Engine commit and local environment, builds the benchmark once, and writes one raw log per concurrency under a timestamped `benchmarks/results/` directory. The current CUDA dispatcher selects native batched execution for eligible multi-row greedy decode batches and falls back to the per-row path for single-row, mixed, or otherwise unsupported batches. These results therefore exercise the real serving boundary and its current batch-selection behavior; interpret them with the exact commit, mode, workload, and concurrency recorded for each run.
+The script builds `engine-qwen`'s example and records revision, environment and one
+raw log per concurrency under `benchmarks/results/`. Compatible multi-row decode uses
+backend batch lanes; mixed/single rows stay per-row. Explicit `--gemv=scalar|warp|int-dot`,
+`--prefill-chunk`, fixture prompts and six divergence probes remain available.
+Preparation timing now includes loading/staging/kernels; execution timing includes
+AR admission and event observation. The effective batch-token limit is printed.
+This fixed-arrival sweep is not representative online serving evidence, and device
+execution of the migrated harness remains pending.
 
 ## Qwen multi-token prefill gate
 
 Before selecting the experimental same-sequence Qwen prefill path in serving, follow
 [`qwen-prefill-qualification.md`](qwen-prefill-qualification.md). It records the
 four-layer diagnostic and full 64-layer ignored parity gates plus a matched serial
-versus chunk-size 2/4/8 timing matrix for the RTX 4090. The path remains unqualified
-until those device gates run successfully; CPU CI and CUDA-feature compilation are
-not performance or numerical evidence.
+versus chunk-size 2/4/8 timing matrix for the RTX 4090. The qualified scope and selected default are recorded there; new geometry or variants
+need their own device gates. CPU CI and CUDA-feature compilation are not performance
+or numerical evidence.
 
 ## Baseline run shape
 

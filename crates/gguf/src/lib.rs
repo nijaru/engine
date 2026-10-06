@@ -5,14 +5,11 @@
 //! execution remains owned by a provider and compute backend.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use engine_core::{
-    DataType, F32BlockStream, ModelLoadError, WeightArtifact, WeightDescription, WeightLoader,
-    WeightSource, WeightTensorSpec,
-};
+use engine_core::{DataType, F32BlockStream, WeightTensorSpec};
 
 mod iq3_s;
 mod tokenizer;
@@ -740,68 +737,6 @@ fn dequantize_iq4_xs(encoded: &[u8]) -> Vec<f32> {
     output
 }
 
-/// A GGUF implementation of the core weight-loader boundary. It validates the
-/// GGUF directory and returns artifact metadata; it does not claim to decode
-/// tensors or provide an execution-ready model.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GgufWeightLoader {
-    path: PathBuf,
-    description: WeightDescription,
-}
-
-impl GgufWeightLoader {
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>, description: WeightDescription) -> Self {
-        Self {
-            path: path.into(),
-            description,
-        }
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Parse the directory independently when callers need tensor metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GgufError`] when the file is not a valid supported GGUF.
-    pub fn inspect(&self) -> Result<GgufFile, GgufError> {
-        GgufFile::open(self.path.clone())
-    }
-}
-
-impl WeightLoader for GgufWeightLoader {
-    fn load(&self) -> Result<WeightArtifact, ModelLoadError> {
-        let file = self
-            .inspect()
-            .map_err(|error| ModelLoadError::InvalidArtifact {
-                path: self.path.clone(),
-                message: error.to_string(),
-            })?;
-        if file.tensor_count() == 0 {
-            return Err(ModelLoadError::InvalidArtifact {
-                path: self.path.clone(),
-                message: "GGUF contains no tensors".to_owned(),
-            });
-        }
-        let byte_len = fs::metadata(&self.path)
-            .map_err(|error| ModelLoadError::Io {
-                path: self.path.clone(),
-                message: error.to_string(),
-            })?
-            .len();
-        WeightArtifact::new(
-            WeightSource::file(self.path.clone()),
-            byte_len,
-            self.description.clone(),
-        )
-        .ok_or_else(|| ModelLoadError::EmptyArtifact(self.path.clone()))
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GgufError {
     Io {
@@ -1268,11 +1203,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    use engine_core::{
-        FileModelProvider, ModelCapabilities, ModelDescription, ModelId, ModelRegion,
-        ModelRegionId, ModelRegionKind, Quantization, WeightFormat,
-    };
-
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend(value.to_le_bytes());
     }
@@ -1612,30 +1542,5 @@ mod tests {
             GgufFile::read_from(&mut reader, PathBuf::from("fixture.gguf")),
             Err(GgufError::DuplicateMetadata(key)) if key == "general.architecture"
         ));
-    }
-
-    #[test]
-    fn gguf_loader_composes_with_core_file_provider() {
-        let path =
-            std::env::temp_dir().join(format!("engine-gguf-{}-{}.gguf", std::process::id(), 1));
-        std::fs::write(&path, fixture()).expect("write fixture");
-        let weights =
-            engine_core::WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km);
-        let loader = GgufWeightLoader::new(&path, weights.clone());
-        let model = ModelDescription::new(
-            ModelId::new("test-model").expect("model ID"),
-            "qwen3",
-            vec![ModelRegion::new(
-                ModelRegionId::new(0),
-                ModelRegionKind::Embedding,
-            )],
-            Vec::new(),
-            ModelCapabilities::new(None, false),
-            weights,
-        )
-        .expect("model description");
-        let provider = FileModelProvider::load(model, &loader).expect("provider");
-        assert_eq!(provider.artifact().source().as_path(), path);
-        std::fs::remove_file(path).expect("remove fixture");
     }
 }

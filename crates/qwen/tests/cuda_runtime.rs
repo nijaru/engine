@@ -79,6 +79,7 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
         (9, false),
         (2, true),
         (8, true),
+        (9, true),
     ] {
         run_case(&model, &reference, concurrency, cancel_decode);
     }

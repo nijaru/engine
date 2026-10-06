@@ -9,15 +9,11 @@ publish = false
 
 [features]
 default = []
-cuda = ["dep:engine-core", "dep:cudarc", "dep:engine-nvidia", "engine-nvidia/cuda", "dep:engine-qwen", "engine-qwen/cuda", "dep:ribn-text", "ribn-text/cuda"]
+cuda = ["dep:ribn-text", "ribn-text/cuda"]
 
 [dependencies]
-engine-qwen = { path = "../qwen", optional = true }
 ribn-text = { path = "../text", optional = true }
-engine-core = { path = "../core", optional = true }
 engine-gguf = { path = "../gguf" }
-engine-nvidia = { path = "../nvidia", optional = true }
-cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
 
 [lints]
 workspace = true

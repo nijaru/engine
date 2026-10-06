@@ -68,6 +68,7 @@ impl From<LoadOptions> for QwenLoadOptions {
             weight_budget_bytes: value.weight_budget_bytes,
             continuation_capacity_bytes: value.continuation_capacity_bytes,
             headroom_bytes: value.headroom_bytes,
+            ..Self::default()
         }
     }
 }

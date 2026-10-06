@@ -30,8 +30,8 @@ possible later execution system, not inference policy.
   the relevant source/tests. The first three design documents own target architecture,
   execution contracts and sequencing respectively.
 - `docs/execution-foundation.md` and `docs/pipeline-composition.md` retain experimental
-  evidence and limitations. Their provisional types are not mandatory architecture.
-  Historical docs and private notes do not override current design owners.
+  counterexamples and limitations, not provisional APIs to preserve. Historical evidence
+  and private notes do not override current design owners.
 - Resolve observable ownership, failure scope, cancellation, bounds, readiness and
   shutdown before implementing a dependent architectural slice. Record open decisions
   in the roadmap. A counterexample may justify changing the design; update the owning

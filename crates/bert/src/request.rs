@@ -154,7 +154,7 @@ impl EncoderShape {
 
     /// Bytes this request holds on the device from submission until release.
     ///
-    /// [`crate::CudaBertEncoder::device_bytes`] reports the same quantity from the
+    /// `EncoderSubmission::device_bytes` reports the same quantity from the
     /// allocations that actually exist, so a device test can prove the prediction
     /// the pool is charged for equals the storage it covers.
     #[must_use]

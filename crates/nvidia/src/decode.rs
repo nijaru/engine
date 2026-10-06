@@ -290,7 +290,7 @@ pub struct CudaQwen35Decode {
 /// scalar oracle by per-family parity tests and a full-model greedy replay.
 /// `Scalar` remains available as the parity-tested correctness oracle.
 /// `IntegerDot` is the explicit opt-in experimental path: supported families
-/// run the lossy `Q8_1` integer-dot kernels (see [`CudaIntDotProjector`]),
+/// run the lossy `Q8_1` integer-dot kernels (implemented by `CudaIntDotProjector`),
 /// and every other family transparently falls back to the warp float path.
 /// Integer-dot packing is lossy, so this mode is never token-identical to
 /// the float modes; it exists for measured throughput comparison, not as a

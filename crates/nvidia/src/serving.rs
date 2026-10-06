@@ -326,7 +326,7 @@ impl CudaQwen35ServingDispatcher {
     /// still one segment with one outcome, and only the leading whole chunks
     /// leave the serial path.
     ///
-    /// Chunk sizes above [`crate::quantized::MAX_BATCH_MEMBERS`] are rejected
+    /// Chunk sizes above the backend's `MAX_BATCH_MEMBERS` limit are rejected
     /// because no qualified lane exists for them.
     ///
     /// # Errors

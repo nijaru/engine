@@ -2,7 +2,8 @@
 
 ## Host-only gates
 
-The `ribn` crate has no third-party or CUDA dependencies. External fixture model
+The `ribn` crate has no CUDA dependency. It uses foundation readiness and Flume for
+bounded blocking/async driver channels. External fixture model
 implementations exercise its real public trait with different private state
 layouts. Qwen bridge tests inject a host backend into the actual translation and
 lease code. These tests do not evaluate model numerics or execute GPU kernels.
@@ -414,13 +415,27 @@ cargo run -p ribn-cli --features cuda -- run \
   --model /absolute/path/model.gguf --prompt 'Explain a mutex.' --max-tokens 128
 ```
 
-`run` uses the new runtime and reports preparation/memory diagnostics on stderr.
-`local` retains the previous correctness frontend. Both currently target the
-existing Qwen text artifact path, not arbitrary GGUF architectures. Compare token
-fixtures rather than raw stdout: `run` streams bytes without an added newline,
-whereas `local` prints a finalized string. A token limit that cuts a UTF-8 code point
-now ends the stream with one replacement character, because the facade flushes an
-incomplete trailing code point at its terminal event.
+`run` uses the shared text facade and reports preparation/memory diagnostics on stderr.
+It targets the existing Qwen text artifact path, not arbitrary GGUF architectures.
+The duplicate `local` command is retired. Compare token fixtures rather than raw stdout:
+`run` streams without an added newline. A token limit cutting a UTF-8 code point ends
+with one replacement character when the facade flushes its terminal.
+
+## Legacy-runtime retirement: pending device re-execution
+
+The duplicate core serving scheduler/runtime is removed. Its wrapper-only host tests
+retired; current AR/Qwen contract tests retain lifecycle protection. The two stateless
+CUDA reference tests now use the backend directly and retain exact `[16.0, 14.0]` checks.
+The 8/9-row cancellation fixtures are consolidated into
+`retires_in_flight_members_without_losing_peers_or_state`: it checks deferred physical
+release, charge retention, peer progress, the nine-to-eight lane transition and an empty
+registry after teardown. Actual cancellation/output suppression remains in Qwen's AR
+gate, now also at concurrency nine. No numerical kernels changed.
+
+These migrated ignored fixtures compile on the host but have **not** been re-executed
+on device. Run `cuda_reference` and `cuda_runtime` serially with the commands above when
+desktop is available. Earlier numerical results qualify their recorded revisions,
+not this new test plumbing.
 
 ## Ground-up alignment cost and isolation
 

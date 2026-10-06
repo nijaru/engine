@@ -2,8 +2,8 @@
 //!
 //! This crate validates artifact bytes and exposes borrowed tensor payloads plus
 //! format metadata. It does not allocate execution tensors, choose parameter
-//! semantics, decide placement, or create [`ribn_foundation::ParameterMaterialization`]
-//! values. Those responsibilities belong to model integration and preparation.
+//! semantics, decide placement, or materialize backend storage. Those
+//! responsibilities belong to model integration and preparation.
 //!
 //! Validation and metadata extraction happen once, when the artifact is
 //! constructed. Tensor lookups afterwards are index lookups into retained

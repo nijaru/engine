@@ -1,23 +1,14 @@
-//! Core types and interfaces for Engine.
+//! Transitional execution, weight and state contracts used by Qwen and NVIDIA.
 //!
-//! These interfaces describe inference semantics and execution ownership without
-//! committing the core to a checkpoint format, device backend, or scheduler
-//! implementation. Model state remains typed without baking one model family's
-//! state bundle into the runtime boundary.
+//! Request scheduling and serving lifecycle belong to `ribn`, not this crate.
+//! Surviving contracts stay here until their model/backend consumers migrate;
+//! they are not the general inference engine API.
 
 pub mod backend;
 pub mod device;
 pub mod execution;
 pub mod model;
-pub mod policy;
-pub mod qualification;
-pub mod readiness;
 pub mod request;
-pub mod residency;
-pub mod runtime;
-pub mod scheduler;
-pub mod serving;
-pub mod serving_runtime;
 pub mod state;
 pub mod tensor;
 pub mod weights;
@@ -30,40 +21,13 @@ pub use device::DeviceId;
 pub use execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionMetrics, ExecutionOutcome,
     ExecutionPhase, ExecutionPlan, ExecutionSegment, ExecutionStage, ExecutionTokenInput,
-    PlanError,
+    PlanError, PolicyVersion,
 };
 pub use model::{
-    FileModelProvider, FileWeightLoader, ModelCapabilities, ModelDescription, ModelError, ModelId,
-    ModelLoadError, ModelProvider, ModelRegion, ModelRegionId, ModelRegionKind, MtpCapability,
-    WeightArtifact, WeightDescription, WeightLoader, WeightSource,
+    ModelCapabilities, ModelDescription, ModelError, ModelId, ModelProvider, ModelRegion,
+    ModelRegionId, ModelRegionKind, MtpCapability, WeightDescription,
 };
-pub use policy::{
-    PolicyError, PolicySnapshot, PolicyVersion, SpeculationPolicy, StateTierPreference,
-};
-pub use qualification::{
-    ExecutionVariant, ExecutionVariantId, ExecutionVariantIdError, QualificationError,
-    QualificationEvidence, QualificationScope, QualificationStatus,
-};
-pub use readiness::{ReadinessError, ReadinessState, RuntimeReadiness};
-pub use request::{
-    PromptFormat, PromptPolicy, RequestError, RequestId, RequestSemantics, RequestSpec,
-    SamplingError, SamplingParams, SpecialTokenPolicy, ThinkingMode,
-};
-pub use residency::{
-    ModelResidencyPlan, ModelResourceId, ResidencyError, ResidencyLocation, ResidencyOverride,
-};
-pub use runtime::{
-    CompletedExecution, CompletedExecutionBatch, ExecutionRuntime, RuntimeError, RuntimeStateError,
-    RuntimeSubmission,
-};
-pub use scheduler::{
-    ScheduledWork, SchedulerConfig, SchedulerCounts, SchedulerError, ServingScheduler,
-};
-pub use serving::{
-    ActiveRequestSlot, AdmissionError, RequestLifecycle, RequestProgress, RequestSlotError,
-    RequestSlotId, RequestSlots,
-};
-pub use serving_runtime::{GeneratedToken, ServingIteration, ServingRuntime, ServingRuntimeError};
+pub use request::{RequestId, SamplingError, SamplingParams};
 pub use state::{
     ConvolutionStateShape, InferenceState, InferenceStateSet, KvState, KvStateSpec,
     LogicalStateManager, RecurrentMatrixShape, RecurrentState, RecurrentStateSpec, StateError,
@@ -137,12 +101,6 @@ mod tests {
 
         assert!(plan.requires_kv_state());
         assert!(plan.requires_recurrent_state());
-        assert_eq!(plan.variant().status(), QualificationStatus::Experimental);
-        assert!(plan.variant().evidence().is_none());
-        assert_eq!(
-            plan.residency().default_location(),
-            ResidencyLocation::Device(DeviceId::new(0))
-        );
         assert_eq!(
             description
                 .capabilities()
@@ -283,83 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn request_semantics_do_not_contain_performance_policy() {
-        let sampling = SamplingParams::greedy(Some(42));
-        let semantics = RequestSemantics::new(128, sampling, ThinkingMode::Off)
-            .expect("valid request semantics");
-        let request = RequestSpec::new(
-            RequestId::new(1).expect("valid request ID"),
-            ModelId::new("Qwen/Qwen3.8-27B").expect("valid model identity"),
-            semantics,
-        );
-
-        assert_eq!(request.semantics().sampling().seed(), Some(42));
-        assert_eq!(request.semantics().thinking(), ThinkingMode::Off);
-        assert_eq!(request.semantics().max_output_tokens(), 128);
-        assert_eq!(
-            request.semantics().prompt_policy(),
-            PromptPolicy::plain_text()
-        );
-        let chat_request = request.clone();
-        let chat_semantics =
-            chat_request
-                .semantics()
-                .clone()
-                .with_prompt_policy(PromptPolicy::new(
-                    PromptFormat::EmbeddedChatTemplate,
-                    SpecialTokenPolicy::AddBosAndEos,
-                ));
-        assert_eq!(
-            chat_semantics.prompt_policy().format(),
-            PromptFormat::EmbeddedChatTemplate
-        );
-        assert_eq!(
-            chat_semantics.prompt_policy().special_tokens(),
-            SpecialTokenPolicy::AddBosAndEos
-        );
-    }
-
-    #[test]
-    fn policy_snapshot_is_versioned_and_validated() {
-        let snapshot = PolicySnapshot::new(
-            PolicyVersion::new(7).expect("valid policy version"),
-            8,
-            2048,
-            StateTierPreference::Automatic,
-            SpeculationPolicy::native_mtp(3).expect("valid MTP budget"),
-        )
-        .expect("valid policy snapshot");
-
-        assert_eq!(snapshot.version().get(), 7);
-        assert_eq!(snapshot.max_batch_tokens(), 2048);
-        assert_eq!(
-            snapshot.speculation(),
-            SpeculationPolicy::NativeMtp {
-                max_draft_tokens: 3
-            }
-        );
-        assert!(
-            snapshot
-                .validate_for(qwen_description().capabilities())
-                .is_ok()
-        );
-        assert_eq!(
-            snapshot.validate_for(ModelCapabilities::new(None, false)),
-            Err(policy::PolicyError::SpeculationUnavailable)
-        );
-        assert!(
-            PolicySnapshot::new(
-                PolicyVersion::new(8).expect("valid policy version"),
-                0,
-                2048,
-                StateTierPreference::Device,
-                SpeculationPolicy::Disabled,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn logical_state_manager_accounts_for_typed_allocations() {
         let device = DeviceId::new(0);
         let spec = KvStateSpec::new(1, 1, 2, 4, DataType::F16).expect("KV spec");
@@ -382,25 +263,5 @@ mod tests {
             .release(committed.kv().expect("KV state").handle().clone())
             .expect("release");
         assert_eq!(manager.used_bytes(StateLocation::Device(device)), Some(0));
-    }
-
-    #[test]
-    fn file_provider_verifies_artifact_metadata_without_reading_weights() {
-        let path = std::env::temp_dir().join(format!(
-            "engine-core-weight-{}-{}",
-            std::process::id(),
-            RequestId::new(7).expect("request ID").get()
-        ));
-        std::fs::write(&path, b"weight metadata probe").expect("write fixture");
-        let description = qwen_description();
-        let loader = FileWeightLoader::new(
-            &path,
-            WeightDescription::new(WeightFormat::Gguf, Quantization::GgufQ4Km),
-        );
-        let provider = FileModelProvider::load(description, &loader).expect("load provider");
-        assert_eq!(provider.artifact().byte_len(), 21);
-        assert_eq!(provider.artifact().source().as_path(), path);
-        assert_eq!(provider.description().architecture(), "qwen3.8-hybrid");
-        std::fs::remove_file(path).expect("remove fixture");
     }
 }

@@ -8,8 +8,8 @@
 //!
 //! What it does own on the scheduling side is its own executor seam: which request
 //! shapes it accepts, how many device bytes each accepted request holds, and the
-//! device-resident result a consumer must await before reading. [`request`] makes
-//! those decisions on the host, [`executor`] binds them to the batching runtime, and
+//! device-resident result a consumer must await before reading. `request` makes
+//! those decisions on the host, `executor` binds them to the batching runtime, and
 //! device execution consumes them rather than re-deriving them.
 //!
 //! The encoder exists in this repository as a second, materially different model

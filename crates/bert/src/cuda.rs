@@ -249,7 +249,7 @@ impl CudaBertEncoder {
     /// A failure that leaves device work running keeps that storage in the encoder's
     /// retirement list, because no caller may free storage it cannot prove complete.
     /// The caller that holds a shared-pool reservation should use
-    /// [`Self::enqueue`] instead, so the charge covering that storage travels with
+    /// the internal `enqueue` path instead, so the charge covering that storage travels with
     /// it.
     ///
     /// # Errors

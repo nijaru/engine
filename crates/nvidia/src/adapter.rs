@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use engine_core::PolicyVersion;
 use engine_core::backend::{
     BackendCapabilities, BackendError, BackendKind, BackendSubmissionId, ComputeBackend,
 };
@@ -9,7 +10,6 @@ use engine_core::execution::{
     ExecutionBatch, ExecutionBatchEvent, ExecutionEvent, ExecutionOutcome, ExecutionPlan,
     ExecutionSegment,
 };
-use engine_core::policy::PolicyVersion;
 use engine_core::state::InferenceStateSet;
 use engine_core::weights::WeightBinding;
 
@@ -296,11 +296,11 @@ impl<D: NvidiaDispatcher> ComputeBackend for NvidiaBackend<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_core::PolicyVersion;
     use engine_core::backend::{BackendFeatures, BackendId};
     use engine_core::device::DeviceId;
     use engine_core::execution::{ExecutionMetrics, ExecutionPhase, ExecutionStage};
     use engine_core::model::{ModelId, ModelRegionId};
-    use engine_core::policy::PolicyVersion;
     use engine_core::request::{RequestId, SamplingParams};
     use engine_core::state::{
         InferenceStateSet, KvStateSpec, LogicalStateManager, StateLocation, StateManager,

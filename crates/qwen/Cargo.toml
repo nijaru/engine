@@ -20,6 +20,10 @@ engine-gguf = { path = "../gguf", optional = true }
 engine-nvidia = { path = "../nvidia", optional = true }
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "cuda-13020", "cublas", "dynamic-loading"] }
 
+[[example]]
+name = "qwen_serving_bench"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
 

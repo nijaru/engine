@@ -101,7 +101,7 @@ pub enum Admission {
     Ready,
     /// No sequence resources were retained. Register before checking the
     /// blocking condition; the engine retries only when the source changes.
-    /// The driver observes this registration on its bounded poll interval.
+    /// The driver arms this registration on its bounded wake transport before parking.
     Deferred(ReadinessWait),
 }
 

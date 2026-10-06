@@ -40,7 +40,7 @@ before gate 3 integrates CUDA Rust kernels through it. Do not integrate a second
 new serving path around the legacy request API. Kernel gate 2 remains independent;
 none of the runtime tests claims it has passed. The older boundary descriptions
 below explain the retained comparison path during this transition. See
-[runtime redesign](runtime-redesign.md) and [roadmap](roadmap.md).
+[execution contracts](resource-protocol.md) and [roadmap](roadmap.md).
 
 ## Boundary review
 
