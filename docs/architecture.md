@@ -68,9 +68,10 @@ charge until a drain proves completion.
 
 `ribn-foundation` owns `BytePool`/`PoolLease`/`AllocationId`, shared readiness,
 parameter version labels and scalar metadata. Unused topology/materialization/placement
-metadata and the fixture-only operator registry are removed. AR uses a separate logical
-byte authority: common readiness is not unified cross-runtime accounting. A real shared
-encoder/AR pool and downstream-workspace progress proof remain unfinished.
+metadata and the fixture-only operator registry are removed. AR logical state and
+encoder reservations use this same byte authority; host tests cover supplied pools,
+atomic hybrid grants and sibling readiness. Production Qwen retains a private pool.
+Shared CUDA physical retirement and downstream-workspace progress remain unproven.
 
 ## Source owners
 

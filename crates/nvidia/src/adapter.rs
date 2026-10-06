@@ -555,7 +555,11 @@ mod tests {
             StateRequirement::FullAttentionKv(spec) => spec,
             StateRequirement::Recurrent(_) => unreachable!(),
         };
-        let mut manager = LogicalStateManager::new(device, 1024, 0);
+        let mut manager = LogicalStateManager::new(
+            device,
+            ribn_foundation::BytePool::new(1024).shared(),
+            ribn_foundation::BytePool::new(0).shared(),
+        );
         let kv = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("state allocation");

@@ -114,6 +114,7 @@ dependencies = [
  "engine-core",
  "engine-gguf",
  "engine-qwen",
+ "ribn-foundation",
 ]
 
 [[package]]
@@ -125,6 +126,7 @@ dependencies = [
  "engine-gguf",
  "engine-nvidia",
  "ribn",
+ "ribn-foundation",
  "sha2",
 ]
 

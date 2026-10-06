@@ -80,6 +80,30 @@ The synthetic [dispatch comparison](runtime-alignment/README.md#ar-preparation-r
 is separately bounded evidence. Re-run real Qwen numerical, lifecycle and serving gates
 when a device is available before qualifying this changed execution path.
 
+## AR reservation authority host gate
+
+AR's logical state manager now grants from supplied `BytePool` authorities.
+A hybrid bundle validates and receives one aggregate lease, shared by its component
+records until the last retires. Qwen no longer checks a free-byte snapshot before
+per-component allocation and rollback; the authority makes the atomic decision.
+
+Core host tests cover failed feasibility/duplicate validation without charge or wake,
+conservative bundle charging across partial release, invalid whole-set release,
+sibling grants and readiness, closure without returning live bytes, and charge retention
+when an unreleased logical owner disappears. Existing allocation-provenance and atomic
+prefix-commit coverage remains. Qwen tests cover a refused hybrid grant, waiting peer
+progress, and authority closure rejecting a waiter while its admitted peer completes.
+
+```sh
+cargo test -p engine-core --locked
+cargo test -p engine-qwen --locked
+```
+
+These are reservation/control tests, not a shared CUDA peak-memory qualification.
+Production Qwen retains its private pool, full-reachable reservation and contiguous
+storage. See [physical accounting and retirement](../docs/resource-protocol.md#encoder-preparation-and-prepared-resources)
+for partial-construction, event-creation failure and cross-stream release gaps.
+
 ## Shared text frontend
 
 `ribn-text` reuses the low-level runtime for raw prompt, chat-message, and token-ID

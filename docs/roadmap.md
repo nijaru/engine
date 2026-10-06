@@ -31,6 +31,7 @@ fixtures may establish control contracts without enabling an unqualified physica
 | 3. Real encoder preparation | BERT CUDA fixture through `ribn-batch`, shared byte leases, completion-owned results, uncertain-enqueue retirement and cancellation. [Encoder qualification](../benchmarks/encoder-qualification.md) |
 | 4a. Request-reachable continuation | Qwen charges prompt plus output reach, not maximum context. Three reference-matching requests fit a 500 MiB authority that cannot hold two context-sized charges. [Runtime evidence](../benchmarks/runtime-contract.md) |
 | 4b host preparation | Aggregate accepted ranges, credit refunds, parked readiness, local rejection and uncertain-retirement ownership through the real AR engine. Qwen validates/retains a full-reachable prepared batch; no dynamic physical growth. [Host gate](../benchmarks/runtime-contract.md#ar-pre-submit-preparation-host-gate) |
+| 4b host authority | AR reservations use supplied `BytePool` authorities with one atomic hybrid grant, sibling readiness and closure handling. Production Qwen keeps a private pool. [Host gate](../benchmarks/runtime-contract.md#ar-reservation-authority-host-gate) |
 | 4b prerequisite | Block-table attention **reads** qualified at `ee689d7`; production Qwen remains contiguous. [Addressing evidence](../benchmarks/runtime-contract.md#block-table-kv-addressing-2026-10-12-ee689d7) |
 
 Admission notification (`3e4dbec`) and shared batch/AR readiness (`e8e3b48`) are
@@ -58,10 +59,11 @@ paging code; a scalar prefix or block hash is not an allocation owner.
    indexes one shared contiguous K/V base per layer, not a vector of independent device
    allocations. Decide a bounded resident arena or qualify another addressing scheme.
    Arena bytes stay charged while resident; reusable slots have a separate occupancy
-   authority and cannot refund physical bytes. AR and encoder currently have separate
-   accounting, despite sharing readiness. Unify physical accounting before claiming a
-   bound across runtimes on one device. Include paged **writes**, block-table transfer
-   lifetime and all prepared lanes; read addressing alone is insufficient.
+   authority and cannot refund physical bytes. AR now uses the encoder's `BytePool`
+   mechanism with host-tested supplied authorities and atomic bundle grants. Production
+   Qwen still owns a private pool; qualify physical retirement before sharing it with
+   encoder execution or claiming a bound across runtimes on one device. Include paged
+   **writes**, block-table transfer lifetime and all prepared lanes; read addressing alone is insufficient.
 2. **Integrate physical growth with AR preparation.** The host control seam now accepts
    positive ranges, refunds unused credits, parks unaffordable rows with readiness and
    rejects impossible rows locally. Whole-report validation and abandoned/uncertain
@@ -161,8 +163,11 @@ Checkpoint recovery and distributed training require separate qualification.
 - **Encoder accounting:** partial allocation/upload construction and result/quarantine
   teardown need charge retention through proven backing release. cudarc stream-ordered
   free is not instantaneous physical capacity for sibling streams. Existing post-enqueue
-  fault injection does not cover partial construction; add that device gate before a
-  hard cross-stream peak-memory claim.
+  fault injection does not cover partial construction. Locked cudarc 0.19.9 can also
+  lose the allocated pointer when tracking-event creation fails: a stream drain cannot
+  release it. Resolve that failure owner and add partial-construction/teardown gates
+  before a hard cross-stream peak-memory claim. See the
+  [physical accounting contract](resource-protocol.md#encoder-preparation-and-prepared-resources).
 - **Artifact loading:** HF shard-cache count does not bound peak bytes; incoming loads and
   retained clones overlap eviction. Establish streaming/byte-aware ownership before
   large-model claims.

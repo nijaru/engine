@@ -182,14 +182,19 @@ fn fixture_requirements() -> Vec<StateRequirement> {
 }
 
 fn model_with_capacity(control: Arc<Mutex<Control>>, capacity: u64) -> Model {
-    model_with_requirements(control, capacity, fixture_requirements())
+    model_with_requirements(
+        control,
+        ribn_foundation::BytePool::new(capacity).shared(),
+        fixture_requirements(),
+    )
 }
 
 fn model_with_requirements(
     control: Arc<Mutex<Control>>,
-    capacity: u64,
+    pool: Arc<ribn_foundation::BytePool>,
     requirements: Vec<StateRequirement>,
 ) -> Model {
+    let capacity = pool.capacity();
     let device = DeviceId::new(0);
     let model = ModelId::new("Qwen adapter fixture").unwrap();
     let backend = BackendId::new("host-fixture").unwrap();
@@ -230,7 +235,11 @@ fn model_with_requirements(
         },
         info,
         plan,
-        state::manager(device, capacity),
+        engine_core::LogicalStateManager::new(
+            device,
+            pool,
+            ribn_foundation::BytePool::new(0).shared(),
+        ),
         100,
     ))
 }
@@ -243,8 +252,12 @@ fn engine(control: Arc<Mutex<Control>>) -> Engine {
 }
 
 fn engine_with_capacity(control: Arc<Mutex<Control>>, capacity: u64) -> Engine {
+    engine_with_model(model_with_capacity(control, capacity))
+}
+
+fn engine_with_model(model: Model) -> Engine {
     Engine::new(
-        model_with_capacity(control, capacity),
+        model,
         EngineConfig {
             max_active_requests: 2,
             max_queued_requests: 2,
@@ -504,6 +517,31 @@ fn insufficient_continuation_capacity_waits_for_a_release_instead_of_failing() {
 }
 
 #[test]
+fn closed_continuation_authority_rejects_a_waiter_without_losing_its_live_peer() {
+    let control = Arc::new(Mutex::new(Control::default()));
+    let pool = ribn_foundation::BytePool::new(48).shared();
+    let model = model_with_requirements(control.clone(), Arc::clone(&pool), fixture_requirements());
+    let mut engine = engine_with_model(model);
+    let live = engine.enqueue(request(vec![1, 2, 3])).unwrap();
+    let waiter = engine.enqueue(request(vec![4, 5, 6])).unwrap();
+    engine.step().unwrap();
+    assert_eq!(pool.granted(), 48);
+    assert_eq!(control.lock().unwrap().admissions.len(), 2);
+    pool.close();
+    let events = drive(&mut engine);
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Finished { request, reason: FinishReason::Failed(diagnostic), .. }
+        if *request == waiter && diagnostic.to_string().contains("pool is closed")
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Finished { request, reason: FinishReason::Length, .. } if *request == live
+    )));
+    assert_eq!(control.lock().unwrap().admissions.len(), 3);
+    assert_eq!(pool.granted(), 0);
+    engine.shutdown().unwrap();
+}
+
+#[test]
 fn failed_hybrid_reservation_does_not_publish_its_own_readiness() {
     use engine_core::{ConvolutionStateShape, RecurrentMatrixShape, RecurrentStateSpec};
     let control = Arc::new(Mutex::new(Control::default()));
@@ -520,7 +558,11 @@ fn failed_hybrid_reservation_does_not_publish_its_own_readiness() {
         )
         .unwrap(),
     ));
-    let mut model = model_with_requirements(control, 176, requirements);
+    let mut model = model_with_requirements(
+        control,
+        ribn_foundation::BytePool::new(176).shared(),
+        requirements,
+    );
     let first = model
         .0
         .manager

@@ -174,17 +174,12 @@ impl<B: ComputeBackend> QwenExecution<B> {
                 "Qwen needs {required} continuation bytes, above the {capacity}-byte authority"
             )));
         }
-        // Check the whole bundle before allocating any component. Otherwise a
-        // failed recurrent allocation could roll back newly reserved KV and publish
-        // a release that wakes this same waiter despite no net capacity change.
-        let used = self
+        // The authority grants the whole bundle atomically, including when a
+        // sibling draws from this pool concurrently. A refused grant publishes nothing.
+        match self
             .manager
-            .used_bytes(StateLocation::Device(self.manager.device()))
-            .expect("validated device authority");
-        if required > capacity - used {
-            return Ok(None);
-        }
-        match state::allocate(&mut self.manager, &requirements) {
+            .allocate_set(&requirements, StateLocation::Device(self.manager.device()))
+        {
             Ok(state) => Ok(Some((state, Arc::from(requirements)))),
             Err(StateError::CapacityExceeded { .. }) => Ok(None),
             Err(error) => Err(model_error(error)),

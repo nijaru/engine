@@ -245,7 +245,11 @@ mod tests {
         let device = DeviceId::new(0);
         let spec = KvStateSpec::new(1, 1, 2, 4, DataType::F16).expect("KV spec");
         assert_eq!(spec.byte_size(), Some(32));
-        let mut manager = LogicalStateManager::new(device, 32, 0);
+        let mut manager = LogicalStateManager::new(
+            device,
+            ribn_foundation::BytePool::new(32).shared(),
+            ribn_foundation::BytePool::new(0).shared(),
+        );
         let state = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("first allocation");

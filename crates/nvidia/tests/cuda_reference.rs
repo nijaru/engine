@@ -1126,7 +1126,11 @@ fn allocates_distinct_physical_hybrid_state_buffers() {
     let device = DeviceId::new(0);
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
-    let mut manager = LogicalStateManager::new(device, 1024, 0);
+    let mut manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(1024).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let kv = manager
         .allocate_kv(kv_spec, StateLocation::Device(device))
         .expect("KV allocation");
@@ -5921,7 +5925,11 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
 
     // Eager reference: ROWS independent requests, one segment per submit,
     // running through the per-row seam.
-    let mut eager_manager = LogicalStateManager::new(device, state_bytes * ROWS as u64, 0);
+    let mut eager_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes * ROWS as u64).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut eager_states = (0..ROWS)
         .map(|_| allocate_state(&mut eager_manager))
         .collect::<Vec<_>>();
@@ -5941,7 +5949,11 @@ fn serves_multi_row_batches_asynchronously_matching_the_eager_path() {
 
     // Batched path: the same ROWS requests through one dispatcher, whose
     // submit seam picks the batched executor for all-decode batches.
-    let mut batched_manager = LogicalStateManager::new(device, state_bytes * ROWS as u64, 0);
+    let mut batched_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes * ROWS as u64).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut batched_states = (0..ROWS)
         .map(|_| allocate_state(&mut batched_manager))
         .collect::<Vec<_>>();
@@ -6442,7 +6454,11 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
     // Reference: eager dispatcher, driven through the same backend boundary.
     // The logical state manager stays alive so each completed step can commit
     // its new prefix position, exactly like the serving runtime does.
-    let mut eager_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut eager_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut eager_state = allocate_state(&mut eager_manager);
     let eager_executor = CudaQwen35Decode::new(
         &context,
@@ -6459,7 +6475,11 @@ fn serves_qwen_tokens_asynchronously_matching_the_eager_path() {
         NvidiaBackend::new(capabilities.clone(), eager_dispatcher).expect("eager backend");
 
     // Async: the new pinned-output completion path.
-    let mut async_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut async_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut async_state = allocate_state(&mut async_manager);
     let async_executor = CudaQwen35Decode::new(
         &context,
@@ -6781,7 +6801,11 @@ fn serves_chunked_prefill_matching_the_serial_path() {
         InferenceStateSet::new(states).expect("state set")
     };
 
-    let mut serial_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut serial_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut serial_state = allocate_state(&mut serial_manager);
     let serial_executor = CudaQwen35Decode::new(
         &context,
@@ -6797,7 +6821,11 @@ fn serves_chunked_prefill_matching_the_serial_path() {
     let mut serial_backend =
         NvidiaBackend::new(capabilities.clone(), serial_dispatcher).expect("serial backend");
 
-    let mut chunked_manager = LogicalStateManager::new(device, state_bytes, 0);
+    let mut chunked_manager = LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(state_bytes).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    );
     let mut chunked_state = allocate_state(&mut chunked_manager);
     let chunked_executor = CudaQwen35Decode::new(
         &context,
@@ -7030,7 +7058,11 @@ fn retires_in_flight_members_without_losing_peers_or_state() {
             ),
         );
         let mut backend = NvidiaBackend::new(caps, dispatcher).unwrap();
-        let mut manager = LogicalStateManager::new(device, state_bytes * members as u64, 0);
+        let mut manager = LogicalStateManager::new(
+            device,
+            ribn_foundation::BytePool::new(state_bytes * members as u64).shared(),
+            ribn_foundation::BytePool::new(0).shared(),
+        );
         let mut states: Vec<_> = (0..members)
             .map(|_| {
                 let families = requirements

@@ -68,8 +68,9 @@ The real BERT device path subsequently established owning leases, completion
 dependencies, partial-enqueue retirement and cancellation through `ribn-batch`.
 A dequeued result keeps its charge until its owner safely releases storage. See
 [encoder qualification](../benchmarks/encoder-qualification.md) for tested geometry
-and failure paths. AR still uses a separate logical capacity authority; sharing one
-physical pool across AR and encoder execution remains unfinished.
+and failure paths. AR now uses the same `BytePool` mechanism, with atomic hybrid
+reservation and supplied-authority host coverage. Qwen still uses a private pool;
+completion-safe shared physical accounting across AR and encoder remains unfinished.
 
 ## Composition
 

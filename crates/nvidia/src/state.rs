@@ -1016,7 +1016,11 @@ mod tests {
     fn fresh_materialization_rejects_nonzero_logical_prefix() {
         let device = DeviceId::new(0);
         let spec = KvStateSpec::new(1, 1, 2, 8, DataType::F16).expect("KV spec");
-        let mut manager = LogicalStateManager::new(device, 1024, 0);
+        let mut manager = LogicalStateManager::new(
+            device,
+            ribn_foundation::BytePool::new(1024).shared(),
+            ribn_foundation::BytePool::new(0).shared(),
+        );
         let kv = manager
             .allocate_kv(spec, StateLocation::Device(device))
             .expect("logical KV state");

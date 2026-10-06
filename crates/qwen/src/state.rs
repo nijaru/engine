@@ -1,51 +1,4 @@
-use engine_core::{
-    DeviceId, InferenceState, InferenceStateSet, LogicalStateManager, StateError, StateLocation,
-    StateManager, StateRequirement,
-};
-
-/// Allocate the old Qwen bundle transactionally while it remains in use.
-/// A rejected admission must not leave even a logical capacity reservation.
-pub(crate) fn allocate(
-    manager: &mut LogicalStateManager,
-    requirements: &[StateRequirement],
-) -> Result<InferenceStateSet, StateError> {
-    let location = StateLocation::Device(manager.device());
-    let mut states: Vec<InferenceState> = Vec::with_capacity(requirements.len());
-    for requirement in requirements {
-        let result = match *requirement {
-            StateRequirement::FullAttentionKv(spec) => manager
-                .allocate_kv(spec, location)
-                .map(InferenceState::from),
-            StateRequirement::Recurrent(spec) => manager
-                .allocate_recurrent(spec, location)
-                .map(InferenceState::from),
-        };
-        match result {
-            Ok(state) => states.push(state),
-            Err(error) => {
-                for state in &states {
-                    manager
-                        .release(state.handle().clone())
-                        .expect("owned fresh allocation");
-                }
-                return Err(error);
-            }
-        }
-    }
-    let handles = states
-        .iter()
-        .map(|state| state.handle().clone())
-        .collect::<Vec<_>>();
-    match InferenceStateSet::new(states) {
-        Ok(set) => Ok(set),
-        Err(error) => {
-            for handle in handles {
-                manager.release(handle).expect("owned fresh allocation");
-            }
-            Err(error)
-        }
-    }
-}
+use engine_core::{DeviceId, LogicalStateManager, StateRequirement};
 
 pub(crate) fn capacity(requirements: &[StateRequirement], sequences: usize) -> Option<u64> {
     requirements
@@ -57,13 +10,17 @@ pub(crate) fn capacity(requirements: &[StateRequirement], sequences: usize) -> O
 }
 
 pub(crate) fn manager(device: DeviceId, bytes: u64) -> LogicalStateManager {
-    LogicalStateManager::new(device, bytes, 0)
+    LogicalStateManager::new(
+        device,
+        ribn_foundation::BytePool::new(bytes).shared(),
+        ribn_foundation::BytePool::new(0).shared(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_core::{DataType, KvStateSpec};
+    use engine_core::{DataType, KvStateSpec, StateError, StateLocation, StateManager};
 
     fn kv(tokens: u32) -> StateRequirement {
         StateRequirement::FullAttentionKv(KvStateSpec::new(1, 1, 2, tokens, DataType::F16).unwrap())
@@ -75,7 +32,7 @@ mod tests {
         let mut manager = manager(DeviceId::new(0), 32);
         let wait = manager.capacity_wait(location).unwrap();
         let host_wait = manager.capacity_wait(StateLocation::Host).unwrap();
-        let mut state = allocate(&mut manager, &[kv(4)]).unwrap();
+        let mut state = manager.allocate_set(&[kv(4)], location).unwrap();
         let old_handle = state.kv().unwrap().handle().clone();
         manager.commit(&mut state, 1).unwrap();
         assert!(!wait.changed());
@@ -87,20 +44,25 @@ mod tests {
     }
 
     #[test]
-    fn allocation_and_bundle_validation_failures_restore_capacity() {
+    fn refused_and_invalid_bundles_preserve_capacity_without_publication() {
         let location = StateLocation::Device(DeviceId::new(0));
         let mut manager = manager(DeviceId::new(0), 32);
+        let wait = manager.capacity_wait(location).unwrap();
         assert!(matches!(
-            allocate(&mut manager, &[kv(2), kv(4)]),
+            manager.allocate_set(&[kv(2), kv(4)], location),
             Err(StateError::CapacityExceeded { .. })
         ));
         assert_eq!(manager.used_bytes(location), Some(0));
         assert_eq!(
-            allocate(&mut manager, &[kv(2), kv(2)]),
+            manager.allocate_set(&[kv(2), kv(2)], location),
             Err(StateError::DuplicateRequirement)
         );
         assert_eq!(manager.used_bytes(location), Some(0));
-        let state = allocate(&mut manager, &[kv(4)]).unwrap();
+        assert!(
+            !wait.changed(),
+            "refused and invalid bundles never create a rollback wake"
+        );
+        let state = manager.allocate_set(&[kv(4)], location).unwrap();
         assert_eq!(manager.used_bytes(location), Some(32));
         manager.release_set(&state).unwrap();
         assert_eq!(manager.used_bytes(location), Some(0));

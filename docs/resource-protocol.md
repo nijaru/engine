@@ -145,6 +145,13 @@ no retained submission carries their charge. Post-enqueue qualification does not
 cover that path or prove global physical-byte availability after normal result Drop.
 These paths need completion-safe charge retirement before a hard cross-stream peak
 bound is claimed; safe ordering of device accesses alone is not physical release.
+Locked [cudarc 0.19.9](https://github.com/coreylowman/cudarc/blob/08ae53f143b635e77df5f68f273b7e277632c449/src/driver/safe/core.rs#L1534-L1560)
+also calls `malloc_async`/`malloc_sync` before creating tracking
+events in `CudaStream::alloc`. If event creation fails, it returns without a `CudaSlice`
+owner for the pointer. A stream drain alone cannot free that unreachable allocation;
+allocation failure cannot uniformly be classified as a clean refusal. Resolve the
+allocator failure owner as well as stream-ordered free completion before claiming a
+hard shared CUDA bound.
 
 1. **One authority, owning byte leases.** The first concrete authority is a shared byte
    pool that grants an owning, non-duplicable lease per reservation. Moving a lease
@@ -210,6 +217,25 @@ byte authority per shared device pool. Current Qwen logical accounting and encod
 `BytePool` accounting remain separate; common readiness does not establish a shared
 capacity bound. Resident backing and reusable slot occupancy obey the distinction
 above.
+
+### AR reservation authority
+
+AR's transitional state manager uses supplied `BytePool` authorities, not another
+counter/epoch implementation. Bundle allocation validates all components and grants
+one aggregate lease before committing any allocation records. Failed feasibility or
+validation retains no grant and publishes no artificial rollback wake. The lease is
+shared only among that bundle's manager records: it charges once and stays reserved
+until the last component retires. Individual allocations have independent grants.
+
+Pool usage/readiness includes every owner of that authority, not just one manager.
+Closure wakes waiters and refuses new allocation while live charges remain. A logical
+handle does not prove physical retirement. Explicit release is allowed only after its
+backend establishes safe reuse; dropping a manager with unreleased records retains
+those charges rather than silently refunding memory whose lifetime it cannot prove.
+
+Production Qwen still constructs a private continuation pool. No shared CUDA deployment
+or resident-byte bound follows from this common mechanism: backend teardown and
+partial-construction retirement must qualify before sharing it with the encoder.
 
 1. **A declaration is a shape and a bound.** A model declares each continuation
    component's shape and maximum capacity. A concrete state materializes a capacity
