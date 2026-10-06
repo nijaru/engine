@@ -471,6 +471,13 @@ impl CudaQwen35ServingDispatcher {
         if batch.len() <= 1 || batch.len() > crate::quantized::MAX_BATCH_MEMBERS {
             return false;
         }
+        // The dense batched attention lane uses one uniform KV stride. Request-
+        // reachable allocations may have different capacities even in one model.
+        // Those valid rows must stay on the per-row lane, not fault the executor.
+        let kv_spec = states
+            .first()
+            .and_then(InferenceStateSet::kv)
+            .map(engine_core::KvState::spec);
         batch
             .segments()
             .iter()
@@ -484,6 +491,7 @@ impl CudaQwen35ServingDispatcher {
                         .and_then(engine_core::ExecutionTokenInput::decode_token)
                         .is_some()
                     && state.token_position().is_some()
+                    && state.kv().map(engine_core::KvState::spec) == kv_spec
             })
     }
 
@@ -960,11 +968,66 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
 }
 
 #[cfg(test)]
-mod chunk_tests {
-    use super::chunked_prefix_len;
+mod tests {
+    use super::{CudaQwen35ServingDispatcher, chunked_prefix_len};
+    #[test]
+    fn batch_decode_selection_respects_concrete_kv_capacity() {
+        use engine_core::{
+            DataType, DeviceId, ExecutionBatch, ExecutionPhase, ExecutionSegment,
+            ExecutionTokenInput, KvStateSpec, LogicalStateManager, RequestId, SamplingParams,
+            StateLocation, StateManager, StateRequirement,
+        };
+        let device = DeviceId::new(0);
+        let location = StateLocation::Device(device);
+        let mut manager = LogicalStateManager::new(
+            device,
+            ribn_foundation::BytePool::new(1024).shared(),
+            ribn_foundation::BytePool::new(0).shared(),
+        );
+        for (capacities, batchable) in [([4, 4], true), ([4, 5], false)] {
+            let mut states = capacities
+                .into_iter()
+                .map(|capacity| {
+                    manager
+                        .allocate_set(
+                            &[StateRequirement::FullAttentionKv(
+                                KvStateSpec::new(1, 1, 2, capacity, DataType::F16).unwrap(),
+                            )],
+                            location,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            manager.commit_batch(&mut states, &[1, 1]).unwrap();
+            let segments = states
+                .iter()
+                .enumerate()
+                .map(|(index, state)| {
+                    ExecutionSegment::new(
+                        RequestId::new(u64::try_from(index + 1).unwrap()).unwrap(),
+                        ExecutionPhase::Decode,
+                        1,
+                        1,
+                        1,
+                        state.requirements(),
+                    )
+                    .unwrap()
+                    .with_token_input(ExecutionTokenInput::Decode { token: 7 })
+                    .unwrap()
+                    .with_sampling(SamplingParams::greedy(None))
+                })
+                .collect();
+            let batch = ExecutionBatch::new(segments).unwrap();
+            assert_eq!(
+                CudaQwen35ServingDispatcher::batch_is_batchable(&batch, &states),
+                batchable
+            );
+            for state in &states {
+                manager.release_set(state).unwrap();
+            }
+        }
+    }
 
-    /// A sampling segment must keep its final token on the batch-1 path: that
-    /// token is the only one whose logits the output path reads.
     #[test]
     fn chunked_prefix_keeps_the_sampling_token_serial() {
         for (token_count, members, expected) in [

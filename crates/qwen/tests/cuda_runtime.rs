@@ -81,7 +81,12 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
         (8, true),
         (9, true),
     ] {
-        run_case(&model, &reference, concurrency, cancel_decode);
+        run_case(
+            &model,
+            &reference,
+            &vec![u32::try_from(reference.output.len()).unwrap(); concurrency],
+            cancel_decode,
+        );
     }
 }
 
@@ -174,8 +179,23 @@ fn owned_driver_preserves_reference_with_stalled_and_abandoned_peers() {
     owner.shutdown().unwrap();
 }
 
-fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decode: bool) {
-    let max_output_tokens = u32::try_from(reference.output.len()).unwrap();
+#[test]
+#[ignore = "requires an idle CUDA GPU, RIBN_MODEL, and independently recorded RIBN_REFERENCE token fixture"]
+fn mixed_request_reaches_preserve_reference_and_cancelled_peers() {
+    let model = std::env::var("RIBN_MODEL").expect("RIBN_MODEL GGUF path");
+    let fixture = std::env::var("RIBN_REFERENCE").expect("RIBN_REFERENCE fixture path");
+    let reference = reference(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    assert!(reference.output.len() >= 8);
+    // Different output budgets create different concrete KV capacities even
+    // with identical prompts. Cancellation leaves two compatible survivors.
+    for cancel_decode in [false, true] {
+        run_case(&model, &reference, &[4, 8, 8], cancel_decode);
+    }
+}
+
+fn run_case(model: &str, reference: &Reference, budgets: &[u32], cancel_decode: bool) {
+    let concurrency = budgets.len();
+    let max_output_tokens = *budgets.iter().max().unwrap();
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
     let context_tokens = prompt_tokens.checked_add(max_output_tokens).unwrap();
     let prepared = QwenCuda::load_gguf(
@@ -201,8 +221,9 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
         SchedulePolicy::default(),
     )
     .unwrap();
-    let requests = (0..concurrency)
-        .map(|_| {
+    let requests = budgets
+        .iter()
+        .map(|&max_output_tokens| {
             engine
                 .enqueue(TokenRequest::new(
                     reference.prompt.clone(),
@@ -252,7 +273,7 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
         std::thread::yield_now();
     }
     assert_eq!(engine.status().active_sequences, 0);
-    for request in requests {
+    for (request, &budget) in requests.into_iter().zip(budgets) {
         if Some(request) == cancelled {
             assert_eq!(finished[&request], FinishReason::Cancelled);
             // Final prefill's already committed output remains deliverable;
@@ -262,12 +283,13 @@ fn run_case(model: &str, reference: &Reference, concurrency: usize, cancel_decod
                 outputs[&request],
                 reference.output[..outputs[&request].len()]
             );
-            assert!(outputs[&request].len() < reference.output.len());
+            assert!(outputs[&request].len() < usize::try_from(budget).unwrap());
         } else {
             assert_eq!(finished[&request], FinishReason::Length);
             assert_eq!(
-                outputs[&request], reference.output,
-                "concurrency {concurrency}"
+                outputs[&request],
+                reference.output[..usize::try_from(budget).unwrap()],
+                "concurrency {concurrency}, budget {budget}"
             );
         }
     }
