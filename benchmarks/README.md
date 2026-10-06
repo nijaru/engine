@@ -114,6 +114,54 @@ AR admission and event observation. The effective batch-token limit is printed.
 This fixed-arrival sweep is not representative online serving evidence, and device
 execution of the migrated harness remains pending.
 
+### Mixed-arrival native traces
+
+Replay a finite open-loop workload through the same AR engine:
+
+```sh
+WORKLOAD=benchmarks/workloads/qwen-mixed-arrivals.json \
+QUEUED_REQUESTS=4 CONCURRENCIES="1 2 4" \
+CONTINUATION_CAPACITY_BYTES=524288000 \
+TTFT_SLO_MS=5000 ITL_SLO_MS=200 E2E_SLO_MS=10000 \
+ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
+bash benchmarks/run-qwen-serving-sweep.sh
+```
+
+Trace mode defaults to the qualified warp GEMV and production same-sequence prefill
+chunking; the old burst sweep retains its scalar-script/serial-prefill baseline.
+The example accepts `--prefill-chunk=off` for a serial comparison.
+
+A workload is a JSON array. Each row specifies a nondecreasing `arrival_ms`,
+positive `output_tokens`, a `prompt_fixture` path relative to the workload file,
+and optional `prompt_tokens` selecting a nonempty fixture prefix. Fixture files use
+the three-line artifact/prompt/reference format in
+[`crates/qwen/tests/fixtures`](../crates/qwen/tests/fixtures/README.md).
+The trace supplies request lengths; do not combine it with burst prompt/token flags.
+
+`--concurrency` bounds active requests; `--queue-capacity` bounds additional requests
+(default zero). `--continuation-capacity-bytes` optionally constrains the model's private
+continuation authority. Rejected arrivals are counted, never delayed or retried.
+TTFT and E2E start at the **planned arrival**, so host dispatch lateness is included
+rather than erased; submit-lag statistics expose that lateness. A blocking engine step
+can delay actual submission, so this is not an independent network load generator.
+ITL measures successive host-observed token events. Successful-request distributions
+report nearest-rank p50/p95/p99; failures and rejections are separate. SLO goodput counts
+completed requests satisfying every supplied TTFT, maximum-ITL and E2E threshold.
+A one-token request has no ITL interval.
+
+The script writes JSON with configuration, workload and per-request outcomes alongside
+raw logs and environment metadata. Direct invocation uses `--workload=PATH`,
+`--result-json=PATH` (a new file, never overwriting inputs/results) and optional
+`--ttft-slo-ms`, `--itl-slo-ms`, `--e2e-slo-ms`.
+Inputs are preloaded; model load and client-bookkeeping initialization are outside the
+arrival timeline. There is no execution warmup. Reservation capacity and device-free
+snapshots are **not** a measured physical peak.
+
+The checked-in eight-request trace is a heterogeneous smoke workload, not steady-state
+traffic or competitive evidence. It excludes HTTP and tokenization. Use matched endpoint
+load generators above for serving comparisons. Its initial device evidence and the
+heterogeneous-capacity regression are in the [runtime contract](runtime-contract.md#mixed-arrival-native-qwen-gate).
+
 ## Qwen multi-token prefill gate
 
 Before selecting the experimental same-sequence Qwen prefill path in serving, follow

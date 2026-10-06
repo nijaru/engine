@@ -127,6 +127,8 @@ dependencies = [
  "engine-nvidia",
  "ribn",
  "ribn-foundation",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

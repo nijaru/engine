@@ -2,7 +2,8 @@
 //!
 //! Compatible decode rows use backend-native batch lanes; mixed batches and
 //! single rows stay per-row. This is a bounded timing/probe workload, not a
-//! representative mixed-arrival serving benchmark or device qualification.
+//! representative serving benchmark or device qualification. `--workload` adds
+//! finite open-loop mixed arrivals over the same Engine (no HTTP/tokenization).
 //!
 //! ```text
 //! ENGINE_QWEN_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
@@ -11,7 +12,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine_nvidia::GemvMode;
@@ -39,117 +39,15 @@ const DEFAULT_OUTPUT_TOKENS: u32 = 32;
 const PREFILL_CHUNK_TOKENS: u32 = 16;
 const WEIGHT_BUDGET_BYTES: u64 = 20_u64 << 30;
 
-struct Options {
-    concurrency: usize,
-    output_tokens: u32,
-    prompt: Arc<[u32]>,
-    fixture_prompt: bool,
-    gemv_mode: GemvMode,
-    prefill_chunk: Option<usize>,
-    print_tokens: bool,
-    divergence_probe: bool,
-    context_tokens: u32,
-}
+#[path = "serving_bench/options.rs"]
+mod options;
+#[path = "serving_bench/trace.rs"]
+mod trace;
+use options::Options;
 
-impl Options {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let concurrency = parse_usize(arguments, "--concurrency=", DEFAULT_CONCURRENCY)?;
-        let output_tokens = parse_u32(arguments, "--tokens=", DEFAULT_OUTPUT_TOKENS)?;
-        if concurrency == 0 || output_tokens == 0 {
-            return Err("concurrency and token count must be greater than zero".to_owned());
-        }
-        let fixture_tokens = arguments
-            .iter()
-            .find_map(|argument| argument.strip_prefix("--prompt-fixture="))
-            .map(read_fixture_prompt)
-            .transpose()?;
-        let prompt_tokens = parse_usize(
-            arguments,
-            "--prompt-tokens=",
-            fixture_tokens.as_ref().map_or(PROMPT.len(), Vec::len),
-        )?;
-        if prompt_tokens == 0 {
-            return Err("prompt token count must be greater than zero".to_owned());
-        }
-        let gemv_mode = parse_gemv_mode(arguments)?;
-        let prefill_chunk = arguments
-            .iter()
-            .find_map(|argument| argument.strip_prefix("--prefill-chunk="))
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .map_err(|_| format!("--prefill-chunk expects a number, got {value}"))
-            })
-            .transpose()?;
-        if prefill_chunk == Some(0) {
-            return Err("--prefill-chunk must be greater than zero".to_owned());
-        }
-        let print_tokens = arguments
-            .iter()
-            .any(|argument| argument == "--print-tokens");
-        let divergence_probe = arguments
-            .iter()
-            .any(|argument| argument == "--divergence-probe");
-        if divergence_probe && !print_tokens {
-            return Err(
-                "--divergence-probe requires --print-tokens to emit comparable token streams"
-                    .to_owned(),
-            );
-        }
-        let longest_prompt = if divergence_probe {
-            PROBE_PROMPTS
-                .iter()
-                .map(|prompt| prompt.len())
-                .max()
-                .expect("six prompts")
-        } else {
-            prompt_tokens
-        };
-        let context_tokens = u32::try_from(longest_prompt)
-            .map_err(|_| "prompt length does not fit the runtime".to_owned())?
-            .checked_add(output_tokens)
-            .ok_or_else(|| "prompt plus output budget overflowed".to_owned())?;
-        // Without a fixture, repeat the fixed prompt. This is a timing fixture,
-        // not real prompt content. Fixture lengths always select a prefix.
-        let prompt = match &fixture_tokens {
-            Some(tokens) => {
-                if tokens.len() < prompt_tokens {
-                    return Err(format!(
-                        "prompt fixture holds {} tokens, fewer than the requested {prompt_tokens}",
-                        tokens.len()
-                    ));
-                }
-                Arc::from(&tokens[..prompt_tokens])
-            }
-            None => Arc::from(
-                PROMPT
-                    .iter()
-                    .copied()
-                    .cycle()
-                    .take(prompt_tokens)
-                    .collect::<Vec<_>>(),
-            ),
-        };
-        Ok(Self {
-            concurrency,
-            output_tokens,
-            prompt,
-            fixture_prompt: fixture_tokens.is_some(),
-            gemv_mode,
-            prefill_chunk,
-            print_tokens,
-            divergence_probe,
-            context_tokens,
-        })
-    }
-
-    fn prompt_for(&self, index: usize) -> Arc<[u32]> {
-        if self.divergence_probe {
-            Arc::from(PROBE_PROMPTS[index % PROBE_PROMPTS.len()])
-        } else {
-            Arc::clone(&self.prompt)
-        }
-    }
+enum RunMeasurements {
+    Burst(Measurements),
+    Trace(trace::Measurements),
 }
 
 fn main() {
@@ -167,12 +65,21 @@ fn run() -> Result<(), String> {
         .find_map(|argument| argument.strip_prefix("--model=").map(str::to_owned))
         .or_else(|| std::env::var("ENGINE_QWEN_GGUF").ok())
         .ok_or_else(|| "set ENGINE_QWEN_GGUF or pass --model=/path/to/model.gguf".to_owned())?;
-    let input_budget = u64::from(options.context_tokens - options.output_tokens)
-        .checked_mul(u64::try_from(options.concurrency).map_err(|_| "concurrency is too large")?)
+    let max_prompt_tokens = options.workload.as_ref().map_or_else(
+        || options.context_tokens - options.output_tokens,
+        |workload| workload.max_prompt_tokens,
+    );
+    let request_capacity = options
+        .concurrency
+        .checked_add(options.queue_capacity)
+        .ok_or("request capacity overflowed")?;
+    let input_budget = u64::from(max_prompt_tokens)
+        .checked_mul(u64::try_from(request_capacity).map_err(|_| "request capacity is too large")?)
         .ok_or_else(|| "aggregate input token budget overflowed".to_owned())?;
     let event_budget = options
         .concurrency
-        .checked_mul(2)
+        .checked_add(options.queue_capacity)
+        .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| "aggregate event budget overflowed".to_owned())?;
     let batch_tokens = u32::try_from(options.concurrency)
         .ok()
@@ -181,21 +88,23 @@ fn run() -> Result<(), String> {
 
     let load_started = Instant::now();
     let prepared = QwenCuda::load_gguf(
-        model_path,
+        &model_path,
         QwenLoadOptions {
             context_tokens: options.context_tokens,
             max_sequences: options.concurrency,
             gemv_mode: options.gemv_mode,
-            // Preserve the benchmark's serial default, independently of the
-            // production loader's enabled-by-default same-sequence lane.
+            // Burst probes preserve their serial baseline; trace traffic uses
+            // the production prefill default unless explicitly set to off.
             prefill_chunk_members: options.prefill_chunk,
             weight_budget_bytes: Some(WEIGHT_BUDGET_BYTES),
+            continuation_capacity_bytes: options.continuation_capacity_bytes,
             ..QwenLoadOptions::default()
         },
     )
     .map_err(|error| error.to_string())?;
     let load_elapsed = load_started.elapsed();
     let memory = prepared.memory_report();
+    let artifact = prepared.info().name.clone();
     let policy = SchedulePolicy {
         max_batch_tokens: batch_tokens.min(prepared.info().limits.max_batch_tokens),
         prefill_chunk_tokens: PREFILL_CHUNK_TOKENS,
@@ -205,7 +114,7 @@ fn run() -> Result<(), String> {
         prepared,
         EngineConfig {
             max_active_requests: options.concurrency,
-            max_queued_requests: 0,
+            max_queued_requests: options.queue_capacity,
             max_queued_input_tokens: input_budget,
             max_buffered_events: event_budget,
             max_events_per_request: 2,
@@ -215,7 +124,16 @@ fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     // Include enqueue errors in the explicit shutdown path. A failed shutdown
     // leaves Engine owning retirement; its defensive Drop retains uncertain work.
-    let measured = measure(&mut engine, &options);
+    let measured = match &options.workload {
+        Some(workload) => trace::measure(
+            &mut engine,
+            workload,
+            &options.objectives,
+            options.print_tokens,
+        )
+        .map(RunMeasurements::Trace),
+        None => measure(&mut engine, &options).map(RunMeasurements::Burst),
+    };
     let shutdown = engine
         .shutdown()
         .map_err(|error| format!("shutdown: {error}"));
@@ -224,13 +142,73 @@ fn run() -> Result<(), String> {
         (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
         (Err(error), Err(shutdown)) => return Err(format!("{error}; {shutdown}")),
     };
-    report(
-        &options,
-        &measured,
-        load_elapsed,
-        memory.reserved_sequence_bytes,
-        policy,
+    match measured {
+        RunMeasurements::Burst(measured) => report(
+            &options,
+            &measured,
+            load_elapsed,
+            memory.reserved_sequence_bytes,
+            policy,
+        ),
+        RunMeasurements::Trace(measured) => {
+            report_trace(
+                &options,
+                &measured,
+                &model_path,
+                &artifact,
+                load_elapsed,
+                memory,
+                policy,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn report_trace(
+    options: &Options,
+    measured: &trace::Measurements,
+    model_path: &str,
+    artifact: &str,
+    load_elapsed: Duration,
+    memory: engine_qwen::MemoryReport,
+    policy: SchedulePolicy,
+) -> Result<(), String> {
+    measured.print();
+    println!(
+        "  continuation capacity: {} bytes (reservation bound, not measured peak)",
+        memory.reserved_sequence_bytes
     );
+    if options.print_tokens {
+        for (index, request) in measured.requests.iter().enumerate() {
+            println!(
+                "  tokens[{index}]: {}",
+                request
+                    .tokens
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+    if let Some(path) = &options.result_json {
+        let output = std::fs::File::create_new(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        serde_json::to_writer_pretty(output, &serde_json::json!({
+            "schema_version": 1, "surface": "direct_ar_engine_open_loop",
+            "model": model_path, "artifact": artifact, "load_seconds": load_elapsed.as_secs_f64(),
+            "max_active_requests": options.concurrency, "max_queued_requests": options.queue_capacity,
+            "batch_token_budget": policy.max_batch_tokens, "prefill_token_budget": policy.prefill_chunk_tokens,
+            "prefill_chunk_members": options.prefill_chunk, "gemv_mode": format!("{:?}", options.gemv_mode),
+            "continuation_capacity_bytes": memory.reserved_sequence_bytes,
+            "free_before_preparation_bytes": memory.free_before_preparation_bytes,
+            "free_after_preparation_bytes": memory.free_after_preparation_bytes,
+            "objectives": options.objectives,
+            "workload": options.workload.as_ref().expect("trace measurements").inputs,
+            "measurements": measured,
+        })).map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -414,63 +392,6 @@ fn report(
     }
 }
 
-/// Read the fixture format used in `crates/qwen/tests/fixtures`: artifact
-/// identity, prompt token IDs, then reference continuation (unused for timing).
-fn read_fixture_prompt(path: &str) -> Result<Vec<u32>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("read prompt fixture {path}: {error}"))?;
-    let mut lines = text.lines();
-    lines
-        .next()
-        .ok_or_else(|| format!("prompt fixture {path} has no identity line"))?;
-    lines
-        .next()
-        .ok_or_else(|| format!("prompt fixture {path} has no prompt line"))?
-        .split_whitespace()
-        .map(|token| {
-            token
-                .parse::<u32>()
-                .map_err(|error| format!("prompt fixture {path} token: {error}"))
-        })
-        .collect()
-}
-
-fn parse_usize(arguments: &[String], prefix: &str, default: usize) -> Result<usize, String> {
-    arguments
-        .iter()
-        .find_map(|argument| argument.strip_prefix(prefix))
-        .map_or(Ok(default), |value| {
-            value
-                .parse::<usize>()
-                .map_err(|_| format!("{prefix} expects an integer"))
-        })
-}
-
-fn parse_u32(arguments: &[String], prefix: &str, default: u32) -> Result<u32, String> {
-    arguments
-        .iter()
-        .find_map(|argument| argument.strip_prefix(prefix))
-        .map_or(Ok(default), |value| {
-            value
-                .parse::<u32>()
-                .map_err(|_| format!("{prefix} expects an integer"))
-        })
-}
-
-fn parse_gemv_mode(arguments: &[String]) -> Result<GemvMode, String> {
-    arguments
-        .iter()
-        .find_map(|argument| argument.strip_prefix("--gemv="))
-        .map_or(Ok(GemvMode::default()), |value| match value {
-            "scalar" => Ok(GemvMode::Scalar),
-            "warp" => Ok(GemvMode::Warp),
-            "int-dot" => Ok(GemvMode::IntegerDot),
-            other => Err(format!(
-                "--gemv expects scalar, warp, or int-dot, got {other}"
-            )),
-        })
-}
-
 fn duration_mean_max(values: &[Duration]) -> (Duration, Duration) {
     if values.is_empty() {
         return (Duration::ZERO, Duration::ZERO);
@@ -486,6 +407,74 @@ fn duration_mean_max(values: &[Duration]) -> (Duration, Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ribn::{
+        Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationLimits, SequenceId,
+        StepCompletion, SubmissionId,
+    };
+
+    // Substitute only device execution; exercise the real scheduling,
+    // globally allocated request IDs, event credits and terminal delivery.
+    struct ProbeExecutor {
+        info: ExecutorInfo,
+        first_tokens: HashMap<SequenceId, u32>,
+        pending: Option<Vec<StepCompletion>>,
+        polled: bool,
+    }
+    impl GenerationExecutor for ProbeExecutor {
+        fn info(&self) -> &ExecutorInfo {
+            &self.info
+        }
+        fn admit(
+            &mut self,
+            _: RequestId,
+            sequence: SequenceId,
+            request: &TokenRequest,
+        ) -> Result<Admission, ExecutionError> {
+            if request.tokens[0] == u32::MAX {
+                return Err(ExecutionError::new("invalid fixture token"));
+            }
+            self.first_tokens.insert(sequence, request.tokens[0]);
+            Ok(Admission::Ready)
+        }
+        fn prepare(&mut self, _: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+            Ok(ribn::BatchPreparation::Ready)
+        }
+        fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+        fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
+            self.pending = Some(
+                batch
+                    .iter()
+                    .map(|item| StepCompletion {
+                        sequence: item.sequence,
+                        prefix: item.prefix + item.token_budget,
+                        tokens: vec![
+                            self.first_tokens[&item.sequence];
+                            item.output_budget as usize
+                        ],
+                    })
+                    .collect(),
+            );
+            self.polled = false;
+            Ok(SubmissionId::new(1))
+        }
+        fn poll(&mut self, _: SubmissionId) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
+            if !self.polled {
+                self.polled = true;
+                return Ok(None);
+            }
+            Ok(self.pending.take())
+        }
+        fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {
+            self.first_tokens.remove(&sequence);
+            Ok(())
+        }
+        fn synchronize(&mut self) -> Result<(), ExecutionError> {
+            self.pending = None;
+            Ok(())
+        }
+    }
 
     fn options(arguments: &[&str]) -> Result<Options, String> {
         Options::parse(
@@ -556,77 +545,6 @@ mod tests {
 
     #[test]
     fn measurement_drains_real_engine_events_into_probe_slot_order() {
-        use ribn::{
-            Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationLimits, SequenceId,
-            StepCompletion, SubmissionId,
-        };
-
-        // Substitute only device execution; exercise the real scheduling,
-        // globally allocated request IDs, event credits and terminal delivery.
-        struct ProbeExecutor {
-            info: ExecutorInfo,
-            first_tokens: HashMap<SequenceId, u32>,
-            pending: Option<Vec<StepCompletion>>,
-            polled: bool,
-        }
-        impl GenerationExecutor for ProbeExecutor {
-            fn info(&self) -> &ExecutorInfo {
-                &self.info
-            }
-            fn admit(
-                &mut self,
-                _: RequestId,
-                sequence: SequenceId,
-                request: &TokenRequest,
-            ) -> Result<Admission, ExecutionError> {
-                self.first_tokens.insert(sequence, request.tokens[0]);
-                Ok(Admission::Ready)
-            }
-            fn prepare(
-                &mut self,
-                _: &[BatchItem],
-            ) -> Result<ribn::BatchPreparation, ExecutionError> {
-                Ok(ribn::BatchPreparation::Ready)
-            }
-            fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
-                Ok(())
-            }
-            fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
-                self.pending = Some(
-                    batch
-                        .iter()
-                        .map(|item| StepCompletion {
-                            sequence: item.sequence,
-                            prefix: item.prefix + item.token_budget,
-                            tokens: vec![
-                                self.first_tokens[&item.sequence];
-                                item.output_budget as usize
-                            ],
-                        })
-                        .collect(),
-                );
-                self.polled = false;
-                Ok(SubmissionId::new(1))
-            }
-            fn poll(
-                &mut self,
-                _: SubmissionId,
-            ) -> Result<Option<Vec<StepCompletion>>, ExecutionError> {
-                if !self.polled {
-                    self.polled = true;
-                    return Ok(None);
-                }
-                Ok(self.pending.take())
-            }
-            fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError> {
-                self.first_tokens.remove(&sequence);
-                Ok(())
-            }
-            fn synchronize(&mut self) -> Result<(), ExecutionError> {
-                self.pending = None;
-                Ok(())
-            }
-        }
         let options = options(&[
             "--divergence-probe",
             "--print-tokens",
@@ -671,6 +589,123 @@ mod tests {
     }
 
     #[test]
+    fn open_loop_counts_overload_and_local_failure_without_retrying() {
+        let request = |prompt: &[u32], output_tokens| trace::ScheduledRequest {
+            arrival: Duration::ZERO,
+            prompt: std::sync::Arc::from(prompt),
+            output_tokens,
+        };
+        let workload = trace::Workload {
+            inputs: vec![],
+            requests: vec![
+                request(&[7, 8], 3),
+                request(&[u32::MAX], 1),
+                request(&[9], 2),
+                request(&[10], 2),
+            ],
+            context_tokens: 5,
+            max_prompt_tokens: 2,
+        };
+        let mut engine = probe_engine(2, 0);
+        let measured =
+            trace::measure(&mut engine, &workload, &trace::Objectives::default(), true).unwrap();
+        assert_eq!(
+            (
+                measured.offered,
+                measured.completed,
+                measured.failed,
+                measured.rejected
+            ),
+            (4, 1, 1, 2)
+        );
+        assert_eq!(measured.emitted_tokens, 3);
+        assert_eq!(measured.requests[0].tokens, vec![7, 7, 7]);
+        assert_eq!(measured.slo_completed, None);
+        assert_eq!(engine.status().requests, 0);
+        engine.shutdown().unwrap();
+
+        // The sleeping path has no live work to race; only one future arrival.
+        let mut request = request(&[9], 1);
+        request.arrival = Duration::from_millis(2);
+        let future = trace::Workload {
+            requests: vec![request],
+            ..workload
+        };
+        let mut engine = probe_engine(1, 0);
+        let measured =
+            trace::measure(&mut engine, &future, &trace::Objectives::default(), false).unwrap();
+        assert_eq!(measured.completed, 1);
+        assert!(measured.elapsed_s >= 0.002);
+        engine.shutdown().unwrap();
+    }
+
+    fn probe_engine(active: usize, queued: usize) -> Engine {
+        Engine::new(
+            ProbeExecutor {
+                info: ExecutorInfo {
+                    name: "host trace".to_owned(),
+                    limits: GenerationLimits {
+                        context_tokens: 64,
+                        max_sequences: active,
+                        max_batch_tokens: 128,
+                        max_decode_tokens: 1,
+                    },
+                },
+                first_tokens: HashMap::new(),
+                pending: None,
+                polled: false,
+            },
+            EngineConfig {
+                max_active_requests: active,
+                max_queued_requests: queued,
+                max_queued_input_tokens: 128,
+                max_buffered_events: 16,
+                max_events_per_request: 2,
+            },
+            SchedulePolicy::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn checked_in_mixed_trace_has_valid_reach_and_explicit_kernel_overrides() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/workloads/qwen-mixed-arrivals.json"
+        );
+        let flag = format!("--workload={path}");
+        let parsed = options(&[
+            &flag,
+            "--queue-capacity=4",
+            "--ttft-slo-ms=2000",
+            "--continuation-capacity-bytes=524288000",
+        ])
+        .unwrap();
+        assert_eq!(parsed.context_tokens, 289);
+        assert_eq!(parsed.queue_capacity, 4);
+        assert_eq!(
+            parsed.prefill_chunk,
+            Some(engine_qwen::DEFAULT_PREFILL_CHUNK_MEMBERS)
+        );
+        assert_eq!(parsed.gemv_mode, GemvMode::Warp);
+        let workload = parsed.workload.unwrap();
+        assert_eq!(workload.requests.len(), 8);
+        assert_eq!(workload.max_prompt_tokens, 257);
+        assert!(std::sync::Arc::ptr_eq(
+            &workload.requests[0].prompt,
+            &workload.requests[3].prompt
+        ));
+        assert!(options(&[&flag, "--tokens=8"]).is_err());
+        assert!(options(&[&flag, "--divergence-probe", "--print-tokens"]).is_err());
+        assert_eq!(
+            options(&[&flag, "--prefill-chunk=off"])
+                .unwrap()
+                .prefill_chunk,
+            None
+        );
+    }
+
+    #[test]
     fn invalid_options_fail_before_device_loading() {
         for flag in [
             "--concurrency=0",
@@ -681,8 +716,29 @@ mod tests {
             "--tokens=no",
             "--divergence-probe",
             "--tokens=4294967295",
+            "--queue-capacity=1",
+            "--ttft-slo-ms=10",
+            "--unknown=1",
+            "--continuation-capacity-bytes=0",
         ] {
             assert!(options(&[flag]).is_err(), "{flag}");
         }
+        assert!(options(&["--tokens=3", "--tokens=4"]).is_err());
+        assert!(
+            options(&[
+                "--divergence-probe",
+                "--print-tokens",
+                "--prompt-tokens=4294967296"
+            ])
+            .is_err()
+        );
+        assert!(
+            options(&[
+                "--divergence-probe",
+                "--print-tokens",
+                "--prompt-fixture=missing"
+            ])
+            .is_err()
+        );
     }
 }

@@ -80,6 +80,57 @@ The synthetic [dispatch comparison](runtime-alignment/README.md#ar-preparation-r
 is separately bounded evidence. Re-run real Qwen numerical, lifecycle and serving gates
 when a device is available before qualifying this changed execution path.
 
+## Mixed-arrival native Qwen gate
+
+The production AR engine's finite trace harness varies prompt prefixes, output budgets
+and planned arrival times. It retains the original clock through dispatch lag and overload,
+counts rejected/failed requests, and reports latency-objective goodput. See
+[trace usage and semantics](README.md#mixed-arrival-native-traces).
+
+The initial device run exposed a real selection defect: heterogeneous request-reachable
+KV capacities were routed to a dense batched attention lane requiring uniform capacity.
+The run faulted with `batched attention requires positive uniform KV capacity`.
+Selection now requires equal concrete KV specifications; heterogeneous valid rows stay on
+the qualified per-row lane. This does not pad requests back to maximum context or widen
+the batched kernel's qualified scope. It also does not provide efficient heterogeneous
+batching: those rows lose cross-request weight amortization until a suitable lane qualifies.
+
+The host selection regression failed before the fix and passes afterward.
+`mixed_request_reaches_preserve_reference_and_cancelled_peers` exercises three identical
+prompts with output budgets 4/8/8, including cancellation leaving compatible survivors.
+Both cases passed on RTX 4090, driver 615.71.09, Rust 1.98.0, using the pinned GGUF and
+independent llama.cpp fixture in [fixture provenance](../crates/qwen/tests/fixtures/README.md).
+The gate compares eight tokens, not a complete 32-token reference: the fixture's known
+near-tie divergence after its eighteen-token agreed prefix remains unresolved.
+The existing full-model Qwen gates also passed again: reference/cancellation at
+1/2/8/9 rows (including nine-to-eight), owned-driver stalled/abandoned peers and
+constrained request-reachable admission. Those three tests took 267 seconds serialized;
+there were no competing compute processes and 33 MiB remained after teardown.
+The migrated linear backend, bounded GGUF materialization and physical 8/9-row
+retirement gates also passed (0.44, 0.19 and 21.48 seconds respectively).
+
+One cold-execution smoke run on 2026-10-06, base `9a78aa8` plus this selection fix
+and trace harness, used the checked-in workload, warp GEMV, prefill chunks of eight,
+active/queue limits 4/4 and a 524,288,000-byte continuation authority:
+
+| Offered/completed/rejected/failed | Output tokens | Elapsed | Completed output tok/s | TTFT p95 | ITL p95 | E2E p95 | SLO goodput |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 / 8 / 0 / 0 | 136 | 9.900 s | 13.74 | 8994.78 ms | 288.85 ms | 9449.68 ms | 0 requests/s |
+
+SLOs were TTFT <= 5000 ms, maximum per-request ITL <= 200 ms and E2E <= 10000 ms.
+Mean/max submit lag was 75.45/180.53 ms. The sample is one finite eight-request run,
+not a throughput distribution, optimization comparison or SOTA claim. No physical-peak
+or bottleneck-cause claim follows from it. [Raw structured results](qwen-trace/2026-10-06-mixed-4.json) retain per-request outcomes,
+configuration and token streams. Reproduce with the checked-in workload and flags above.
+
+```sh
+RIBN_MODEL=/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf \
+RIBN_REFERENCE=$(pwd)/crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens \
+cargo test --release -p engine-qwen --features cuda --test cuda_runtime --locked \
+  mixed_request_reaches_preserve_reference_and_cancelled_peers \
+  -- --ignored --exact --test-threads=1
+```
+
 ## AR reservation authority host gate
 
 AR's logical state manager now grants from supplied `BytePool` authorities.

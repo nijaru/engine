@@ -1,0 +1,10 @@
+[
+  {"arrival_ms": 0, "output_tokens": 32, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 257},
+  {"arrival_ms": 0, "output_tokens": 8, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 5},
+  {"arrival_ms": 40, "output_tokens": 16, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 17},
+  {"arrival_ms": 40, "output_tokens": 8, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 257},
+  {"arrival_ms": 100, "output_tokens": 32, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 17},
+  {"arrival_ms": 200, "output_tokens": 16, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 5},
+  {"arrival_ms": 400, "output_tokens": 8, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 257},
+  {"arrival_ms": 800, "output_tokens": 16, "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens", "prompt_tokens": 17}
+]

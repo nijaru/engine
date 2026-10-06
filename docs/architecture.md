@@ -98,8 +98,10 @@ resurrection. It does not freeze transitional crates against an accepted migrati
 Current Qwen/text and BERT fixture evidence lives in [runtime qualification](../benchmarks/runtime-contract.md),
 [encoder qualification](../benchmarks/encoder-qualification.md) and
 [prefill qualification](../benchmarks/qwen-prefill-qualification.md). Host fixtures
-establish lifecycle contracts, not GPU memory safety or model support. Migrated device
-fixtures, notification changes and AR preparation still need re-execution when desktop is available.
+establish lifecycle contracts, not GPU memory safety or model support. Qwen preparation,
+owned-driver, constrained admission, reference/cancellation and migrated linear/GGUF/8–9-row
+retirement gates have been re-executed; see the runtime evidence. Broader untested paths
+do not inherit that qualification.
 GDN chunk scan remains opt-in while its full-model numerical gate fails.
 
 [Foundation evidence](execution-foundation.md) and [composition counterexamples](pipeline-composition.md)

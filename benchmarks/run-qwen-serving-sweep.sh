@@ -21,7 +21,14 @@ fi
 
 tokens="${TOKENS:-32}"
 concurrencies="${CONCURRENCIES:-1 2 4 8}"
-gemv="${GEMV:-scalar}"
+workload="${WORKLOAD:-}"
+queue_capacity="${QUEUED_REQUESTS:-0}"
+if [[ -n "$workload" ]]; then
+  [[ -f "$workload" ]] || { echo "WORKLOAD does not exist: $workload" >&2; exit 2; }
+  gemv="${GEMV:-warp}"
+else
+  gemv="${GEMV:-scalar}"
+fi
 case "$gemv" in
   scalar|warp|int-dot) ;;
   *) echo "GEMV must be scalar, warp, or int-dot, got: $gemv" >&2; exit 2 ;;
@@ -37,6 +44,13 @@ benchmarks/collect-env.sh "$out_dir/env" >/dev/null
   echo "tokens=$tokens"
   echo "concurrencies=$concurrencies"
   echo "gemv=$gemv"
+  echo "workload=$workload"
+  echo "queue_capacity=$queue_capacity"
+  echo "continuation_capacity_bytes=${CONTINUATION_CAPACITY_BYTES:-auto}"
+  echo "ttft_slo_ms=${TTFT_SLO_MS:-unset}"
+  echo "itl_slo_ms=${ITL_SLO_MS:-unset}"
+  echo "e2e_slo_ms=${E2E_SLO_MS:-unset}"
+  if [[ -n "$workload" ]]; then sha256sum "$workload"; fi
   echo "engine_commit=$(git rev-parse HEAD)"
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$out_dir/sweep.txt"
@@ -47,11 +61,17 @@ bench="target/release/examples/qwen_serving_bench"
 for concurrency in $concurrencies; do
   log="$out_dir/runs/concurrency-${concurrency}.log"
   echo "== concurrency=$concurrency tokens=$tokens ==" | tee "$log"
-  "$bench" \
-    --model="$model" \
-    --concurrency="$concurrency" \
-    --tokens="$tokens" \
-    --gemv="$gemv" 2>&1 | tee -a "$log"
+  args=(--model="$model" --concurrency="$concurrency" --gemv="$gemv")
+  if [[ -n "$workload" ]]; then
+    args+=(--workload="$workload" --queue-capacity="$queue_capacity" --result-json="$out_dir/runs/concurrency-${concurrency}.json")
+    [[ -z "${TTFT_SLO_MS:-}" ]] || args+=(--ttft-slo-ms="$TTFT_SLO_MS")
+    [[ -z "${ITL_SLO_MS:-}" ]] || args+=(--itl-slo-ms="$ITL_SLO_MS")
+    [[ -z "${E2E_SLO_MS:-}" ]] || args+=(--e2e-slo-ms="$E2E_SLO_MS")
+  else
+    args+=(--tokens="$tokens")
+  fi
+  [[ -z "${CONTINUATION_CAPACITY_BYTES:-}" ]] || args+=(--continuation-capacity-bytes="$CONTINUATION_CAPACITY_BYTES")
+  "$bench" "${args[@]}" 2>&1 | tee -a "$log"
 done
 
 echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$out_dir/sweep.txt"
