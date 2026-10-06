@@ -21,8 +21,8 @@ pub use config::{EngineConfig, SchedulePolicy};
 pub use engine::{Engine, EngineStatus, StepStatus};
 pub use error::EngineError;
 pub use executor::{
-    Admission, BatchItem, ExecutionError, ExecutorInfo, GenerationExecutor, GenerationLimits,
-    SequenceId, StepCompletion, StepKind, SubmissionId,
+    Admission, BatchItem, BatchPreparation, ExecutionError, ExecutorInfo, GenerationExecutor,
+    GenerationLimits, PreparedRow, SequenceId, StepCompletion, StepKind, SubmissionId,
 };
 pub use request::{
     Event, FinishReason, GenerationOptions, RequestId, Sampling, TokenRequest, Usage,

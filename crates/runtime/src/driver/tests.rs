@@ -47,6 +47,8 @@ fn wait(mut condition: impl FnMut() -> bool) {
 struct Control {
     ready: AtomicBool,
     deferred: AtomicBool,
+    deferred_preparation: AtomicBool,
+    preparations: AtomicUsize,
     readiness: crate::Readiness,
     fail_poll: AtomicBool,
     panic_poll: AtomicBool,
@@ -65,6 +67,8 @@ impl Default for Control {
         Self {
             ready: AtomicBool::new(true),
             deferred: AtomicBool::new(false),
+            deferred_preparation: AtomicBool::new(false),
+            preparations: AtomicUsize::new(0),
             readiness: crate::Readiness::default(),
             fail_poll: AtomicBool::new(false),
             panic_poll: AtomicBool::new(false),
@@ -109,6 +113,22 @@ impl GenerationExecutor for Model {
         self.states.insert(sequence, input.tokens[0]);
         self.control.admitted.fetch_add(1, Ordering::SeqCst);
         Ok(Admission::Ready)
+    }
+    fn prepare(&mut self, batch: &[BatchItem]) -> Result<crate::BatchPreparation, ExecutionError> {
+        self.control.preparations.fetch_add(1, Ordering::SeqCst);
+        let wait = self.control.readiness.register();
+        if self.control.deferred_preparation.load(Ordering::SeqCst) {
+            return Ok(crate::BatchPreparation::Selected(
+                batch
+                    .iter()
+                    .map(|_| crate::PreparedRow::Deferred(wait.clone()))
+                    .collect(),
+            ));
+        }
+        Ok(crate::BatchPreparation::Ready)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
     }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         assert!(self.pending.is_none());
@@ -619,63 +639,77 @@ fn park_without_pending_wake(handle: &GenerationHandle) -> Sender<()> {
 }
 
 #[test]
-fn resource_publication_wakes_deferred_admission_without_polling() {
-    let control = Arc::new(Control::default());
-    control.deferred.store(true, Ordering::SeqCst);
-    let (mut owner, handle) = setup(&control, Duration::from_secs(60));
-    let mut stream = run(handle.stream(input(7, 1))).unwrap();
-    wait(|| control.attempts.load(Ordering::SeqCst) == 1);
-    for previous_attempts in 1..=2 {
-        let resume = park_without_pending_wake(&handle);
-        assert_eq!(control.attempts.load(Ordering::SeqCst), previous_attempts);
-        // The first retry still cannot fit and must register for a second change.
-        if previous_attempts == 2 {
-            control.deferred.store(false, Ordering::SeqCst);
+fn resource_publication_wakes_waiting_work_without_polling() {
+    for preparation in [false, true] {
+        let control = Arc::new(Control::default());
+        let (deferred, attempts) = if preparation {
+            (&control.deferred_preparation, &control.preparations)
+        } else {
+            (&control.deferred, &control.attempts)
+        };
+        deferred.store(true, Ordering::SeqCst);
+        let (mut owner, handle) = setup(&control, Duration::from_secs(60));
+        let mut stream = run(handle.stream(input(7, 1))).unwrap();
+        wait(|| attempts.load(Ordering::SeqCst) == 1);
+        for previous_attempts in 1..=2 {
+            let resume = park_without_pending_wake(&handle);
+            assert_eq!(attempts.load(Ordering::SeqCst), previous_attempts);
+            // The first retry still cannot fit and must register for a second change.
+            if previous_attempts == 2 {
+                deferred.store(false, Ordering::SeqCst);
+            }
+            control.readiness.publish();
+            resume.send(()).unwrap();
+            // No frontend/device notification can substitute for the resource wake.
+            wait(|| attempts.load(Ordering::SeqCst) == previous_attempts + 1);
         }
-        control.readiness.publish();
-        resume.send(()).unwrap();
-        // No frontend/device notification can substitute for the resource wake.
-        wait(|| control.attempts.load(Ordering::SeqCst) == previous_attempts + 1);
+        wait(|| control.admitted.load(Ordering::SeqCst) == 1);
+        assert!(matches!(
+            collect(&mut stream).last(),
+            Some(Event::Finished {
+                reason: FinishReason::Length,
+                ..
+            })
+        ));
+        owner.shutdown().unwrap();
     }
-    wait(|| control.admitted.load(Ordering::SeqCst) == 1);
-    assert!(matches!(
-        collect(&mut stream).last(),
-        Some(Event::Finished {
-            reason: FinishReason::Length,
-            ..
-        })
-    ));
-    owner.shutdown().unwrap();
 }
 
 #[test]
-fn registered_admission_rechecks_without_retry_and_observes_publication_before_park() {
-    let control = Arc::new(Control::default());
-    control.deferred.store(true, Ordering::SeqCst);
-    let (mut owner, handle) = setup(&control, Duration::from_millis(1));
-    let mut stream = run(handle.stream(input(7, 1))).unwrap();
-    wait(|| control.attempts.load(Ordering::SeqCst) == 1);
-    let (entered_tx, entered) = flume::bounded(1);
-    let (resume, resume_rx) = flume::bounded(1);
-    *handle.shared.before_wait.lock().unwrap() = Some((entered_tx, resume_rx));
-    handle.shared.notify();
-    entered.recv_timeout(Duration::from_secs(3)).unwrap();
-    // An unrelated wake steps the worker, but unchanged readiness must not retry
-    // model admission. Resource publication in the check-to-park gap must persist.
-    let attempts = control.attempts.load(Ordering::SeqCst);
-    control.deferred.store(false, Ordering::SeqCst);
-    control.readiness.publish();
-    resume.send(()).unwrap();
-    assert_eq!(attempts, 1);
-    assert!(matches!(
-        collect(&mut stream).last(),
-        Some(Event::Finished {
-            reason: FinishReason::Length,
-            ..
-        })
-    ));
-    assert_eq!(control.attempts.load(Ordering::SeqCst), 2);
-    owner.shutdown().unwrap();
+fn registered_resource_waits_recheck_without_retry_and_observe_publication_before_park() {
+    for preparation in [false, true] {
+        let control = Arc::new(Control::default());
+        let (deferred, attempts) = if preparation {
+            (&control.deferred_preparation, &control.preparations)
+        } else {
+            (&control.deferred, &control.attempts)
+        };
+        deferred.store(true, Ordering::SeqCst);
+        let (mut owner, handle) = setup(&control, Duration::from_millis(1));
+        let mut stream = run(handle.stream(input(7, 1))).unwrap();
+        wait(|| attempts.load(Ordering::SeqCst) == 1);
+        let (entered_tx, entered) = flume::bounded(1);
+        let (resume, resume_rx) = flume::bounded(1);
+        *handle.shared.before_wait.lock().unwrap() = Some((entered_tx, resume_rx));
+        handle.shared.notify();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        // An unrelated wake steps the worker, but unchanged readiness must not retry
+        // model work. Resource publication in the check-to-park gap must persist.
+        let observed = attempts.load(Ordering::SeqCst);
+        deferred.store(false, Ordering::SeqCst);
+        control.readiness.publish();
+        resume.send(()).unwrap();
+        assert_eq!(observed, 1);
+        assert!(matches!(
+            collect(&mut stream).last(),
+            Some(Event::Finished {
+                reason: FinishReason::Length,
+                ..
+            })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        owner.shutdown().unwrap();
+    }
 }
 
 #[test]

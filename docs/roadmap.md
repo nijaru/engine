@@ -30,6 +30,7 @@ fixtures may establish control contracts without enabling an unqualified physica
 | 2. Concurrent application access | One token execution worker, cloneable bounded handles/streams, cancellation and shutdown retry; bounded text preprocessing/decoding and ordered offline batching. [Contract](resource-protocol.md#owned-ar-driver-contract), [frontend overhead](../benchmarks/runtime-alignment/README.md) |
 | 3. Real encoder preparation | BERT CUDA fixture through `ribn-batch`, shared byte leases, completion-owned results, uncertain-enqueue retirement and cancellation. [Encoder qualification](../benchmarks/encoder-qualification.md) |
 | 4a. Request-reachable continuation | Qwen charges prompt plus output reach, not maximum context. Three reference-matching requests fit a 500 MiB authority that cannot hold two context-sized charges. [Runtime evidence](../benchmarks/runtime-contract.md) |
+| 4b host preparation | Aggregate accepted ranges, credit refunds, parked readiness, local rejection and uncertain-retirement ownership through the real AR engine. Qwen validates/retains a full-reachable prepared batch; no dynamic physical growth. [Host gate](../benchmarks/runtime-contract.md#ar-pre-submit-preparation-host-gate) |
 | 4b prerequisite | Block-table attention **reads** qualified at `ee689d7`; production Qwen remains contiguous. [Addressing evidence](../benchmarks/runtime-contract.md#block-table-kv-addressing-2026-10-12-ee689d7) |
 
 Admission notification (`3e4dbec`) and shared batch/AR readiness (`e8e3b48`) are
@@ -61,12 +62,13 @@ paging code; a scalar prefix or block hash is not an allocation owner.
    accounting, despite sharing readiness. Unify physical accounting before claiming a
    bound across runtimes on one device. Include paged **writes**, block-table transfer
    lifetime and all prepared lanes; read addressing alone is insufficient.
-2. **Add AR-specific aggregate preparation.** Choose positive accepted ranges, reserve
-   new growth before launch, and park unaffordable rows outside runnable queues using
-   existing readiness. Refund output credits for omitted/shortened rows. Abandonment
-   releases only new reservations. Failed partial enqueue retains old continuation and
-   new growth under one executor retirement owner. Prove this through the real AR engine
-   on the host; retain Qwen's full-reachable policy until device integration qualifies.
+2. **Integrate physical growth with AR preparation.** The host control seam now accepts
+   positive ranges, refunds unused credits, parks unaffordable rows with readiness and
+   rejects impossible rows locally. Whole-report validation and abandoned/uncertain
+   growth ownership pass through the real engine and byte authority. An all-omitted
+   offer cannot strand an unoffered healthy peer. Qwen retains its validated backend
+   batch but keeps full-reachable reservation; integrate real growth and retain that
+   policy until the affected device gates pass.
 3. **Prove progress before partial envelopes.** Active sequences can exhaust the pool
    while all wait to grow. Readiness cannot break this deadlock. Resolve protected
    completion headroom versus recomputation preemption. Recompute needs one bounded
@@ -86,8 +88,9 @@ paging code; a scalar prefix or block hash is not an allocation owner.
    allocation cannot, using a geometry where checkpoint economics permit it. Record
    checkpoint/copy peak bytes and replay/TTFT benefit separately.
 
-Open layout/policy choices: arena size/growth, block size, checkpoint spacing and the
-concrete prepared transaction. Avoid a universal continuation framework or cost vector.
+Open layout/policy choices: arena size/growth, block size, checkpoint spacing,
+completion headroom/preemption policy and concrete physical growth reservations.
+The single-owner preparation transaction is defined in the resource protocol. Avoid a universal continuation framework or cost vector.
 
 Recorded hybrid geometry: 149.6 MiB recurrent state per live sequence, 16.8 MiB KV at
 257-token reach and 275 MiB KV at 4096. Three private recurrent copies plus even one

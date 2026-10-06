@@ -230,6 +230,12 @@ impl GenerationExecutor for Fixture {
         Ok(Admission::Ready)
     }
 
+    fn prepare(&mut self, _: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+        Ok(ribn::BatchPreparation::Ready)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
+    }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.batch = Some(batch.to_vec());
         self.next += 1;

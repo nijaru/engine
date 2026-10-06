@@ -84,6 +84,26 @@ pub struct BatchItem {
     pub output_budget: u32,
 }
 
+/// An aggregate pre-submit decision. The executor owns any new reservations;
+/// this report owns no storage and is not a transferable resource lease.
+#[derive(Debug)]
+pub enum BatchPreparation {
+    /// Every offered row is accepted unchanged.
+    Ready,
+    /// Exactly one ordered decision for each offered row.
+    Selected(Vec<PreparedRow>),
+}
+
+#[derive(Debug)]
+pub enum PreparedRow {
+    /// Identity, kind and prefix are unchanged; budgets may shrink positively.
+    Ready(BatchItem),
+    /// No new reservation retained. Register before testing the condition.
+    Deferred(ReadinessWait),
+    /// Permanent request-local refusal; existing continuation remains owned.
+    Rejected(ExecutionError),
+}
+
 /// Completed work for one sequence. The prefix counts consumed model inputs;
 /// sampled output is tracked separately. Rejected speculative work must not
 /// appear in either committed field. A row may settle on a shorter feasible
@@ -149,7 +169,9 @@ pub trait GenerationExecutor: Send {
     /// Immutable scheduling metadata, resolved before the engine is created.
     fn info(&self) -> &ExecutorInfo;
 
-    /// Validate request semantics and reserve the complete continuation bundle.
+    /// Validate request semantics and reserve a coherent initial continuation
+    /// bundle. Partial envelopes require a model-specific progress policy; the
+    /// current Qwen implementation keeps full request-reachable reservation.
     /// `request_id` is stable for the runtime request and may correlate model-
     /// prepared inputs or tracing; `sequence` identifies executor continuation
     /// ownership at prefix zero. `Deferred` or an error must retain no admission resources.
@@ -165,7 +187,25 @@ pub trait GenerationExecutor: Send {
         request: &TokenRequest,
     ) -> Result<Admission, ExecutionError>;
 
-    /// Queue an accepted batch. Copy/retain everything needed after this call;
+    /// Negotiate aggregate resources for one offered batch. Retain all newly
+    /// granted resources in the executor, not in the returned report. Deferred
+    /// and rejected rows retain no new reservation. Do not advance continuation.
+    /// There may be only one outstanding preparation and no pending submission.
+    ///
+    /// # Errors
+    /// An error faults the engine. Retain any uncertain preparation resources
+    /// until abandonment or synchronization establishes safe retirement.
+    fn prepare(&mut self, batch: &[BatchItem]) -> Result<BatchPreparation, ExecutionError>;
+
+    /// Abandon the outstanding unsubmitted preparation, idempotently. Release
+    /// only new reservations, never pre-existing sequence continuation.
+    ///
+    /// # Errors
+    /// Failed retirement retains executor ownership for synchronization/retry.
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError>;
+
+    /// Consume the outstanding preparation by queueing its exact ready subset,
+    /// in offered order. Copy/retain everything needed after this call;
     /// references to the borrowed batch must not escape it. Logical prefixes
     /// advance only after a matching successful completion is returned.
     ///
@@ -196,8 +236,8 @@ pub trait GenerationExecutor: Send {
     /// An unsuccessful release must retain enough ownership for a later retry.
     fn release(&mut self, sequence: SequenceId) -> Result<(), ExecutionError>;
 
-    /// Establish completion of ALL queued work, including partial submissions
-    /// and faulted batches. Used for explicit shutdown and defensive Drop.
+    /// Settle outstanding preparation and establish completion of ALL queued
+    /// work, including partial submissions and faulted batches. Used for explicit shutdown and defensive Drop.
     /// This may block; normal serving uses `poll`, not per-step synchronization.
     /// Shutdown may consume pending results to return resource leases; callers
     /// must not expect to resume polling those submissions after shutdown.

@@ -117,6 +117,12 @@ impl<S: PrivateState> GenerationExecutor for Model<S> {
         Ok(Admission::Ready)
     }
 
+    fn prepare(&mut self, _: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+        Ok(ribn::BatchPreparation::Ready)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
+    }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         let mut control = self.control.lock().unwrap();
         if control.fail_submit {

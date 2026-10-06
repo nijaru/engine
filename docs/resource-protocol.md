@@ -1,13 +1,13 @@
 # Resource, submission and snapshot protocol
 
-Status: accepted direction. Encoder preparation and current AR completion/discard
-are implemented as identified below; AR growth preparation and snapshot replacement
-are not implemented APIs. The [roadmap](roadmap.md) owns implementation order and
+Status: accepted direction. Encoder preparation, AR completion/discard and AR
+pre-submit preparation are implemented as identified below. Preparation control
+is host-qualified; dynamic Qwen growth and snapshot replacement remain unimplemented. The [roadmap](roadmap.md) owns implementation order and
 qualification gaps.
 
 ## Current boundary
 
-`GenerationExecutor` combines admission, submission and completion. Since roadmap 4a,
+`GenerationExecutor` combines admission, aggregate preparation, submission and completion. Since roadmap 4a,
 Qwen reserves the continuation capacity its own request can reach instead of the
 model's whole context (see [AR continuation resources](#ar-continuation-resources));
 it still reserves that capacity once, at admission, and executes the offered range.
@@ -17,10 +17,9 @@ remains pending, not a settled request waiting for a resource.
 The incomplete completion-time `Blocked` enum was removed: it had no readiness source
 or parking and could immediately resubmit unchanged work. Positive partial-prefill
 completion remains: it reports a contiguous consumed range, not permission to exceed
-physical capacity and not a pre-submit reservation. Ordinary resource waiting must
-arrive with a real preparation implementation and its readiness source, not another
-isolated completion enum. Admission waits carry an authority-owned readiness
-registration. Direct callers recheck registrations when stepping; the driver arms
+physical capacity and not a pre-submit reservation. Ordinary resource waiting belongs to pre-submit preparation and its readiness source,
+not another isolated completion enum. Admission and preparation waits carry an
+authority-owned readiness registration. Direct callers recheck registrations when stepping; the driver arms
 one-shot notifications on its capacity-one wake channel before parking. Device
 completion alone retains the bounded polling fallback.
 
@@ -280,7 +279,39 @@ above.
    Refund omitted/shortened output reservations. Abandoning unsubmitted preparation
    releases only new growth; uncertain enqueue retains it together with old continuation
    until executor-owned settlement or quarantine. Aggregate demand, not per-row resets,
-   determines the accepted batch. The concrete representation remains a roadmap gate.
+   determines the accepted batch.
+
+### AR preparation transaction
+
+`GenerationExecutor::prepare` negotiates one offered batch at a time. The executor,
+not the returned report, owns newly granted resources. `BatchPreparation::Ready`
+accepts the entire offer without allocating a per-row report; `Selected` returns exactly
+one ordered `PreparedRow` per offered row: a ready `BatchItem`, a registered deferred
+wait, or a permanent request-local error. Ready rows preserve sequence, kind and prefix;
+only positive token budgets and their corresponding output budgets may shrink.
+
+The engine reserves output before offering work, validates the **whole** report before
+changing any row, refunds omitted/shortened credits, and marks only accepted rows in
+flight. Deferred rows retain their old continuation but no new preparation reservation.
+They park outside runnable queues and share the admission wake transport. Rejected rows
+finish locally; peers remain eligible. An all-omitted offer triggers a bounded rebuild
+for unoffered runnable peers before parking, without reactivating unchanged waits.
+A source change permits another attempt, not a guaranteed allocation.
+
+`submit` consumes the exact ready subset in its original order. There is at most one
+outstanding preparation and one submission; another preparation cannot overwrite either.
+`abandon_preparation` is idempotent and releases only new, unsubmitted reservations.
+The engine abandons an invalid report or an offer with no accepted rows. Preparation,
+abandonment or enqueue errors fault the owner and keep executor retirement ownership;
+`synchronize` must also settle any outstanding preparation. Fallible retirement cannot
+turn into implicit Drop-based proof of device completion.
+
+Preparation and submission are synchronous within one `Engine::step`; driver intent
+cannot interrupt that call. Cancellation observed after launch waits for completion.
+Cancellation of a parked row drops its registration and retires its old continuation
+without restoring it to a runnable queue. Logical prefixes still advance only at valid
+completion. This control seam does not enable partial-envelope Qwen admission or prove
+all-active growth progress.
 
 The engine owns which sequence holds which committed prefix and the policy decisions
 (admission, eviction, preemption, priority). The model/backend owns layout, block or
@@ -341,7 +372,7 @@ explicit cancel and output-credit return without a second cancellation queue.
   it can race with an already-settled terminal. Dropping the stream suppresses delivery.
 - The worker never blocks sending output. Only it sends to each stream; it checks channel
   space before draining that runtime mailbox. Consumption wakes the execution owner.
-- An idle/output-blocked owner sleeps on the wake channel. Registered admission waits
+- An idle/output-blocked owner sleeps on the wake channel. Registered admission/preparation waits
   arm one-shot notifications before parking and recheck the source epoch; unchanged
   registrations do not rerun model admission. Only pending device completion uses the
   configured nonzero timed-poll fallback. Synchronous backend calls remain non-preemptible;

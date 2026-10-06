@@ -128,7 +128,7 @@ fn drive(
         if progress || step.submitted || step.completed {
             continue;
         }
-        engine.arm_admission_waits(&resource_waker);
+        engine.arm_resource_waits(&resource_waker);
         let needs_poll = engine.status().in_flight;
         #[cfg(test)]
         {

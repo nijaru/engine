@@ -1,5 +1,5 @@
 //! Selection over engine-owned queues; no duplicate request or resource owner.
-use super::{Engine, WorkState};
+use super::Engine;
 use crate::{BatchItem, StepKind};
 
 impl Engine {
@@ -14,6 +14,9 @@ impl Engine {
         }
         self.schedule_kind(StepKind::Decode, &mut budget, usize::MAX);
         self.schedule_kind(StepKind::Prefill, &mut budget, usize::MAX);
+    }
+
+    pub(super) fn record_scheduled_batch(&mut self) {
         if self.batch.iter().any(|item| item.kind == StepKind::Prefill) {
             self.decode_only_steps = 0;
         } else if !self.batch.is_empty() && !self.prefill.is_empty() {
@@ -66,7 +69,6 @@ impl Engine {
                 continue;
             }
             self.output.reserve(sequence.output, outputs as usize + 1);
-            sequence.work = WorkState::InFlight;
             self.batch.push(BatchItem {
                 sequence: sequence.id,
                 kind,

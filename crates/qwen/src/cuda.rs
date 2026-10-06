@@ -61,6 +61,13 @@ impl GenerationExecutor for QwenCuda {
     ) -> Result<Admission, ExecutionError> {
         self.resources()?.execution.admit(id, request)
     }
+    fn prepare(&mut self, batch: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+        self.resources()?.execution.prepare(batch)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        self.resources()?.execution.abandon_preparation();
+        Ok(())
+    }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.resources()?.execution.submit(batch)
     }

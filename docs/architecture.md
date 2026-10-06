@@ -22,14 +22,17 @@ pool, not a second execution loop. Offline batching consumes a bounded window an
 yields ordered per-item outcomes. A slow head bounds lookahead; decoding failure
 abandons only its request. See [text semantics](resource-protocol.md#text-application-facade).
 
-The token driver provides fail-fast preparation permits, encoded-input bounds,
+The token driver provides fail-fast application preparation permits, encoded-input bounds,
 nonblocking bounded delivery, cancellation intent and retryable shutdown. Permits
 cover preprocessing, execution and retained delivery, including retirement after
-stream abandonment. Resource waits arm one-shot notifications on the capacity-one
+stream abandonment. Admission and AR preparation waits arm one-shot notifications on the capacity-one
 wake channel before parking; only device completion retains timed polling.
 
-Direct `Engine` use remains channel-free. It owns one in-flight batch, reserves output
-credits before launch and validates all completion rows before logical commitment.
+Direct `Engine` use remains channel-free. It owns one in-flight batch and negotiates
+aggregate work before launch. It validates the whole preparation report, refunds omitted
+or shortened output credits and parks deferred rows outside runnable queues. All-omitted
+offers rebuild for healthy unoffered peers before sleeping. Completion rows still validate
+before any logical prefix or output commitment.
 Cancellation is intent, not completion. Executor uncertainty faults the owner and
 retains retirement ownership. Mailboxes can outlive execution slots; runtime-owned
 discard works across that boundary, without frontend orphan queues.
@@ -38,7 +41,8 @@ Qwen reserves continuation for prompt plus output reach at admission. Deferred
 admission retains no allocation and retries only after authority publication. It
 checks whole-bundle capacity before allocation so a rolled-back partial attempt does
 not wake itself. The adapter still translates scalar AR rows into transitional core
-batch/state types; it has no second scheduler.
+batch/state types; it has no second scheduler. Preparation retains one validated backend batch without taking
+continuation leases; submit consumes its exact rows, and abandonment preserves old state.
 
 Block-table attention reads exist in the backend, but production Qwen remains
 contiguous. There is no paged write/growth consumer, prefix cache, restore operation
@@ -94,7 +98,7 @@ Current Qwen/text and BERT fixture evidence lives in [runtime qualification](../
 [encoder qualification](../benchmarks/encoder-qualification.md) and
 [prefill qualification](../benchmarks/qwen-prefill-qualification.md). Host fixtures
 establish lifecycle contracts, not GPU memory safety or model support. Migrated device
-fixtures and notification changes still need re-execution when desktop is available.
+fixtures, notification changes and AR preparation still need re-execution when desktop is available.
 GDN chunk scan remains opt-in while its full-model numerical gate fails.
 
 [Foundation evidence](execution-foundation.md) and [composition counterexamples](pipeline-composition.md)

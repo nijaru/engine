@@ -7,8 +7,8 @@ use engine_core::{
     RequestId, SamplingParams, StateError, StateLocation, StateManager, StateRequirement,
 };
 use ribn::{
-    Admission, BatchItem, ExecutionError, ExecutorInfo, SequenceId, StepCompletion, StepKind,
-    SubmissionId, TokenRequest,
+    Admission, BatchItem, BatchPreparation, ExecutionError, ExecutorInfo, SequenceId,
+    StepCompletion, StepKind, SubmissionId, TokenRequest,
 };
 
 use crate::state;
@@ -28,6 +28,11 @@ struct Sequence {
 /// A reserved continuation and the concrete requirements that describe it.
 type ReservedContinuation = (InferenceStateSet, Arc<[StateRequirement]>);
 
+struct Prepared {
+    items: Vec<BatchItem>,
+    batch: ExecutionBatch,
+}
+
 struct Pending {
     id: BackendSubmissionId,
     items: Vec<BatchItem>,
@@ -43,6 +48,7 @@ pub(crate) struct QwenExecution<B> {
     plan: ExecutionPlan,
     manager: LogicalStateManager,
     sequences: HashMap<SequenceId, Sequence>,
+    prepared: Option<Prepared>,
     pending: Option<Pending>,
     faulted: bool,
     vocabulary_size: u32,
@@ -62,6 +68,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
             manager,
             sequences: HashMap::with_capacity(info.limits.max_sequences),
             info,
+            prepared: None,
             pending: None,
             faulted: false,
             vocabulary_size,
@@ -261,8 +268,11 @@ impl<B: ComputeBackend> QwenExecution<B> {
         })
     }
 
-    pub(crate) fn submit(&mut self, items: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
-        if self.faulted || self.pending.is_some() {
+    pub(crate) fn prepare(
+        &mut self,
+        items: &[BatchItem],
+    ) -> Result<BatchPreparation, ExecutionError> {
+        if self.faulted || self.pending.is_some() || self.prepared.is_some() {
             return Err(ExecutionError::new("Qwen execution is faulted or busy"));
         }
         let tokens = items
@@ -279,6 +289,33 @@ impl<B: ComputeBackend> QwenExecution<B> {
             .collect::<Result<Vec<_>, _>>()?;
         // Includes duplicate detection, before taking a single sequence lease.
         let batch = ExecutionBatch::new(segments).map_err(model_error)?;
+        self.prepared = Some(Prepared {
+            items: items.to_vec(),
+            batch,
+        });
+        // Admission already owns the complete request-reachable envelope. This
+        // transaction validates and retains the backend batch, without growth.
+        Ok(BatchPreparation::Ready)
+    }
+
+    pub(crate) fn abandon_preparation(&mut self) {
+        self.prepared = None;
+    }
+
+    pub(crate) fn submit(&mut self, items: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
+        if self.faulted || self.pending.is_some() {
+            return Err(ExecutionError::new("Qwen execution is faulted or busy"));
+        }
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| ExecutionError::new("Qwen batch was not prepared"))?;
+        if prepared.items != items {
+            return Err(ExecutionError::new(
+                "Qwen submission differs from its preparation",
+            ));
+        }
+        let prepared = self.prepared.take().expect("validated preparation");
         let mut states = items
             .iter()
             .map(|item| {
@@ -290,13 +327,16 @@ impl<B: ComputeBackend> QwenExecution<B> {
                     .expect("validated lease")
             })
             .collect::<Vec<_>>();
-        match self.backend.submit(&self.plan, &batch, &mut states) {
+        match self
+            .backend
+            .submit(&self.plan, &prepared.batch, &mut states)
+        {
             Ok(id) => {
                 self.pending = Some(Pending {
                     id,
-                    items: items.to_vec(),
+                    items: prepared.items,
                     states,
-                    batch,
+                    batch: prepared.batch,
                 });
                 Ok(SubmissionId::new(id.get()))
             }
@@ -411,6 +451,13 @@ impl<B: ComputeBackend> QwenExecution<B> {
         let Some(sequence) = self.sequences.get(&id) else {
             return Ok(());
         };
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.items.iter().any(|item| item.sequence == id))
+        {
+            return Err(ExecutionError::new("cannot release prepared Qwen state"));
+        }
         let state = sequence
             .state
             .as_ref()
@@ -426,6 +473,7 @@ impl<B: ComputeBackend> QwenExecution<B> {
     /// After the CUDA owner establishes a stream barrier, collect pending
     /// outcomes to return leases. Shutdown may discard their unreported output.
     pub(crate) fn drain_after_barrier(&mut self) -> Result<(), ExecutionError> {
+        self.abandon_preparation();
         if let Some(pending) = self.pending.as_ref() {
             let id = SubmissionId::new(pending.id.get());
             if self.poll(id)?.is_none() {

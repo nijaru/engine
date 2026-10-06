@@ -582,6 +582,15 @@ mod tests {
                 self.first_tokens.insert(sequence, request.tokens[0]);
                 Ok(Admission::Ready)
             }
+            fn prepare(
+                &mut self,
+                _: &[BatchItem],
+            ) -> Result<ribn::BatchPreparation, ExecutionError> {
+                Ok(ribn::BatchPreparation::Ready)
+            }
+            fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+                Ok(())
+            }
             fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
                 self.pending = Some(
                     batch

@@ -1,10 +1,10 @@
 //! What a backend may report for one submitted row, and what the engine refuses.
 //!
-//! A prefill row may accept fewer inputs than its budget, because a backend has to
-//! be able to stop before work it cannot do. Every completion must still advance
+//! A prefill completion may report fewer executed inputs than its prepared budget.
+//! Feasibility must already have been established before launching that work. Every completion must still advance
 //! by at least one input: a row that can do nothing is not a completion, and a
-//! permanent inability to proceed is admission-time request-local rejection, not a
-//! completion-time outcome. Everything else stays strict: the engine refuses a
+//! permanent inability to proceed is admission/preparation-time request-local
+//! rejection, not a completion-time outcome. Everything else stays strict: the engine refuses a
 //! completion that claims progress it did not receive, that samples output before
 //! the prompt is finished, or that makes an empty successful decode step.
 //!
@@ -135,6 +135,12 @@ impl GenerationExecutor for Fixture {
         Ok(Admission::Ready)
     }
 
+    fn prepare(&mut self, _: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+        Ok(ribn::BatchPreparation::Ready)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
+    }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         *self.submitted_rows.lock().unwrap() += batch.len();
         self.pending = Some(batch.to_vec());

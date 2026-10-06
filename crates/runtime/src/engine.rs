@@ -12,6 +12,7 @@ use crate::config::validate_policy;
 use crate::output::{Output, OutputId};
 
 mod completion;
+mod preparation;
 mod scheduling;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -28,6 +29,7 @@ pub struct EngineStatus {
     pub requests: usize,
     /// Includes terminal sequences whose resource release has not succeeded.
     pub active_sequences: usize,
+    /// Admission waits plus admitted sequences parked during preparation.
     pub waiting: usize,
     pub buffered_events: usize,
     pub in_flight: bool,
@@ -55,7 +57,7 @@ struct Sequence {
     prefix: u32,
     generated: u32,
     admitted: bool,
-    admission_wait: Option<crate::ReadinessWait>,
+    resource_wait: Option<crate::ReadinessWait>,
     work: WorkState,
     terminal: Option<FinishReason>,
     notified: bool,
@@ -76,6 +78,7 @@ pub struct Engine {
     free: Vec<usize>,
     requests: HashMap<RequestId, usize>,
     waiting: VecDeque<usize>,
+    parked: VecDeque<usize>,
     prefill: VecDeque<usize>,
     decode: VecDeque<usize>,
     terminal: VecDeque<usize>,
@@ -123,6 +126,7 @@ impl Engine {
             free: Vec::with_capacity(capacity),
             requests: HashMap::with_capacity(capacity),
             waiting: VecDeque::with_capacity(capacity),
+            parked: VecDeque::with_capacity(config.max_active_requests),
             prefill: VecDeque::with_capacity(config.max_active_requests),
             decode: VecDeque::with_capacity(config.max_active_requests),
             terminal: VecDeque::with_capacity(capacity),
@@ -179,7 +183,7 @@ impl Engine {
         EngineStatus {
             requests: self.requests.len(),
             active_sequences: self.active,
-            waiting: self.waiting.len(),
+            waiting: self.waiting.len() + self.parked.len(),
             buffered_events: self.output.len(),
             in_flight: self.pending.is_some(),
             faulted: self.fault.is_some(),
@@ -265,7 +269,7 @@ impl Engine {
             prefix: 0,
             generated: 0,
             admitted: false,
-            admission_wait: None,
+            resource_wait: None,
             work: WorkState::Idle,
             terminal: None,
             notified: false,
@@ -295,6 +299,7 @@ impl Engine {
         }
         if sequence.work == WorkState::Idle {
             self.waiting.retain(|&slot| slot != index);
+            self.parked.retain(|&slot| slot != index);
             self.prefill.retain(|&slot| slot != index);
             self.decode.retain(|&slot| slot != index);
             self.terminate(index, FinishReason::Cancelled);
@@ -348,16 +353,28 @@ impl Engine {
                 ..StepStatus::default()
             });
         }
+        self.reactivate_parked();
         self.admit_waiters();
         self.flush_terminals()?;
-        self.build_batch();
-        if self.batch.is_empty() {
-            return Ok(StepStatus {
-                completed,
-                output_blocked: !self.prefill.is_empty() || !self.decode.is_empty(),
-                ..StepStatus::default()
-            });
+        loop {
+            self.build_batch();
+            if self.batch.is_empty() {
+                return Ok(StepStatus {
+                    completed,
+                    output_blocked: !self.prefill.is_empty() || !self.decode.is_empty(),
+                    ..StepStatus::default()
+                });
+            }
+            if self.prepare_batch()? {
+                break;
+            }
+            // An all-omitted offer parks or rejects every selected row. Rebuild
+            // before sleeping so unoffered healthy peers cannot be stranded.
+            // Parked rows reactivate only on the next step, bounding this loop
+            // by the runnable rows present at entry, without resource retries.
+            self.flush_terminals()?;
         }
+        self.record_scheduled_batch();
         match self
             .model
             .as_mut()
@@ -371,6 +388,7 @@ impl Engine {
                 return Err(EngineError::Faulted(error));
             }
         }
+        self.flush_terminals()?;
         Ok(StepStatus {
             submitted: true,
             completed,
@@ -399,6 +417,7 @@ impl Engine {
         self.batch.clear();
         self.batch_slots.clear();
         self.waiting.clear();
+        self.parked.clear();
         self.prefill.clear();
         self.decode.clear();
         for index in 0..self.slots.len() {
@@ -421,11 +440,11 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn arm_admission_waits(&mut self, waker: &std::task::Waker) {
-        for &index in &self.waiting {
+    pub(crate) fn arm_resource_waits(&mut self, waker: &std::task::Waker) {
+        for &index in self.waiting.iter().chain(&self.parked) {
             if let Some(wait) = self.slots[index]
                 .as_mut()
-                .and_then(|slot| slot.admission_wait.as_mut())
+                .and_then(|slot| slot.resource_wait.as_mut())
             {
                 wait.wake_on_change(waker);
             }
@@ -443,7 +462,7 @@ impl Engine {
                 .expect("waiting queue was nonempty");
             let sequence = self.slots[index].as_ref().expect("waiting slot exists");
             if sequence
-                .admission_wait
+                .resource_wait
                 .as_ref()
                 .is_some_and(|wait| !wait.changed())
             {
@@ -460,7 +479,7 @@ impl Engine {
                 Ok(Admission::Ready) => {
                     let sequence = self.slots[index].as_mut().expect("waiting slot exists");
                     sequence.admitted = true;
-                    sequence.admission_wait = None;
+                    sequence.resource_wait = None;
                     sequence.input = None;
                     self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
                     self.active += 1;
@@ -470,7 +489,7 @@ impl Engine {
                     self.slots[index]
                         .as_mut()
                         .expect("waiting slot exists")
-                        .admission_wait = Some(wait);
+                        .resource_wait = Some(wait);
                     self.waiting.push_back(index);
                 }
                 Err(error) => self.terminate(index, FinishReason::Failed(error)),
@@ -486,7 +505,7 @@ impl Engine {
         if sequence.input.take().is_some() {
             self.queued_prompt_tokens -= u64::from(sequence.prompt_tokens);
         }
-        sequence.admission_wait = None;
+        sequence.resource_wait = None;
         sequence.terminal = Some(reason);
         sequence.work = WorkState::Idle;
         self.terminal.push_back(index);
@@ -554,6 +573,7 @@ impl Engine {
         self.pending = None;
         self.release_output_reservations();
         self.waiting.clear();
+        self.parked.clear();
         self.prefill.clear();
         self.decode.clear();
         self.batch.clear();

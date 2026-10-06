@@ -51,6 +51,35 @@ pin reservation retention, ready-list unlinking and discarded terminal publicati
 when a peer holds all buffer capacity. Request-scoped callers use `pop_event_for`;
 the aggregate drain intentionally includes other clients' events.
 
+## AR pre-submit preparation host gate
+
+The real `Engine` now negotiates aggregate work before submission through required
+executor preparation/abandonment methods. Qwen retains a validated backend batch and
+consumes its exact ready rows, preserving full-reachable reservation and current kernels.
+There is no paged Qwen growth or inherited device qualification.
+
+`crates/runtime/tests/preparation.rs` uses the real byte authority and owning host storage
+to cover shortened prefill/decode, credit refunds before completion, aggregate pressure,
+healthy peer progress, parked cancellation, local rejection, whole-report refusal,
+abandonment preserving old continuation, and failed preparation/abandonment/enqueue plus
+failed-barrier retry. These are control/ownership tests, not numerical or GPU evidence.
+Driver notification tests now exercise both admission and preparation waits, including
+publication in the check-to-park gap and re-registration without idle polling.
+
+A new scheduling regression was reproduced before its fix: with a one-row offer budget,
+two deferred rows could hide a third ready row and leave the worker sleeping indefinitely.
+A bounded rebuild now offers unoffered peers in the same step; parked rows are not retried.
+
+```sh
+cargo test -p ribn --test preparation --locked
+cargo test -p ribn --lib resource --locked
+cargo test -p engine-qwen --features cuda --lib --locked
+```
+
+The synthetic [dispatch comparison](runtime-alignment/README.md#ar-preparation-relative-to-71c326f)
+is separately bounded evidence. Re-run real Qwen numerical, lifecycle and serving gates
+when a device is available before qualifying this changed execution path.
+
 ## Shared text frontend
 
 `ribn-text` reuses the low-level runtime for raw prompt, chat-message, and token-ID

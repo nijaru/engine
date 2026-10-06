@@ -13,12 +13,18 @@ use ribn::{
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum BackendFault {
+    Submit,
+    Output,
+    Release,
+}
+
 #[derive(Default)]
 struct Control {
     pending_polls: usize,
-    bad_token: bool,
-    fail_submit: bool,
-    fail_release: bool,
+    fault: Option<BackendFault>,
+    probe_preparation: bool,
     releases: usize,
     admissions: Vec<SequenceId>,
     batches: Vec<Vec<(ExecutionPhase, u32, u32)>>,
@@ -57,7 +63,7 @@ impl ComputeBackend for Backend {
                 .map(|row| (row.phase(), row.state_position(), row.token_count()))
                 .collect(),
         );
-        if control.fail_submit {
+        if matches!(control.fault, Some(BackendFault::Submit)) {
             return Err(BackendError::ExecutionFailed(
                 "injected submission failure".into(),
             ));
@@ -77,7 +83,13 @@ impl ComputeBackend for Backend {
                 )
                 .unwrap();
                 if row.requests_sampling() {
-                    result.with_output_token(if control.bad_token { 100 } else { 7 })
+                    result.with_output_token(
+                        if matches!(control.fault, Some(BackendFault::Output)) {
+                            100
+                        } else {
+                            7
+                        },
+                    )
                 } else {
                     result
                 }
@@ -100,7 +112,7 @@ impl ComputeBackend for Backend {
     fn release_inference_state(&mut self, _: &InferenceStateSet) -> Result<(), BackendError> {
         assert!(self.pending.is_none(), "release precedes barrier");
         let mut control = self.control.lock().unwrap();
-        if control.fail_release {
+        if matches!(control.fault, Some(BackendFault::Release)) {
             return Err(BackendError::ExecutionFailed(
                 "injected release failure".into(),
             ));
@@ -123,6 +135,27 @@ impl GenerationExecutor for Model {
     ) -> Result<Admission, ExecutionError> {
         self.0.backend.control.lock().unwrap().admissions.push(id);
         self.0.admit(id, request)
+    }
+    fn prepare(&mut self, batch: &[BatchItem]) -> Result<ribn::BatchPreparation, ExecutionError> {
+        let prepared = self.0.prepare(batch)?;
+        let probe = std::mem::take(&mut self.0.backend.control.lock().unwrap().probe_preparation);
+        if probe {
+            let location = StateLocation::Device(self.0.manager.device());
+            let reserved = self.0.manager.used_bytes(location);
+            assert!(self.0.release(batch[0].sequence).is_err());
+            let mut changed = batch.to_vec();
+            changed[0].token_budget += 1;
+            assert!(self.0.submit(&changed).is_err());
+            self.0.abandon_preparation();
+            self.0.abandon_preparation();
+            assert_eq!(self.0.manager.used_bytes(location), reserved);
+            return self.0.prepare(batch);
+        }
+        Ok(prepared)
+    }
+    fn abandon_preparation(&mut self) -> Result<(), ExecutionError> {
+        self.0.abandon_preparation();
+        Ok(())
     }
     fn submit(&mut self, batch: &[BatchItem]) -> Result<SubmissionId, ExecutionError> {
         self.0.submit(batch)
@@ -239,6 +272,29 @@ fn request(tokens: Vec<u32>) -> TokenRequest {
 }
 
 #[test]
+fn prepared_qwen_protects_continuation_and_consumes_only_its_exact_batch() {
+    let control = Arc::new(Mutex::new(Control {
+        probe_preparation: true,
+        ..Control::default()
+    }));
+    let mut engine = engine(control.clone());
+    engine.enqueue(request(vec![1, 2, 3])).unwrap();
+    let mut events = Vec::new();
+    for _ in 0..16 {
+        engine.step().unwrap();
+        events.extend(std::iter::from_fn(|| engine.pop_event()));
+        if engine.status().requests == 0 {
+            break;
+        }
+    }
+    assert!(
+        matches!(events.last(), Some(Event::Finished { reason: FinishReason::Length, usage, .. }) if usage.completion_tokens == 3)
+    );
+    assert_eq!(control.lock().unwrap().releases, 1);
+    engine.shutdown().unwrap();
+}
+
+#[test]
 fn qwen_bridge_preserves_chunk_boundaries_completion_and_cancellation() {
     let control = Arc::new(Mutex::new(Control {
         pending_polls: 1,
@@ -327,8 +383,11 @@ fn adapter_rejects_unsupported_semantics_before_allocating() {
 fn adapter_returns_leases_on_submission_and_completion_failure() {
     for submit in [false, true] {
         let control = Arc::new(Mutex::new(Control {
-            fail_submit: submit,
-            bad_token: !submit,
+            fault: Some(if submit {
+                BackendFault::Submit
+            } else {
+                BackendFault::Output
+            }),
             ..Control::default()
         }));
         let mut engine = engine(control.clone());
@@ -349,7 +408,7 @@ fn adapter_returns_leases_on_submission_and_completion_failure() {
 #[test]
 fn adapter_release_failure_is_retryable_after_output_completion() {
     let control = Arc::new(Mutex::new(Control {
-        fail_release: true,
+        fault: Some(BackendFault::Release),
         ..Control::default()
     }));
     let mut engine = engine(control.clone());
@@ -359,7 +418,7 @@ fn adapter_release_failure_is_retryable_after_output_completion() {
     engine.step().unwrap();
     assert!(engine.step().is_err());
     assert_eq!(engine.status().active_sequences, 1);
-    control.lock().unwrap().fail_release = false;
+    control.lock().unwrap().fault = None;
     engine.step().unwrap();
     assert_eq!(engine.status().requests, 0);
     assert_eq!(control.lock().unwrap().releases, 1);

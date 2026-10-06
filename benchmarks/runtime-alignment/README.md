@@ -1,5 +1,31 @@
 # Host runtime and delivery cost
 
+## AR preparation relative to `71c326f`
+
+Apple M3 Max, macOS 26.6.2 (25G83), Rust 1.98.0, release mode. Same
+`host_overhead` immediate executor and 128 warmup/10,000 measured iterations per
+concurrency. Three baseline runs preceded three candidate runs, not alternating
+pairs. [Raw CSV](ar-preparation-macos.csv) includes per-run medians and p99s.
+
+Median of the three iteration medians, nanoseconds:
+
+| Concurrency | Baseline | Preparation | Difference |
+| --- | ---: | ---: | ---: |
+| 1 | 83 | 83 | 0 |
+| 8 | 375 | 375 | 0 |
+| 32 | 1416 | 1417 | +1 |
+| 128 | 5583 | 5625 | +42 |
+
+The unchanged full-range path returns `BatchPreparation::Ready` without a row-report
+allocation. The measured differences are within 0.8%, with timer quantization and
+run-order uncertainty. This does **not** establish zero overhead or serving performance:
+there is no model/device work, growth allocation, resource pressure or owned driver in
+these timings. Device requalification remains pending.
+
+```sh
+cargo run --release -p ribn --example host_overhead --locked
+```
+
 ## Owned token driver (`7005fad`)
 
 Measured 2026-09-14 on Apple M3 Max, macOS 26.6.2 (25G83), Rust 1.98.0, release
