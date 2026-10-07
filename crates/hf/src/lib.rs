@@ -134,7 +134,9 @@ pub struct LocalWeightSet<'a> {
 /// Eviction happens only on a call that mutably borrows the set, so an artifact a
 /// caller currently borrows is never dropped underneath it; a caller that needs a
 /// shard to outlive that borrow should keep the returned artifact (it is cheap to
-/// clone and shares the same bytes).
+/// clone and shares the same bytes). Eviction precedes opening incoming shards,
+/// even if the open fails. Counts cover this set, not caller-held clones or
+/// transient copies while reading and validating a shard; they are not byte bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidencyPolicy {
     /// Keep every shard opened so far for the set's lifetime.
@@ -345,8 +347,8 @@ impl LocalWeightSet<'_> {
             .ok_or_else(|| PackageError::UnknownParameter(parameter.to_owned()))?
             .to_owned();
         if !self.artifacts.contains_key(&path) {
+            self.make_room_for_shard();
             let artifact = open_artifact(&path)?;
-            self.evict_before_insert();
             self.artifacts.insert(path.clone(), artifact);
         }
         self.touch(&path);
@@ -392,7 +394,7 @@ impl LocalWeightSet<'_> {
     }
 
     /// Free residency for one incoming shard under the configured policy.
-    fn evict_before_insert(&mut self) {
+    fn make_room_for_shard(&mut self) {
         let ResidencyPolicy::Resident { max_open_shards } = self.residency else {
             return;
         };
@@ -1048,6 +1050,16 @@ mod tests {
         assert!(bounded.tensor("first.weight").is_ok());
         assert_eq!(bounded.opened_shard_count(), 1);
         assert_eq!(bounded.resident_bytes(), shard_bytes);
+
+        // An incoming shard must not overlap this cache's old backing, even
+        // when opening/validation fails. A caller-held clone remains valid.
+        let clone = bounded.artifact("first.weight").unwrap().clone();
+        fs::write(dir.path().join(shards[1].0), b"invalid artifact").unwrap();
+        assert!(bounded.tensor("second.weight").is_err());
+        assert_eq!(bounded.opened_shard_count(), 0);
+        assert_eq!(bounded.resident_bytes(), 0);
+        assert_eq!(clone.tensor("first.weight").unwrap().data().len(), 12);
+        assert!(bounded.tensor("first.weight").is_ok());
 
         assert!(matches!(
             package.weight_set_resident(0),

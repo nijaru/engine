@@ -55,8 +55,12 @@ explicit GEMV variants; its new timings are not the legacy baseline's qualificat
 
 `ribn-safetensors` validates artifact bytes once and exposes indexed tensor views.
 `ribn-hf` resolves local config and unsharded/sharded weights without choosing model
-semantics. It lazily caches whole owned shards; cache-entry limits do not bound peak
-bytes while loading or while clones retain storage.
+semantics. It lazily caches whole owned shards, evicting before opening incoming
+shards under a resident policy. Entry limits do not bound total peak bytes: caller
+clones and transient read/validation copies can retain storage. BERT loads with one
+resident source shard and moves each decoded parameter into its host owner without
+a duplicate tensor cache; host weights and device-upload staging still consume memory.
+See the [loader-memory comparison](../benchmarks/loader-memory/README.md).
 
 `engine-bert` owns configuration, parameter mapping, masked bidirectional attention,
 embedding/LayerNorm/GELU/pooler semantics and a CUDA executor through `ribn-batch`.

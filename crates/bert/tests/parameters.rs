@@ -33,6 +33,68 @@ fn fixture_package_supplies_every_parameter() {
 }
 
 #[test]
+fn sharded_package_preserves_every_decoded_parameter() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let package = LocalModelPackage::open(fixture()).unwrap();
+    let config = BertConfig::from_json(package.config()).unwrap();
+    let expected = HostWeights::load(&package, &config).unwrap();
+    let artifact = package
+        .open_weights_for("embeddings.word_embeddings.weight")
+        .unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "ribn-bert-sharded-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    std::fs::write(root.join("config.json"), package.config().to_string()).unwrap();
+    let mut shards: [(serde_json::Map<String, serde_json::Value>, Vec<u8>); 3] =
+        std::array::from_fn(|_| (serde_json::Map::new(), Vec::new()));
+    let mut weight_map = serde_json::Map::new();
+    // Interleave parameters rather than assuming that model read order matches
+    // shard order. Evicted artifacts must be reopened without losing values.
+    for (index, name) in artifact.names().into_iter().enumerate() {
+        let shard = index % shards.len();
+        let tensor = artifact.tensor(&name).unwrap();
+        let (header, payload) = &mut shards[shard];
+        let start = payload.len();
+        payload.extend_from_slice(tensor.data());
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": "F32", "shape": tensor.shape(), "data_offsets": [start, payload.len()]}),
+        );
+        weight_map.insert(
+            name,
+            serde_json::json!(format!("model-{shard}.safetensors")),
+        );
+    }
+    for (index, (header, payload)) in shards.into_iter().enumerate() {
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(payload);
+        std::fs::write(root.join(format!("model-{index}.safetensors")), bytes).unwrap();
+    }
+    std::fs::write(
+        root.join("model.safetensors.index.json"),
+        serde_json::json!({"weight_map": weight_map}).to_string(),
+    )
+    .unwrap();
+    let sharded = LocalModelPackage::open(root).unwrap();
+    assert_eq!(HostWeights::load(&sharded, &config).unwrap(), expected);
+}
+
+#[test]
 fn unsupported_architecture_is_named_rather_than_inferred() {
     let package = LocalModelPackage::open(fixture()).expect("fixture package");
     let mut config = package.config().clone();

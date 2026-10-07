@@ -4,7 +4,6 @@
 //! shape each one has. Resolving the package and reading tensor bytes belongs to
 //! [`ribn_hf`]; interpreting those bytes as this model's parameters belongs here.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use ribn_hf::{LocalModelPackage, LocalWeightSet, PackageError};
@@ -55,12 +54,16 @@ pub struct HostWeights {
 impl HostWeights {
     /// Read every parameter this encoder needs from a resolved local package.
     ///
+    /// Decoded parameters move into the returned owner once. The reader retains
+    /// at most one source shard; arbitrary shard layouts may require rereads.
+    /// This is not a byte bound or streaming device upload.
+    ///
     /// # Errors
     /// Returns [`WeightError`] for a missing parameter, a wrong shape or dtype, or
     /// a package resolution failure.
     pub fn load(package: &LocalModelPackage, config: &BertConfig) -> Result<Self, WeightError> {
         let hidden = config.hidden_size;
-        let mut reader = Reader::new(package);
+        let mut reader = Reader::new(package)?;
         let weights = Self {
             word_embeddings: reader.tensor(
                 "embeddings.word_embeddings.weight",
@@ -213,17 +216,13 @@ impl From<PackageError> for WeightError {
 
 struct Reader<'a> {
     weights: LocalWeightSet<'a>,
-    /// Tensors already decoded, keyed by parameter name. A BERT parameter is
-    /// consumed once each, so this only avoids a second decode within one load.
-    decoded: BTreeMap<String, Vec<f32>>,
 }
 
 impl<'a> Reader<'a> {
-    fn new(package: &'a LocalModelPackage) -> Self {
-        Self {
-            weights: package.weight_set(),
-            decoded: BTreeMap::new(),
-        }
+    fn new(package: &'a LocalModelPackage) -> Result<Self, WeightError> {
+        Ok(Self {
+            weights: package.weight_set_resident(1)?,
+        })
     }
 
     fn dense(&mut self, prefix: &str, input: usize, output: usize) -> Result<Dense, WeightError> {
@@ -236,9 +235,6 @@ impl<'a> Reader<'a> {
     }
 
     fn tensor(&mut self, parameter: &str, expected: &[usize]) -> Result<Vec<f32>, WeightError> {
-        if let Some(values) = self.decoded.get(parameter) {
-            return Ok(values.clone());
-        }
         let tensor = self
             .weights
             .tensor(parameter)
@@ -274,7 +270,6 @@ impl<'a> Reader<'a> {
                 found: values.len(),
             });
         }
-        self.decoded.insert(parameter.to_owned(), values.clone());
         Ok(values)
     }
 }

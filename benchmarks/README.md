@@ -66,6 +66,7 @@ Throughput without latency/SLO context is not sufficient for a serving claim.
   independent Hugging Face reference.
 - [Qwen prefill qualification](qwen-prefill-qualification.md) — chunked same-sequence prefill.
 - [Runtime alignment](runtime-alignment/README.md) — host and CUDA frontend overhead.
+- [Loader memory](loader-memory/README.md) — sharded BERT host-loading peak and bit preservation.
 
 ## Initial workload matrix
 
