@@ -541,6 +541,37 @@ re-execution on 2026-10-06. See the [current Qwen gate](#mixed-arrival-native-qw
 for hardware, artifact, scope and timing. This qualifies the changed test plumbing;
 earlier performance measurements remain historical.
 
+## Compatible decode subgroup candidate
+
+Device gates passed on 2026-10-07 for production `c0c0242`, RTX 4090/driver 615.71.09,
+Rust 1.98.0 and the same pinned artifact/reference as the mixed-arrival gate. The
+updated test source is committed with this evidence; production arithmetic is unchanged.
+Run serially with `RIBN_GROUPED_DECODE=1`, `RIBN_MODEL` and `RIBN_REFERENCE`:
+
+- `prepared_qwen_matches_reference_and_preserves_cancelled_peers`: 1–9 rows, plus
+  cancellation at 2/8/9, matching all 18 independently agreed outputs. The known
+  near-tie at index 18 remains excluded; no independent 32-token parity claim.
+- `mixed_request_reaches_preserve_reference_and_cancelled_peers`: `[4,8,8]` and
+  nonadjacent `[8,4,8]` budgets, normal/cancelled; staggered prefill beside decode peers.
+- `nonadjacent_reaches_preserve_distinct_reference_histories`: `[8,4,6]` budgets with
+  reference offsets `[0,0,2]`. The last prompt includes two independently recorded
+  teacher-forced outputs, preserving equal reach for rows 0/2 while their decode outputs
+  differ. This detects token routing swaps that same-prompt rows cannot.
+- `owned_driver_preserves_reference_with_stalled_and_abandoned_peers`: grouped execution
+  with healthy, stalled and abandoned consumers.
+- NVIDIA `retires_in_flight_members_without_losing_peers_or_state`: physical 8/9-row
+  retirement, retained charges, nine-to-eight transition and clean teardown. In grouped
+  mode, a launched decode subgroup followed by unsupported sampling on a later prefill
+  row drains successfully, restores all taken states and retains logical charges until
+  explicit release. This does **not** test a failed synchronization or prove pinned-slot
+  exactly-once recycling after every composed failure.
+
+All five gates exited zero. The three-request constrained-capacity gate also passed,
+with default whole-batch selection, not grouped execution. Host gates passed separately;
+compilation is not this device evidence. The [matched trace comparison](README.md#mixed-arrival-native-traces)
+found no measurable benefit, so the candidate remains default-off. Paging, growth and
+cross-runtime physical capacity are not enabled or qualified by these tests.
+
 ## Ground-up alignment cost and isolation
 
 The current mailbox implementation reserves both global and per-request event

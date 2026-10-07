@@ -132,8 +132,9 @@ Trace mode defaults to the qualified warp GEMV and production same-sequence pref
 chunking; the old burst sweep retains its scalar-script/serial-prefill baseline.
 The example accepts `--prefill-chunk=off` for a serial comparison.
 `--grouped-decode` opts into the experimental compatible-row subgroup candidate;
-its device and mixed-workload performance gates are pending. Omit it for the qualified
-whole-batch policy. JSON records the choice; it does not enable paging or change admission.
+bounded device gates passed, but the mixed trace showed no measurable benefit and
+failed-drain qualification remains open. Omit it for the default whole-batch policy.
+JSON records the choice; it does not enable paging or change admission.
 
 A workload is a JSON array. Each row specifies a nondecreasing `arrival_ms`,
 positive `output_tokens`, a `prompt_fixture` path relative to the workload file,
@@ -165,6 +166,21 @@ The checked-in eight-request trace is a heterogeneous smoke workload, not steady
 traffic or competitive evidence. It excludes HTTP and tokenization. Use matched endpoint
 load generators above for serving comparisons. Its initial device evidence and the
 heterogeneous-capacity regression are in the [runtime contract](runtime-contract.md#mixed-arrival-native-qwen-gate).
+
+The 2026-10-07 subgroup comparison used three `8427f63` baseline runs followed by three
+`c0c0242` runs with `--grouped-decode`, otherwise identical flags including
+`--print-tokens`. At four active/four queued requests and 500 MiB continuation capacity,
+median throughput was 13.735 versus 13.736 tok/s; TTFT/ITL/E2E p95 were effectively
+unchanged and both earned zero goodput at 5000/200/10000 ms objectives. All runs completed
+8 requests/136 tokens without rejection or failure; every request's tokens matched.
+This is **no measurable improvement**, not competitive evidence or an isolated bottleneck.
+The [six-run CSV](qwen-trace/2026-10-07-grouped-comparison.csv) and median-throughput
+[baseline](qwen-trace/2026-10-07-grouped-baseline.json)/[candidate](qwen-trace/2026-10-07-grouped-candidate.json)
+JSON preserve outcomes and configuration. Runs were process-cold, not filesystem-cache-cold,
+without warmup, on RTX 4090/driver 615.71.09/Rust 1.98.0. Pre/post-load free-memory
+snapshots were identical; they are not peak-memory evidence. Use separate Cargo target
+directories for compared worktrees: shared example paths can be overwritten while
+another worktree's fingerprints still report fresh.
 
 ## Qwen multi-token prefill gate
 

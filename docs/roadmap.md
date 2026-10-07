@@ -159,17 +159,15 @@ Checkpoint recovery and distributed training require separate qualification.
 - **GDN scan:** remains opt-in. Full-model error `1.10e-2` exceeds `5.0e-3`; cause
   unestablished. Compare captured common-history state against higher-precision recurrence.
   Existing baseline error grants no tolerance budget.
-- **Decode subgroups:** an opt-in backend candidate groups compatible decode rows
-  inside mixed/heterogeneous offers and restores original completion order. Default
-  execution retains the qualified whole-batch selector. Host checks do not promote
-  the candidate: run `RIBN_GROUPED_DECODE=1` Qwen reference/cancellation gates across
-  1–9 rows, mixed reaches and staggered arrivals, then repeat the pinned mixed trace
-  with `--grouped-decode` against the saved `8427f63` baseline. Keep numerical histories,
-  latency objectives and memory limits matched; no candidate GPU evidence exists yet.
-  Before promotion, also qualify distinct independently referenced subgroup histories
-  (same-prompt peers cannot detect swapped tokens) and a successful subgroup followed
-  by a later enqueue failure, including a failed drain. Prove no uncertain pinned-slot
-  reuse and exactly-once recycling after a successful drain.
+- **Decode subgroups:** the default-off candidate passed bounded device gates at
+  1–9 rows, cancellation at 2/8/9, mixed reaches, staggered prefill/decode, distinct
+  independently referenced nonadjacent histories, stalled/abandoned consumers and
+  partial enqueue followed by a successful drain. The matched mixed trace showed
+  no measurable throughput/latency benefit and zero SLO goodput for both policies.
+  Do not promote without a representative benefit and targeted failed-drain ownership
+  evidence: no uncertain pinned-slot reuse and exactly-once recycling after a proven
+  drain. See [qualification](../benchmarks/runtime-contract.md#compatible-decode-subgroup-candidate)
+  and [measurements](../benchmarks/README.md#mixed-arrival-native-traces).
 - **Kernel scaling:** retain qualified small-M kernels. Investigate tiled quantized GEMM,
   packed work and tiled attention with actual measurements. Do not repeat measured losers
   without new evidence: four rows per warp, shared IQ4 codebook, pre-elimination decayed keys.

@@ -51,8 +51,9 @@ its duplicate scheduler, serving runtime and `ribn local` frontend have been rem
 The Qwen-owned serving benchmark exercises the real AR engine and preserves explicit
 GEMV variants; its timings are not the legacy baseline's qualification. Compatible decode
 subgroups within mixed offers are an experimental, default-off backend option. They
-retain original completion order and whole-batch completion; device/performance gates
-are pending, so ordinary text/CLI loading retains qualified whole-batch selection.
+retain original completion order and whole-batch completion. Bounded device gates
+passed, but the mixed trace showed no measurable benefit and failed-drain ownership
+qualification remains open; ordinary text/CLI loading retains whole-batch selection.
 
 ## Encoder and artifact paths
 

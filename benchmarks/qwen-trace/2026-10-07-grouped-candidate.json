@@ -1,0 +1,378 @@
+{
+  "artifact": "gguf:sha256:322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+  "batch_token_budget": 64,
+  "continuation_capacity_bytes": 524288000,
+  "free_after_preparation_bytes": 8743944192,
+  "free_before_preparation_bytes": 24885723136,
+  "gemv_mode": "Warp",
+  "grouped_decode": true,
+  "load_seconds": 18.211702673,
+  "max_active_requests": 4,
+  "max_queued_requests": 4,
+  "measurements": {
+    "completed": 8,
+    "completed_requests_per_s": 0.8080003013792645,
+    "completed_tokens_per_s": 13.736005123447496,
+    "e2e": {
+      "max_ms": 9450.926815,
+      "mean_ms": 6905.7641943749995,
+      "p50_ms": 6879.756846,
+      "p95_ms": 9450.926815,
+      "p99_ms": 9450.926815
+    },
+    "elapsed_s": 9.900986406,
+    "emitted_tokens": 136,
+    "failed": 0,
+    "goodput_requests_per_s": 0.0,
+    "itl": {
+      "max_ms": 395.451386,
+      "mean_ms": 159.46949359375003,
+      "p50_ms": 93.967037,
+      "p95_ms": 289.00761,
+      "p99_ms": 395.451366
+    },
+    "offered": 8,
+    "rejected": 0,
+    "requests": [
+      {
+        "arrival_ms": 0.0,
+        "e2e_ms": 7461.097286,
+        "emitted_tokens": 32,
+        "max_itl_ms": 381.34047999999996,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 257,
+        "requested_output_tokens": 32,
+        "submit_lag_ms": 0.000095,
+        "tokens": [
+          6488,
+          283,
+          1876,
+          198,
+          285,
+          638,
+          83841,
+          470,
+          283,
+          21979,
+          470,
+          1358,
+          727,
+          2706,
+          34071,
+          5164,
+          21761,
+          25,
+          592,
+          8,
+          1411,
+          21427,
+          2561,
+          25,
+          198,
+          262,
+          4071,
+          14048,
+          264,
+          4566,
+          886,
+          1083
+        ],
+        "tpot_ms": 151.44449787096775,
+        "ttft_ms": 2766.31765
+      },
+      {
+        "arrival_ms": 0.0,
+        "e2e_ms": 2492.4028599999997,
+        "emitted_tokens": 8,
+        "max_itl_ms": 395.451366,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 5,
+        "requested_output_tokens": 8,
+        "submit_lag_ms": 0.0010780000000000002,
+        "tokens": [
+          198,
+          2,
+          256,
+          803,
+          25,
+          328,
+          4211,
+          1
+        ],
+        "tpot_ms": 293.589567,
+        "ttft_ms": 437.275598
+      },
+      {
+        "arrival_ms": 40.0,
+        "e2e_ms": 4846.197662,
+        "emitted_tokens": 16,
+        "max_itl_ms": 395.451386,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 17,
+        "requested_output_tokens": 16,
+        "submit_lag_ms": 182.98609699999997,
+        "tokens": [
+          464,
+          2556,
+          198,
+          464,
+          311,
+          198,
+          464,
+          5530,
+          198,
+          464,
+          854,
+          198,
+          464,
+          44521,
+          198,
+          1445
+        ],
+        "tpot_ms": 278.6661362666666,
+        "ttft_ms": 666.205272
+      },
+      {
+        "arrival_ms": 40.0,
+        "e2e_ms": 5600.605213,
+        "emitted_tokens": 8,
+        "max_itl_ms": 225.534603,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 257,
+        "requested_output_tokens": 8,
+        "submit_lag_ms": 182.98652,
+        "tokens": [
+          6488,
+          283,
+          1876,
+          198,
+          285,
+          638,
+          83841,
+          470
+        ],
+        "tpot_ms": 128.67959614285715,
+        "ttft_ms": 4699.847903
+      },
+      {
+        "arrival_ms": 100.0,
+        "e2e_ms": 9414.140596,
+        "emitted_tokens": 32,
+        "max_itl_ms": 381.34051,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 17,
+        "requested_output_tokens": 32,
+        "submit_lag_ms": 122.98678100000001,
+        "tokens": [
+          464,
+          2556,
+          198,
+          464,
+          311,
+          198,
+          464,
+          5530,
+          198,
+          464,
+          854,
+          198,
+          464,
+          44521,
+          198,
+          1445,
+          18904,
+          1120,
+          5586,
+          11,
+          28173,
+          11,
+          1697,
+          11,
+          11906,
+          11,
+          23846,
+          271,
+          464,
+          8328,
+          430,
+          2510
+        ],
+        "tpot_ms": 146.48371477419357,
+        "ttft_ms": 4873.145098
+      },
+      {
+        "arrival_ms": 200.0,
+        "e2e_ms": 6879.756846,
+        "emitted_tokens": 16,
+        "max_itl_ms": 175.640452,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 5,
+        "requested_output_tokens": 16,
+        "submit_lag_ms": 22.986911,
+        "tokens": [
+          198,
+          2,
+          256,
+          803,
+          25,
+          328,
+          4211,
+          1,
+          198,
+          2,
+          256,
+          3874,
+          25,
+          328,
+          4211,
+          1
+        ],
+        "tpot_ms": 94.4956596,
+        "ttft_ms": 5462.321873
+      },
+      {
+        "arrival_ms": 400.0,
+        "e2e_ms": 9450.926815,
+        "emitted_tokens": 8,
+        "max_itl_ms": 88.88476800000001,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 257,
+        "requested_output_tokens": 8,
+        "submit_lag_ms": 37.27573,
+        "tokens": [
+          6488,
+          283,
+          1876,
+          198,
+          285,
+          638,
+          83841,
+          470
+        ],
+        "tpot_ms": 64.91351171428572,
+        "ttft_ms": 8996.532141
+      },
+      {
+        "arrival_ms": 800.0,
+        "e2e_ms": 9100.986277,
+        "emitted_tokens": 16,
+        "max_itl_ms": 286.759463,
+        "outcome": {
+          "status": "completed"
+        },
+        "prompt_tokens": 17,
+        "requested_output_tokens": 16,
+        "submit_lag_ms": 69.137253,
+        "tokens": [
+          464,
+          2556,
+          198,
+          464,
+          311,
+          198,
+          464,
+          5530,
+          198,
+          464,
+          854,
+          198,
+          464,
+          44521,
+          198,
+          1445
+        ],
+        "tpot_ms": 144.5743284,
+        "ttft_ms": 6932.371257
+      }
+    ],
+    "slo_completed": 0,
+    "submit_lag": {
+      "max_ms": 182.98652,
+      "mean_ms": 77.295058125,
+      "p50_ms": 37.27573,
+      "p95_ms": 182.98652,
+      "p99_ms": 182.98652
+    },
+    "ttft": {
+      "max_ms": 8996.532141,
+      "mean_ms": 4354.252098999999,
+      "p50_ms": 4699.847903,
+      "p95_ms": 8996.532141,
+      "p99_ms": 8996.532141
+    }
+  },
+  "model": "/home/nick/models/qwen38-27b/Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "objectives": {
+    "e2e_ms": 10000,
+    "itl_ms": 200,
+    "ttft_ms": 5000
+  },
+  "prefill_chunk_members": 8,
+  "prefill_token_budget": 16,
+  "schema_version": 1,
+  "surface": "direct_ar_engine_open_loop",
+  "workload": [
+    {
+      "arrival_ms": 0,
+      "output_tokens": 32,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 257
+    },
+    {
+      "arrival_ms": 0,
+      "output_tokens": 8,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 5
+    },
+    {
+      "arrival_ms": 40,
+      "output_tokens": 16,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 17
+    },
+    {
+      "arrival_ms": 40,
+      "output_tokens": 8,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 257
+    },
+    {
+      "arrival_ms": 100,
+      "output_tokens": 32,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 17
+    },
+    {
+      "arrival_ms": 200,
+      "output_tokens": 16,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 5
+    },
+    {
+      "arrival_ms": 400,
+      "output_tokens": 8,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 257
+    },
+    {
+      "arrival_ms": 800,
+      "output_tokens": 16,
+      "prompt_fixture": "../../crates/qwen/tests/fixtures/qwen38-code-fill4096-257.tokens",
+      "prompt_tokens": 17
+    }
+  ]
+}

@@ -6982,7 +6982,8 @@ fn serves_chunked_prefill_matching_the_serial_path() {
 }
 
 /// Request cancellation is covered through the AR runtime. This gate preserves
-/// physical retirement coverage for the eight-row lane and nine-row fallback.
+/// physical retirement coverage for the eight-row lane and nine-row offer.
+/// `RIBN_GROUPED_DECODE=1` also checks a subgroup followed by a failed row.
 #[test]
 #[ignore = "requires pinned Qwen artifact and CUDA"]
 #[allow(
@@ -7034,6 +7035,7 @@ fn retires_in_flight_members_without_losing_peers_or_state() {
     )
     .unwrap();
 
+    let grouped_decode = std::env::var_os("RIBN_GROUPED_DECODE").is_some();
     for members in [8, 9] {
         let executor = CudaQwen35Decode::new(
             &context,
@@ -7044,7 +7046,9 @@ fn retires_in_flight_members_without_losing_peers_or_state() {
         )
         .unwrap();
         let dispatcher =
-            CudaQwen35ServingDispatcher::new(&context, executor, stream.clone(), members).unwrap();
+            CudaQwen35ServingDispatcher::new(&context, executor, stream.clone(), members)
+                .unwrap()
+                .with_grouped_decode(grouped_decode);
         let caps = BackendCapabilities::new(
             id.clone(),
             device,
@@ -7152,6 +7156,54 @@ fn retires_in_flight_members_without_losing_peers_or_state() {
                 manager.release_set(&states[0]).unwrap();
                 assert_eq!(backend.dispatcher().state_registry().len(), members - 1);
             }
+        }
+        if grouped_decode {
+            // The compatible decode subgroup launches first. A later prefill
+            // row rejects non-greedy sampling after leasing its output slot.
+            // Logical progress is intentionally not committed after failure;
+            // all affected continuation is discarded only after the drain.
+            let segments = (1..members)
+                .map(|index| {
+                    let failing_row = index == members - 1;
+                    let (phase, input, sampling) = if failing_row {
+                        (
+                            ExecutionPhase::Prefill,
+                            ExecutionTokenInput::prompt(Arc::from([next_tokens[index]]), 0, 1)
+                                .unwrap(),
+                            SamplingParams::new(None, 1.0, 1.0, 0).unwrap(),
+                        )
+                    } else {
+                        (
+                            ExecutionPhase::Decode,
+                            ExecutionTokenInput::decode(next_tokens[index]),
+                            SamplingParams::greedy(None),
+                        )
+                    };
+                    ExecutionSegment::new(
+                        engine_core::RequestId::new(index as u64 + 1).unwrap(),
+                        phase,
+                        1,
+                        1,
+                        8,
+                        requirements.clone(),
+                    )
+                    .unwrap()
+                    .with_token_input(input)
+                    .unwrap()
+                    .with_sampling(sampling)
+                })
+                .collect();
+            let batch = ExecutionBatch::new(segments).unwrap();
+            assert!(matches!(
+                backend.submit(&plan, &batch, &mut states[1..]),
+                Err(engine_core::BackendError::Unsupported(_))
+            ));
+            assert_eq!(backend.dispatcher().state_registry().len(), members - 1);
+            assert_eq!(backend.dispatcher().pending_submissions(), 0);
+            assert_eq!(
+                manager.used_bytes(StateLocation::Device(device)),
+                Some(state_bytes * (members - 1) as u64)
+            );
         }
         for state in &states[1..] {
             backend.release_inference_state(state).unwrap();

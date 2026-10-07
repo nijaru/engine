@@ -92,6 +92,7 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
             &vec![u32::try_from(reference.output.len()).unwrap(); concurrency],
             cancel_decode,
             false,
+            None,
         );
     }
 }
@@ -129,6 +130,7 @@ fn owned_driver_preserves_reference_with_stalled_and_abandoned_peers() {
         QwenLoadOptions {
             context_tokens: u32::try_from(reference.prompt.len() + reference.output.len()).unwrap(),
             max_sequences: 3,
+            grouped_decode: std::env::var_os("RIBN_GROUPED_DECODE").is_some(),
             ..QwenLoadOptions::default()
         },
     )
@@ -197,11 +199,35 @@ fn mixed_request_reaches_preserve_reference_and_cancelled_peers() {
     // the distinct pinned-slot host case checks the scatter mapping.
     for budgets in [&[4, 8, 8][..], &[8, 4, 8][..]] {
         for cancel_decode in [false, true] {
-            run_case(&model, &reference, budgets, cancel_decode, false);
+            run_case(&model, &reference, budgets, cancel_decode, false, None);
         }
     }
     // The late third request prefills while the first two decode together.
-    run_case(&model, &reference, &[8, 8, 8], false, true);
+    run_case(&model, &reference, &[8, 8, 8], false, true, None);
+}
+
+#[test]
+#[ignore = "requires an idle CUDA GPU, RIBN_MODEL, and independently recorded RIBN_REFERENCE token fixture"]
+fn nonadjacent_reaches_preserve_distinct_reference_histories() {
+    let model = std::env::var("RIBN_MODEL").expect("RIBN_MODEL GGUF path");
+    let fixture = std::env::var("RIBN_REFERENCE").expect("RIBN_REFERENCE fixture path");
+    let reference = reference(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    assert!(reference.output.len() >= 8);
+    assert_ne!(
+        reference.output[1], reference.output[3],
+        "the first grouped decode must distinguish these histories"
+    );
+    // Row 2 starts two teacher-forced tokens into the independent reference.
+    // Rows 0/2 have equal reach but different next tokens, detecting swapped
+    // outputs without regenerating expectations from Ribn.
+    run_case(
+        &model,
+        &reference,
+        &[8, 4, 6],
+        false,
+        false,
+        Some(&[0, 0, 2]),
+    );
 }
 
 #[expect(
@@ -214,11 +240,29 @@ fn run_case(
     budgets: &[u32],
     cancel_decode: bool,
     stagger_last: bool,
+    history_offsets: Option<&[usize]>,
 ) {
     let concurrency = budgets.len();
-    let max_output_tokens = *budgets.iter().max().unwrap();
+    if let Some(offsets) = history_offsets {
+        assert_eq!(offsets.len(), concurrency);
+    }
+    let offset = |index: usize| history_offsets.map_or(0, |offsets| offsets[index]);
+    let prompt = |index: usize| {
+        let mut prompt = reference.prompt.clone();
+        prompt.extend_from_slice(&reference.output[..offset(index)]);
+        prompt
+    };
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
-    let context_tokens = prompt_tokens.checked_add(max_output_tokens).unwrap();
+    let reach = budgets
+        .iter()
+        .enumerate()
+        .map(|(index, &budget)| {
+            assert!(offset(index) + usize::try_from(budget).unwrap() <= reference.output.len());
+            budget + u32::try_from(offset(index)).unwrap()
+        })
+        .max()
+        .unwrap();
+    let context_tokens = prompt_tokens.checked_add(reach).unwrap();
     let prepared = QwenCuda::load_gguf(
         model,
         QwenLoadOptions {
@@ -236,7 +280,7 @@ fn run_case(
         EngineConfig {
             max_active_requests: concurrency,
             max_queued_requests: 0,
-            max_queued_input_tokens: reference.prompt.len() as u64 * concurrency as u64,
+            max_queued_input_tokens: u64::from(context_tokens) * concurrency as u64,
             max_buffered_events: concurrency * 4,
             max_events_per_request: 64,
         },
@@ -246,10 +290,11 @@ fn run_case(
     let mut requests = budgets
         .iter()
         .take(concurrency - usize::from(stagger_last))
-        .map(|&max_output_tokens| {
+        .enumerate()
+        .map(|(index, &max_output_tokens)| {
             engine
                 .enqueue(TokenRequest::new(
-                    reference.prompt.clone(),
+                    prompt(index),
                     GenerationOptions {
                         max_output_tokens,
                         ..GenerationOptions::default()
@@ -277,7 +322,7 @@ fn run_case(
         {
             let request = engine
                 .enqueue(TokenRequest::new(
-                    reference.prompt.clone(),
+                    prompt(concurrency - 1),
                     GenerationOptions {
                         max_output_tokens: budgets[concurrency - 1],
                         ..GenerationOptions::default()
@@ -313,7 +358,7 @@ fn run_case(
         std::thread::yield_now();
     }
     assert_eq!(engine.status().active_sequences, 0);
-    for (request, &budget) in requests.into_iter().zip(budgets) {
+    for (index, (request, &budget)) in requests.into_iter().zip(budgets).enumerate() {
         if Some(request) == cancelled {
             assert_eq!(finished[&request], FinishReason::Cancelled);
             // Final prefill's already committed output remains deliverable;
@@ -321,14 +366,14 @@ fn run_case(
             assert!(cancel_issued);
             assert_eq!(
                 outputs[&request],
-                reference.output[..outputs[&request].len()]
+                reference.output[offset(index)..offset(index) + outputs[&request].len()]
             );
             assert!(outputs[&request].len() < usize::try_from(budget).unwrap());
         } else {
             assert_eq!(finished[&request], FinishReason::Length);
             assert_eq!(
                 outputs[&request],
-                reference.output[..usize::try_from(budget).unwrap()],
+                reference.output[offset(index)..offset(index) + usize::try_from(budget).unwrap()],
                 "concurrency {concurrency}, budget {budget}"
             );
         }
