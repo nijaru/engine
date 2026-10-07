@@ -525,7 +525,7 @@ The duplicate `local` command is retired. Compare token fixtures rather than raw
 `run` streams without an added newline. A token limit cutting a UTF-8 code point ends
 with one replacement character when the facade flushes its terminal.
 
-## Legacy-runtime retirement: pending device re-execution
+## Legacy-runtime retirement: device re-execution passed
 
 The duplicate core serving scheduler/runtime is removed. Its wrapper-only host tests
 retired; current AR/Qwen contract tests retain lifecycle protection. The two stateless
@@ -536,10 +536,10 @@ release, charge retention, peer progress, the nine-to-eight lane transition and 
 registry after teardown. Actual cancellation/output suppression remains in Qwen's AR
 gate, now also at concurrency nine. No numerical kernels changed.
 
-These migrated ignored fixtures compile on the host but have **not** been re-executed
-on device. Run `cuda_reference` and `cuda_runtime` serially with the commands above when
-desktop is available. Earlier numerical results qualify their recorded revisions,
-not this new test plumbing.
+These migrated fixtures and the Qwen nine-row case passed serialized device
+re-execution on 2026-10-06. See the [current Qwen gate](#mixed-arrival-native-qwen-gate)
+for hardware, artifact, scope and timing. This qualifies the changed test plumbing;
+earlier performance measurements remain historical.
 
 ## Ground-up alignment cost and isolation
 

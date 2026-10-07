@@ -43,9 +43,11 @@ refunding live leases.
 Cleanup removes the duplicate core scheduler/runtime and `ribn local`, retaining the
 Qwen/backend bridge and moving its benchmark onto the real AR engine. Legacy host
 lifecycle tests retire with that implementation; current runtime/Qwen tests retain
-ownership protection. Migrated 8/9-row physical-retirement fixtures and the new nine-row
-AR cancellation case require device execution. Historical benchmark measurements remain
-historical; the migrated harness has no inherited performance qualification.
+ownership protection. Migrated linear/GGUF/8–9-row retirement fixtures and the new
+nine-row AR cancellation case passed device re-execution on 2026-10-06; see the
+[current Qwen gate](../benchmarks/runtime-contract.md#mixed-arrival-native-qwen-gate).
+Historical benchmark measurements remain historical; the migrated harness has no
+inherited performance qualification.
 
 ## 4. Dynamic hybrid AR and model-local integration
 
