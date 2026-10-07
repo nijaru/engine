@@ -93,6 +93,7 @@ fn run() -> Result<(), String> {
             context_tokens: options.context_tokens,
             max_sequences: options.concurrency,
             gemv_mode: options.gemv_mode,
+            grouped_decode: options.grouped_decode,
             // Burst probes preserve their serial baseline; trace traffic uses
             // the production prefill default unless explicitly set to off.
             prefill_chunk_members: options.prefill_chunk,
@@ -150,17 +151,15 @@ fn run() -> Result<(), String> {
             memory.reserved_sequence_bytes,
             policy,
         ),
-        RunMeasurements::Trace(measured) => {
-            report_trace(
-                &options,
-                &measured,
-                &model_path,
-                &artifact,
-                load_elapsed,
-                memory,
-                policy,
-            )?;
-        }
+        RunMeasurements::Trace(measured) => report_trace(
+            &options,
+            &measured,
+            &model_path,
+            &artifact,
+            load_elapsed,
+            memory,
+            policy,
+        )?,
     }
     Ok(())
 }
@@ -201,6 +200,7 @@ fn report_trace(
             "max_active_requests": options.concurrency, "max_queued_requests": options.queue_capacity,
             "batch_token_budget": policy.max_batch_tokens, "prefill_token_budget": policy.prefill_chunk_tokens,
             "prefill_chunk_members": options.prefill_chunk, "gemv_mode": format!("{:?}", options.gemv_mode),
+            "grouped_decode": options.grouped_decode,
             "continuation_capacity_bytes": memory.reserved_sequence_bytes,
             "free_before_preparation_bytes": memory.free_before_preparation_bytes,
             "free_after_preparation_bytes": memory.free_after_preparation_bytes,
@@ -493,6 +493,9 @@ mod tests {
         assert_eq!(&*defaults.prompt, &PROMPT);
         assert_eq!(defaults.context_tokens, 37);
         assert_eq!(defaults.prefill_chunk, None);
+        assert!(!defaults.grouped_decode);
+        assert!(!QwenLoadOptions::default().grouped_decode);
+        assert!(options(&["--grouped-decode"]).unwrap().grouped_decode);
         assert_eq!(defaults.gemv_mode, GemvMode::Warp);
         assert_eq!(QwenLoadOptions::default().gemv_mode, GemvMode::Warp);
         for (flag, expected) in [

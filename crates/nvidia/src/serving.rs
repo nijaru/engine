@@ -42,6 +42,21 @@ struct QueuedRows {
     state_keys: Vec<CudaStateKey>,
 }
 
+impl QueuedRows {
+    /// Restore scheduler positions after independently owned rows run together.
+    fn scatter_group(&mut self, indices: &[usize], group: Self) {
+        debug_assert_eq!(indices.len(), group.outputs.len());
+        debug_assert_eq!(indices.len(), group.elapsed_nanos.len());
+        for ((&index, output), elapsed) in
+            indices.iter().zip(group.outputs).zip(group.elapsed_nanos)
+        {
+            self.outputs[index] = output;
+            self.elapsed_nanos[index] = elapsed;
+        }
+        self.state_keys.extend(group.state_keys);
+    }
+}
+
 /// One-stream asynchronous Qwen3.8 CUDA serving dispatcher.
 ///
 /// Compatible decode rows execute together through prepared batch lanes;
@@ -86,6 +101,8 @@ pub struct CudaQwen35ServingDispatcher {
     /// `max_pending_rows`: prefill concurrency is not request concurrency, and
     /// one long prompt benefits even when only one request is live.
     prefill_lane: Option<CudaQwen35BatchDecode>,
+    /// Unqualified subgroup selection is opt-in; defaults retain whole-batch selection.
+    grouped_decode: bool,
 }
 
 /// How many leading tokens of one prefill segment can run through a
@@ -314,7 +331,16 @@ impl CudaQwen35ServingDispatcher {
             deferred_releases: Vec::new(),
             batched,
             prefill_lane: None,
+            grouped_decode: false,
         })
+    }
+
+    /// Opt into experimental decode subgroups within heterogeneous/mixed offers.
+    /// Device and performance qualification is pending; disabled by default.
+    #[must_use]
+    pub fn with_grouped_decode(mut self, enabled: bool) -> Self {
+        self.grouped_decode = enabled;
+        self
     }
 
     /// Enable same-sequence prefill chunking with `members` tokens per chunk.
@@ -471,28 +497,56 @@ impl CudaQwen35ServingDispatcher {
         if batch.len() <= 1 || batch.len() > crate::quantized::MAX_BATCH_MEMBERS {
             return false;
         }
-        // The dense batched attention lane uses one uniform KV stride. Request-
-        // reachable allocations may have different capacities even in one model.
-        // Those valid rows must stay on the per-row lane, not fault the executor.
         let kv_spec = states
             .first()
             .and_then(InferenceStateSet::kv)
             .map(engine_core::KvState::spec);
-        batch
-            .segments()
-            .iter()
-            .zip(states.iter())
-            .all(|(segment, state)| {
-                segment.phase() == ExecutionPhase::Decode
-                    && segment.token_count() == 1
-                    && segment.requests_sampling()
-                    && segment
-                        .token_input()
-                        .and_then(engine_core::ExecutionTokenInput::decode_token)
-                        .is_some()
-                    && state.token_position().is_some()
-                    && state.kv().map(engine_core::KvState::spec) == kv_spec
+        batch.segments().iter().zip(states).all(|(segment, state)| {
+            segment.phase() == ExecutionPhase::Decode
+                && segment.token_count() == 1
+                && segment.requests_sampling()
+                && segment
+                    .token_input()
+                    .and_then(engine_core::ExecutionTokenInput::decode_token)
+                    .is_some()
+                && state.token_position().is_some()
+                && state.kv().map(engine_core::KvState::spec) == kv_spec
+        })
+    }
+
+    /// Gather compatible decode rows in stable scheduler order. Requests have
+    /// independent state, so device execution may group nonadjacent rows while
+    /// completion stays in original row order. A prefill never enters this lane.
+    fn decode_group(
+        segments: &[ExecutionSegment],
+        states: &[InferenceStateSet],
+        scheduled: &[bool],
+        first: usize,
+    ) -> Vec<usize> {
+        let eligible = |index: usize| {
+            let segment = &segments[index];
+            segment.phase() == ExecutionPhase::Decode
+                && segment.token_count() == 1
+                && segment.requests_sampling()
+                && segment
+                    .token_input()
+                    .and_then(engine_core::ExecutionTokenInput::decode_token)
+                    .is_some()
+                && states[index].token_position().is_some()
+                && states[index].kv().is_some()
+        };
+        if !eligible(first) {
+            return vec![first];
+        }
+        let spec = states[first].kv().expect("eligible KV").spec();
+        (first..segments.len())
+            .filter(|&index| {
+                !scheduled[index]
+                    && eligible(index)
+                    && states[index].kv().expect("eligible KV").spec() == spec
             })
+            .take(crate::quantized::MAX_BATCH_MEMBERS)
+            .collect()
     }
 
     /// Queue one fully-decode batch through the batched executor.
@@ -518,10 +572,10 @@ impl CudaQwen35ServingDispatcher {
     )]
     fn enqueue_batched_decode(
         &mut self,
-        batch: &ExecutionBatch,
-        states: &mut [InferenceStateSet],
+        segments: &[&ExecutionSegment],
+        states: &[&InferenceStateSet],
     ) -> Result<QueuedRows, BackendError> {
-        let row_count = batch.len();
+        let row_count = segments.len();
         let started = Instant::now();
         let mut leased: Vec<Option<PinnedSlotLease>> = Vec::with_capacity(row_count);
         let mut elapsed_nanos = Vec::with_capacity(row_count);
@@ -535,7 +589,7 @@ impl CudaQwen35ServingDispatcher {
 
         let result = (|| -> Result<(), BackendError> {
             // Reject non-greedy sampling before touching any device state.
-            for segment in batch.segments() {
+            for segment in segments {
                 if let Some(sampling) = segment.sampling()
                     && sampling.temperature() != 0.0
                 {
@@ -546,7 +600,7 @@ impl CudaQwen35ServingDispatcher {
             }
 
             // Lease one pinned slot per sampling row, in batch order.
-            for segment in batch.segments() {
+            for segment in segments {
                 if segment.requests_sampling() {
                     leased.push(Some(self.lease_output()?));
                 } else {
@@ -556,7 +610,7 @@ impl CudaQwen35ServingDispatcher {
 
             // Take member physical states out of the registry in row order;
             // the registry allows one mutable borrow at a time.
-            for state in states.iter() {
+            for state in states {
                 let key = CudaStateKey::from_state_set(state);
                 let Some(physical) = self.states.take(&key) else {
                     return Err(BackendError::ExecutionFailed(
@@ -574,7 +628,7 @@ impl CudaQwen35ServingDispatcher {
             // Assemble the step's tokens and positions.
             let mut tokens = Vec::with_capacity(row_count);
             let mut positions = Vec::with_capacity(row_count);
-            for segment in batch.segments() {
+            for segment in segments {
                 let token = segment
                     .token_input()
                     .and_then(engine_core::ExecutionTokenInput::decode_token)
@@ -661,20 +715,48 @@ impl CudaQwen35ServingDispatcher {
         states: &mut [InferenceStateSet],
     ) -> Result<QueuedRows, BackendError> {
         let row_count = batch.len();
-        let mut outputs = Vec::with_capacity(row_count);
-        let mut elapsed_nanos = Vec::with_capacity(row_count);
-        let mut state_keys = Vec::with_capacity(row_count);
-        let mut leased: Vec<PinnedSlotLease> = Vec::new();
+        let segments = batch.segments();
+        let mut queued_rows = QueuedRows {
+            outputs: vec![None; row_count],
+            elapsed_nanos: vec![0; row_count],
+            state_keys: Vec::with_capacity(row_count),
+        };
+        let mut scheduled = vec![false; row_count];
 
         let enqueue_result = (|| -> Result<(), BackendError> {
-            for (segment, state) in batch.segments().iter().zip(states.iter_mut()) {
+            for first in 0..row_count {
+                if scheduled[first] {
+                    continue;
+                }
+                let group = self
+                    .grouped_decode
+                    .then(|| Self::decode_group(segments, states, &scheduled, first));
+                if let Some(group) = group.filter(|group| group.len() > 1) {
+                    let group_segments = group
+                        .iter()
+                        .map(|&index| &segments[index])
+                        .collect::<Vec<_>>();
+                    let group_states = group
+                        .iter()
+                        .map(|&index| &states[index])
+                        .collect::<Vec<_>>();
+                    let queued = self.enqueue_batched_decode(&group_segments, &group_states)?;
+                    queued_rows.scatter_group(&group, queued);
+                    for index in group {
+                        scheduled[index] = true;
+                    }
+                    continue;
+                }
+                let segment = &segments[first];
+                let state = &states[first];
                 let lease = if segment.requests_sampling() {
-                    let lease = self.lease_output()?;
-                    leased.push(lease);
-                    Some(lease)
+                    Some(self.lease_output()?)
                 } else {
                     None
                 };
+                // Retain the lease before any fallible launch so partial rows
+                // and previously enqueued groups share the outer retirement guard.
+                queued_rows.outputs[first] = lease;
                 // Disjoint field borrows: the executor, the state registry,
                 // and the leased pinned slot are independent of each other,
                 // so one row can hold all three at once.
@@ -685,7 +767,7 @@ impl CudaQwen35ServingDispatcher {
                     pinned_outputs,
                     ..
                 } = self;
-                let pinned = lease
+                let mut pinned = lease
                     .map(|lease| {
                         pinned_outputs.get_mut(lease.index).ok_or_else(|| {
                             BackendError::ExecutionFailed(
@@ -694,38 +776,29 @@ impl CudaQwen35ServingDispatcher {
                         })
                     })
                     .transpose()?;
-                let (_, row_elapsed) = if let Some(pinned) = pinned {
-                    run_row(
-                        executor,
-                        prefill_lane.as_mut(),
-                        registry,
-                        segment,
-                        state,
-                        |executor, physical, token, position| {
-                            executor
-                                .decode_step_into_pinned(physical, token, position, pinned)
-                                .map(|()| None)
-                                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
-                        },
-                    )?
-                } else {
-                    run_row(
-                        executor,
-                        prefill_lane.as_mut(),
-                        registry,
-                        segment,
-                        state,
-                        |executor, physical, token, position| {
-                            executor
-                                .prefill_step(physical, token, position)
-                                .map(|()| None)
-                                .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
-                        },
-                    )?
-                };
-                elapsed_nanos.push(row_elapsed);
-                outputs.push(lease);
-                state_keys.push(CudaStateKey::from_state_set(state));
+                let (_, row_elapsed) = run_row(
+                    executor,
+                    prefill_lane.as_mut(),
+                    registry,
+                    segment,
+                    state,
+                    |executor, physical, token, position| {
+                        let result = match &mut pinned {
+                            Some(pinned) => {
+                                executor.decode_step_into_pinned(physical, token, position, pinned)
+                            }
+                            None => executor.prefill_step(physical, token, position),
+                        };
+                        result
+                            .map(|()| None)
+                            .map_err(|error| BackendError::ExecutionFailed(error.to_string()))
+                    },
+                )?;
+                queued_rows.elapsed_nanos[first] = row_elapsed;
+                queued_rows
+                    .state_keys
+                    .push(CudaStateKey::from_state_set(state));
+                scheduled[first] = true;
             }
             Ok(())
         })();
@@ -736,17 +809,13 @@ impl CudaQwen35ServingDispatcher {
                     "{error}; CUDA flush after enqueue failure also failed: {sync_error}"
                 ))));
             }
-            for lease in leased {
+            for lease in queued_rows.outputs.into_iter().flatten() {
                 self.recycle_output(lease);
             }
             return Err(error);
         }
 
-        Ok(QueuedRows {
-            outputs,
-            elapsed_nanos,
-            state_keys,
-        })
+        Ok(queued_rows)
     }
 
     /// Read one leased pinned output slot. Safe only after the owning
@@ -846,8 +915,10 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
             )));
         }
 
-        let rows = if Self::batch_is_batchable(batch, states) {
-            self.enqueue_batched_decode(batch, states)?
+        let rows = if !self.grouped_decode && Self::batch_is_batchable(batch, states) {
+            let segments = batch.segments().iter().collect::<Vec<_>>();
+            let states = states.iter().collect::<Vec<_>>();
+            self.enqueue_batched_decode(&segments, &states)?
         } else {
             self.enqueue_batch(batch, states)?
         };
@@ -969,9 +1040,38 @@ impl NvidiaDispatcher for CudaQwen35ServingDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaQwen35ServingDispatcher, chunked_prefix_len};
+    use super::{Arc, CudaQwen35ServingDispatcher, chunked_prefix_len};
     #[test]
-    fn batch_decode_selection_respects_concrete_kv_capacity() {
+    fn nonadjacent_group_slots_return_to_original_positions() {
+        use super::{PinnedSlotLease, QueuedRows};
+        let mut rows = QueuedRows {
+            outputs: vec![None; 3],
+            elapsed_nanos: vec![0; 3],
+            state_keys: Vec::new(),
+        };
+        rows.scatter_group(
+            &[0, 2],
+            QueuedRows {
+                outputs: vec![
+                    Some(PinnedSlotLease { index: 7 }),
+                    Some(PinnedSlotLease { index: 3 }),
+                ],
+                elapsed_nanos: vec![11, 19],
+                state_keys: Vec::new(),
+            },
+        );
+        assert_eq!(
+            rows.outputs
+                .iter()
+                .map(|slot| slot.map(|slot| slot.index))
+                .collect::<Vec<_>>(),
+            [Some(7), None, Some(3)]
+        );
+        assert_eq!(rows.elapsed_nanos, [11, 0, 19]);
+    }
+
+    #[test]
+    fn decode_groups_preserve_order_and_concrete_kv_compatibility() {
         use engine_core::{
             DataType, DeviceId, ExecutionBatch, ExecutionPhase, ExecutionSegment,
             ExecutionTokenInput, KvStateSpec, LogicalStateManager, RequestId, SamplingParams,
@@ -984,7 +1084,13 @@ mod tests {
             ribn_foundation::BytePool::new(1024).shared(),
             ribn_foundation::BytePool::new(0).shared(),
         );
-        for (capacities, batchable) in [([4, 4], true), ([4, 5], false)] {
+        for (capacities, prefill, expected) in [
+            (vec![4, 4], None, vec![0, 1]),
+            (vec![4, 5], None, vec![0]),
+            (vec![4, 5, 4], None, vec![0, 2]),
+            (vec![4, 4, 4], Some(1), vec![0, 2]),
+            (vec![4; 9], None, (0..8).collect()),
+        ] {
             let mut states = capacities
                 .into_iter()
                 .map(|capacity| {
@@ -998,30 +1104,53 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>();
-            manager.commit_batch(&mut states, &[1, 1]).unwrap();
+            let positions = vec![1; states.len()];
+            manager.commit_batch(&mut states, &positions).unwrap();
             let segments = states
                 .iter()
                 .enumerate()
                 .map(|(index, state)| {
                     ExecutionSegment::new(
                         RequestId::new(u64::try_from(index + 1).unwrap()).unwrap(),
-                        ExecutionPhase::Decode,
+                        if Some(index) == prefill {
+                            ExecutionPhase::Prefill
+                        } else {
+                            ExecutionPhase::Decode
+                        },
                         1,
                         1,
                         1,
                         state.requirements(),
                     )
                     .unwrap()
-                    .with_token_input(ExecutionTokenInput::Decode { token: 7 })
+                    .with_token_input(if Some(index) == prefill {
+                        ExecutionTokenInput::prompt(Arc::from([7, 7]), 1, 1).unwrap()
+                    } else {
+                        ExecutionTokenInput::Decode { token: 7 }
+                    })
                     .unwrap()
                     .with_sampling(SamplingParams::greedy(None))
                 })
                 .collect();
             let batch = ExecutionBatch::new(segments).unwrap();
+            let mut scheduled = vec![false; states.len()];
             assert_eq!(
-                CudaQwen35ServingDispatcher::batch_is_batchable(&batch, &states),
-                batchable
+                CudaQwen35ServingDispatcher::decode_group(batch.segments(), &states, &scheduled, 0),
+                expected
             );
+            for &index in &expected {
+                scheduled[index] = true;
+            }
+            if let Some(first) = scheduled.iter().position(|&done| !done) {
+                let group = CudaQwen35ServingDispatcher::decode_group(
+                    batch.segments(),
+                    &states,
+                    &scheduled,
+                    first,
+                );
+                assert!(group.iter().all(|&index| !scheduled[index]));
+                assert_eq!(group[0], first);
+            }
             for state in &states {
                 manager.release_set(state).unwrap();
             }

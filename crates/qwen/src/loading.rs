@@ -36,6 +36,9 @@ pub struct QwenLoadOptions {
     /// Backend-native projection mode. Warp is the existing qualified default;
     /// scalar is the correctness oracle and integer-dot is explicitly lossy.
     pub gemv_mode: GemvMode,
+    /// Experimental compatible decode subgroups. Disabled until device and
+    /// mixed-workload performance gates pass; does not change continuation policy.
+    pub grouped_decode: bool,
     /// Same-sequence prefill chunk size, or `None` for the serial prefill
     /// path. Enabled by default: the lane is backend-local, and its parity and
     /// serving-effect gates are recorded in
@@ -61,6 +64,7 @@ impl Default for QwenLoadOptions {
             context_tokens: 4096,
             max_sequences: 1,
             gemv_mode: GemvMode::default(),
+            grouped_decode: false,
             prefill_chunk_members: Some(DEFAULT_PREFILL_CHUNK_MEMBERS),
             weight_budget_bytes: None,
             continuation_capacity_bytes: None,
@@ -139,7 +143,8 @@ pub(crate) fn load(
     executor.set_gemv_mode(options.gemv_mode);
     let dispatcher =
         CudaQwen35ServingDispatcher::new(&context, executor, stream.clone(), options.max_sequences)
-            .map_err(model_error)?;
+            .map_err(model_error)?
+            .with_grouped_decode(options.grouped_decode);
     // The chunk lane is part of preparation, so its scratch is allocated
     // before the post-preparation memory check below accounts for it.
     let dispatcher = match options.prefill_chunk_members {

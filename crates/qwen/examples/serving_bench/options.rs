@@ -4,12 +4,17 @@ use engine_nvidia::GemvMode;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent benchmark input, output and experimental execution flags"
+)]
 pub(super) struct Options {
     pub concurrency: usize,
     pub output_tokens: u32,
     pub prompt: Arc<[u32]>,
     pub fixture_prompt: bool,
     pub gemv_mode: GemvMode,
+    pub grouped_decode: bool,
     pub prefill_chunk: Option<usize>,
     pub print_tokens: bool,
     pub divergence_probe: bool,
@@ -97,6 +102,9 @@ impl Options {
             prompt: input.tokens,
             fixture_prompt: input.fixture,
             gemv_mode,
+            grouped_decode: arguments
+                .iter()
+                .any(|argument| argument == "--grouped-decode"),
             prefill_chunk,
             print_tokens,
             divergence_probe: input.divergence,
@@ -142,7 +150,7 @@ fn validate_arguments(arguments: &[String]) -> Result<(), String> {
             .find(|prefix| argument.starts_with(**prefix))
             .copied()
             .or_else(|| {
-                ["--print-tokens", "--divergence-probe"]
+                ["--print-tokens", "--divergence-probe", "--grouped-decode"]
                     .into_iter()
                     .find(|flag| argument == flag)
             })

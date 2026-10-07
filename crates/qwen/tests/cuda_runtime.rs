@@ -75,6 +75,11 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
     for (concurrency, cancel_decode) in [
         (1, false),
         (2, false),
+        (3, false),
+        (4, false),
+        (5, false),
+        (6, false),
+        (7, false),
         (8, false),
         (9, false),
         (2, true),
@@ -86,6 +91,7 @@ fn prepared_qwen_matches_reference_and_preserves_cancelled_peers() {
             &reference,
             &vec![u32::try_from(reference.output.len()).unwrap(); concurrency],
             cancel_decode,
+            false,
         );
     }
 }
@@ -186,14 +192,29 @@ fn mixed_request_reaches_preserve_reference_and_cancelled_peers() {
     let fixture = std::env::var("RIBN_REFERENCE").expect("RIBN_REFERENCE fixture path");
     let reference = reference(&std::fs::read_to_string(fixture).unwrap()).unwrap();
     assert!(reference.output.len() >= 8);
-    // Different output budgets create different concrete KV capacities even
-    // with identical prompts. Cancellation leaves two compatible survivors.
-    for cancel_decode in [false, true] {
-        run_case(&model, &reference, &[4, 8, 8], cancel_decode);
+    // Different reaches partition decode into compatible subgroups, including
+    // a nonadjacent pair. Same-history tokens do not prove cross-request ordering;
+    // the distinct pinned-slot host case checks the scatter mapping.
+    for budgets in [&[4, 8, 8][..], &[8, 4, 8][..]] {
+        for cancel_decode in [false, true] {
+            run_case(&model, &reference, budgets, cancel_decode, false);
+        }
     }
+    // The late third request prefills while the first two decode together.
+    run_case(&model, &reference, &[8, 8, 8], false, true);
 }
 
-fn run_case(model: &str, reference: &Reference, budgets: &[u32], cancel_decode: bool) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one complete device scenario keeps admission, stagger, cancellation and teardown together"
+)]
+fn run_case(
+    model: &str,
+    reference: &Reference,
+    budgets: &[u32],
+    cancel_decode: bool,
+    stagger_last: bool,
+) {
     let concurrency = budgets.len();
     let max_output_tokens = *budgets.iter().max().unwrap();
     let prompt_tokens = u32::try_from(reference.prompt.len()).unwrap();
@@ -203,6 +224,7 @@ fn run_case(model: &str, reference: &Reference, budgets: &[u32], cancel_decode: 
         QwenLoadOptions {
             context_tokens,
             max_sequences: concurrency,
+            grouped_decode: std::env::var_os("RIBN_GROUPED_DECODE").is_some(),
             ..QwenLoadOptions::default()
         },
     )
@@ -221,8 +243,9 @@ fn run_case(model: &str, reference: &Reference, budgets: &[u32], cancel_decode: 
         SchedulePolicy::default(),
     )
     .unwrap();
-    let requests = budgets
+    let mut requests = budgets
         .iter()
+        .take(concurrency - usize::from(stagger_last))
         .map(|&max_output_tokens| {
             engine
                 .enqueue(TokenRequest::new(
@@ -247,6 +270,23 @@ fn run_case(model: &str, reference: &Reference, budgets: &[u32], cancel_decode: 
     while finished.len() < concurrency {
         assert!(Instant::now() < deadline, "Qwen qualification stalled");
         engine.step().unwrap();
+        if requests.len() < concurrency
+            && engine
+                .committed_prefix(requests[0])
+                .is_some_and(|prefix| prefix >= prompt_tokens)
+        {
+            let request = engine
+                .enqueue(TokenRequest::new(
+                    reference.prompt.clone(),
+                    GenerationOptions {
+                        max_output_tokens: budgets[concurrency - 1],
+                        ..GenerationOptions::default()
+                    },
+                ))
+                .unwrap();
+            requests.push(request);
+            outputs.insert(request, Vec::new());
+        }
         // The step that commits final prefill has already submitted decode.
         if !cancel_issued
             && let Some(request) = cancelled

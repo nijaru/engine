@@ -48,8 +48,11 @@ Block-table attention reads exist in the backend, but production Qwen remains
 contiguous. There is no paged write/growth consumer, prefix cache, restore operation
 or recomputation preemption. The surviving `engine-core` contracts are transitional;
 its duplicate scheduler, serving runtime and `ribn local` frontend have been removed.
-The Qwen-owned serving benchmark now exercises the real AR engine and preserves
-explicit GEMV variants; its new timings are not the legacy baseline's qualification.
+The Qwen-owned serving benchmark exercises the real AR engine and preserves explicit
+GEMV variants; its timings are not the legacy baseline's qualification. Compatible decode
+subgroups within mixed offers are an experimental, default-off backend option. They
+retain original completion order and whole-batch completion; device/performance gates
+are pending, so ordinary text/CLI loading retains qualified whole-batch selection.
 
 ## Encoder and artifact paths
 

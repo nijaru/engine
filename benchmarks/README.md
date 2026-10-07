@@ -131,6 +131,9 @@ bash benchmarks/run-qwen-serving-sweep.sh
 Trace mode defaults to the qualified warp GEMV and production same-sequence prefill
 chunking; the old burst sweep retains its scalar-script/serial-prefill baseline.
 The example accepts `--prefill-chunk=off` for a serial comparison.
+`--grouped-decode` opts into the experimental compatible-row subgroup candidate;
+its device and mixed-workload performance gates are pending. Omit it for the qualified
+whole-batch policy. JSON records the choice; it does not enable paging or change admission.
 
 A workload is a JSON array. Each row specifies a nondecreasing `arrival_ms`,
 positive `output_tokens`, a `prompt_fixture` path relative to the workload file,
